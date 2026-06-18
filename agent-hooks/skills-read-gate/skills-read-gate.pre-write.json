@@ -1,0 +1,9 @@
+{
+  "id": "skills-read-gate-write",
+  "point": "pre-write",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/skills-read-gate/skills_read_gate.py",
+  "priority": 35,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Enforcement-doctrine gate 4 (check half, code write): on a non-docs code Edit/Write, verify the mandatory skills were Skill-tool-invoked this session. Warns first, then BLOCKS a repeat. Docs/config are not substantive acts. Applies to orchestrator AND subagents. Honest escape hatch: SKIP_SKILLS_READ_GATE=1 + SKIP_SKILLS_READ_GATE_REASON='why'. on_error=open."
+}

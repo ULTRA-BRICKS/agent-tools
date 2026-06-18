@@ -1,0 +1,9 @@
+{
+  "id": "visual-proof-gate-commit",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/visual-proof-gate/visual_proof_gate.py",
+  "priority": 40,
+  "timeout_ms": 4000,
+  "on_error": "open",
+  "description": "Enforcement-doctrine gate 5 (check half, commit): on `git commit`, if the staged change touches user-visible files (UI/asset/render) and there's no fresh visual proof (a visual-proof-cycle skill invocation this session OR a freshly-modified screenshot file), WARN first, then BLOCK a repeat. Honest escape hatch: SKIP_VISUAL_PROOF=1 + SKIP_VISUAL_PROOF_REASON='why', or an inline `# visual-proof-ok: why`. on_error=open."
+}

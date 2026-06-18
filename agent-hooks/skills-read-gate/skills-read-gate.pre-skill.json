@@ -1,0 +1,9 @@
+{
+  "id": "skills-read-gate-record",
+  "point": "pre-skill",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/skills-read-gate/skills_read_gate.py",
+  "priority": 5,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Enforcement-doctrine gate 4 (record half): on a Skill-tool invocation, record the skill as READ this session (per-session marker). This is the satisfiable, honest action that clears the check half — only a real Skill-tool call writes the marker, never a forge. Always allows. on_error=open."
+}

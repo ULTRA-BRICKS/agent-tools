@@ -1,0 +1,9 @@
+{
+  "id": "orchestrator-stays-thin",
+  "point": "pre-write",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/orchestrator-stays-thin/orchestrator_stays_thin.py",
+  "priority": 30,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Enforcement-doctrine gate 2 (pre-write half): the orchestrator (main thread) must NOT edit/write source code inline — it plans, dispatches, verifies. A non-docs code Edit/Write WARNS first, then BLOCKS a repeat within the window, with 'delegate to a subagent'. Docs/config/lockfiles are exempt. SUBAGENTS are EXEMPT (CLAUDE_CODE_CHILD_SESSION). Honest escape hatch: ALLOW_ORCHESTRATOR_WORK=1 + ALLOW_ORCHESTRATOR_WORK_REASON='why'. on_error=open."
+}
