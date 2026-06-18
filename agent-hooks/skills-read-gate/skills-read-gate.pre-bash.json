@@ -1,0 +1,9 @@
+{
+  "id": "skills-read-gate-commit",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/skills-read-gate/skills_read_gate.py",
+  "priority": 35,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Enforcement-doctrine gate 4 (check half, commit): on `git commit`, verify the mandatory skills (delegate-work-to-subagents, visual-proof-cycle; override via SKILLS_READ_MANDATORY) were Skill-tool-invoked this session. Warns first, then BLOCKS a repeat. Applies to orchestrator AND subagents. Honest escape hatch: SKIP_SKILLS_READ_GATE=1 + SKIP_SKILLS_READ_GATE_REASON='why', or an inline `# skills-read-ok: why`. on_error=open."
+}

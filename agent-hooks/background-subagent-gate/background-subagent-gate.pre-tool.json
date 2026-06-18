@@ -1,0 +1,9 @@
+{
+  "id": "background-subagent-gate",
+  "point": "pre-tool",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/background-subagent-gate/background_subagent_gate.py",
+  "priority": 20,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Enforcement-doctrine gate 1: the ORCHESTRATOR (main thread) must dispatch a subagent in the BACKGROUND. Fires on the Task/Agent dispatch tool (pre-tool point); if run_in_background isn't truthy, a non-trivial dispatch is BLOCKED with a 3-part reminder (why / set run_in_background:true or a Workflow / orchestrator-plans-dispatches-verifies), a trivial one warns. SUBAGENTS are EXEMPT (CLAUDE_CODE_CHILD_SESSION). Honest escape hatch: ALLOW_FOREGROUND_SUBAGENT=1 + ALLOW_FOREGROUND_SUBAGENT_REASON='why', or an inline `foreground-subagent-ok: why` in the prompt. on_error=open: a behavioral nudge must never wedge dispatching."
+}

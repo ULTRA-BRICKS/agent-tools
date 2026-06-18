@@ -1,0 +1,9 @@
+{
+  "id": "visual-proof-gate-stop",
+  "point": "stop",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/visual-proof-gate/visual_proof_gate.py",
+  "priority": 40,
+  "timeout_ms": 4000,
+  "on_error": "open",
+  "description": "Enforcement-doctrine gate 5 (check half, 'done' claim): when the turn ends, if there's a user-visible change with no fresh visual proof, BLOCK the stop ONCE per session with the visual-proof reminder (a genuine no-proof stop can finish after seeing the message once). Honest escape hatch: SKIP_VISUAL_PROOF=1 + SKIP_VISUAL_PROOF_REASON='why'. on_error=open."
+}

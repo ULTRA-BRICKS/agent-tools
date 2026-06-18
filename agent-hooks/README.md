@@ -66,16 +66,26 @@ These are the *logical* points; map them to your harness's actual tool-use event
 
 > **Claude Code:** CC does NOT run these descriptors directly — it only runs hooks declared
 > in `settings.json`. The `lib/cc_hook_bridge` dispatcher is the carrier that makes them
-> fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`, Stop for
-> `stop`) and translates the exit-10 BLOCK into CC's `permissionDecision: "deny"` /
-> `decision: "block"`. Without that bridge these hooks are inert in CC (agent-tools#18).
+> fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`/`pre-tool`
+> (`Task|Agent`)/`pre-skill` (`Skill`), Stop for `stop`) and translates the exit-10 BLOCK
+> into CC's `permissionDecision: "deny"` / `decision: "block"`. Without that bridge these
+> hooks are inert in CC (agent-tools#18).
 
 | point          | fires when…                                  | hooks                                   |
 | -------------- | -------------------------------------------- | --------------------------------------- |
-| `pre-bash`     | before a shell command runs                  | block-no-verify, block-raw-pr-merge, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash |
-| `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env |
+| `pre-bash`     | before a shell command runs                  | block-no-verify, block-raw-pr-merge, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, skills-read-gate, visual-proof-gate |
+| `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, skills-read-gate |
+| `pre-tool`     | before a subagent-dispatch tool (`Task`/`Agent`) runs | background-subagent-gate          |
+| `pre-skill`    | before the `Skill` tool runs                 | skills-read-gate (record)               |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write                         |
-| `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
+| `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck, visual-proof-gate |
+
+The enforcement-doctrine gates (`background-subagent-gate`, `orchestrator-stays-thin`,
+`no-long-inline-process`, `skills-read-gate`, `visual-proof-gate`) encode the
+orchestrate-only / background-subagents / read-skills / visual-proof rules as structural
+guards instead of regressing prose. Each is satisfiable by an honest action, tiered (warn
+before block), carries an honest auditable escape hatch, and gates 1-3 exempt subagents via
+CC's `CLAUDE_CODE_CHILD_SESSION` env signal. See each hook's README.
 
 ### `post-write` — react to a *completed* write
 

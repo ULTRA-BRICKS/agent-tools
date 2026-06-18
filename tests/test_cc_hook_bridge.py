@@ -84,8 +84,32 @@ def test_point_for_event_maps_tool_to_logical_point():
     assert dispatch.point_for_event("PreToolUse", "MultiEdit") == "pre-write"
     assert dispatch.point_for_event("PreToolUse", "NotebookEdit") == "pre-write"
     assert dispatch.point_for_event("Stop", None) == "stop"
+    # the subagent-dispatch tools → pre-tool (background-subagent-gate hangs off this).
+    assert dispatch.point_for_event("PreToolUse", "Task") == "pre-tool"
+    assert dispatch.point_for_event("PreToolUse", "Agent") == "pre-tool"
+    # the Skill tool → pre-skill (the skills-read / visual-proof record half).
+    assert dispatch.point_for_event("PreToolUse", "Skill") == "pre-skill"
     # an unmapped tool (e.g. Read) on PreToolUse has no logical point → nothing fires
     assert dispatch.point_for_event("PreToolUse", "Read") is None
+
+
+def test_to_v1_event_passes_task_dispatch_payload_through():
+    """The pre-tool event must carry the WHOLE tool_input under args (run_in_background,
+    prompt) so the background-subagent-gate can inspect it."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Task",
+          "tool_input": {"run_in_background": False, "prompt": "go", "subagent_type": "worker"}}
+    v1 = dispatch.to_v1_event(cc, point="pre-tool")
+    assert v1["tool"] == "Task"
+    assert v1["point"] == "pre-tool"
+    assert v1["args"]["run_in_background"] is False
+    assert v1["args"]["prompt"] == "go"
+
+
+def test_to_v1_event_passes_skill_name_through():
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Skill",
+          "tool_input": {"skill": "visual-proof-cycle"}}
+    v1 = dispatch.to_v1_event(cc, point="pre-skill")
+    assert v1["args"]["skill"] == "visual-proof-cycle"
 
 
 def test_to_v1_event_carries_the_bash_command():
@@ -466,6 +490,134 @@ def test_first_block_wins_collects_reason(tmp_path):
     out = json.loads(proc.stdout)
     reason = out["hookSpecificOutput"]["permissionDecisionReason"]
     assert "first-reason" in reason, out
+
+
+# ── end-to-end: the enforcement-doctrine gates fire THROUGH the real bridge ────────────
+
+BACKGROUND_SUBAGENT_GATE = (
+    _REPO / "agent-hooks" / "background-subagent-gate" / "background_subagent_gate.py"
+)
+
+
+def _run_dispatch_env(event: str, cc_event: dict, *, home: Path,
+                      env_extra: dict) -> subprocess.CompletedProcess:
+    """Like _run_dispatch but lets the test control extra env (the subagent signal).
+
+    This is the crux of doctrine clause (c): the subagent-exemption signal
+    (CLAUDE_CODE_CHILD_SESSION) must reach the HOOK subprocess. The bridge runs the hook as
+    a child that inherits the bridge's env, so the env the harness sets on the bridge call
+    flows through to the gate. This test proves that whole chain end-to-end.
+    """
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["PYTHONPATH"] = str(_LIB) + os.pathsep + env.get("PYTHONPATH", "")
+    env.pop("CLAUDE_CODE_CHILD_SESSION", None)
+    env.pop("CLAUDE_AGENT_IS_SUBAGENT", None)
+    env.update(env_extra)
+    return subprocess.run(
+        [sys.executable, "-m", "cc_hook_bridge", event],
+        input=json.dumps(cc_event),
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+
+
+def _task_event(tmp_path: Path):
+    long_prompt = "implement the parser " * 30
+    return {"hook_event_name": "PreToolUse", "tool_name": "Task",
+            "tool_input": {"run_in_background": False, "prompt": long_prompt},
+            "cwd": str(tmp_path)}
+
+
+def test_background_subagent_gate_blocks_through_bridge(tmp_path):
+    """A foreground Task dispatch on the MAIN thread → the bridge emits a CC permission deny."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="background-subagent-gate", point="pre-tool",
+                        cmd=BACKGROUND_SUBAGENT_GATE, on_error="open")
+    proc = _run_dispatch_env("PreToolUse", _task_event(tmp_path), home=home, env_extra={})
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+    assert "run_in_background" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_background_subagent_gate_exempt_in_subagent_through_bridge(tmp_path):
+    """The SAME foreground dispatch is ALLOWED when CLAUDE_CODE_CHILD_SESSION is set — proving
+    the subagent-exemption signal flows bridge → hook subprocess (doctrine clause c)."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="background-subagent-gate", point="pre-tool",
+                        cmd=BACKGROUND_SUBAGENT_GATE, on_error="open")
+    proc = _run_dispatch_env("PreToolUse", _task_event(tmp_path), home=home,
+                             env_extra={"CLAUDE_CODE_CHILD_SESSION": "1"})
+    assert proc.returncode == 0, proc.stderr
+    # no block JSON emitted → the tool proceeds (subagent is exempt).
+    assert proc.stdout.strip() == "", proc.stdout
+
+
+def test_background_subagent_gate_allows_background_through_bridge(tmp_path):
+    """A background Task dispatch passes the gate cleanly through the bridge."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="background-subagent-gate", point="pre-tool",
+                        cmd=BACKGROUND_SUBAGENT_GATE, on_error="open")
+    cc_event = {"hook_event_name": "PreToolUse", "tool_name": "Task",
+                "tool_input": {"run_in_background": True, "prompt": "x" * 400},
+                "cwd": str(tmp_path)}
+    proc = _run_dispatch_env("PreToolUse", cc_event, home=home, env_extra={})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "", proc.stdout
+
+
+SKILLS_READ_GATE = (
+    _REPO / "agent-hooks" / "skills-read-gate" / "skills_read_gate.py"
+)
+
+
+def test_skills_read_gate_record_then_check_loop_through_bridge(tmp_path):
+    """The Skill-tool RECORD (pre-skill) and the commit CHECK (pre-bash) must share the CC
+    session id THROUGH the bridge — proving the satisfiable loop works end-to-end.
+
+    The bridge sets v1 ``event_id`` to the CC ``session_id`` for every point, so a Skill
+    invocation and a later commit in the same CC session key the same marker. This locks the
+    cross-point session correlation the gate depends on.
+    """
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    marker_dir = tmp_path / "skills-markers"
+    _install_descriptor(hooks, hook_id="skills-read-gate-record", point="pre-skill",
+                        cmd=SKILLS_READ_GATE, on_error="open", priority=5)
+    _install_descriptor(hooks, hook_id="skills-read-gate-commit", point="pre-bash",
+                        cmd=SKILLS_READ_GATE, on_error="open", priority=35)
+    env_extra = {
+        "SKILLS_READ_MARKER_DIR": str(marker_dir),
+        "SKILLS_READ_MANDATORY": "visual-proof-cycle",
+    }
+    sid = "cc-session-42"
+
+    def commit():
+        return _run_dispatch_env(
+            "PreToolUse",
+            {"hook_event_name": "PreToolUse", "tool_name": "Bash", "session_id": sid,
+             "tool_input": {"command": "git commit -m feat"}, "cwd": str(tmp_path)},
+            home=home, env_extra=env_extra)
+
+    # 1st commit with the skill UNREAD → warn (allow, no block JSON).
+    p1 = commit()
+    assert p1.returncode == 0 and p1.stdout.strip() == "", p1.stdout
+    # 2nd commit → the gate escalates to BLOCK.
+    p2 = commit()
+    assert json.loads(p2.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny", p2.stdout
+    # invoke the real skill (RECORD half) in the SAME session...
+    rec = _run_dispatch_env(
+        "PreToolUse",
+        {"hook_event_name": "PreToolUse", "tool_name": "Skill", "session_id": sid,
+         "tool_input": {"skill": "visual-proof-cycle"}, "cwd": str(tmp_path)},
+        home=home, env_extra=env_extra)
+    assert rec.returncode == 0 and rec.stdout.strip() == "", rec.stdout
+    # ...now the commit is ALLOWED — the loop is satisfiable end-to-end through the bridge.
+    p3 = commit()
+    assert p3.returncode == 0 and p3.stdout.strip() == "", p3.stdout
 
 
 if __name__ == "__main__":

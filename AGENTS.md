@@ -89,10 +89,22 @@ The shipped hooks and their points:
 
 | Point | Hooks |
 | --- | --- |
-| `pre-bash` | `block-no-verify` (fail-closed), `block-raw-pr-merge`, `require-review-before-commit`, `require-ticket-before-commit`, `enforce-timeout-on-bash` |
-| `pre-write` | `block-secrets-write`, `block-raw-process-env` |
+| `pre-bash` | `block-no-verify` (fail-closed), `block-raw-pr-merge`, `require-review-before-commit`, `require-ticket-before-commit`, `enforce-timeout-on-bash`, `orchestrator-stays-thin` (gate 2, bash half), `no-long-inline-process` (gate 3), `skills-read-gate` (gate 4, commit), `visual-proof-gate` (gate 5, commit) |
+| `pre-write` | `block-secrets-write`, `block-raw-process-env`, `orchestrator-stays-thin` (gate 2, write half), `skills-read-gate` (gate 4, code-write) |
+| `pre-tool` | `background-subagent-gate` (gate 1 — fires on the `Task`/`Agent` dispatch tool) |
+| `pre-skill` | `skills-read-gate` (records a skill as read) — fires on the `Skill` tool |
 | `post-write` | `format-on-write` (reacts to the completed write; never blocks — see the bridge note: not carried to CC yet) |
-| `stop` | `stop-completion-selfcheck` |
+| `stop` | `stop-completion-selfcheck`, `visual-proof-gate` (gate 5 — blocks a "done" on an un-proven visible change, once) |
+
+The **enforcement-doctrine gates** (ROADMAP "DOCTRINE: enforce correct agent behavior with
+PreToolUse hooks") — `background-subagent-gate`, `orchestrator-stays-thin`,
+`no-long-inline-process`, `skills-read-gate`, `visual-proof-gate` — make the
+orchestrate-only / background-subagents / read-your-skills / visual-proof rules STRUCTURAL
+instead of prose that regresses. Each is **satisfiable** by an honest action, **tiered**
+(warn before block), carries an **honest escape hatch** (an env override with a logged
+reason, or an inline sentinel — never a forge), and gates 1-3 **exempt subagents** via CC's
+`CLAUDE_CODE_CHILD_SESSION` env signal (set in every child/subagent session). See each hook's
+README for its triggers, env knobs, and tests.
 
 **The carrier trap (`lib/cc_hook_bridge`).** Claude Code does **not** run these descriptors
 directly — it only runs hooks declared in `settings.json`. `lib/cc_hook_bridge` is the
@@ -103,11 +115,14 @@ at the top level (a broken bridge must never wedge every tool call), while an in
 fail-closed hook still blocks.
 
 **Non-obvious:** the bridge only maps the points CC has a matching event for —
-`PreToolUse` → `pre-bash`/`pre-write` and `Stop` → `stop` (see `point_for_event` in
-`dispatch.py`). It does **not** yet map `PostToolUse` → `post-write`, so `format-on-write` —
-the one `post-write` hook — is not carried to CC through this bridge today; it works on
-harnesses whose own `post-write`/`PostToolUse` event you map it to directly. Don't assume every
-shipped hook is live in CC just because the bridge exists.
+`PreToolUse` → `pre-bash`/`pre-write`/`pre-tool` (`Task|Agent`)/`pre-skill` (`Skill`) and
+`Stop` → `stop` (see `point_for_event` in `dispatch.py`). It does **not** yet map
+`PostToolUse` → `post-write`, so `format-on-write` — the one `post-write` hook — is not
+carried to CC through this bridge today; it works on harnesses whose own
+`post-write`/`PostToolUse` event you map it to directly. Don't assume every shipped hook is
+live in CC just because the bridge exists. Each new PreToolUse point also needs its matcher
+in rig-cli's `hook_bridge_entries` (`Task|Agent`, `Skill`) — without that, CC never invokes
+the bridge for that tool and the gate is inert (the same carrier trap).
 
 **The "runs before the command" trap.** `pre-bash` hooks run *before* the command they gate,
 so the precondition they check must already be satisfied. The clearest example is

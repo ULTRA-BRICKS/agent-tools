@@ -1,0 +1,9 @@
+{
+  "id": "orchestrator-stays-thin-bash",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/orchestrator-stays-thin/orchestrator_stays_thin.py",
+  "priority": 30,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Enforcement-doctrine gate 2 (pre-bash half): the orchestrator (main thread) must NOT run multi-step / heavy build/test/install Bash inline — delegate it to a subagent. Read-only inspection (git status, gh pr view, ls/cat/grep) is fine. A heavy/multi-step command WARNS first, then BLOCKS a repeat. SUBAGENTS are EXEMPT (CLAUDE_CODE_CHILD_SESSION). Honest escape hatch: ALLOW_ORCHESTRATOR_WORK=1 + ALLOW_ORCHESTRATOR_WORK_REASON='why', or an inline `# orchestrator-work-ok: why`. on_error=open."
+}

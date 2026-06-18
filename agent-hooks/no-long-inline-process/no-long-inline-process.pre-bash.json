@@ -1,0 +1,9 @@
+{
+  "id": "no-long-inline-process",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/no-long-inline-process/no_long_inline_process.py",
+  "priority": 25,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Enforcement-doctrine gate 3: BLOCK a long-running command in the orchestrator (main thread) — `review` (minutes), any `--watch`, `gh pr checks --watch`, build/test suites, `sleep`. Run it in a BACKGROUND subagent instead. Already-backgrounded (`... &`, nohup, setsid) or short `timeout N` self-bounded commands are exempt/warn-only. SUBAGENTS are EXEMPT (CLAUDE_CODE_CHILD_SESSION) — they legitimately run review / watch CI. Honest escape hatch: ALLOW_LONG_INLINE=1 + ALLOW_LONG_INLINE_REASON='why', or an inline `# long-inline-ok: why`. on_error=open."
+}

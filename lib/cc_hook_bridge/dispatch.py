@@ -44,6 +44,14 @@ _KNOWN_EVENTS = frozenset({"PreToolUse", "Stop", "PostToolUse"})
 # point table and the rig-cli matcher `Edit|Write|MultiEdit|NotebookEdit`.
 _WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 
+# The subagent-dispatch tools CC exposes. CC's first-party name is `Task`; some harness
+# builds/SDKs surface it as `Agent`. The enforcement-doctrine `background-subagent` gate
+# (agent-hooks/background-subagent-gate) hangs off the `pre-tool` point below so it can
+# inspect the WHOLE tool_input (e.g. `run_in_background`) — the bridge passes tool_input
+# through under `args` verbatim, so a hook reads any field it needs. Keep this set in sync
+# with the README's point table and the rig-cli matcher `Task|Agent`.
+_SUBAGENT_DISPATCH_TOOLS = frozenset({"Task", "Agent"})
+
 
 def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
     """Map a CC (event, tool) pair to a logical v1 point, or None if nothing applies."""
@@ -54,6 +62,10 @@ def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
             return "pre-bash"
         if tool_name in _WRITE_TOOLS:
             return "pre-write"
+        if tool_name in _SUBAGENT_DISPATCH_TOOLS:
+            return "pre-tool"
+        if tool_name == "Skill":
+            return "pre-skill"
     return None
 
 
