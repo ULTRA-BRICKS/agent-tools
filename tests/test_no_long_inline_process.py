@@ -57,6 +57,7 @@ def _decision(out: str) -> str:
 @pytest.mark.parametrize("command", [
     "review",
     "review -C /repo",
+    "review diff -C /repo -m claude:claude-opus-4-8",  # the real diff-review invocation
     "gh pr checks 42 --watch",
     "vitest --watch",
     "npm test",
@@ -68,6 +69,7 @@ def _decision(out: str) -> str:
     "sleep 30",
     "sleep 5m",                      # 5 minutes — a bare \\d+ would read this as 5 and pass
     "sleep 1h",                      # 1 hour
+    "sleep 600",                     # 10 minutes
 ])
 def test_block_long_running(command, monkeypatch):
     out, _e, code = _run(command, monkeypatch)
@@ -90,6 +92,31 @@ def test_block_long_running(command, monkeypatch):
     "echo done",
 ])
 def test_allow_benign(command, monkeypatch):
+    out, _e, code = _run(command, monkeypatch)
+    assert code == 0, command
+    assert _decision(out) == "allow"
+
+
+# ── #60: a long-process KEYWORD inside a QUOTED ARGUMENT to a DIFFERENT command must ALLOW ──
+# The old raw regex anchored on shell-separator chars (`(`/`|`/`;`/`&&`) and a bare `--watch`
+# substring; those chars also appear INSIDE quoted argument strings, so a benign report/commit/
+# echo whose TEXT mentioned review/--watch/npm test/sleep was mis-read as the invocation and
+# BLOCKED. argv-awareness flags only the REAL invoked command (argv[0]), so these now ALLOW.
+
+@pytest.mark.parametrize("command", [
+    'tg --tag report --title x "text with review and review-qa in it"',
+    'tg --tag report --title "x" "we ran review-qa (review) today"',  # `(review` inside quotes
+    'echo "run review later"',
+    'git commit -m "add review gate"',
+    'git commit -m "fix; npm test now green"',          # `;` + suite inside the quoted message
+    'git commit -m "wire --watch flag"',                # `--watch` substring inside the message
+    'tg "status: (sleep 600 elapsed) done"',            # `(sleep 600` inside the quoted arg
+    'echo "ci runs | pytest fast"',                     # `|` + runner inside the quoted arg
+    'tg --photo p.png "review the screenshot in review-qa"',
+])
+def test_allow_keyword_in_quoted_argument(command, monkeypatch):
+    """#60: review / --watch / npm test / sleep appearing inside a quoted argument to a DIFFERENT
+    command (tg / echo / git commit -m) must NOT trip the gate — only a real invocation does."""
     out, _e, code = _run(command, monkeypatch)
     assert code == 0, command
     assert _decision(out) == "allow"
@@ -138,6 +165,13 @@ def test_allow_wrapped_benign_command(command, monkeypatch):
 
 def test_subagent_exempt_allows_long_process(monkeypatch):
     out, _e, code = _run("npm test", monkeypatch, agent_id="sub-3")
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_subagent_exempt_allows_review(monkeypatch):
+    """The same real `review` that blocks for the orchestrator is allowed inside a subagent."""
+    out, _e, code = _run("review diff -C /repo", monkeypatch, agent_id="sub-7")
     assert code == 0
     assert _decision(out) == "allow"
 
