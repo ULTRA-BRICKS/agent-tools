@@ -10,10 +10,14 @@ repo_local="${toplevel:+$toplevel/ci/ship/ship.sh}"
 if [[ -n "$repo_local" && -f "$repo_local" ]]; then
   exec "$repo_local" "$@"
 fi
-canonical="${AGENT_TOOLS_ROOT:+$AGENT_TOOLS_ROOT/ci/ship/ship.sh}"
-if [[ -n "$canonical" && -f "$canonical" ]]; then
+_rig_default=/Users/ultra/xp/agent-tools
+AGENT_TOOLS_ROOT="${AGENT_TOOLS_ROOT:-$_rig_default}"
+unset _rig_default
+export AGENT_TOOLS_ROOT
+canonical="$AGENT_TOOLS_ROOT/ci/ship/ship.sh"
+if [[ -f "$canonical" ]]; then
   exec "$canonical" "$@"
 fi
-echo "pr-ship.sh: canonical ship.sh not found (tried repo-local $repo_local and AGENT_TOOLS_ROOT=${AGENT_TOOLS_ROOT:-<unset>})." >&2
+echo "pr-ship.sh: canonical ship.sh not found (repo-local $repo_local nor $canonical)." >&2
 echo "Set AGENT_TOOLS_ROOT to your agent-tools checkout, or re-run 'rig apply'." >&2
 exit 127
