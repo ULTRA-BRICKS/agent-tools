@@ -419,6 +419,17 @@ def test_sed_in_place_anywhere_still_implementation(tmp_path, monkeypatch):
     "gh api repos/o/r/pulls | jq '.[]' | head",    # 2 pipes — the jq fix (was blocked before)
     "git worktree list",                           # worktree inspection
     "review diff",                                  # multi-model review CLI
+    "dev start web",                                # configured dev/e2e lifecycle
+    "dev list",                                     # inspect configured/running dev targets
+    "dev status smoke",                             # e2e/dev progress/status
+    "dev logs smoke --tail 50",                     # configured logs, not raw docker logs
+    "dev e2e run smoke",                            # first-class e2e run
+    "dev e2e status smoke",                         # first-class e2e status
+    "dev e2e logs smoke",                           # first-class e2e logs
+    "dev run test",                                  # project-scoped rig.yaml scripts
+    "dev stop --port 5173",                          # project-scoped dev process control
+    "dev stop --pgid 5001",                          # validated dev/e2e process group stop
+    "dev env --add-project ../api",                  # session-scoped multi-project setup
 ])
 def test_orchestration_chain_never_blocks(command, tmp_path, monkeypatch):
     """`gh` reads / `gh ship` / `tg` / `review` / `git worktree list` are orchestration, never
@@ -434,6 +445,59 @@ def test_orchestration_chain_never_blocks(command, tmp_path, monkeypatch):
 def test_gh_ship_is_all_inline_allowed():
     assert ost._is_all_inline_allowed("gh ship 5 && tg 'done'") is True
     assert ost._is_all_read_only("gh ship 5 && tg 'done'") is False  # not read-only, but allowed
+
+
+def test_dev_head_does_not_launder_impl_tail(tmp_path, monkeypatch):
+    """`dev` is allowed only as its own sanctioned segment; a real build chained after it
+    is still implementation-shaped and warn-then-blocks."""
+    assert ost._is_all_inline_allowed("dev run test && npm run build") is False
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "dev run test && npm run build"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_dev_run_only_known_safe_scripts_are_orchestration(tmp_path, monkeypatch):
+    """`dev run test` is sanctioned, but `dev run <anything>` must not become a blanket
+    implementation bypass for configured scripts with side effects."""
+    assert ost._is_all_inline_allowed("dev run test") is True
+    assert ost._is_all_inline_allowed("dev run build") is False
+    assert ost._is_implementation_bash("dev run build") is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": "dev run build"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_dev_e2e_is_allowed_inside_command_substitution():
+    assert ost._dev_segment_is_unknown("dev e2e run smoke") is False
+    assert ost._is_implementation_bash('tg "$(dev e2e status smoke)"') is False
+
+
+def test_dev_unknown_subcommand_is_not_allowlisted(tmp_path, monkeypatch):
+    """A blanket `dev` head would launder arbitrary argv; only known orchestration
+    subcommands get the carve-out."""
+    assert ost._is_all_inline_allowed("dev npm run build") is False
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "dev npm run build && cat out"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_dev_e2e_unknown_nested_subcommand_is_not_allowlisted(tmp_path, monkeypatch):
+    """`dev e2e` is first-class, but it cannot launder arbitrary nested argv."""
+    assert ost._is_all_inline_allowed("dev e2e npm run build") is False
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "dev e2e npm run build && cat out"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
 def test_gh_head_with_impl_tail_still_blocks_on_repeat(tmp_path, monkeypatch):

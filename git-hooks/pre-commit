@@ -15,6 +15,14 @@ cd "$ROOT"
 
 run() { echo "pre-commit → $*"; "$@"; }
 
+run_configured_tests() {
+  if command -v dev >/dev/null 2>&1 && dev has-script test >/dev/null 2>&1; then
+    run dev run test || { echo "FAIL: tests"; exit 1; }
+    return 0
+  fi
+  return 1
+}
+
 if [ -f "$ROOT/package.json" ]; then
   # ---- bun / node ---------------------------------------------------------------
   # Prefer project-local binaries over npx (deterministic, no network). See the
@@ -32,7 +40,9 @@ if [ -f "$ROOT/package.json" ]; then
     || $PM type-check 2>/dev/null \
     || ./node_modules/.bin/tsc --noEmit \
     || { echo "FAIL: typecheck"; exit 1; }
-  $PM test        2>/dev/null || { echo "FAIL: tests";      exit 1; }
+  if ! run_configured_tests; then
+    $PM test      2>/dev/null || { echo "FAIL: tests";      exit 1; }
+  fi
 
 elif [ -f "$ROOT/pyproject.toml" ] || [ -f "$ROOT/uv.lock" ]; then
   # ---- python (uv) --------------------------------------------------------------
@@ -42,18 +52,24 @@ elif [ -f "$ROOT/pyproject.toml" ] || [ -f "$ROOT/uv.lock" ]; then
   if uv run python -c "import mypy" 2>/dev/null; then
     run uv run mypy .               || { echo "FAIL: mypy";   exit 1; }
   fi
-  run uv run pytest -q              || { echo "FAIL: pytest"; exit 1; }
+  if ! run_configured_tests; then
+    run uv run pytest -q            || { echo "FAIL: pytest"; exit 1; }
+  fi
 
 elif [ -f "$ROOT/go.mod" ]; then
   # ---- go -----------------------------------------------------------------------
   run go build ./...                || { echo "FAIL: build"; exit 1; }
-  run go test ./... -count=1        || { echo "FAIL: tests"; exit 1; }
+  if ! run_configured_tests; then
+    run go test ./... -count=1      || { echo "FAIL: tests"; exit 1; }
+  fi
   if command -v golangci-lint >/dev/null 2>&1; then
     run golangci-lint run ./...     || { echo "FAIL: lint";  exit 1; }
   fi
 
 else
-  echo "pre-commit: no recognized toolchain (package.json / pyproject.toml / go.mod) — skipping language gate"
+  if ! run_configured_tests; then
+    echo "pre-commit: no recognized toolchain (package.json / pyproject.toml / go.mod) — skipping language gate"
+  fi
 fi
 
 # Secret scan over the staged diff, regardless of language (see no-secrets-scan).

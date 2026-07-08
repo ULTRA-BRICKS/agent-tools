@@ -7,6 +7,9 @@
 
 version: 1
 
+scripts:
+  test: uv run --with pytest pytest tests/
+
 ci:
   # enabled: is the category kill-switch; each item's own enabled: is the opt-in. Both must
   # be true for a slot to install (parent off → nothing installs regardless of items).

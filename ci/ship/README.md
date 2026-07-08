@@ -28,6 +28,11 @@ Then it squash-merges, deletes the remote branch, removes the local branch+workt
 (unless you're *inside* that worktree — then it's left so your session keeps a cwd), and
 fast-forwards your main checkout.
 
+When ship decides CI is structurally unavailable and runs its local fallback gates, the
+test runner first prefers `dev run test` if `rig.yaml` declares top-level `scripts.test`
+and `dev` is on PATH. If not, it falls back to the portable pyproject/package/Cargo
+auto-detection in `ship.sh`.
+
 ## Quick start
 
 ```bash

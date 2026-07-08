@@ -1355,6 +1355,40 @@ def test_cidown_local_gate_passes_merges(repo_with_pr_worktree, tmp_path):
     assert "merged #1" in r.stdout, r.stdout
 
 
+def test_cidown_local_gate_prefers_dev_run_test_when_rig_script_exists(repo_with_pr_worktree, tmp_path):
+    """When a repo declares `scripts.test` in rig.yaml and `dev` is installed, the local
+    CI-down fallback should use `dev run test` instead of guessing a package manager."""
+    main, _wt = repo_with_pr_worktree
+    (main / "rig.yaml").write_text("scripts:\n  test: echo from rig\n", encoding="utf-8")
+    _git("add", "rig.yaml", cwd=main)
+    _git("commit", "-qm", "add rig test script", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    dev_log = tmp_path / "dev.log"
+    dev = bindir / "dev"
+    dev.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"$1\" = 'has-script' ] && [ \"$2\" = 'test' ]; then exit 0; fi\n"
+        "printf '%s\\n' \"$*\" >> \"$SHIP_TEST_DEV_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    dev.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_TEST_DEV_LOG": str(dev_log),
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed when the dev-backed local gate passes\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert dev_log.read_text(encoding="utf-8").strip() == "run test"
+    assert "[ship] local gate: running dev run test (rig.yaml scripts.test)" in r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
 def test_cidown_local_tests_fail_blocks(repo_with_pr_worktree, tmp_path):
     """CI-down path: SHIP_TEST_CI_DOWN=1, but local tests FAIL → ship refuses."""
     main, _wt = repo_with_pr_worktree

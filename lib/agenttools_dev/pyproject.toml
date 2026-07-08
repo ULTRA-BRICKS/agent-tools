@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttools-dev"
+version = "0.1.1"
+description = "Project-scoped development command helper for rig.yaml scripts and safe dev process control."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+keywords = ["development", "cli", "rig", "agent-tools"]
+dependencies = ["agenttools-config>=0.1,<1"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+dev = "agenttools_dev.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/agent-tools"
+
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["agenttools_dev*"]
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]
