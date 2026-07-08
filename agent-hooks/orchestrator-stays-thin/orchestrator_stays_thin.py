@@ -101,6 +101,11 @@ ORCH_ALLOW = re.compile(
     r"|git\s+worktree\s+list\b"                           # worktree inspection
     r")"
 )
+_DEV_ALLOWED_SUBCOMMANDS = frozenset({"start", "run", "list", "status", "logs", "stop", "env", "help"})
+_DEV_ALLOWED_E2E_SUBCOMMANDS = frozenset({"run", "status", "logs", "stop", "help"})
+# Intentionally narrower than `dev run <script>` itself: only common test/e2e script names are
+# orchestration; other script names remain implementation-shaped so `dev run deploy` is not a bypass.
+_DEV_ALLOWED_RUN_SCRIPTS = frozenset({"test", "tests", "e2e", "smoke"})
 # `gh api` is orchestration ONLY when GET-shaped. Rather than a fragile inline lookahead, detect
 # it with two token-aware regexes: the HEAD (`gh api`) and any MUTATION signal — a method flag
 # (`-X`/`--method`), a POST field (`-f`/`-F`/`--field`/`--raw-field`/`--input`, incl. ATTACHED
@@ -427,7 +432,12 @@ def _seg_is_allowed(segment: str) -> bool:
         return False
     if _git_subcommand(segment) == "branch" and _git_branch_has_arg(segment):
         return False
-    if READ_ONLY_BASH.search(segment) or ORCH_ALLOW.search(segment) or CD_HEAD.match(segment):
+    if (
+        READ_ONLY_BASH.search(segment)
+        or ORCH_ALLOW.search(segment)
+        or _dev_segment_is_allowed(segment)
+        or CD_HEAD.match(segment)
+    ):
         return True
     if _git_subcommand(segment) in _GIT_READ_SUBS:  # `git -C d status`, `/usr/bin/git log`, …
         return True
@@ -475,9 +485,42 @@ def _seg_is_impl_signal(segment: str) -> bool:
     """A single (env-stripped) segment is implementation on its own: a build/edit head (sed -i, tee,
     npm/…), a `git commit`/`push` or a `pytest`/`python -m pytest` test (all spellings), a
     `uv run … pytest` wrapper, OR a `gh api` MUTATION. Caught even unchained (codex P1)."""
-    if BUILD_EDIT.search(segment) or _is_uv_test(segment) or _is_git_or_python_impl(segment):
+    if (
+        BUILD_EDIT.search(segment)
+        or _is_uv_test(segment)
+        or _is_git_or_python_impl(segment)
+        or _dev_segment_is_unknown(segment)
+    ):
         return True
     return bool(_GH_API_HEAD.match(segment)) and _gh_api_is_mutation(segment)
+
+
+def _dev_tokens(segment: str) -> list[str] | None:
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return None
+    if not toks or toks[0].rsplit("/", 1)[-1] != "dev":
+        return None
+    return toks
+
+
+def _dev_segment_is_allowed(segment: str) -> bool:
+    toks = _dev_tokens(segment)
+    if not toks:
+        return False
+    if len(toks) == 1 or toks[1] in ("-h", "--help"):
+        return True
+    if toks[1] == "run":
+        return len(toks) >= 3 and (toks[2] in _DEV_ALLOWED_RUN_SCRIPTS or toks[2] in ("-h", "--help"))
+    if toks[1] == "e2e":
+        return len(toks) == 2 or toks[2] in _DEV_ALLOWED_E2E_SUBCOMMANDS or toks[2] in ("-h", "--help")
+    return toks[1] in _DEV_ALLOWED_SUBCOMMANDS
+
+
+def _dev_segment_is_unknown(segment: str) -> bool:
+    toks = _dev_tokens(segment)
+    return toks is not None and not _dev_segment_is_allowed(segment)
 
 
 # git global options that take a SEPARATE operand (so `git -C /repo commit` finds `commit`, not `/repo`).

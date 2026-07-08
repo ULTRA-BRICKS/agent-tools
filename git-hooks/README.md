@@ -1,9 +1,10 @@
 # Git hooks
 
-Copyable git hooks plus a `lefthook.yml` example, generalized across three toolchains:
-**bun/node**, **python (uv)**, and **go**. Each hook auto-detects the stack from files in
-the repo root and runs the matching gate, so the same file drops into any of the three
-kinds of project.
+Copyable git hooks plus a `lefthook.yml` example. When a repo declares
+`scripts.test` in `rig.yaml` and the `dev` CLI is on PATH, the hooks run
+`dev run test` as the repo's test command. Otherwise they fall back to auto-detecting
+**bun/node**, **python (uv)**, and **go** from files in the repo root, so the same file
+drops into any of the three kinds of project.
 
 > **Want a hook to run in EVERY repo on the machine — even ones with lefthook/husky that
 > override `core.hooksPath`?** Use the **global dispatcher** in
@@ -50,14 +51,19 @@ gates after one `lefthook install`.
 
 ## Stack detection
 
-The standalone hooks detect the toolchain by what's in the repo root:
+The standalone hooks first prefer the repo-owned test script:
+
+- `rig.yaml` top-level `scripts.test` + `dev` on PATH -> `dev run test`
+
+When that is absent, they detect the toolchain by what's in the repo root:
 
 - `package.json` (+ `bun.lockb`/`bunfig.toml` or not) → **bun/node**
 - `pyproject.toml` / `uv.lock` → **python (uv)**
 - `go.mod` → **go**
 
-and run the corresponding lint/typecheck/test commands. Adjust the command lists to your
-project's actual scripts.
+and run the corresponding lint/typecheck/test commands. Prefer moving project-specific test
+details into `rig.yaml` `scripts.test`; adjust the fallback command lists only when a repo
+cannot use `dev`.
 
 ## Carrier choice
 
