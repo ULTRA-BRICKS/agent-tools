@@ -89,8 +89,8 @@ These commits skip the gate by default:
 
 ## Per-commit escapes (the deliberate, documented bypass)
 
-For the rare legitimate ticketless commit, escape a single commit (mirrors the
-review-gate's `REVIEW_SKIP`):
+For the rare legitimate ticketless commit, escape a single commit with this hook's own
+ticket-specific escape:
 
 - a `[skip-ticket: <reason>]` trailer in the commit message (the reason is mandatory), or
 - an inline env on the command: `REQUIRE_TICKET_SKIP=1 git commit …`.

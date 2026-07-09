@@ -18,7 +18,7 @@
 # bypass it — they invoke the SAME dispatcher via a one-line injection instead
 # (see agent-tools git-hooks/global-dispatcher/install-local-hooks.sh).
 #
-# Bypass EVERYTHING (last resort): REVIEW_SKIP=1 git commit ... | git commit --no-verify
+# Git's blanket hook bypass still bypasses everything: git commit --no-verify
 HOOK_DIR="$(dirname "$0")"
 # Bail out cleanly if we're somehow not inside a git repo (also our git-dir lookup).
 git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || exit 0

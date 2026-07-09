@@ -185,8 +185,8 @@ tracked hook config — wire the main repo once and worktrees inherit it.
 
 ## Bypass / escape hatches
 
-- `REVIEW_SKIP=1 git commit ...` or `git commit --no-verify` — bypasses ALL pre-commit
-  gates (last resort).
+- `git commit --no-verify` — Git's blanket bypass for ALL pre-commit gates (last resort;
+  there is no `REVIEW_SKIP` self-service bypass in the review gate).
 - Secret-scan false positive: inline `gitleaks:allow` comment, or an `[allowlist]` in
   `~/.config/gitleaks/gitleaks.toml` (global) / the repo's `.gitleaks.toml`.
 

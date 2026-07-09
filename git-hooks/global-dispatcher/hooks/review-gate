@@ -6,19 +6,18 @@
 # that used to live at the top of this file has MOVED UP into the composer so it
 # runs exactly ONCE — do NOT re-add it here.
 #
-# Blocks a commit whose staged diff has not been reviewed. Bypass with
-#   REVIEW_SKIP=1 git commit ...   or   git commit --no-verify
+# Blocks a commit whose staged diff has not been reviewed. There is no REVIEW_SKIP
+# self-service bypass; `git commit --no-verify` remains Git's blanket hook bypass.
 #
 # `command git` bypasses shell aliases and functions (e.g. an rtk-style wrapper that
 # rewrites `git diff` output), so the hash matches the one written by review-cli, which
 # also calls the real git binary directly. Without this, a shell alias rewriting `git diff`
 # could produce a different hash and block a legitimately-reviewed commit.
-[ -n "$REVIEW_SKIP" ] && exit 0
 [ -z "$(command git diff --cached --name-only)" ] && exit 0
 h=$(command git diff --no-ext-diff --cached | shasum -a 256 | cut -d' ' -f1)
 stamp=$(command git rev-parse --git-path review-stamp)
 if [ -f "$stamp" ] && grep -q "$h" "$stamp"; then exit 0; fi
 echo "review-before-commit: staged changes have not been reviewed." >&2
-echo "  run:  review --staged      (then commit)" >&2
-echo "  skip: REVIEW_SKIP=1 git commit ...   |   git commit --no-verify" >&2
+echo "  run:  review diff --staged      (then commit)" >&2
+echo "  skip: none in this gate (Git's --no-verify bypasses this and all other hooks)" >&2
 exit 1

@@ -317,10 +317,6 @@ def test_empty_command_allows(monkeypatch):
     assert _decision(out) == "allow"
 
 
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(pytest.main([__file__, "-v"]))
-
-
 # ── `\`-newline line continuation must not hide the merge (Codex review on #231) ────────────
 
 
@@ -348,3 +344,7 @@ def test_hatch_inline_line_continuation_reaches_tg_ctl(tmp_path, monkeypatch):
     out, _err, code = _run(command, monkeypatch, cwd=tmp_path)  # env NOT set — inline only
     assert code == 0 and _decision(out) == "allow"
     assert "ship gate down, manual verify done" in question.read_text()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(pytest.main([__file__, "-v"]))
