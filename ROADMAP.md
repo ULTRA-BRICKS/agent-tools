@@ -1652,15 +1652,15 @@ The `require-review-before-commit` agent-hook blocks a commit when no fresh revi
 (`~/.cache/agent-tools/last-review`, mtime-windowed) exists — but: (1) it fires on a pure **docs-only**
 change (e.g. a ROADMAP.md edit), where the project rule explicitly allows skipping review; (2) it also
 catches `git stash` (any persisting git op), so you can't even park a docs edit; (3) it does NOT honor
-`REVIEW_SKIP=1` / `REVIEW_MARKER=...` passed as INLINE ENV on the git command — the hook reads the marker
+`REVIEW_MARKER=...` passed as INLINE ENV on the git command — the hook reads the marker
 FILE / its own process env, not the to-be-run command's env, so `REVIEW_MARKER=x git commit` is ignored
 (the error message advertises `REVIEW_MARKER` as if inline would work). Net: a docs commit forces either a
 full multi-model `review` run (heavy, and a crash-risk when other agents are already reviewing) or a touch
 of the GLOBAL marker (which then lets concurrent code agents' commits skip the gate inside the 1h window).
-Fix: (a) detect docs-only diffs (paths match `*.md`/docs globs) and allow them, OR honor a real per-commit
-skip — `git commit -m '... [skip-review: docs]'` trailer, or a `REVIEW_SKIP`/`REVIEW_MARKER` env the hook
-actually reads from the command; (b) don't gate `git stash`/`git worktree` (non-commit ops). Pairs with the
-"docs-only OK to skip review" rule. Tracking: agent-hooks (this repo).
+Resolved direction: detect docs-only diffs (paths match `*.md`/docs globs) and allow them; keep
+self-service review bypasses removed; use explicit external hatch approval for real exceptions; and don't
+gate `git stash`/`git worktree` (non-commit ops). Pairs with the "docs-only OK to skip review" rule.
+Tracking: agent-hooks (this repo).
 
 ## rig setup — interactive config wizard (CTO 2026-06-17)
 `rig setup` is the INTERACTIVE wizard. It (1) SHOWS what is currently enabled/configured — the live
@@ -1790,7 +1790,7 @@ cross-harness). Tracking: skills/universal + agent-hooks + lib/providers + rig p
   response currently red-fails CI and blocks ships.) Dedicated PR.
 - **`review` CLI shim can't import `reviewlib` in agent/subagent shells** — `/opt/homebrew/bin/review` fails
   to import `reviewlib` (it lives in `~/xp/review-cli`, not on the shim's sys.path); even an explicit
-  PYTHONPATH run produced no output. A shipper had to fall back to the sanctioned `REVIEW_SKIP=1` (tests /
+  PYTHONPATH run produced no output. A shipper had to fall back to the then-sanctioned manual bypass (tests /
   secrets / leftover gates still ran). This makes the review-before-commit gate effectively non-functional in
   those shells and is the deeper reason the gate fought us all session (the #36 marker-write fix only helps
   when `review` actually RUNS). Investigate the shim's path resolution / install model

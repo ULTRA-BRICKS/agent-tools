@@ -82,12 +82,12 @@ esac
 
 
 def _clean_git_env() -> dict:
-    """A git env immune to the developer box's GLOBAL hooks / config: an empty
-    core.hooksPath (so a host `review`-install pre-commit can't block the test's own
-    commits) and REVIEW_SKIP set for belt-and-suspenders."""
-    env = dict(os.environ)
-    env["REVIEW_SKIP"] = "1"
-    return env
+    """Base env for git helpers.
+
+    The hook isolation is on `_git` itself via `git -c core.hooksPath= ...`, so test
+    bootstrap commits cannot be blocked by a developer machine's global pre-commit gate.
+    """
+    return dict(os.environ)
 
 
 def _sh(*args, cwd, env=None):

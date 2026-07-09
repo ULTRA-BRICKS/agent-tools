@@ -22,8 +22,7 @@ Exempt from the gate (no ticket expected): trivial-chore commit types
 (`chore:`/`docs:`/`style:`/`ci:`/`build:`/`test:`), and `wip`/`fixup!`/`squash!`
 /`amend`/merge/revert commits. Configure via env (see README).
 
-Per-commit escapes (mirror the review-gate's REVIEW_SKIP), for the rare legit
-ticketless commit:
+Per-commit escapes, for the rare legit ticketless commit:
   - a `[skip-ticket: <reason>]` trailer in the commit message, and
   - an inline `REQUIRE_TICKET_SKIP=1 git commit …` env on the command.
 And `REQUIRE_TICKET_STRICT=0` is an explicit opt-out back to warn-only.
@@ -74,14 +73,13 @@ STRICT = os.environ.get("REQUIRE_TICKET_STRICT", "1").strip().lower() not in _ST
 
 # Per-commit escape: a `[skip-ticket: <reason>]` trailer in the commit message. The reason
 # is mandatory (non-empty), so the escape is a deliberate, documented choice — not a blank
-# bypass. Mirrors the review-gate's `[skip-review: <reason>]`.
+# bypass.
 # Require a NON-WHITESPACE reason between the colon and the closing bracket, so a blank
 # `[skip-ticket: ]` is not a valid escape (the reason must be a deliberate, real choice).
 SKIP_TICKET_TRAILER = re.compile(r"\[skip-ticket:\s*\S[^\]]*\]", re.IGNORECASE)
 
 # A leading `VAR=value` inline-env assignment on the command (`REQUIRE_TICKET_SKIP=1 git
-# commit …`). Mirrors the review-gate's inline `REVIEW_SKIP` parse: read from the COMMAND
-# the agent is about to run, NOT the hook's own process env.
+# commit …`). Read from the COMMAND the agent is about to run, NOT the hook's own process env.
 _INLINE_ENV = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _SKIP_FALSEY = frozenset({"", "0", "false", "no", "off"})
 
@@ -499,7 +497,7 @@ def has_inline_skip(segment: CommitSegment) -> bool:
     """True when the commit segment is prefixed with `REQUIRE_TICKET_SKIP=<truthy>` inline env.
 
     Reads the inline env on the COMMAND the agent is about to run (`REQUIRE_TICKET_SKIP=1 git
-    commit …`), not the hook's process env — mirroring the review-gate's `REVIEW_SKIP`. The env is
+    commit …`), not the hook's process env. The env is
     already scoped to the real `git commit` segment by the parser, so an assignment on a SIBLING
     command (`REQUIRE_TICKET_SKIP=1 echo x; git commit …`) is NOT seen here and does not bypass.
     Falsey values (`0`/`false`/`no`/`off`/empty) are matched case-insensitively so they don't
