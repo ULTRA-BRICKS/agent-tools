@@ -319,3 +319,60 @@ def test_empty_command_allows(monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ── `\`-newline line continuation must not hide the merge (Codex review on #231) ────────────
+
+
+def test_line_continuation_does_not_hide_merge():
+    """shlex (whitespace_split=False) emits a standalone `\\n` token for a `\\`-newline line
+    continuation. After the leading `VAR=` assignment is stripped that token would become
+    argv[0], so `_is_gh_pr_merge` saw `argv[0] == '\\n'` and reported NO merge → the raw merge was
+    ALLOWED with no approval. Detection must survive the continuation."""
+    command = 'RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="x" \\\n  gh pr merge 123 --admin'
+    assert hook._command_contains_gh_pr_merge(command) is True
+
+
+def test_hatch_inline_line_continuation_reaches_tg_ctl(tmp_path, monkeypatch):
+    """End-to-end for the exact README inline-hatch shape (`VAR="why" \\`+newline+`gh pr merge`):
+    it must be DETECTED as a raw merge AND route the inline justification to tg-ctl (env var NOT
+    exported). If the `\\`-newline still hid the merge, the hook would `emit("allow")` WITHOUT
+    ever calling the mocked tg-ctl, so the question file would not be written."""
+    question = tmp_path / "q.txt"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f'printf "%s" "$2" > "{question}"\nexit 0\n')
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    command = (
+        'RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="ship gate down, manual verify done" \\\n'
+        '  gh pr merge 123 --admin'
+    )
+    out, _err, code = _run(command, monkeypatch, cwd=tmp_path)  # env NOT set — inline only
+    assert code == 0 and _decision(out) == "allow"
+    assert "ship gate down, manual verify done" in question.read_text()
+
+
+# ── bare-newline command separator: a merge on the 2nd line must not evade detection ────────
+
+
+def test_bare_newline_second_line_merge_is_detected(monkeypatch):
+    """A BARE newline separates commands in shell, so `echo ok`+newline+`gh pr merge 1` is a real
+    raw merge on the second line and must BLOCK. shlex consumes a bare newline as whitespace, so
+    without normalizing it to a `;` separator the two lines collapse into one `echo`-headed
+    segment and the merge evades the gate (Codex review on #231)."""
+    out, _err, code = _run("echo ok\ngh pr merge 1 --admin", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_bare_newline_after_env_assignment_merge_is_detected(monkeypatch):
+    """`cd repo`+newline+`gh pr merge` — the merge on the second line is still detected."""
+    out, _err, code = _run("cd repo\ngh pr merge 7 --squash", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_newline_inside_quoted_message_is_not_a_merge(monkeypatch):
+    """A newline INSIDE a quoted argument must NOT be treated as a command separator — a two-line
+    commit message merely mentioning a merge is not a `gh pr merge` invocation and must ALLOW."""
+    out, _err, code = _run('git commit -m "line one\ngh pr merge in prose"', monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"

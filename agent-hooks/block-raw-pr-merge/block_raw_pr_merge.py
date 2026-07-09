@@ -105,7 +105,14 @@ def _split_segments(command: str) -> list[list[str]]:
     Each segment is one independent command (the shell atoms between separators).
     Returns a list of token lists; raises ValueError on unbalanced quotes
     (caller treats this as fail-closed).
+
+    A `\`-newline line continuation is first folded to a space, and a remaining BARE newline is
+    normalized to `;` — in a real shell a newline separates commands (like `;`), but shlex
+    consumes it as whitespace, so without this `echo ok`+newline+`gh pr merge` collapses into one
+    `echo`-headed segment and the raw merge on the second line evades detection. shlex keeps a
+    newline inside quotes literal, so neither normalization splits a quoted argument.
     """
+    command = command.replace("\\\n", " ").replace("\n", ";")
     lex = shlex.shlex(command, posix=True, punctuation_chars=True)
     lex.whitespace_split = False
     tokens = list(lex)  # raises ValueError on unbalanced quotes
@@ -116,8 +123,12 @@ def _split_segments(command: str) -> list[list[str]]:
             if current:
                 segments.append(current)
                 current = []
-        else:
+        elif tok.strip():
             current.append(tok)
+        # A pure-whitespace token is never a real argv element. shlex (whitespace_split=False)
+        # emits a standalone `'\n'` token for a `\`-newline line continuation; dropping it keeps
+        # `VAR=x \`+newline+`gh pr merge` from hiding the merge behind that stray token, which
+        # would else strip the `VAR=` assignment, see argv[0] == '\n', and ALLOW the raw merge.
     if current:
         segments.append(current)
     return segments
