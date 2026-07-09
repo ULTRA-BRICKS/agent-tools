@@ -2410,6 +2410,10 @@ def _run_hatch_main(monkeypatch, tmp_path, *, request, resolve_home, audit,
     account's real home (where it looks for a rig.yaml tg_ctl_path override)."""
     mod = _load_hatch_module()
     monkeypatch.setattr(mod, "resolve_home", lambda: str(resolve_home))
+    # The shared lib now resolves tg-ctl authority from ITS OWN resolve_home (not the cwd the ship
+    # passes), so the controllable fake home must be injected there too — otherwise the lib reads
+    # the real account home and would contact the real tg-ctl.
+    monkeypatch.setattr(mod.hatch_escalation, "resolve_home", lambda: str(resolve_home))
     if trusted is not None:
         monkeypatch.setattr(mod.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", tuple(trusted))
     monkeypatch.setenv("RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM", request)

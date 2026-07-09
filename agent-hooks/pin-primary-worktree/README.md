@@ -74,7 +74,8 @@ agent_hooks:
   worktree_only: true
   approval_cmd: "/path/to/approve.sh"   # optional; run when a block would fire
   approval_cmd_timeout_s: 5             # optional; default 5.0, capped at 6.0
-  tg_ctl_path: "/path/to/tg-ctl"         # optional; trusted absolute tg-ctl path
+  tg_ctl_path: "/path/to/tg-ctl"         # optional tg-ctl override — read ONLY from the ACCOUNT
+                                         # HOME's rig.yaml (never this repo's; see hatch note below)
 ```
 
 `agent_hooks.approval_cmd` is a **single, shared key** — the same `approval_cmd` is read by
@@ -96,10 +97,13 @@ Telegram and falls through to `approval_cmd` / default deny. If the env var is p
 whitespace-only, or a bare flag value such as `1`, `true`, `yes`, or `on`, the hook does not contact
 Telegram and denies. A real justification runs `tg-ctl ask <question> --timeout 900`; exit 0 allows,
 and exit 1, any other nonzero exit, launch errors, and timeouts all deny. The helper never resolves
-`tg-ctl` from ambient `PATH`: it uses the optional absolute `agent_hooks.tg_ctl_path` first, then
-hardcoded absolute candidates including `/Users/ultra/.files/bin/tg-ctl`
-(`/Users/ultra/.files/repos/tg-cli/tg-ctl` after realpath), `/usr/local/bin/tg-ctl`, and
-`/opt/homebrew/bin/tg-ctl`.
+`tg-ctl` from ambient `PATH`. **The approval binary is a trust anchor: it is resolved from the
+account's REAL home only** (`agent_hooks.tg_ctl_path` in the home `rig.yaml`, home located via
+`pwd.getpwuid` — never `$HOME`, never the repo/`cwd` the hook runs in), then the hardcoded absolute
+candidates `/Users/ultra/.files/bin/tg-ctl` (`/Users/ultra/.files/repos/tg-cli/tg-ctl` after
+realpath), `/usr/local/bin/tg-ctl`, `/opt/homebrew/bin/tg-ctl`. A **repo-local** `tg_ctl_path` is
+deliberately IGNORED — otherwise a guarded agent could commit `rig.yaml` pointing it at an
+always-exit-0 binary and self-approve (the exact self-service bypass this gate closes).
 
 > `approval_cmd` is read with the same minimal, stdlib-only rig.yaml scanner used for
 > `worktree_only` (these hooks import no YAML library). It is a single-line scalar: quote the

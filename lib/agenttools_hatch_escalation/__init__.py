@@ -9,6 +9,7 @@ path. It never consults ambient PATH.
 from __future__ import annotations
 
 import os
+import pwd
 import re
 import shlex
 import signal
@@ -156,6 +157,12 @@ def request_hatch_approval(
 ) -> HatchApprovalResult:
     """Request Telegram approval when this hook's hatch env var carries a real justification.
 
+    SECURITY: the approval binary (`tg-ctl`) is resolved from the account's REAL home
+    (`resolve_home`) plus a hardcoded trusted-path list — NEVER from `cwd`, which the guarded
+    agent controls. `cwd` here is used ONLY for the human-facing question context (the "CWD:"
+    line). This is what stops a guarded agent from committing a repo-local `rig.yaml` with
+    `agent_hooks.tg_ctl_path: /tmp/always-exit-0` and self-approving.
+
     The justification is read from EITHER of two sources, checked in this precedence order:
 
     1. The hook process environment (`env`, defaulting to `os.environ`) — set when the agent
@@ -240,7 +247,7 @@ def _request_present_hatch_approval(
             env_present=True,
         )
 
-    tg_ctl = _find_tg_ctl(cwd, tg_ctl_candidates)
+    tg_ctl = _find_tg_ctl(tg_ctl_candidates)
     if tg_ctl is None:
         return HatchApprovalResult(
             requested=True,
@@ -338,9 +345,34 @@ def _format_seconds(timeout_s: float) -> str:
     return str(timeout_s)
 
 
-def _find_tg_ctl(cwd: str, candidates: Sequence[Path | str] | None) -> Path | None:
+def resolve_home() -> str | None:
+    """The account's REAL home directory, from the OS identity (`pwd.getpwuid`) — deliberately
+    NOT `$HOME` and NOT the repo the guarded agent is acting in. Returns None when the OS account
+    home cannot be resolved (e.g. a no-passwd container).
+
+    This is the trust anchor for resolving the approval binary (see `_candidate_paths`): a
+    `rig.yaml agent_hooks.tg_ctl_path` override is honored ONLY from this home, never from the
+    agent-controlled working directory. Keying off `getpwuid` (not the environment) means a
+    guarded agent cannot redirect the approval binary by committing a repo-local `rig.yaml`, by
+    running the hook from a doctored `cwd`, or by exporting `HOME` — which would otherwise
+    reopen the exact self-service bypass this hatch exists to close (mirrors the ship
+    review-quorum gate's `resolve_home`, PR #225).
+
+    It deliberately does NOT fall back to `os.path.expanduser("~")` on failure: that would read
+    `$HOME` (agent-exportable) or, if `$HOME` is unset, resolve `~` relative to the (agent-
+    controlled) cwd and walk up into the repo — exactly the untrusted anchors this exists to
+    exclude. Returning None makes the caller SKIP the rig.yaml override entirely (fail closed to
+    the hardcoded trusted paths). Overridable in tests via monkeypatch (never via the environment)."""
+
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        return None
+
+
+def _find_tg_ctl(candidates: Sequence[Path | str] | None) -> Path | None:
     seen: set[Path] = set()
-    for candidate in _candidate_paths(cwd, candidates):
+    for candidate in _candidate_paths(candidates):
         resolved = _resolve_executable(candidate)
         if resolved is None or resolved in seen:
             continue
@@ -349,9 +381,15 @@ def _find_tg_ctl(cwd: str, candidates: Sequence[Path | str] | None) -> Path | No
     return None
 
 
-def _candidate_paths(cwd: str, candidates: Sequence[Path | str] | None) -> list[Path | str]:
+def _candidate_paths(candidates: Sequence[Path | str] | None) -> list[Path | str]:
     out: list[Path | str] = []
-    rig_path = _rig_tg_ctl_path(cwd)
+    # SECURITY: the rig.yaml `tg_ctl_path` override is read from the account's REAL home, NEVER
+    # from the (agent-controlled) working directory the hook was invoked in — otherwise a guarded
+    # agent could commit `rig.yaml` with `tg_ctl_path: /tmp/always-exit-0` and self-approve. When
+    # the home can't be resolved (`resolve_home()` is None) the override is SKIPPED entirely (fail
+    # closed to the hardcoded trusted paths) rather than falling back to an $HOME/cwd anchor.
+    home = resolve_home()
+    rig_path = _rig_tg_ctl_path(home) if home else None
     if rig_path is not None:
         out.append(rig_path)
     out.extend(_TRUSTED_TG_CTL_PATHS if candidates is None else candidates)
@@ -359,7 +397,11 @@ def _candidate_paths(cwd: str, candidates: Sequence[Path | str] | None) -> list[
 
 
 def _resolve_executable(candidate: Path | str) -> Path | None:
-    path = Path(os.path.expanduser(str(candidate)))
+    # SECURITY: a candidate MUST be a genuine absolute path. Do NOT `expanduser()` it — that would
+    # expand a `~/…` value (e.g. a home rig.yaml `tg_ctl_path: "~/bin/tg-ctl"`) against the
+    # agent-exportable `$HOME`, reintroducing an agent-controllable anchor. A `~`-prefixed or
+    # otherwise non-absolute path is rejected outright.
+    path = Path(str(candidate))
     if not path.is_absolute():
         return None
     try:
@@ -371,12 +413,16 @@ def _resolve_executable(candidate: Path | str) -> Path | None:
     return resolved
 
 
-def _rig_tg_ctl_path(cwd: str) -> str | None:
-    root = _find_rig_yaml(cwd)
-    if root is None:
-        return None
+def _rig_tg_ctl_path(home: str) -> str | None:
+    """The `agent_hooks.tg_ctl_path` override read from EXACTLY `<home>/rig.yaml`.
+
+    SECURITY: this reads only the home dir's own rig.yaml — it deliberately does NOT walk UP into
+    parent directories. If the account home is nested under a workspace (or any other
+    agent-controlled dir), a parent `rig.yaml` must NOT be able to redirect the approval binary.
+    """
+
     try:
-        text = (root / "rig.yaml").read_text(encoding="utf-8")
+        text = (Path(home) / "rig.yaml").read_text(encoding="utf-8")
     except OSError:
         return None
     value = _agent_hooks_raw(text, _RIG_TG_CTL_KEY)
@@ -384,17 +430,6 @@ def _rig_tg_ctl_path(cwd: str) -> str | None:
         return None
     value = value.strip()
     return value or None
-
-
-def _find_rig_yaml(cwd: str) -> Path | None:
-    try:
-        here = Path(cwd or ".").resolve()
-    except OSError:
-        return None
-    for directory in (here, *here.parents):
-        if (directory / "rig.yaml").is_file():
-            return directory
-    return None
 
 
 def _agent_hooks_raw(rig_yaml_text: str, key: str) -> str | None:
@@ -468,4 +503,5 @@ __all__ = [
     "MAX_TG_CTL_TIMEOUT_S",
     "hatch_env_var",
     "request_hatch_approval",
+    "resolve_home",
 ]
