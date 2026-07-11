@@ -65,9 +65,11 @@
 #   SHIP_SKIP_VERSION_BUMP=1  override the version-bump gate (same effect as
 #                          --no-version-bump-ok, with a generic env-set reason). Use only for a
 #                          genuine no-release ship.
-#   SHIP_VERSION_FILES     space-separated list of version files to check (relative to the repo
-#                          root). Default: auto-detect pyproject.toml then package.json at the
-#                          root. Set it for a non-standard layout (e.g. a nested package).
+#   SHIP_VERSION_FILES     space-separated list of version sources to check (relative to the
+#                          repo root). Use path::ATTR for a Python module attribute. Default:
+#                          auto-detect static pyproject.toml, dynamic pyproject.toml sources
+#                          (VERSION / __init__.py), Poetry, then package.json. Set it for a
+#                          non-standard layout (e.g. a nested package).
 #   SHIP_REVIEW_DWELL      minimum seconds since the PR's last code push before a merge is
 #                          allowed, so asynchronous review (multi-model / CI-AI / human) has
 #                          time to FORM its comments. Default 600 (10 min). 0 disables the gate.
@@ -166,6 +168,7 @@ fi
 DEFAULT_BRANCH="${SHIP_DEFAULT_BRANCH:-main}"
 MERGE_METHOD="${SHIP_MERGE_METHOD:-squash}"
 UI_PATH_REGEX="${SHIP_UI_PATH_REGEX-(^|/)(components|pages|views|ui|app|src/app)/|\.(tsx|jsx|vue|svelte)$}"
+DYNAMIC_VERSION_UNRESOLVED="__ship_dynamic_pyproject_version_unresolved__"
 
 run() { if [ "$DRY_RUN" = "1" ]; then echo "[dry-run] $*"; else "$@"; fi; }
 
@@ -746,8 +749,8 @@ fi
 #
 # Repo-agnostic: detection works off the PR's own changed files + diff (no tracker / layout /
 # org hard-coded). A changed path is "shippable source" UNLESS it matches the docs/test/CI
-# exclusion set below; the version file is auto-located (pyproject.toml `version =`, then
-# package.json `"version"`) or pinned via SHIP_VERSION_FILES.
+# exclusion set below; the version source is auto-located (static/dynamic pyproject,
+# Poetry, then package.json) or pinned via SHIP_VERSION_FILES.
 
 # A path is NON-shippable (does NOT, on its own, make a ship a release) iff it is docs, a
 # test, or CI/meta. Everything else is treated as shippable source. Kept deliberately broad
@@ -792,16 +795,273 @@ any_shippable_source() {  # stdin: changed paths -> rc 0 if any shippable
   return $found
 }
 
+pyproject_declares_static_version() {  # rc 0 iff [project] has a literal version field
+  [ -f "$ROOT/pyproject.toml" ] || return 1
+  awk '
+    /^\[project\][[:space:]]*$/ { in_project = 1; next }
+    /^\[/ { in_project = 0 }
+    in_project && /^[[:space:]]*version[[:space:]]*=/ { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$ROOT/pyproject.toml"
+}
+
+pyproject_declares_poetry_version() {  # rc 0 iff [tool.poetry] has a literal version field
+  [ -f "$ROOT/pyproject.toml" ] || return 1
+  awk '
+    /^\[tool\.poetry\][[:space:]]*$/ { in_poetry = 1; next }
+    /^\[/ { in_poetry = 0 }
+    in_poetry && /^[[:space:]]*version[[:space:]]*=/ { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$ROOT/pyproject.toml"
+}
+
+pyproject_declares_dynamic_version() {  # rc 0 iff [project] dynamic includes "version"
+  [ -f "$ROOT/pyproject.toml" ] || return 1
+  awk '
+    /^\[project\][[:space:]]*$/ { in_project = 1; in_dynamic = 0; next }
+    /^\[/ { in_project = 0; in_dynamic = 0 }
+    in_project {
+      if ($0 ~ /^[[:space:]]*dynamic[[:space:]]*=/) in_dynamic = 1
+      if (in_dynamic && $0 ~ /["\047]version["\047]/) found = 1
+      if (in_dynamic && $0 ~ /\]/) in_dynamic = 0
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$ROOT/pyproject.toml"
+}
+
+version_file_spec() {  # $1 = path, $2 = optional attr or @plain -> prints an opaque spec
+  if [ -n "${2:-}" ]; then
+    printf '%s::%s' "$1" "$2"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+version_spec_path() {  # $1 = version file spec -> path for display/diff-section lookup
+  printf '%s' "${1%%::*}"
+}
+
+explicit_version_file_spec() {  # $1 = SHIP_VERSION_FILES entry -> normalized spec
+  local entry path f
+  entry="$1"
+  path=$(version_spec_path "$entry")
+  case "$entry" in
+    *::*) printf '%s' "$entry"; return 0 ;;
+  esac
+  case "$path" in
+    pyproject.toml|*/pyproject.toml)
+      if awk '
+        /^\[project\][[:space:]]*$/ { in_project = 1; next }
+        /^\[/ { in_project = 0 }
+        in_project && /^[[:space:]]*version[[:space:]]*=/ { found = 1 }
+        END { exit(found ? 0 : 1) }
+      ' "$ROOT/$path"; then
+        version_file_spec "$path" "@project"; return 0
+      fi
+      if awk '
+        /^\[project\][[:space:]]*$/ { in_project = 1; in_dynamic = 0; next }
+        /^\[/ { in_project = 0; in_dynamic = 0 }
+        in_project {
+          if ($0 ~ /^[[:space:]]*dynamic[[:space:]]*=/) in_dynamic = 1
+          if (in_dynamic && $0 ~ /["\047]version["\047]/) found = 1
+          if (in_dynamic && $0 ~ /\]/) in_dynamic = 0
+        }
+        END { exit(found ? 0 : 1) }
+      ' "$ROOT/$path"; then
+        if [ "$path" = "pyproject.toml" ] && f=$(locate_dynamic_pyproject_version_file); then
+          printf '%s' "$f"; return 0
+        fi
+        printf '%s' "$DYNAMIC_VERSION_UNRESOLVED"; return 0
+      fi
+      if awk '
+        /^\[tool\.poetry\][[:space:]]*$/ { in_poetry = 1; next }
+        /^\[/ { in_poetry = 0 }
+        in_poetry && /^[[:space:]]*version[[:space:]]*=/ { found = 1 }
+        END { exit(found ? 0 : 1) }
+      ' "$ROOT/$path"; then
+        version_file_spec "$path" "@poetry"; return 0
+      fi
+      printf '%s' "$path"; return 0 ;;
+    package.json|*/package.json|*.py) printf '%s' "$path"; return 0 ;;
+    *) version_file_spec "$path" "@plain"; return 0 ;;
+  esac
+}
+
+pyproject_package_dir() {  # prints normalized [project] name, e.g. draw-cli -> draw_cli
+  [ -f "$ROOT/pyproject.toml" ] || return 1
+  local name
+  name=$(awk '
+    /^\[project\][[:space:]]*$/ { in_project = 1; next }
+    /^\[/ { in_project = 0 }
+    in_project && /^[[:space:]]*name[[:space:]]*=/ {
+      line = $0
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      sub(/[[:space:]]*#.*$/, "", line)
+      gsub(/["\047[:space:]]/, "", line)
+      print line
+      exit
+    }
+  ' "$ROOT/pyproject.toml")
+  [ -n "$name" ] || return 1
+  printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr '.-' '__'
+}
+
+dynamic_attr_file_spec() {  # $1 = attr path like pkg._meta.VERSION -> path::VERSION
+  local attr_path module attr module_path f
+  attr_path="$1"
+  case "$attr_path" in *.*) : ;; *) return 1 ;; esac
+  module=${attr_path%.*}
+  attr=${attr_path##*.}
+  [ -n "$module" ] && [ -n "$attr" ] || return 1
+  module_path=${module//./\/}
+  for f in "$module_path.py" "$module_path/__init__.py" "src/$module_path.py" "src/$module_path/__init__.py"; do
+    if [ -f "$ROOT/$f" ]; then
+      version_file_spec "$f" "$attr"
+      return 0
+    fi
+  done
+  return 1
+}
+
+pyproject_setuptools_dynamic_version_source() {  # prints "attr:pkg.__version__" or "file:VERSION"
+  [ -f "$ROOT/pyproject.toml" ] || return 1
+  awk '
+    function print_quoted_sources(prefix, line) {
+      while (match(line, /["\047][^"\047]+["\047]/)) {
+        print prefix substr(line, RSTART + 1, RLENGTH - 2)
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }
+    /^\[tool\.setuptools\.dynamic\][[:space:]]*$/ { in_section = "inline"; next }
+    /^\[tool\.setuptools\.dynamic\.version\][[:space:]]*$/ { in_section = "subtable"; next }
+    /^\[/ { in_section = "" }
+    in_section == "inline" && /^[[:space:]]*version[[:space:]]*=/ {
+      line = $0
+      if (line ~ /attr[[:space:]]*=/) {
+        sub(/^.*attr[[:space:]]*=[[:space:]]*/, "", line)
+        if (match(line, /["\047][^"\047]+["\047]/)) {
+          print "attr:" substr(line, RSTART + 1, RLENGTH - 2)
+          exit
+        }
+      }
+      if (line ~ /file[[:space:]]*=/) {
+        sub(/^.*file[[:space:]]*=[[:space:]]*/, "", line)
+        print_quoted_sources("file:", line)
+        exit
+      }
+    }
+    in_section == "subtable" && /^[[:space:]]*attr[[:space:]]*=/ {
+      line = $0
+      sub(/^.*attr[[:space:]]*=[[:space:]]*/, "", line)
+      if (match(line, /["\047][^"\047]+["\047]/)) {
+        print "attr:" substr(line, RSTART + 1, RLENGTH - 2)
+        exit
+      }
+    }
+    in_section == "subtable" && /^[[:space:]]*file[[:space:]]*=/ {
+      line = $0
+      sub(/^.*file[[:space:]]*=[[:space:]]*/, "", line)
+      print_quoted_sources("file:", line)
+      exit
+    }
+  ' "$ROOT/pyproject.toml"
+}
+
+dynamic_source_file_from_setuptools() {
+  local source path attr_path saw=1
+  while IFS= read -r source; do
+    [ -n "$source" ] || continue
+    saw=0
+    case "$source" in
+      file:*)
+        path=${source#file:}
+        if [ -f "$ROOT/$path" ]; then
+          version_file_spec "$path" "@plain"
+          return 0
+        fi ;;
+      attr:*)
+        attr_path=${source#attr:}
+        if dynamic_attr_file_spec "$attr_path"; then
+          return 0
+        fi ;;
+    esac
+  done < <(pyproject_setuptools_dynamic_version_source || true)
+
+  [ "$saw" -eq 0 ] || return 1
+  printf '%s' "$DYNAMIC_VERSION_UNRESOLVED"
+  return 0
+}
+
+locate_dynamic_pyproject_version_file() {
+  local pkg f found="" count=0
+  pyproject_declares_dynamic_version || return 1
+
+  if f=$(dynamic_source_file_from_setuptools); then
+    printf '%s' "$f"
+    return 0
+  fi
+
+  if pyproject_declares_poetry_version; then
+    version_file_spec 'pyproject.toml' '@poetry'
+    return 0
+  fi
+
+  if [ -f "$ROOT/VERSION" ]; then
+    printf 'VERSION'
+    return 0
+  fi
+
+  pkg=$(pyproject_package_dir || true)
+  if [ -n "$pkg" ]; then
+    for f in "$pkg/__init__.py" "src/$pkg/__init__.py"; do
+      if [ -f "$ROOT/$f" ] && grep -Eq '^[[:space:]]*__version__[[:space:]]*(:[^=]+)?[[:space:]]*=' "$ROOT/$f"; then
+        version_file_spec "$f" "__version__"
+        return 0
+      fi
+    done
+  fi
+
+  while IFS= read -r f; do
+    if grep -Eq '^[[:space:]]*__version__[[:space:]]*(:[^=]+)?[[:space:]]*=' "$f"; then
+      found=$(version_file_spec "${f#"$ROOT"/}" "__version__")
+      count=$((count+1))
+    fi
+  done < <(find "$ROOT" \
+    \( -path "$ROOT/.git" -o -path '*/.git' -o -path "$ROOT/.venv" -o -path "$ROOT/venv" -o -path "$ROOT/.tox" \
+       -o -path '*/vendor' -o -path '*/.eggs' -o -path '*/site-packages' \
+       -o -path '*/build' -o -path '*/dist' -o -path '*/node_modules' \) -prune \
+    -o -name __init__.py -type f -print)
+
+  if [ "$count" -eq 1 ]; then
+    printf '%s' "$found"
+    return 0
+  fi
+  return 1
+}
+
 # Locate the repo's version file: the explicit override, else pyproject.toml (with a
-# `[project] version =`), else package.json (with a `"version"`). Prints the path, or nothing.
+# `[project] version =`), else a dynamic pyproject source (`VERSION` or `__init__.py`), else
+# package.json (with a `"version"`). Prints the path, or nothing.
 locate_version_file() {
   local f
   if [ -n "${SHIP_VERSION_FILES:-}" ]; then
-    for f in $SHIP_VERSION_FILES; do [ -f "$ROOT/$f" ] && { printf '%s' "$f"; return 0; }; done
+    for f in $SHIP_VERSION_FILES; do [ -f "$ROOT/$(version_spec_path "$f")" ] && { explicit_version_file_spec "$f"; return 0; }; done
     return 1
   fi
-  if [ -f "$ROOT/pyproject.toml" ] && grep -Eq '^[[:space:]]*version[[:space:]]*=' "$ROOT/pyproject.toml"; then
-    printf 'pyproject.toml'; return 0
+  if pyproject_declares_static_version; then
+    version_file_spec 'pyproject.toml' '@project'; return 0
+  fi
+  if pyproject_declares_dynamic_version; then
+    if f=$(locate_dynamic_pyproject_version_file); then
+      printf '%s' "$f"; return 0
+    fi
+    if pyproject_declares_poetry_version; then
+      version_file_spec 'pyproject.toml' '@poetry'; return 0
+    fi
+    printf '%s' "$DYNAMIC_VERSION_UNRESOLVED"; return 0
+  fi
+  if pyproject_declares_poetry_version; then
+    version_file_spec 'pyproject.toml' '@poetry'; return 0
   fi
   if [ -f "$ROOT/package.json" ] && grep -Eq '"version"[[:space:]]*:' "$ROOT/package.json"; then
     printf 'package.json'; return 0
@@ -816,8 +1076,112 @@ locate_version_file() {
 # VALUES inside that file's diff section and require a NEW value that differs from the OLD.
 # (A version DECLARED for the first time — an added `+` with no matching `-` — also counts: a
 # brand-new version field is a move from "no version".)
-version_line_bumped() {  # $1 = version file path; uses $PR_DIFF (full patch text)
-  local file="$1" oldv newv
+toml_diff_version_value() {  # $1 = section text, $2 = project|tool.poetry, $3 = +|-, $4 = file
+  printf '%s\n' "$1" | awk -v wanted="$2" -v sign="$3" -v source_file="${4:-}" '
+    BEGIN {
+      if (source_file != "") {
+        while ((getline src < source_file) > 0) {
+          if (src ~ /^[[:space:]]*\[/) {
+            file_in_target = (src ~ ("^[[:space:]]*\\[" wanted "\\][[:space:]]*$"))
+          }
+          file_target[++source_nr] = file_in_target
+        }
+        close(source_file)
+      }
+      source_unreadable = (source_file != "" && source_nr == 0)
+      in_target = source_unreadable ? 0 : 1
+    }
+    function target_at(line_no) {
+      if (source_unreadable) return 0
+      if (source_nr > 0 && line_no > 0 && line_no <= source_nr) return file_target[line_no]
+      return in_target
+    }
+    {
+      if ($0 ~ /^@@ /) {
+        hunk = $0
+        sub(/^@@ -/, "", hunk)
+        split(hunk, parts, " ")
+        old_line = parts[1]
+        new_line = parts[2]
+        sub(/,.*/, "", old_line)
+        sub(/^\+/, "", new_line)
+        sub(/,.*/, "", new_line)
+        old_line += 0
+        new_line += 0
+        next
+      }
+      marker = substr($0, 1, 1)
+      line = $0
+      if (marker == "+" || marker == "-" || marker == " ") line = substr($0, 2)
+      if (line ~ /^[[:space:]]*\[/) {
+        in_target = (line ~ ("^[[:space:]]*\\[" wanted "\\][[:space:]]*$"))
+      }
+      lookup_line = new_line
+      if (marker == sign && target_at(lookup_line) && line ~ /^[[:space:]]*version[[:space:]]*=/) {
+        if (match(line, /[0-9][0-9A-Za-z.+_-]*/)) {
+          print substr(line, RSTART, RLENGTH)
+          exit
+        }
+      }
+      if (marker == " ") { old_line++; new_line++ }
+      else if (marker == "-") { old_line++ }
+      else if (marker == "+") { new_line++ }
+    }'
+}
+
+version_is_increase() {  # $1 = old, $2 = new
+  local old="$1" new="$2"
+  [ -n "$new" ] || return 1
+  [ "$new" != "$old" ] || return 1
+  [ -n "$old" ] || return 0
+  awk -v old="$old" -v new="$new" '
+    function core(v) { sub(/[^0-9.].*$/, "", v); return v }
+    function suffix(v, c) {
+      v = substr(v, length(c) + 1)
+      sub(/^[^0-9A-Za-z]+/, "", v)
+      return v
+    }
+    function suffix_gt(old_s, new_s,   oa, na, olen, nlen, max, i, o, n, onum, nnum) {
+      olen = split(old_s, oa, /[^0-9A-Za-z]+/)
+      nlen = split(new_s, na, /[^0-9A-Za-z]+/)
+      max = (olen > nlen) ? olen : nlen
+      for (i = 1; i <= max; i++) {
+        o = oa[i]; n = na[i]
+        if (o == n) continue
+        if (o == "") return 1
+        if (n == "") return 0
+        onum = (o ~ /^[0-9]+$/)
+        nnum = (n ~ /^[0-9]+$/)
+        if (onum && nnum) return ((n + 0) > (o + 0))
+        if (onum && !nnum) return 1
+        if (!onum && nnum) return 0
+        return (n > o)
+      }
+      return 0
+    }
+    BEGIN {
+      o = core(old); n = core(new)
+      if (o !~ /^[0-9]+([.][0-9]+)*$/ || n !~ /^[0-9]+([.][0-9]+)*$/) exit 1
+      olen = split(o, oa, "."); nlen = split(n, na, ".")
+      max = (olen > nlen) ? olen : nlen
+      for (i = 1; i <= max; i++) {
+        oi = (oa[i] == "") ? 0 : oa[i] + 0
+        ni = (na[i] == "") ? 0 : na[i] + 0
+        if (ni > oi) exit 0
+        if (ni < oi) exit 1
+      }
+      old_suffix = suffix(old, o)
+      new_suffix = suffix(new, n)
+      if (old_suffix != "" && new_suffix == "") exit 0
+      if (old_suffix == "" && new_suffix != "") exit 1
+      exit(suffix_gt(old_suffix, new_suffix) ? 0 : 1)
+    }'
+}
+
+version_line_bumped() {  # $1 = version file spec; uses $PR_DIFF (full patch text)
+  local spec="$1" file attr="" oldv newv
+  file=$(version_spec_path "$spec")
+  case "$spec" in *::*) attr=${spec#*::} ;; esac
   # Restrict to that file's section of the unified diff so an unrelated `version` elsewhere
   # can't falsely satisfy the gate. A file's section runs from its `diff --git a/.. b/<file>`
   # header up to the next `diff --git`.
@@ -827,16 +1191,51 @@ version_line_bumped() {  # $1 = version file path; uses $PR_DIFF (full patch tex
         /^diff --git / { insec = ($0 == "diff --git a/" f " b/" f) ? 1 : 0; next }
         insec { print }
       ')
-  # Extract the quoted value from a version-declaration line (both pyproject `version = "X"`
-  # and package.json `"version": "X"` quote the value). `head -1` guards against multiple
-  # matches (e.g. a workspace member) — take the first, which is the package's own.
-  newv=$(printf '%s\n' "$section" | grep -E '^\+[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
-           | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
-  oldv=$(printf '%s\n' "$section" | grep -E '^-[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
-           | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
-  [ -n "$newv" ] || return 1            # no new version value declared -> not bumped
-  [ "$newv" != "$oldv" ] || return 1    # value unchanged (cosmetic-only edit) -> not bumped
-  return 0
+  # Extract the value from a version-declaration line. Static manifests quote the value;
+  # dynamic pyproject versions commonly live in `__version__ = "X"` or a plain VERSION file.
+  if [ "${file##*/}" = "pyproject.toml" ] && [ "$attr" = "@project" ]; then
+    newv=$(toml_diff_version_value "$section" "project" "+" "$ROOT/$file")
+    oldv=$(toml_diff_version_value "$section" "project" "-" "$ROOT/$file")
+  elif [ "${file##*/}" = "pyproject.toml" ] && [ "$attr" = "@poetry" ]; then
+    newv=$(toml_diff_version_value "$section" "tool[.]poetry" "+" "$ROOT/$file")
+    oldv=$(toml_diff_version_value "$section" "tool[.]poetry" "-" "$ROOT/$file")
+  elif [ "${file##*/}" = "VERSION" ] || [ "$attr" = "@plain" ]; then
+    newv=$(printf '%s\n' "$section" | grep -E '^\+[[:space:]]*v?[0-9][0-9A-Za-z.+_-]*[[:space:]]*$|^\+[[:space:]]*"?[Vv]ersion"?[[:space:]]*[:=][[:space:]]*"?v?[0-9]' \
+             | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
+    oldv=$(printf '%s\n' "$section" | grep -E '^-[[:space:]]*v?[0-9][0-9A-Za-z.+_-]*[[:space:]]*$|^-[[:space:]]*"?[Vv]ersion"?[[:space:]]*[:=][[:space:]]*"?v?[0-9]' \
+             | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
+  elif [ -n "$attr" ]; then
+    newv=$(printf '%s\n' "$section" | awk -v attr="$attr" '
+      index($0, "+") == 1 {
+        line = substr($0, 2)
+        sub(/^[[:space:]]*/, "", line)
+        if (line ~ ("^" attr "([[:space:]]*:[^=]+)?[[:space:]]*=")) {
+          sub("^" attr "([[:space:]]*:[^=]+)?[[:space:]]*=[[:space:]]*", "", line)
+          if (match(line, /[0-9][0-9A-Za-z.+_-]*/)) {
+            print substr(line, RSTART, RLENGTH)
+            exit
+          }
+        }
+      }')
+    oldv=$(printf '%s\n' "$section" | awk -v attr="$attr" '
+      index($0, "-") == 1 {
+        line = substr($0, 2)
+        sub(/^[[:space:]]*/, "", line)
+        if (line ~ ("^" attr "([[:space:]]*:[^=]+)?[[:space:]]*=")) {
+          sub("^" attr "([[:space:]]*:[^=]+)?[[:space:]]*=[[:space:]]*", "", line)
+          if (match(line, /[0-9][0-9A-Za-z.+_-]*/)) {
+            print substr(line, RSTART, RLENGTH)
+            exit
+          }
+        }
+      }')
+  else
+    newv=$(printf '%s\n' "$section" | grep -E '^\+[[:space:]]*(__version__|version|VERSION)[[:space:]]*=|^\+[[:space:]]*"version"[[:space:]]*:' \
+             | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
+    oldv=$(printf '%s\n' "$section" | grep -E '^-[[:space:]]*(__version__|version|VERSION)[[:space:]]*=|^-[[:space:]]*"version"[[:space:]]*:' \
+             | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
+  fi
+  version_is_increase "$oldv" "$newv"
 }
 
 if [ "${SHIP_SKIP_VERSION_BUMP:-0}" = "1" ] && [ -z "$NO_VBUMP_OK" ]; then
@@ -849,20 +1248,27 @@ else
     if printf '%s\n' "$PR_FILES_VB" | any_shippable_source; then
       # Shippable source changed -> this ship is a release. The version field must have moved.
       if VFILE=$(locate_version_file); then
+        if [ "$VFILE" = "$DYNAMIC_VERSION_UNRESOLVED" ]; then
+          { echo "Refusing: PR #$PR changes shippable source and pyproject.toml declares dynamic = [\"version\"], but ship could not locate the dynamic version source."
+            echo "  Supported auto-detection: [tool.setuptools.dynamic] version attr/file, [tool.setuptools.dynamic.version] attr/file, root VERSION, package __init__.py __version__, or [tool.poetry] version."
+            echo "  Configure SHIP_VERSION_FILES with the version source path (or path::ATTR for a Python attribute) for a non-standard layout, then re-run ship."; } >&2
+          exit 1
+        fi
+        VFILE_PATH=$(version_spec_path "$VFILE")
         if PR_DIFF=$(gh pr diff "$PR" 2>/dev/null); then
           if ! version_line_bumped "$VFILE"; then
-            { echo "Refusing: PR #$PR changes shippable source but the version in $VFILE is UNCHANGED — this ship is a release, so bump the version (skill: bump-version-on-release)."
-              echo "  Semver: patch for a fix, minor for a feature, major for a breaking change. Edit $VFILE's version field, push, re-run ship."
+            { echo "Refusing: PR #$PR changes shippable source but the version in $VFILE_PATH is UNCHANGED — this ship is a release, so bump the version (skill: bump-version-on-release)."
+              echo "  Semver: patch for a fix, minor for a feature, major for a breaking change. Edit $VFILE_PATH's version field, push, re-run ship."
               echo "  If this is genuinely NOT a release (docs-only / pure test or CI / a revert), override: --no-version-bump-ok <reason> (or SHIP_SKIP_VERSION_BUMP=1)."; } >&2
             exit 1
           fi
-          echo "[ship] version-bump gate OK — $VFILE version is bumped in PR #$PR."
+          echo "[ship] version-bump gate OK — $VFILE_PATH version is bumped in PR #$PR."
         else
           echo "Refusing: could not read the diff for PR #$PR — cannot evaluate the version-bump gate (override with --no-version-bump-ok <reason> if intended)." >&2
           exit 1
         fi
       else
-        echo "[ship] version-bump gate: no version file (pyproject.toml/package.json) found at repo root — skipping (set SHIP_VERSION_FILES for a non-standard layout)."
+        echo "[ship] version-bump gate: no version file (pyproject.toml/Poetry/package.json) found at repo root — skipping (set SHIP_VERSION_FILES for a non-standard layout)."
       fi
     else
       echo "[ship] version-bump gate: PR #$PR changes no shippable source (docs/tests/CI only) — no bump required."

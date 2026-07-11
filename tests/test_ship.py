@@ -463,7 +463,18 @@ _PATCH_WITH_BUMP = (
     "@@ -1 +1 @@\n-old\n+new\n"
     "diff --git a/pyproject.toml b/pyproject.toml\n"
     "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
-    '@@ -3 +3 @@\n-version = "0.4.1"\n+version = "0.4.2"\n'
+    '@@ -1,3 +1,3 @@\n [project]\n name = "mytool"\n-version = "0.4.1"\n+version = "0.4.2"\n'
+)
+
+# A realistic pyproject hunk may omit the [project] header when the version line is more
+# than git's context window away from it. The selected pyproject source should still count.
+_PATCH_WITH_BUMP_NO_SECTION_HEADER = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pyproject.toml b/pyproject.toml\n"
+    "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+    '@@ -7,3 +7,3 @@\n description = "x"\n requires-python = ">=3.11"\n-version = "0.4.1"\n+version = "0.4.2"\n'
 )
 
 # A PR diff that changes source but does NOT touch the version line.
@@ -506,6 +517,643 @@ def test_source_change_with_version_bump_passes(repo_with_pyproject, tmp_path):
     assert r.returncode == 0, f"ship should pass with a version bump\n{r.stdout}\n{r.stderr}"
     assert "version-bump gate OK" in r.stdout, r.stdout
     assert "merged #1" in r.stdout, r.stdout
+
+
+def test_pyproject_version_bump_without_section_header_passes(repo_with_pyproject, tmp_path):
+    """A selected [project] version bump can appear in a diff hunk without its section header."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "pyproject.toml").write_text(
+        (
+            '[project]\nname = "mytool"\na = "1"\nb = "2"\nc = "3"\nd = "4"\n'
+            'description = "x"\nrequires-python = ">=3.11"\nversion = "0.4.1"\n'
+        ),
+        encoding="utf-8",
+    )
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\npyproject.toml",
+        patch=_PATCH_WITH_BUMP_NO_SECTION_HEADER,
+    )
+
+    assert r.returncode == 0, f"sectionless pyproject bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "version-bump gate OK" in r.stdout, r.stdout
+
+
+@pytest.fixture
+def repo_with_dynamic_pyproject_init_version(tmp_path):
+    """A repo whose pyproject.toml declares a dynamic version sourced from __init__.py."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+
+    main = tmp_path / "main"
+    main.mkdir()
+    (main / "draw_cli").mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "pyproject.toml").write_text(
+        (
+            '[project]\nname = "draw-cli"\ndynamic = ["version"]\n\n'
+            '[tool.setuptools.dynamic]\nversion = {attr = "draw_cli.__version__"}\n'
+        ),
+        encoding="utf-8",
+    )
+    (main / "draw_cli" / "__init__.py").write_text('__version__ = "0.4.1"\n', encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+    return main, wt
+
+
+_PATCH_DYNAMIC_INIT_BUMP = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/draw_cli/__init__.py b/draw_cli/__init__.py\n"
+    "--- a/draw_cli/__init__.py\n+++ b/draw_cli/__init__.py\n"
+    '@@ -1 +1 @@\n-__version__ = "0.4.1"\n+__version__ = "0.4.2"\n'
+)
+
+_PATCH_DYNAMIC_INIT_ANNOTATED_BUMP = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/draw_cli/__init__.py b/draw_cli/__init__.py\n"
+    "--- a/draw_cli/__init__.py\n+++ b/draw_cli/__init__.py\n"
+    '@@ -1 +1 @@\n-__version__: str = "0.4.1"\n+__version__: str = "0.4.2"\n'
+)
+
+_PATCH_DYNAMIC_INIT_DOWNGRADE = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/draw_cli/__init__.py b/draw_cli/__init__.py\n"
+    "--- a/draw_cli/__init__.py\n+++ b/draw_cli/__init__.py\n"
+    '@@ -1 +1 @@\n-__version__ = "0.4.2"\n+__version__ = "0.4.1"\n'
+)
+
+
+def test_dynamic_pyproject_init_version_bump_passes(repo_with_dynamic_pyproject_init_version, tmp_path):
+    """A dynamic pyproject version sourced from package __init__.py must satisfy the bump gate."""
+    main, _wt = repo_with_dynamic_pyproject_init_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\ndraw_cli/__init__.py",
+        patch=_PATCH_DYNAMIC_INIT_BUMP,
+    )
+
+    assert r.returncode == 0, f"dynamic __init__.py bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "draw_cli/__init__.py version is bumped" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_ship_version_files_bare_dynamic_pyproject_resolves_dynamic_source(
+    repo_with_dynamic_pyproject_init_version, tmp_path
+):
+    """Explicit SHIP_VERSION_FILES=pyproject.toml keeps dynamic pyproject source detection."""
+    main, _wt = repo_with_dynamic_pyproject_init_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\ndraw_cli/__init__.py",
+        patch=_PATCH_DYNAMIC_INIT_BUMP,
+        env_extra={"SHIP_VERSION_FILES": "pyproject.toml"},
+    )
+
+    assert r.returncode == 0, f"bare dynamic pyproject override should pass\n{r.stdout}\n{r.stderr}"
+    assert "draw_cli/__init__.py version is bumped" in r.stdout, r.stdout
+
+
+def test_ship_version_files_bare_pyproject_prefers_setuptools_dynamic_over_poetry(
+    repo_with_dynamic_pyproject_init_version, tmp_path
+):
+    """Bare pyproject override uses the same dynamic-before-Poetry precedence as auto-detect."""
+    main, _wt = repo_with_dynamic_pyproject_init_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "pyproject.toml").write_text(
+        (
+            '[project]\nname = "draw-cli"\ndynamic = ["version"]\n\n'
+            '[tool.setuptools.dynamic]\nversion = {attr = "draw_cli.__version__"}\n\n'
+            '[tool.poetry]\nname = "draw-cli"\nversion = "9.9.9"\n'
+        ),
+        encoding="utf-8",
+    )
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\ndraw_cli/__init__.py",
+        patch=_PATCH_DYNAMIC_INIT_BUMP,
+        env_extra={"SHIP_VERSION_FILES": "pyproject.toml"},
+    )
+
+    assert r.returncode == 0, f"bare pyproject override should prefer dynamic source\n{r.stdout}\n{r.stderr}"
+    assert "draw_cli/__init__.py version is bumped" in r.stdout, r.stdout
+    assert "version in pyproject.toml is UNCHANGED" not in r.stderr, r.stderr
+
+
+def test_dynamic_pyproject_setuptools_subtable_attr_bump_passes(
+    repo_with_dynamic_pyproject_init_version, tmp_path
+):
+    """setuptools also supports [tool.setuptools.dynamic.version] attr syntax."""
+    main, _wt = repo_with_dynamic_pyproject_init_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "pyproject.toml").write_text(
+        (
+            '[project]\nname = "draw-cli"\ndynamic = ["version"]\n\n'
+            '[tool.setuptools.dynamic.version]\nattr = "draw_cli.VERSION"\n'
+        ),
+        encoding="utf-8",
+    )
+    (main / "draw_cli" / "__init__.py").write_text('VERSION = "0.4.1"\n', encoding="utf-8")
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\ndraw_cli/__init__.py",
+        patch=_PATCH_DYNAMIC_NAMED_ATTR_BUMP,
+    )
+
+    assert r.returncode == 0, f"setuptools subtable attr bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "draw_cli/__init__.py version is bumped" in r.stdout, r.stdout
+
+
+def test_dynamic_pyproject_annotated_attr_bump_passes(repo_with_dynamic_pyproject_init_version, tmp_path):
+    """Typed Python attr assignments still satisfy the configured setuptools attr source."""
+    main, _wt = repo_with_dynamic_pyproject_init_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\ndraw_cli/__init__.py",
+        patch=_PATCH_DYNAMIC_INIT_ANNOTATED_BUMP,
+    )
+
+    assert r.returncode == 0, f"annotated dynamic attr bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "draw_cli/__init__.py version is bumped" in r.stdout, r.stdout
+
+
+def test_dynamic_pyproject_init_version_unchanged_blocks(repo_with_dynamic_pyproject_init_version, tmp_path):
+    """A dynamic version source that exists but is unchanged must block a source release."""
+    main, _wt = repo_with_dynamic_pyproject_init_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(main, bindir, name_only="src/a.py", patch=_PATCH_NO_BUMP)
+
+    assert r.returncode != 0, f"unchanged dynamic source must block\n{r.stdout}\n{r.stderr}"
+    assert "version in draw_cli/__init__.py is UNCHANGED" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_dynamic_pyproject_version_downgrade_blocks(repo_with_dynamic_pyproject_init_version, tmp_path):
+    """A dynamic Python version source must increase, not merely change."""
+    main, _wt = repo_with_dynamic_pyproject_init_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\ndraw_cli/__init__.py",
+        patch=_PATCH_DYNAMIC_INIT_DOWNGRADE,
+    )
+
+    assert r.returncode != 0, f"dynamic version downgrade must not pass\n{r.stdout}\n{r.stderr}"
+    assert "version in draw_cli/__init__.py is UNCHANGED" in r.stderr, r.stderr
+
+
+@pytest.fixture
+def repo_with_dynamic_pyproject_named_attr_version(tmp_path):
+    """A repo whose setuptools dynamic version attr is not named __version__."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+
+    main = tmp_path / "main"
+    main.mkdir()
+    (main / "draw_cli").mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "pyproject.toml").write_text(
+        (
+            '[project]\nname = "draw-cli"\ndynamic = ["version"]\n\n'
+            '[tool.setuptools.dynamic]\nversion = {attr = "draw_cli.VERSION"}\n'
+        ),
+        encoding="utf-8",
+    )
+    (main / "draw_cli" / "__init__.py").write_text('VERSION = "0.4.1"\n', encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+    return main, wt
+
+
+_PATCH_DYNAMIC_NAMED_ATTR_BUMP = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/draw_cli/__init__.py b/draw_cli/__init__.py\n"
+    "--- a/draw_cli/__init__.py\n+++ b/draw_cli/__init__.py\n"
+    '@@ -1 +1 @@\n-VERSION = "0.4.1"\n+VERSION = "0.4.2"\n'
+)
+
+
+def test_dynamic_pyproject_named_attr_bump_passes(repo_with_dynamic_pyproject_named_attr_version, tmp_path):
+    """setuptools attr sources can use an arbitrary configured attribute name."""
+    main, _wt = repo_with_dynamic_pyproject_named_attr_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\ndraw_cli/__init__.py",
+        patch=_PATCH_DYNAMIC_NAMED_ATTR_BUMP,
+    )
+
+    assert r.returncode == 0, f"dynamic VERSION attr bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "draw_cli/__init__.py version is bumped" in r.stdout, r.stdout
+
+
+@pytest.fixture
+def repo_with_dynamic_pyproject_nested_attr_version(tmp_path):
+    """A repo whose setuptools dynamic version attr lives in a nested module."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+
+    main = tmp_path / "main"
+    main.mkdir()
+    (main / "draw_cli").mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "pyproject.toml").write_text(
+        (
+            '[project]\nname = "draw-cli"\ndynamic = ["version"]\n\n'
+            '[tool.setuptools.dynamic]\nversion = {attr = "draw_cli._meta.VERSION"}\n'
+        ),
+        encoding="utf-8",
+    )
+    (main / "draw_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (main / "draw_cli" / "_meta.py").write_text('VERSION = "0.4.1"\n', encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+    return main, wt
+
+
+_PATCH_DYNAMIC_NESTED_ATTR_BUMP = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/draw_cli/_meta.py b/draw_cli/_meta.py\n"
+    "--- a/draw_cli/_meta.py\n+++ b/draw_cli/_meta.py\n"
+    '@@ -1 +1 @@\n-VERSION = "0.4.1"\n+VERSION = "0.4.2"\n'
+)
+
+
+def test_dynamic_pyproject_nested_attr_bump_passes(repo_with_dynamic_pyproject_nested_attr_version, tmp_path):
+    """setuptools attr sources split at the last dot and locate the module file."""
+    main, _wt = repo_with_dynamic_pyproject_nested_attr_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\ndraw_cli/_meta.py",
+        patch=_PATCH_DYNAMIC_NESTED_ATTR_BUMP,
+    )
+
+    assert r.returncode == 0, f"dynamic nested VERSION attr bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "draw_cli/_meta.py version is bumped" in r.stdout, r.stdout
+
+
+@pytest.fixture
+def repo_with_dynamic_pyproject_version_file(tmp_path):
+    """A repo whose pyproject.toml declares a dynamic version sourced from VERSION."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "pyproject.toml").write_text(
+        (
+            '[project]\nname = "mytool"\ndynamic = ["version"]\n\n'
+            '[tool.setuptools.dynamic]\nversion = {file = "VERSION"}\n'
+        ),
+        encoding="utf-8",
+    )
+    (main / "VERSION").write_text("0.4.1\n", encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+    return main, wt
+
+
+_PATCH_DYNAMIC_VERSION_FILE_BUMP = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/VERSION b/VERSION\n"
+    "--- a/VERSION\n+++ b/VERSION\n"
+    "@@ -1 +1 @@\n-0.4.1\n+0.4.2\n"
+)
+
+
+def test_dynamic_pyproject_version_file_bump_passes(repo_with_dynamic_pyproject_version_file, tmp_path):
+    """A dynamic pyproject version sourced from a VERSION file must satisfy the bump gate."""
+    main, _wt = repo_with_dynamic_pyproject_version_file
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\nVERSION",
+        patch=_PATCH_DYNAMIC_VERSION_FILE_BUMP,
+    )
+
+    assert r.returncode == 0, f"dynamic VERSION bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "VERSION version is bumped" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_dynamic_pyproject_setuptools_file_list_uses_existing_candidate(
+    repo_with_dynamic_pyproject_version_file, tmp_path
+):
+    """setuptools file lists may include fallbacks; ship should use an existing candidate."""
+    main, _wt = repo_with_dynamic_pyproject_version_file
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "pyproject.toml").write_text(
+        (
+            '[project]\nname = "mytool"\ndynamic = ["version"]\n\n'
+            '[tool.setuptools.dynamic]\nversion = {file = ["MISSING", "VERSION"]}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\nVERSION",
+        patch=_PATCH_DYNAMIC_VERSION_FILE_BUMP,
+    )
+
+    assert r.returncode == 0, f"setuptools file list should use VERSION\n{r.stdout}\n{r.stderr}"
+    assert "VERSION version is bumped" in r.stdout, r.stdout
+
+
+@pytest.fixture
+def repo_with_dynamic_pyproject_named_version_file(tmp_path):
+    """A repo whose setuptools dynamic file source is not named VERSION."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "pyproject.toml").write_text(
+        (
+            '[project]\nname = "mytool"\ndynamic = ["version"]\n\n'
+            '[tool.setuptools.dynamic]\nversion = {file = "VERSION.txt"}\n'
+        ),
+        encoding="utf-8",
+    )
+    (main / "VERSION.txt").write_text("0.4.1\n", encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+    return main, wt
+
+
+_PATCH_DYNAMIC_VERSION_TXT_BUMP = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/VERSION.txt b/VERSION.txt\n"
+    "--- a/VERSION.txt\n+++ b/VERSION.txt\n"
+    "@@ -1 +1 @@\n-0.4.1\n+0.4.2\n"
+)
+
+
+def test_dynamic_pyproject_named_version_file_bump_passes(repo_with_dynamic_pyproject_named_version_file, tmp_path):
+    """setuptools file sources are plain version files even when not named VERSION."""
+    main, _wt = repo_with_dynamic_pyproject_named_version_file
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\nVERSION.txt",
+        patch=_PATCH_DYNAMIC_VERSION_TXT_BUMP,
+    )
+
+    assert r.returncode == 0, f"dynamic VERSION.txt bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "VERSION.txt version is bumped" in r.stdout, r.stdout
+
+
+@pytest.fixture
+def repo_with_unresolved_dynamic_pyproject(tmp_path):
+    """A repo with dynamic pyproject version but no supported source to locate."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "pyproject.toml").write_text(
+        '[project]\nname = "mytool"\ndynamic = ["version"]\n', encoding="utf-8"
+    )
+    (main / "package.json").write_text(
+        '{\n  "name": "fallback-must-not-win",\n  "version": "9.9.9"\n}\n', encoding="utf-8"
+    )
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+    return main, wt
+
+
+def test_unresolved_dynamic_pyproject_version_fails_closed(repo_with_unresolved_dynamic_pyproject, tmp_path):
+    """A dynamic pyproject version with no supported source must refuse instead of falling back."""
+    main, _wt = repo_with_unresolved_dynamic_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(main, bindir, name_only="src/a.py", patch=_PATCH_NO_BUMP)
+
+    assert r.returncode != 0, f"unresolved dynamic source must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "declares dynamic = [\"version\"]" in r.stderr, r.stderr
+    assert "SHIP_VERSION_FILES" in r.stderr, r.stderr
+    assert "package.json version is bumped" not in r.stdout, r.stdout
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_ship_version_files_override_can_pin_python_attr(repo_with_unresolved_dynamic_pyproject, tmp_path):
+    """SHIP_VERSION_FILES supports path::ATTR for non-standard dynamic Python attr sources."""
+    main, _wt = repo_with_unresolved_dynamic_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "pkg").mkdir()
+    (main / "pkg" / "_meta.py").write_text('VERSION = "0.4.1"\n', encoding="utf-8")
+
+    patch = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n+++ b/src/a.py\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+        "diff --git a/pkg/_meta.py b/pkg/_meta.py\n"
+        "--- a/pkg/_meta.py\n+++ b/pkg/_meta.py\n"
+        '@@ -1 +1 @@\n-VERSION = "0.4.1"\n+VERSION = "0.4.2"\n'
+    )
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\npkg/_meta.py",
+        patch=patch,
+        env_extra={"SHIP_VERSION_FILES": "pkg/_meta.py::VERSION"},
+    )
+
+    assert r.returncode == 0, f"path::ATTR override should pass\n{r.stdout}\n{r.stderr}"
+    assert "pkg/_meta.py version is bumped" in r.stdout, r.stdout
+
+
+def test_ship_version_files_bare_python_override_allows_uppercase_version_attr(
+    repo_with_unresolved_dynamic_pyproject, tmp_path
+):
+    """Bare explicit Python version files accept a conventional uppercase VERSION attr."""
+    main, _wt = repo_with_unresolved_dynamic_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "pkg").mkdir()
+    (main / "pkg" / "_meta.py").write_text('VERSION = "0.4.1"\n', encoding="utf-8")
+
+    patch = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n+++ b/src/a.py\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+        "diff --git a/pkg/_meta.py b/pkg/_meta.py\n"
+        "--- a/pkg/_meta.py\n+++ b/pkg/_meta.py\n"
+        '@@ -1 +1 @@\n-VERSION = "0.4.1"\n+VERSION = "0.4.2"\n'
+    )
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\npkg/_meta.py",
+        patch=patch,
+        env_extra={"SHIP_VERSION_FILES": "pkg/_meta.py"},
+    )
+
+    assert r.returncode == 0, f"bare Python VERSION override should pass\n{r.stdout}\n{r.stderr}"
+    assert "pkg/_meta.py version is bumped" in r.stdout, r.stdout
+
+
+def test_ship_version_files_override_can_pin_plain_version_file(repo_with_unresolved_dynamic_pyproject, tmp_path):
+    """SHIP_VERSION_FILES treats explicit non-manifest files as plain version files."""
+    main, _wt = repo_with_unresolved_dynamic_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "VERSION.txt").write_text("0.4.1\n", encoding="utf-8")
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\nVERSION.txt",
+        patch=_PATCH_DYNAMIC_VERSION_TXT_BUMP,
+        env_extra={"SHIP_VERSION_FILES": "VERSION.txt"},
+    )
+
+    assert r.returncode == 0, f"plain file override should pass\n{r.stdout}\n{r.stderr}"
+    assert "VERSION.txt version is bumped" in r.stdout, r.stdout
+
+
+def test_ship_version_files_override_can_pin_key_value_version_file(
+    repo_with_unresolved_dynamic_pyproject, tmp_path
+):
+    """Explicit custom version files may use a simple version=... key-value format."""
+    main, _wt = repo_with_unresolved_dynamic_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "version.properties").write_text("version=0.4.1\n", encoding="utf-8")
+    patch = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n+++ b/src/a.py\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+        "diff --git a/version.properties b/version.properties\n"
+        "--- a/version.properties\n+++ b/version.properties\n"
+        "@@ -1 +1 @@\n-version=0.4.1\n+version=0.4.2\n"
+    )
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\nversion.properties",
+        patch=patch,
+        env_extra={"SHIP_VERSION_FILES": "version.properties"},
+    )
+
+    assert r.returncode == 0, f"key-value file override should pass\n{r.stdout}\n{r.stderr}"
+    assert "version.properties version is bumped" in r.stdout, r.stdout
 
 
 def test_docs_only_pr_is_not_required_to_bump(repo_with_pyproject, tmp_path):
@@ -573,7 +1221,7 @@ _PATCH_COSMETIC_VERSION = (
     "@@ -1 +1 @@\n-old\n+new\n"
     "diff --git a/pyproject.toml b/pyproject.toml\n"
     "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
-    "@@ -3 +3 @@\n-version = \"0.4.1\"\n+version  =  \"0.4.1\"\n"
+    "@@ -1,3 +1,3 @@\n [project]\n name = \"mytool\"\n-version = \"0.4.1\"\n+version  =  \"0.4.1\"\n"
 )
 
 
@@ -589,6 +1237,107 @@ def test_cosmetic_version_edit_is_not_a_bump(repo_with_pyproject, tmp_path):
     )
 
     assert r.returncode != 0, f"cosmetic version edit must not pass as a bump\n{r.stdout}\n{r.stderr}"
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+
+
+_PATCH_UNRELATED_PYPROJECT_VERSION_BUMP = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pyproject.toml b/pyproject.toml\n"
+    "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+    '@@ -4,3 +4,3 @@\n [tool.foo]\n-version = "1.0.0"\n+version = "1.0.1"\n'
+)
+
+_PATCH_UNRELATED_PYPROJECT_VERSION_BUMP_NO_SECTION_HEADER = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pyproject.toml b/pyproject.toml\n"
+    "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+    '@@ -6,3 +6,3 @@\n enabled = true\n label = "x"\n-version = "1.0.0"\n+version = "1.0.1"\n'
+)
+
+
+def test_unrelated_pyproject_version_edit_is_not_a_bump(repo_with_pyproject, tmp_path):
+    """Only the selected pyproject section's version satisfies the version-bump gate."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\npyproject.toml",
+        patch=_PATCH_UNRELATED_PYPROJECT_VERSION_BUMP,
+    )
+
+    assert r.returncode != 0, f"unrelated pyproject version edit must not pass\n{r.stdout}\n{r.stderr}"
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+
+
+def test_sectionless_unrelated_pyproject_version_edit_is_not_a_bump(repo_with_pyproject, tmp_path):
+    """Line numbers keep sectionless pyproject hunks pinned to the selected version source."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "pyproject.toml").write_text(
+        (
+            '[project]\nname = "mytool"\nversion = "0.4.1"\n\n'
+            '[tool.foo]\nenabled = true\nlabel = "x"\nversion = "1.0.0"\n'
+        ),
+        encoding="utf-8",
+    )
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\npyproject.toml",
+        patch=_PATCH_UNRELATED_PYPROJECT_VERSION_BUMP_NO_SECTION_HEADER,
+    )
+
+    assert r.returncode != 0, f"sectionless unrelated pyproject edit must not pass\n{r.stdout}\n{r.stderr}"
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+
+
+def test_ship_version_files_bare_pyproject_override_stays_section_aware(repo_with_pyproject, tmp_path):
+    """Explicit SHIP_VERSION_FILES=pyproject.toml must not fall back to global version grep."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\npyproject.toml",
+        patch=_PATCH_UNRELATED_PYPROJECT_VERSION_BUMP,
+        env_extra={"SHIP_VERSION_FILES": "pyproject.toml"},
+    )
+
+    assert r.returncode != 0, f"bare pyproject override must stay section-aware\n{r.stdout}\n{r.stderr}"
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+
+
+_PATCH_PYPROJECT_DOWNGRADE = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pyproject.toml b/pyproject.toml\n"
+    "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+    '@@ -1,3 +1,3 @@\n [project]\n name = "mytool"\n-version = "0.4.2"\n+version = "0.4.1"\n'
+)
+
+
+def test_pyproject_version_downgrade_is_not_a_bump(repo_with_pyproject, tmp_path):
+    """A numeric downgrade is a version change, but not a release bump."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\npyproject.toml",
+        patch=_PATCH_PYPROJECT_DOWNGRADE,
+    )
+
+    assert r.returncode != 0, f"version downgrade must not pass\n{r.stdout}\n{r.stderr}"
     assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
 
 
@@ -634,6 +1383,46 @@ _PATCH_PKGJSON_NO_BUMP = (
     "--- a/src/a.js\n+++ b/src/a.js\n"
     "@@ -1 +1 @@\n-old\n+new\n"
 )
+_PATCH_PKGJSON_DOWNGRADE = (
+    "diff --git a/src/a.js b/src/a.js\n"
+    "--- a/src/a.js\n+++ b/src/a.js\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/package.json b/package.json\n"
+    "--- a/package.json\n+++ b/package.json\n"
+    '@@ -3 +3 @@\n-  "version": "1.0.1"\n+  "version": "1.0.0"\n'
+)
+_PATCH_PKGJSON_INVALID_CORE = (
+    "diff --git a/src/a.js b/src/a.js\n"
+    "--- a/src/a.js\n+++ b/src/a.js\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/package.json b/package.json\n"
+    "--- a/package.json\n+++ b/package.json\n"
+    '@@ -3 +3 @@\n-  "version": "1.0.0"\n+  "version": "1.x"\n'
+)
+_PATCH_PKGJSON_PRERELEASE_BUMP = (
+    "diff --git a/src/a.js b/src/a.js\n"
+    "--- a/src/a.js\n+++ b/src/a.js\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/package.json b/package.json\n"
+    "--- a/package.json\n+++ b/package.json\n"
+    '@@ -3 +3 @@\n-  "version": "1.0.0-alpha.1"\n+  "version": "1.0.0-alpha.2"\n'
+)
+_PATCH_PKGJSON_PRERELEASE_TO_FINAL = (
+    "diff --git a/src/a.js b/src/a.js\n"
+    "--- a/src/a.js\n+++ b/src/a.js\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/package.json b/package.json\n"
+    "--- a/package.json\n+++ b/package.json\n"
+    '@@ -3 +3 @@\n-  "version": "1.0.0-rc1"\n+  "version": "1.0.0"\n'
+)
+_PATCH_PKGJSON_PRERELEASE_MULTIDIGIT_BUMP = (
+    "diff --git a/src/a.js b/src/a.js\n"
+    "--- a/src/a.js\n+++ b/src/a.js\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/package.json b/package.json\n"
+    "--- a/package.json\n+++ b/package.json\n"
+    '@@ -3 +3 @@\n-  "version": "1.0.0-rc.9"\n+  "version": "1.0.0-rc.10"\n'
+)
 
 
 def test_package_json_source_without_bump_is_blocked(repo_with_package_json, tmp_path):
@@ -659,6 +1448,356 @@ def test_package_json_with_bump_passes(repo_with_package_json, tmp_path):
     assert r.returncode == 0, f"package.json bump should pass\n{r.stdout}\n{r.stderr}"
     assert "version-bump gate OK" in r.stdout, r.stdout
     assert "merged #1" in r.stdout, r.stdout
+
+
+def test_package_json_downgrade_is_not_a_bump(repo_with_package_json, tmp_path):
+    """The package.json code path also rejects numeric version downgrades."""
+    main, _wt = repo_with_package_json
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="src/a.js\npackage.json", patch=_PATCH_PKGJSON_DOWNGRADE
+    )
+
+    assert r.returncode != 0, f"package.json downgrade must not pass\n{r.stdout}\n{r.stderr}"
+    assert "version in package.json is UNCHANGED" in r.stderr, r.stderr
+
+
+def test_package_json_invalid_numeric_core_is_not_a_bump(repo_with_package_json, tmp_path):
+    """Malformed dotted numeric cores fail closed instead of passing as arbitrary changes."""
+    main, _wt = repo_with_package_json
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.js\npackage.json",
+        patch=_PATCH_PKGJSON_INVALID_CORE,
+    )
+
+    assert r.returncode != 0, f"invalid version core must not pass\n{r.stdout}\n{r.stderr}"
+    assert "version in package.json is UNCHANGED" in r.stderr, r.stderr
+
+
+def test_prerelease_suffix_bump_passes(repo_with_package_json, tmp_path):
+    """A prerelease suffix move with the same numeric core is still a version bump."""
+    main, _wt = repo_with_package_json
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.js\npackage.json",
+        patch=_PATCH_PKGJSON_PRERELEASE_BUMP,
+    )
+
+    assert r.returncode == 0, f"prerelease suffix bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "version-bump gate OK" in r.stdout, r.stdout
+
+
+def test_prerelease_to_final_passes(repo_with_package_json, tmp_path):
+    """Promoting an rc/prerelease to the final release is a version bump."""
+    main, _wt = repo_with_package_json
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.js\npackage.json",
+        patch=_PATCH_PKGJSON_PRERELEASE_TO_FINAL,
+    )
+
+    assert r.returncode == 0, f"prerelease to final should pass\n{r.stdout}\n{r.stderr}"
+    assert "version-bump gate OK" in r.stdout, r.stdout
+
+
+def test_prerelease_multidigit_suffix_bump_passes(repo_with_package_json, tmp_path):
+    """Numeric prerelease identifiers compare numerically, not lexicographically."""
+    main, _wt = repo_with_package_json
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.js\npackage.json",
+        patch=_PATCH_PKGJSON_PRERELEASE_MULTIDIGIT_BUMP,
+    )
+
+    assert r.returncode == 0, f"multi-digit prerelease bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "version-bump gate OK" in r.stdout, r.stdout
+
+
+@pytest.fixture
+def repo_with_poetry_pyproject(tmp_path):
+    """A repo whose release version is declared in [tool.poetry] version."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "pyproject.toml").write_text(
+        '[tool.poetry]\nname = "mytool"\nversion = "0.4.1"\n', encoding="utf-8"
+    )
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+    return main, wt
+
+
+_PATCH_POETRY_BUMP = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pyproject.toml b/pyproject.toml\n"
+    "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+    '@@ -1,3 +1,3 @@\n [tool.poetry]\n name = "mytool"\n-version = "0.4.1"\n+version = "0.4.2"\n'
+)
+
+_PATCH_POETRY_BUMP_NO_SECTION_HEADER = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pyproject.toml b/pyproject.toml\n"
+    "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+    '@@ -7,3 +7,3 @@\n description = "x"\n authors = ["A <a@example.com>"]\n-version = "0.4.1"\n+version = "0.4.2"\n'
+)
+
+
+def test_poetry_pyproject_source_without_bump_is_blocked(repo_with_poetry_pyproject, tmp_path):
+    """The [tool.poetry] version code path: source change with no bump is BLOCKED."""
+    main, _wt = repo_with_poetry_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(main, bindir, name_only="src/a.py", patch=_PATCH_NO_BUMP)
+
+    assert r.returncode != 0, f"poetry source w/o bump must be blocked\n{r.stdout}\n{r.stderr}"
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+
+
+def test_poetry_pyproject_with_bump_passes(repo_with_poetry_pyproject, tmp_path):
+    """The [tool.poetry] version code path: a real version bump passes the gate and merges."""
+    main, _wt = repo_with_poetry_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="src/a.py\npyproject.toml", patch=_PATCH_POETRY_BUMP
+    )
+
+    assert r.returncode == 0, f"poetry bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "version-bump gate OK" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_poetry_version_bump_without_section_header_passes(repo_with_poetry_pyproject, tmp_path):
+    """A selected [tool.poetry] version bump can appear without the section header in the hunk."""
+    main, _wt = repo_with_poetry_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "pyproject.toml").write_text(
+        (
+            '[tool.poetry]\nname = "mytool"\na = "1"\nb = "2"\nc = "3"\nd = "4"\n'
+            'description = "x"\nauthors = ["A <a@example.com>"]\nversion = "0.4.1"\n'
+        ),
+        encoding="utf-8",
+    )
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\npyproject.toml",
+        patch=_PATCH_POETRY_BUMP_NO_SECTION_HEADER,
+    )
+
+    assert r.returncode == 0, f"sectionless Poetry bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "version-bump gate OK" in r.stdout, r.stdout
+
+
+@pytest.fixture
+def repo_with_dynamic_poetry_pyproject(tmp_path):
+    """A repo with PEP 621 dynamic version and Poetry's static version metadata."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "pyproject.toml").write_text(
+        (
+            '[project]\nname = "mytool"\ndynamic = ["version"]\n\n'
+            '[tool.poetry]\nname = "mytool"\nversion = "0.4.1"\n'
+        ),
+        encoding="utf-8",
+    )
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+    return main, wt
+
+
+_PATCH_DYNAMIC_POETRY_BUMP = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pyproject.toml b/pyproject.toml\n"
+    "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+    '@@ -4,3 +4,3 @@\n [tool.poetry]\n name = "mytool"\n-version = "0.4.1"\n+version = "0.4.2"\n'
+)
+
+
+def test_dynamic_poetry_pyproject_source_without_bump_is_blocked(repo_with_dynamic_poetry_pyproject, tmp_path):
+    """Poetry remains the version source when [project] also declares dynamic version."""
+    main, _wt = repo_with_dynamic_poetry_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(main, bindir, name_only="src/a.py", patch=_PATCH_NO_BUMP)
+
+    assert r.returncode != 0, f"dynamic+poetry source w/o bump must be blocked\n{r.stdout}\n{r.stderr}"
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+    assert "declares dynamic" not in r.stderr, r.stderr
+
+
+def test_dynamic_poetry_pyproject_with_bump_passes(repo_with_dynamic_poetry_pyproject, tmp_path):
+    """A Poetry version bump passes even when [project] dynamic = [\"version\"] is present."""
+    main, _wt = repo_with_dynamic_poetry_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="src/a.py\npyproject.toml", patch=_PATCH_DYNAMIC_POETRY_BUMP
+    )
+
+    assert r.returncode == 0, f"dynamic+poetry bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "version-bump gate OK" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+_PATCH_DYNAMIC_POETRY_UNRELATED_VERSION_BUMP = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pyproject.toml b/pyproject.toml\n"
+    "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+    '@@ -7,3 +7,3 @@\n [tool.foo]\n-version = "1.0.0"\n+version = "1.0.1"\n'
+)
+
+
+def test_dynamic_poetry_unrelated_pyproject_version_edit_is_not_a_bump(
+    repo_with_dynamic_poetry_pyproject, tmp_path
+):
+    """A Poetry project must not pass by bumping another pyproject section's version."""
+    main, _wt = repo_with_dynamic_poetry_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\npyproject.toml",
+        patch=_PATCH_DYNAMIC_POETRY_UNRELATED_VERSION_BUMP,
+    )
+
+    assert r.returncode != 0, f"unrelated Poetry pyproject version edit must not pass\n{r.stdout}\n{r.stderr}"
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+
+
+_PATCH_DYNAMIC_POETRY_ROOT_VERSION_BUMP_ONLY = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/VERSION b/VERSION\n"
+    "--- a/VERSION\n+++ b/VERSION\n"
+    "@@ -1 +1 @@\n-9.0.0\n+9.0.1\n"
+)
+
+
+def test_dynamic_poetry_prefers_poetry_over_root_version_heuristic(
+    repo_with_dynamic_poetry_pyproject, tmp_path
+):
+    """When Poetry declares the version, a root VERSION file must not become the gate source."""
+    main, _wt = repo_with_dynamic_poetry_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "VERSION").write_text("9.0.0\n", encoding="utf-8")
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\nVERSION",
+        patch=_PATCH_DYNAMIC_POETRY_ROOT_VERSION_BUMP_ONLY,
+    )
+
+    assert r.returncode != 0, f"root VERSION must not satisfy Poetry version gate\n{r.stdout}\n{r.stderr}"
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+    assert "VERSION version is bumped" not in r.stdout, r.stdout
+
+
+@pytest.fixture
+def repo_with_missing_setuptools_dynamic_source(tmp_path):
+    """A repo whose explicit setuptools dynamic source points at a missing file."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "pyproject.toml").write_text(
+        (
+            '[project]\nname = "mytool"\ndynamic = ["version"]\n\n'
+            '[tool.setuptools.dynamic]\nversion = {attr = "missing_meta.VERSION"}\n'
+        ),
+        encoding="utf-8",
+    )
+    (main / "VERSION").write_text("9.0.0\n", encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+    return main, wt
+
+
+def test_missing_explicit_setuptools_dynamic_source_fails_closed(
+    repo_with_missing_setuptools_dynamic_source, tmp_path
+):
+    """Explicit setuptools dynamic config must not degrade into heuristic version sources."""
+    main, _wt = repo_with_missing_setuptools_dynamic_source
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="src/a.py\nVERSION",
+        patch=_PATCH_DYNAMIC_POETRY_ROOT_VERSION_BUMP_ONLY,
+    )
+
+    assert r.returncode != 0, f"missing explicit dynamic source must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "declares dynamic = [\"version\"]" in r.stderr, r.stderr
+    assert "VERSION version is bumped" not in r.stdout, r.stdout
 
 
 def test_mixed_docs_and_source_without_bump_is_blocked(repo_with_pyproject, tmp_path):
@@ -691,10 +1830,7 @@ def test_ci_only_pr_is_not_required_to_bump(repo_with_pyproject, tmp_path):
     assert "no shippable source" in r.stdout, r.stdout
 
 
-def test_ship_version_files_override_locates_nested_manifest(tmp_path):
-    """SHIP_VERSION_FILES pins a non-standard version file; the gate checks THAT file. Here a
-    nested package's pyproject is the version source and a source change without bumping it is
-    blocked."""
+def _make_nested_pyproject_repo(tmp_path: Path, pyproject_text: str) -> Path:
     if not shutil.which("bash") or not shutil.which("git"):
         pytest.skip("bash/git required")
 
@@ -707,15 +1843,24 @@ def test_ship_version_files_override_locates_nested_manifest(tmp_path):
     _git("config", "user.name", "t", cwd=main)
     _git("remote", "add", "origin", str(origin), cwd=main)
     (main / "README.md").write_text("# x\n", encoding="utf-8")
-    (main / "pkg" / "pyproject.toml").write_text(
-        '[project]\nname = "m"\nversion = "2.0.0"\n', encoding="utf-8"
-    )
+    (main / "pkg" / "pyproject.toml").write_text(pyproject_text, encoding="utf-8")
     _git("add", "-A", cwd=main)
     _git("commit", "-qm", "init", cwd=main)
     _git("push", "-q", "origin", "main", cwd=main)
     _git("branch", "feat", cwd=main)
     _git("push", "-q", "origin", "feat", cwd=main)
     _git("worktree", "add", "-q", str(tmp_path / "wt"), "feat", cwd=main)
+    return main
+
+
+def test_ship_version_files_override_locates_nested_manifest(tmp_path):
+    """SHIP_VERSION_FILES pins a non-standard version file; the gate checks THAT file. Here a
+    nested package's pyproject is the version source and a source change without bumping it is
+    blocked."""
+    main = _make_nested_pyproject_repo(
+        tmp_path,
+        '[project]\nname = "m"\nversion = "2.0.0"\n',
+    )
 
     bindir = _fake_gh_vbump_dir(tmp_path)
     r = _run_ship_vbump(
@@ -724,6 +1869,114 @@ def test_ship_version_files_override_locates_nested_manifest(tmp_path):
     )
 
     assert r.returncode != 0, f"pinned version file w/o bump must block\n{r.stdout}\n{r.stderr}"
+    assert "version in pkg/pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+
+
+_PATCH_NESTED_PYPROJECT_PROJECT_BUMP = (
+    "diff --git a/pkg/app.py b/pkg/app.py\n"
+    "--- a/pkg/app.py\n+++ b/pkg/app.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pkg/pyproject.toml b/pkg/pyproject.toml\n"
+    "--- a/pkg/pyproject.toml\n+++ b/pkg/pyproject.toml\n"
+    '@@ -1,3 +1,3 @@\n [project]\n name = "m"\n-version = "2.0.0"\n+version = "2.0.1"\n'
+)
+
+_PATCH_NESTED_PYPROJECT_UNRELATED_BUMP = (
+    "diff --git a/pkg/app.py b/pkg/app.py\n"
+    "--- a/pkg/app.py\n+++ b/pkg/app.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pkg/pyproject.toml b/pkg/pyproject.toml\n"
+    "--- a/pkg/pyproject.toml\n+++ b/pkg/pyproject.toml\n"
+    '@@ -5,3 +5,3 @@\n [tool.foo]\n-version = "9.0.0"\n+version = "9.0.1"\n'
+)
+
+_PATCH_NESTED_PYPROJECT_POETRY_BUMP = (
+    "diff --git a/pkg/app.py b/pkg/app.py\n"
+    "--- a/pkg/app.py\n+++ b/pkg/app.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pkg/pyproject.toml b/pkg/pyproject.toml\n"
+    "--- a/pkg/pyproject.toml\n+++ b/pkg/pyproject.toml\n"
+    '@@ -1,3 +1,3 @@\n [tool.poetry]\n name = "m"\n-version = "2.0.0"\n+version = "2.0.1"\n'
+)
+
+
+def test_ship_version_files_project_spec_matches_nested_pyproject_section(tmp_path):
+    """An explicit nested pyproject ::@project source must use section-specific TOML matching."""
+    main = _make_nested_pyproject_repo(
+        tmp_path,
+        '[project]\nname = "m"\nversion = "2.0.0"\n\n[tool.foo]\nversion = "9.0.0"\n',
+    )
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="pkg/app.py\npkg/pyproject.toml",
+        patch=_PATCH_NESTED_PYPROJECT_PROJECT_BUMP,
+        env_extra={"SHIP_VERSION_FILES": "pkg/pyproject.toml::@project"},
+    )
+
+    assert r.returncode == 0, f"nested ::@project bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "pkg/pyproject.toml version is bumped" in r.stdout, r.stdout
+
+
+def test_ship_version_files_project_spec_rejects_nested_unrelated_section_bump(tmp_path):
+    """A nested ::@project spec must not pass by bumping another section's version."""
+    main = _make_nested_pyproject_repo(
+        tmp_path,
+        '[project]\nname = "m"\nversion = "2.0.0"\n\n[tool.foo]\nversion = "9.0.0"\n',
+    )
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="pkg/app.py\npkg/pyproject.toml",
+        patch=_PATCH_NESTED_PYPROJECT_UNRELATED_BUMP,
+        env_extra={"SHIP_VERSION_FILES": "pkg/pyproject.toml::@project"},
+    )
+
+    assert r.returncode != 0, f"nested unrelated section bump must not pass\n{r.stdout}\n{r.stderr}"
+    assert "version in pkg/pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+
+
+def test_ship_version_files_poetry_spec_matches_nested_pyproject_section(tmp_path):
+    """An explicit nested pyproject ::@poetry source must use section-specific TOML matching."""
+    main = _make_nested_pyproject_repo(
+        tmp_path,
+        '[tool.poetry]\nname = "m"\nversion = "2.0.0"\n\n[tool.foo]\nversion = "9.0.0"\n',
+    )
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="pkg/app.py\npkg/pyproject.toml",
+        patch=_PATCH_NESTED_PYPROJECT_POETRY_BUMP,
+        env_extra={"SHIP_VERSION_FILES": "pkg/pyproject.toml::@poetry"},
+    )
+
+    assert r.returncode == 0, f"nested ::@poetry bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "pkg/pyproject.toml version is bumped" in r.stdout, r.stdout
+
+
+def test_ship_version_files_poetry_spec_rejects_nested_unrelated_section_bump(tmp_path):
+    """A nested ::@poetry spec must not pass by bumping another section's version."""
+    main = _make_nested_pyproject_repo(
+        tmp_path,
+        '[tool.poetry]\nname = "m"\nversion = "2.0.0"\n\n[tool.foo]\nversion = "9.0.0"\n',
+    )
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main,
+        bindir,
+        name_only="pkg/app.py\npkg/pyproject.toml",
+        patch=_PATCH_NESTED_PYPROJECT_UNRELATED_BUMP,
+        env_extra={"SHIP_VERSION_FILES": "pkg/pyproject.toml::@poetry"},
+    )
+
+    assert r.returncode != 0, f"nested Poetry unrelated section bump must not pass\n{r.stdout}\n{r.stderr}"
     assert "version in pkg/pyproject.toml is UNCHANGED" in r.stderr, r.stderr
 
 

@@ -1,6 +1,6 @@
 ---
 name: bump-version-on-release
-description: Use when releasing/shipping a code change in a versioned tool — a CLI, package, or service that declares a version. Bump the declared version (pyproject.toml / package.json) every release, and make `--version` read that declared version dynamically instead of a hardcoded literal that silently goes stale.
+description: Use when releasing/shipping a code change in a versioned tool — a CLI, package, or service that declares a version. Bump the declared version (pyproject.toml, dynamic pyproject source, Poetry, or package.json) every release, and make `--version` read that declared version dynamically instead of a hardcoded literal that silently goes stale.
 ---
 
 # Bump the version on every release — and read it dynamically
@@ -16,14 +16,21 @@ Break either and the version lies. The canonical failure: `rig --version` printe
 hardcoded `0.1.0` for the entire life of the tool — the literal was baked into the code and
 the version was never bumped across many releases. So `--version` told every user `0.1.0`
 no matter which build they had: a useless, permanently-stale string, not a freshness signal.
-Worse, a hardcoded literal can drift from the declared `pyproject.toml`/`package.json`
-version, so the two disagree and neither is trustworthy.
+Worse, a hardcoded literal can drift from the declared `pyproject.toml`, dynamic version
+source, Poetry metadata, or `package.json` version, so the two disagree and neither is
+trustworthy.
 
 ## Rule
 
 - **Bump the declared version on every release** of a code change. The declared version is
   the single source of truth:
   - Python: `[project] version = "X.Y.Z"` in `pyproject.toml`.
+  - Python dynamic metadata: `[project] dynamic = ["version"]` with a declared source such
+    as `[tool.setuptools.dynamic] version = {attr = "pkg.VERSION"}`, `{file = "VERSION"}`,
+    or `[tool.setuptools.dynamic.version] attr = "pkg.VERSION"`. For simple release gates,
+    prefer single-line inline tables or the subtable form; multi-line inline tables may need
+    an explicit `SHIP_VERSION_FILES` source.
+  - Poetry: `[tool.poetry] version = "X.Y.Z"` in `pyproject.toml`.
   - Node: `"version": "X.Y.Z"` in `package.json`.
 - **Semver the bump to the change:**
   - **patch** (`0.4.1` → `0.4.2`) — a bugfix, no API change.
@@ -32,7 +39,7 @@ version, so the two disagree and neither is trustworthy.
 - **`--version` MUST read the declared version dynamically — never a hardcoded literal.**
   Resolve it from package metadata at runtime so it can't drift:
   - Python: `importlib.metadata.version("your-dist")` (installed dist), or read the
-    `[project] version` from `pyproject.toml` for a source checkout.
+    configured pyproject/static/dynamic source for a source checkout.
   - Node: read `version` from `package.json` (e.g. `require('./package.json').version`).
 - **Docs-only / pure-test / pure-CI / a revert** is not a release — no bump required. The
   rule fires only when **shippable source** actually changed.
@@ -52,6 +59,18 @@ impossible — there's one number, and bumping it is the entire release ritual.
 [project]
 name = "mytool"
 version = "0.5.0"        # bump THIS every release (was 0.4.1; minor: added a subcommand)
+```
+
+Dynamic Python packages still have one source of truth; it just lives outside the project
+table:
+
+```toml
+[project]
+name = "mytool"
+dynamic = ["version"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mytool.VERSION"}  # bump mytool/__init__.py's VERSION every release
 ```
 
 ```python

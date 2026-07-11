@@ -165,9 +165,10 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
 - a UI-touching PR carries an embedded **screenshot** (override with `--no-screenshot-ok
   <reason>`);
 - a PR that changes **shippable source** (not docs/test/CI) has **bumped the declared
-  version** (`pyproject.toml` `version` / `package.json` `"version"`) vs the PR base — a ship
-  of source is a release, so `--version` stays a real freshness signal instead of a stale
-  literal (skill: `bump-version-on-release`); override a genuine no-release ship with
+  version** (`pyproject.toml` `[project] version`, Poetry `[tool.poetry] version`, supported
+  dynamic pyproject sources such as `VERSION`/`__init__.py`, or `package.json` `"version"`) vs
+  the PR base — a ship of source is a release, so `--version` stays a real freshness signal
+  instead of a stale literal (skill: `bump-version-on-release`); override a genuine no-release ship with
   `--no-version-bump-ok <reason>` or `SHIP_SKIP_VERSION_BUMP=1`;
 - the **review-quorum bar is met** (Guard-B of the self-merge-authority program) — the PR's task
   code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token from the branch name or PR
