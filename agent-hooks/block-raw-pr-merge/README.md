@@ -56,6 +56,11 @@ without a Telegram call; a real justification runs the trusted `tg-ctl ask` and 
 merge **only on exit 0** (any nonzero exit / error / timeout denies, the block leading with
 `hatch escalation denied: <reason>`).
 
+One hatch approval covers exactly one executable raw merge source. Commands that execute multiple
+raw merges, such as `RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE=why gh pr merge 1 && gh pr merge 2`,
+fail closed without contacting Telegram. Split the work into separate reviewed commands or use
+`gh ship`.
+
 ## Fail-closed
 
 `on_error: "closed"`. If the hook can't inspect the command (a malformed event, a crash),
