@@ -45,8 +45,8 @@ fi
 - `delegate [RIG_ARG …]` — run `rig <RIG_ARG …>`, exit with rig's own code; exit `97`
   (the `NO_RIG_EXIT` sentinel) if rig is absent so the caller runs its own fallback. `97`
   is chosen to sit clear of rig's whole public exit contract (`0-8`, e.g. `3` ==
-  `EXIT_DRIFT`, and `127` == missing dep) so a real `rig apply` drift/failure is never
-  misread as "no rig".
+  `EXIT_DRIFT` from `rig status`, and `127` == missing dep) so a real rig drift/failure is
+  never misread as "no rig".
 
 Keep the library and the CLI mirror in lock-step (`__init__.py` / `__main__.py`).
 

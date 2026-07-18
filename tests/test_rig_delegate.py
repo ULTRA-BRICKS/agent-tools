@@ -209,7 +209,7 @@ def test_cli_delegate_runs_rig(tmp_path, monkeypatch):
 # rig's own public exit-code contract (riglib/errors.py): 0-8 are semantic failure
 # classes (3 == EXIT_DRIFT), 127 == EXIT_MISSING_DEP. The NO_RIG sentinel MUST avoid every
 # one of them, else a shell caller cannot tell "rig absent" from a real rig exit — e.g. a
-# `rig apply` that exits 3 for config↔disk drift would be misread as "no rig" and would
+# `rig status` that exits 3 for config↔disk drift would be misread as "no rig" and would
 # wrongly run the direct hook writer, re-introducing the double-write this helper prevents.
 RIG_EXIT_CODES = frozenset({0, 1, 2, 3, 4, 5, 6, 7, 8, 127})
 

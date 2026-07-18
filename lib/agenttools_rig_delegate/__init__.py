@@ -59,7 +59,7 @@ __all__ = [
 # can branch to its own fallback installer. It MUST NOT collide with any code rig itself
 # can exit with, or the caller cannot distinguish "rig absent" from a real rig outcome.
 # rig's public contract (riglib/errors.py) uses 0-8 for semantic failure classes
-# (notably 3 == EXIT_DRIFT from `rig apply`/`rig status`) and 127 for a missing dep; the
+# (notably 3 == EXIT_DRIFT from `rig status`) and 127 for a missing dep; the
 # shell reserves 126/127 and 128+n for signals. 97 sits clear of all of those, so a
 # non-Python installer that shells out to ``delegate`` can treat this one value — and only
 # this value — as "no rig, run my own installer", never mistaking a rig drift/error for it.
