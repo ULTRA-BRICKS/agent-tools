@@ -287,7 +287,20 @@ def test_block_brace_group_gh_pr_merge(monkeypatch):
 
 def test_unbalanced_quotes_merge_blocks(monkeypatch):
     """Unbalanced quote on a command containing a merge pattern → fail closed (block)."""
-    out, _err, code = _run("gh pr merge 5 --body 'unclosed", monkeypatch)
+    command = "gh pr merge 5 --body 'unclosed"
+    with pytest.raises(ValueError):
+        hook._split_segments(command)
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_unbalanced_quotes_merge_after_inline_env_blocks(monkeypatch):
+    """The unparseable fallback resolves `gh` after a leading inline environment assignment."""
+    command = "FOO=1 gh pr merge 5 --body 'unclosed"
+    with pytest.raises(ValueError):
+        hook._split_segments(command)
+    out, _err, code = _run(command, monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
 
@@ -295,6 +308,17 @@ def test_unbalanced_quotes_merge_blocks(monkeypatch):
 def test_unbalanced_quotes_unrelated_allows(monkeypatch):
     """Unbalanced quote on an unrelated command → allow (not a merge attempt)."""
     out, _err, code = _run("grep won't file", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_unbalanced_non_gh_report_mentioning_merge_tools_allows(monkeypatch):
+    """An unparseable non-gh report that merely mentions merge tooling must still allow."""
+    command = 'tg "text mentioning gh ship and block-raw-pr-merge and commit abc123'
+    with pytest.raises(ValueError):
+        hook._split_segments(command)
+    assert hook._MERGE_HINT.search(command)
+    out, _err, code = _run(command, monkeypatch)
     assert code == 0
     assert _decision(out) == "allow"
 
@@ -727,10 +751,80 @@ def test_gh_api_non_merge_and_prose_is_allowed(command, monkeypatch):
     assert _decision(out) == "allow"
 
 
+def test_gh_api_unquoted_expandable_endpoint_with_write_method_is_blocked(monkeypatch):
+    """A runtime-selected endpoint may expand to the REST merge path, so a write fails closed."""
+    out, _err, code = _run("gh api $ENDPOINT -X PUT", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_gh_api_double_quoted_expandable_endpoint_with_write_method_is_blocked(monkeypatch):
+    """Quoting an expanded endpoint does not make its runtime route provable to the hook."""
+    out, _err, code = _run('gh api "$ENDPOINT" -X PUT', monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_gh_api_expandable_endpoint_with_graphql_fields_is_blocked(monkeypatch):
+    """A runtime-selected endpoint plus fields may reach the protected GraphQL mutation surface."""
+    out, _err, code = _run(
+        'gh api $EP -f query="mutation{mergePullRequest(input:{})}"', monkeypatch
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_gh_api_bare_expandable_endpoint_is_blocked(monkeypatch):
+    """A bare expansion may inject both the merge endpoint and write arguments at runtime."""
+    out, _err, code = _run("gh api $EP", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_gh_api_command_substitution_endpoint_argument_injection_is_blocked(monkeypatch):
+    """Command-substitution output may inject a merge endpoint plus flags as multiple argv words."""
+    out, _err, code = _run("gh api $(cat endpoint-and-args)", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_gh_api_backtick_endpoint_argument_injection_is_blocked(monkeypatch):
+    """Backtick output has the same endpoint-and-argument injection surface as `$()` output."""
+    out, _err, code = _run("gh api `cat endpoint-and-args`", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_gh_api_literal_endpoint_is_allowed(monkeypatch):
+    """A fully literal non-merge endpoint remains a provably benign API read."""
+    out, _err, code = _run("gh api repos/owner/repo/issues", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_gh_api_quoted_command_substitution_endpoint_is_over_blocked(monkeypatch):
+    """Even a benign-looking dynamic endpoint is unprovable at this pre-exec gate."""
+    out, _err, code = _run(
+        'gh api "$(gh repo view --json url -q .url)/issues"', monkeypatch
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
 def test_gh_api_merge_with_unbalanced_quote_fails_closed(monkeypatch):
     """A `gh api …/pulls/<n>/merge` write with an unbalanced quote can't be parsed; the merge-hint
     heuristic must recognise the gh-api merge shape (not just `gh pr merge`) and fail CLOSED."""
     out, _err, code = _run("gh api repos/o/r/pulls/1/merge -X PUT --jq 'unclosed", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_gh_api_graphql_merge_with_unbalanced_quote_fails_closed(monkeypatch):
+    """An unparseable real GraphQL merge must still block via the merge-hint fallback."""
+    command = "gh api graphql -f query='mutation { mergePullRequest(input:{}) }"
+    with pytest.raises(ValueError):
+        hook._split_segments(command)
+    out, _err, code = _run(command, monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
 
@@ -796,6 +890,58 @@ def test_graphql_query_with_expandable_dollar_is_blocked(command, monkeypatch):
     out, _err, code = _run(command, monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
+
+
+def test_graphql_detached_field_with_expandable_key_is_blocked(monkeypatch):
+    """A detached whole field supplied by expansion may become `query=<merge>` at runtime."""
+    out, _err, code = _run("gh api graphql -f $FIELD", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_nested_graphql_detached_field_with_expandable_key_is_blocked(monkeypatch):
+    """The detached-field role check also runs inside a shell command string."""
+    out, _err, code = _run(r'bash -c "gh api graphql -f \$FIELD"', monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_glued_field_with_expandable_key_is_blocked(monkeypatch):
+    """A glued whole field supplied by expansion may become `query=<merge>` at runtime."""
+    out, _err, code = _run("gh api graphql --raw-field=$FIELD", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_bare_expandable_argument_is_blocked(monkeypatch):
+    """A bare expansion may inject arbitrary `gh api graphql` flags at runtime."""
+    out, _err, code = _run("gh api graphql $ARGS", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_literal_non_query_field_with_expandable_value_is_allowed(monkeypatch):
+    """A literal non-query key remains a harmless GraphQL variable even with an expanded value."""
+    out, _err, code = _run(
+        "gh api graphql -F id=$NODE_ID -f query='query { node(id: $id) { id } }'", monkeypatch
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api graphql -f query='query { viewer { login } }' "
+        '-H "Authorization: Bearer $TOKEN"',
+        "gh api graphql -f query='query { viewer { login } }' --jq '$x'",
+    ],
+)
+def test_graphql_recognized_value_flag_with_expandable_value_is_allowed(command, monkeypatch):
+    """Recognized value-taking flags consume their expandable value instead of treating it as bare."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
 
 
 @pytest.mark.parametrize(
@@ -1201,13 +1347,11 @@ def test_graphql_inline_read_query_with_merge_token_is_over_blocked(monkeypatch)
     assert _decision(out) == "block"
 
 
-def test_unparseable_prose_mentioning_gh_api_merge_token_fails_closed(monkeypatch):
-    """The broadened `_MERGE_HINT` fails closed on an UNPARSEABLE command that mentions `gh` plus a
-    gh-api merge token — a deliberate widening of the safe-direction over-block. Locked in so the
-    accepted behaviour is pinned (Opus review round 4)."""
+def test_unparseable_non_gh_prose_mentioning_gh_api_merge_token_is_allowed(monkeypatch):
+    """An unparseable non-gh command mentioning a merge token remains argv-anchored (#289)."""
     out, _err, code = _run("echo gh docs on mergePullRequest don't forget", monkeypatch)
-    assert code == hook.BLOCK_EXIT_CODE
-    assert _decision(out) == "block"
+    assert code == 0
+    assert _decision(out) == "allow"
 
 
 def test_unparseable_prose_without_merge_token_is_allowed(monkeypatch):
