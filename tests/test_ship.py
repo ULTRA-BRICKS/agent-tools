@@ -4429,8 +4429,21 @@ case "$sub" in
       for a in "$@"; do case "$a" in id=*) printf '%s\\n' "${a#id=}" >> "${SHIP_TEST_RESOLVE_LOG}";; esac; done
       echo '{}'
     elif printf '%s' "$argstr" | grep -q isOutdated; then
-      [ -n "${SHIP_TEST_ELIGIBLE_IDS:-}" ] && printf '%s\\n' ${SHIP_TEST_ELIGIBLE_IDS}
-      :
+      jq_filter=""
+      while [ "$#" -gt 0 ]; do
+        if [ "$1" = "--jq" ]; then jq_filter="$2"; break; fi
+        shift
+      done
+      thread_bodies=${SHIP_TEST_THREAD_BODIES:-'{}'}
+      jq -n --arg ids "${SHIP_TEST_ELIGIBLE_IDS:-}" --argjson bodies "$thread_bodies" '
+          ($ids | split(" ") | map(select(length > 0))) as $ids
+          | {data: {repository: {pullRequest: {reviewThreads: {nodes: [
+              $ids[] as $id
+              | {id: $id, isResolved: false, isOutdated: true,
+                 comments: {totalCount: 1, nodes: [{
+                   author: {login: "some-app[bot]"}, body: ($bodies[$id] // "plain nit")
+                 }]}}
+            ]}}}}}' | jq -r "$jq_filter"
     elif printf '%s' "$argstr" | grep -q committedDate; then
       printf '%s\\t%s\\t%s\\n' "${SHIP_TEST_CREATED:-2020-01-01T00:00:00Z}" "" "${SHIP_TEST_LASTCOMMIT:-2020-01-01T00:00:00Z}"
     else
@@ -4484,6 +4497,23 @@ def test_ship_resolves_addressed_bot_thread_then_merges(repo_with_two_worktrees,
     assert "merged #1" in r.stdout, r.stdout
     assert log.exists() and "PRRT_bot1" in log.read_text(encoding="utf-8"), "mutation not called"
     assert "resolved addressed bot thread PRRT_bot1" in r.stdout, r.stdout
+
+
+def test_ship_keeps_high_severity_bot_thread_unresolved_and_blocks_merge(
+        repo_with_two_worktrees, tmp_path):
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_resolve_dir(tmp_path)
+    log = tmp_path / "resolve.log"
+    bodies = json.dumps({"PRRT_nit": "Nit: clearer name.", "PRRT_p1": "This is a **P1**: defect."})
+    r = _run_ship_resolve(
+        main, bindir, extra_args=("--resolve-addressed-threads",),
+        env_extra={"SHIP_TEST_UNRESOLVED": "2", "SHIP_TEST_ELIGIBLE_IDS": "PRRT_nit PRRT_p1",
+                   "SHIP_TEST_THREAD_BODIES": bodies, "SHIP_TEST_RESOLVE_LOG": str(log)},
+    )
+    assert r.returncode != 0, f"the unresolved P1 must block ship\n{r.stdout}\n{r.stderr}"
+    assert log.read_text(encoding="utf-8").splitlines() == ["PRRT_nit"]
+    assert "unresolved review thread" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
 
 
 # A CI-DOWN fake gh that ALSO answers the auto-resolve path. `_local_review_threads_check` (in the
@@ -4624,6 +4654,45 @@ def _extract_resolve_eligible_jq() -> str:
     return m.group(1)
 
 
+def _extract_resolve_thread_query() -> str:
+    text = _SHIP.read_text(encoding="utf-8")
+    m = re.search(r"RESOLVE_THREAD_Q='(.*?)'", text, re.DOTALL)
+    assert m, "RESOLVE_THREAD_Q not found in ship.sh"
+    return m.group(1)
+
+
+def test_resolve_thread_query_fetches_comment_bodies_for_severity_filter():
+    assert "nodes{author{login} body}" in _extract_resolve_thread_query()
+
+
+@pytest.mark.skipif(not shutil.which("jq"), reason="jq required for the eligibility-jq test")
+def test_resolve_eligible_jq_excludes_high_severity_bot_threads():
+    """Any high-severity bot comment excludes its outdated thread; ordinary nits remain eligible."""
+    prog = _extract_resolve_eligible_jq()
+
+    def thread(tid, *bodies):
+        nodes = [{"author": {"login": "some-app[bot]"}, "body": body} for body in bodies]
+        return {"id": tid, "isResolved": False, "isOutdated": True,
+                "comments": {"totalCount": len(nodes), "nodes": nodes}}
+
+    payload = {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+        thread("NIT", "Nit: consider a clearer name."),
+        thread("P1", "This is a **P1**: authentication can be bypassed."),
+        thread("SECURITY", "Potential [security] regression in token validation."),
+        thread("P1_THEN_ACK", "P1: data loss is possible.", "Acknowledged."),
+        thread("NEGATED_P1", "Not a P1, just a nit."),
+        thread("NULL_BODY", None),
+        thread("EMPTY_MARKDOWN_BODY", "  **`# []`**  "),
+        thread("LONGER_ALNUM_WORD", "The p1ateau example is harmless."),
+        thread("HYPHENATED_COMPOUND_OVEREXCLUSION", "Use a security-first-initiative checklist."),
+        thread("P1_HYPHEN_SUFFIX", "P1-blocking issue found here"),
+    ]}}}}}
+    r = subprocess.run(["jq", "-r", prog], input=json.dumps(payload), capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    selected = [line for line in r.stdout.splitlines() if line.strip()]
+    assert selected == ["NIT", "LONGER_ALNUM_WORD"], selected
+
+
 @pytest.mark.skipif(not shutil.which("jq"), reason="jq required for the eligibility-jq test")
 def test_resolve_eligible_jq_selects_only_addressed_bot_threads():
     """Exercise the REAL eligibility jq (extracted from ship.sh) against crafted thread data: only an
@@ -4633,7 +4702,8 @@ def test_resolve_eligible_jq_selects_only_addressed_bot_threads():
     prog = _extract_resolve_eligible_jq()
 
     def thread(tid, *, resolved, outdated, logins, total=None):
-        nodes = [{"author": None if lg is None else {"login": lg}} for lg in logins]
+        nodes = [{"author": None if lg is None else {"login": lg}, "body": "plain nit"}
+                 for lg in logins]
         return {"id": tid, "isResolved": resolved, "isOutdated": outdated,
                 "comments": {"totalCount": len(nodes) if total is None else total, "nodes": nodes}}
 
@@ -4651,7 +4721,8 @@ def test_resolve_eligible_jq_selects_only_addressed_bot_threads():
         thread("BOT_NULLAUTHOR", resolved=False, outdated=True, logins=[None]),
         # a null totalCount (can't prove no human hides beyond the page) → fail closed.
         {"id": "BOT_NULLTOTAL", "isResolved": False, "isOutdated": True,
-         "comments": {"totalCount": None, "nodes": [{"author": {"login": "some-app[bot]"}}]}},
+         "comments": {"totalCount": None,
+                      "nodes": [{"author": {"login": "some-app[bot]"}, "body": "plain nit"}]}},
     ]}}}}}
     r = subprocess.run(["jq", "-r", prog], input=json.dumps(payload), capture_output=True, text=True)
     assert r.returncode == 0, r.stderr

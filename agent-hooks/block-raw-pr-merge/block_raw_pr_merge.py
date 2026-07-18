@@ -23,7 +23,9 @@ basename handles path-qualified invocations (`/usr/local/bin/gh pr merge`).  Thi
 prevents a false positive where the body of an unrelated command (e.g. `gh pr create
 --body "run gh pr merge to land it"`) triggers the guard — with a raw regex that body
 text would match and the command would be blocked even though no actual merge is
-occurring.
+occurring. If unbalanced quotes prevent a full parse, the raw merge-hint fallback is
+likewise gated on a best-effort argv prefix resolving to `gh`, a shell / `eval`, or a known
+wrapper around one; merge-like prose in an unparseable non-gh argument stays allowed (#289).
 
 Allowed (let through):
   - `gh ship <PR>` / a `gh alias` that runs ship
@@ -43,6 +45,8 @@ line is re-injected and blocked. A legitimate heredoc almost never opens a line 
 `gh pr merge`; a prose mention (gh not at argv[0]) still passes. This is a conscious divergence from
 the "heredoc bodies are pure data" convention, made because the cost of a bypass here is a gate
 breach and the cost of the false-positive is re-phrasing a heredoc (or using the Telegram hatch).
+An expandable GraphQL field key or bare post-endpoint argument is likewise blocked because it may
+become a merge-carrying `query=` field or arbitrary flags only after the hook has run (#284).
 
 External approval (replaces the OLD self-service escape hatch): there is NO
 `ALLOW_RAW_PR_MERGE`(+`_REASON`) env and NO `# no-ship-guard: <reason>` inline sentinel any
@@ -129,10 +133,9 @@ _LEADING_SHELL_NOISE = frozenset({"(", "{", "!", "then", "do", "else", "elif"})
 # A VAR=value inline environment assignment that may precede the executable.
 _INLINE_ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
-# Merge-hint pattern: used to gate fail-closed on unbalanced-quote parse errors so that
-# a benign command with an unbalanced quote (e.g. `grep won't file`) is NOT blocked just
-# because shlex can't parse it.  Only if the raw string plausibly contains a merge
-# invocation do we treat a parse error as fail-closed.
+# Merge-hint pattern: used to gate fail-closed on unbalanced-quote parse errors. The fallback also
+# requires a best-effort argv prefix that resolves to a merge-capable invoked head; otherwise prose
+# in an unrelated command's unparseable argument could match this deliberately broad regex (#289).
 _MERGE_HINT = re.compile(
     r"\bgh\b.*(\bpr\b.*\bmerge\b|pulls/[^/]+/merge|mergePullRequest|enablePullRequestAutoMerge"
     r"|enqueuePullRequest|mergeBranch)",
@@ -168,7 +171,9 @@ _SHELL_INTERPRETERS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "mks
 # A shell short-option group that includes `c` (`-c`, `-cx`, `-xc`) — its following token is the
 # command string. Over-block: scan the next token regardless of `c`'s position in the group.
 _SHELL_C_OPT = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
-# gh api flags whose NEXT token is a value — skipped when locating the endpoint positional.
+# Every `gh api` flag whose NEXT token is a value must appear here. Besides endpoint discovery,
+# `_graphql_argument_role_is_unprovable` relies on consuming these values; an omission fails closed
+# by misclassifying a legitimate expandable value as stray bare input.
 _API_VALUE_FLAGS = frozenset(
     {"-H", "--header", "-F", "--field", "-f", "--raw-field", "-q", "--jq", "-X", "--method",
      "--input", "--hostname", "-p", "--preview", "-t", "--template", "--cache"}
@@ -650,10 +655,51 @@ def _graphql_query_field_values(rest: list[str]) -> list[str]:
     return values
 
 
+def _graphql_argument_role_is_unprovable(rest: list[str]) -> bool:
+    """True iff shell expansion can decide a GraphQL field KEY or a bare argument's role.
+
+    A whole expanded field (`-f $FIELD` / `--raw-field=$FIELD`) may become
+    `query=<merge mutation>`, while a bare expansion after the endpoint may inject the same field
+    flags. A literal non-`query` key such as `-F id=$NODE_ID` is provably a GraphQL variable and
+    remains allowed even though its VALUE expands (#284).
+    """
+    endpoint_seen = False
+    i, n = 0, len(rest)
+    while i < n:
+        a = rest[i]
+        if a in _FIELDISH:
+            if i + 1 < n:
+                key = rest[i + 1].partition("=")[0]
+                if "$" in key or "`" in key:
+                    return True
+            i += 2
+            continue
+        m = re.match(r"^(?:--field|--raw-field|-[fF])=?(.*)$", a)
+        if m and m.group(1):
+            key = m.group(1).partition("=")[0]
+            if "$" in key or "`" in key:
+                return True
+            i += 1
+            continue
+        if a in _API_VALUE_FLAGS:
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        if not endpoint_seen:
+            endpoint_seen = True
+        elif "$" in a or "`" in a:
+            return True
+        i += 1
+    return False
+
+
 def _graphql_query_is_unprovable(rest: list[str], strict: bool = False) -> bool:
     """True iff a `gh api graphql` call feeds its `query` (or the whole request body) from a source
     this hook CANNOT READ at pre-exec time — a file (`query=@f`), stdin (`query=@-` / `--input …`), or
-    an empty value — so a merge mutation could hide in it (fail closed).
+    an empty value — or lets shell expansion decide a field key / bare argument role — so a merge
+    mutation could hide in it (fail closed, #284).
 
     `strict` (used only in NESTED contexts — a wrapper `-c`/`eval` string, a substitution body, an
     UNQUOTED heredoc body) ALSO blocks any inline `$`/backtick in a query value, restoring the old
@@ -662,6 +708,8 @@ def _graphql_query_is_unprovable(rest: list[str], strict: bool = False) -> bool:
     heredoc body expands `$Q`), so a `$` cannot be trusted as a literal GraphQL variable. The
     quote-aware single-quote allowance (`_graphql_query_field_is_expandable`) is only sound at the
     TOP LEVEL, where the raw quoting is the real quoting (#268 regression guard: opus/codex)."""
+    if _graphql_argument_role_is_unprovable(rest):
+        return True
     for val in _graphql_query_field_values(rest):
         if val.startswith("@") or val == "":  # file/stdin-backed (`@f`/`@-`) or empty: unreadable
             return True
@@ -723,6 +771,37 @@ def _resolve_invoked_argv(argv: list[str]) -> list[str] | None:
             if _is_invoked_head(os.path.basename(argv[k])):
                 return argv[k:]
     return None
+
+
+def _unparseable_command_has_invoked_head(command: str) -> bool:
+    """Best-effort argv anchoring after `_split_segments` fails on an unbalanced quote.
+
+    Consume every complete token before the lexer error and resolve each complete or partial
+    segment exactly as the normal path does. This keeps the raw `_MERGE_HINT` fail-closed for a real
+    `gh`, shell / `eval`, or wrapper-resolved invocation, while an unrelated head such as `tg` does
+    not inherit merge-like prose from its malformed argument (#289).
+    """
+    lex = shlex.shlex(_normalize_newlines(command), posix=True, punctuation_chars=True)
+    lex.whitespace_split = False
+    lex.wordchars += "@:,{}%+$"
+    lex.commenters = ""
+    segments: list[list[str]] = []
+    current: list[str] = []
+    try:
+        for tok in lex:
+            if tok in _SHELL_SEPS:
+                if current:
+                    segments.append(current)
+                    current = []
+            elif tok.strip():
+                current.append(tok)
+    except ValueError:
+        pass
+    if current:
+        segments.append(current)
+    return any(
+        _resolve_invoked_argv(_segment_argv(segment)) is not None for segment in segments
+    )
 
 
 def _wrapped_command_strings(argv: list[str]) -> list[str]:
@@ -1042,8 +1121,9 @@ def _command_contains_gh_pr_merge(command: str, strict: bool = False) -> bool | 
     `_graphql_query_field_is_expandable`) blocks.
 
     Returns None (fail-closed) when the command — or a merge-like substitution body — cannot be
-    parsed.  A parse failure with no merge-like pattern (e.g. ``grep won't file``) returns False so
-    it is not spuriously blocked.
+    parsed. A top-level raw merge hint is considered only when the best-effort parsed argv prefix
+    resolves to a merge-capable invoked head (#289); other parse failures return False so an
+    unrelated command's prose is not spuriously blocked.
     """
     # A shell-expandable inline graphql `query=` is a merge route too. Run it HERE (not only at the
     # top level) so it applies at every recursion depth — inside a `$( … )` / backtick substitution
@@ -1068,8 +1148,11 @@ def _command_contains_gh_pr_merge(command: str, strict: bool = False) -> bool | 
         return True
     if segments is None:
         # Top-level parse failed: fail-closed if an inner substitution was merge-like-but-unparseable
-        # OR the raw text plausibly contains a merge attempt; otherwise it is a benign parse failure.
-        if sub is None or _MERGE_HINT.search(command):
+        # OR the raw text plausibly contains a merge attempt at a merge-capable invoked head;
+        # otherwise it is a benign parse failure (#289).
+        if sub is None or (
+            _MERGE_HINT.search(command) and _unparseable_command_has_invoked_head(command)
+        ):
             return None
         return False
     return sub  # False, or None (a merge-like substitution body that could not be parsed)

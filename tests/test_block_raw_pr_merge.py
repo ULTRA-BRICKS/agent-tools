@@ -287,7 +287,20 @@ def test_block_brace_group_gh_pr_merge(monkeypatch):
 
 def test_unbalanced_quotes_merge_blocks(monkeypatch):
     """Unbalanced quote on a command containing a merge pattern → fail closed (block)."""
-    out, _err, code = _run("gh pr merge 5 --body 'unclosed", monkeypatch)
+    command = "gh pr merge 5 --body 'unclosed"
+    with pytest.raises(ValueError):
+        hook._split_segments(command)
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_unbalanced_quotes_merge_after_inline_env_blocks(monkeypatch):
+    """The unparseable fallback resolves `gh` after a leading inline environment assignment."""
+    command = "FOO=1 gh pr merge 5 --body 'unclosed"
+    with pytest.raises(ValueError):
+        hook._split_segments(command)
+    out, _err, code = _run(command, monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
 
@@ -295,6 +308,17 @@ def test_unbalanced_quotes_merge_blocks(monkeypatch):
 def test_unbalanced_quotes_unrelated_allows(monkeypatch):
     """Unbalanced quote on an unrelated command → allow (not a merge attempt)."""
     out, _err, code = _run("grep won't file", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_unbalanced_non_gh_report_mentioning_merge_tools_allows(monkeypatch):
+    """An unparseable non-gh report that merely mentions merge tooling must still allow."""
+    command = 'tg "text mentioning gh ship and block-raw-pr-merge and commit abc123'
+    with pytest.raises(ValueError):
+        hook._split_segments(command)
+    assert hook._MERGE_HINT.search(command)
+    out, _err, code = _run(command, monkeypatch)
     assert code == 0
     assert _decision(out) == "allow"
 
@@ -735,6 +759,16 @@ def test_gh_api_merge_with_unbalanced_quote_fails_closed(monkeypatch):
     assert _decision(out) == "block"
 
 
+def test_gh_api_graphql_merge_with_unbalanced_quote_fails_closed(monkeypatch):
+    """An unparseable real GraphQL merge must still block via the merge-hint fallback."""
+    command = "gh api graphql -f query='mutation { mergePullRequest(input:{}) }"
+    with pytest.raises(ValueError):
+        hook._split_segments(command)
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
 def test_graphql_file_backed_query_is_over_blocked(monkeypatch):
     """A `gh api graphql` whose query is fed from a FILE / stdin cannot be inspected at pre-exec
     time and MAY carry a merge mutation, so it is over-blocked (fail closed). Reading the file to
@@ -796,6 +830,58 @@ def test_graphql_query_with_expandable_dollar_is_blocked(command, monkeypatch):
     out, _err, code = _run(command, monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
+
+
+def test_graphql_detached_field_with_expandable_key_is_blocked(monkeypatch):
+    """A detached whole field supplied by expansion may become `query=<merge>` at runtime."""
+    out, _err, code = _run("gh api graphql -f $FIELD", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_nested_graphql_detached_field_with_expandable_key_is_blocked(monkeypatch):
+    """The detached-field role check also runs inside a shell command string."""
+    out, _err, code = _run(r'bash -c "gh api graphql -f \$FIELD"', monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_glued_field_with_expandable_key_is_blocked(monkeypatch):
+    """A glued whole field supplied by expansion may become `query=<merge>` at runtime."""
+    out, _err, code = _run("gh api graphql --raw-field=$FIELD", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_bare_expandable_argument_is_blocked(monkeypatch):
+    """A bare expansion may inject arbitrary `gh api graphql` flags at runtime."""
+    out, _err, code = _run("gh api graphql $ARGS", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_literal_non_query_field_with_expandable_value_is_allowed(monkeypatch):
+    """A literal non-query key remains a harmless GraphQL variable even with an expanded value."""
+    out, _err, code = _run(
+        "gh api graphql -F id=$NODE_ID -f query='query { node(id: $id) { id } }'", monkeypatch
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api graphql -f query='query { viewer { login } }' "
+        '-H "Authorization: Bearer $TOKEN"',
+        "gh api graphql -f query='query { viewer { login } }' --jq '$x'",
+    ],
+)
+def test_graphql_recognized_value_flag_with_expandable_value_is_allowed(command, monkeypatch):
+    """Recognized value-taking flags consume their expandable value instead of treating it as bare."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
 
 
 @pytest.mark.parametrize(
@@ -1201,13 +1287,11 @@ def test_graphql_inline_read_query_with_merge_token_is_over_blocked(monkeypatch)
     assert _decision(out) == "block"
 
 
-def test_unparseable_prose_mentioning_gh_api_merge_token_fails_closed(monkeypatch):
-    """The broadened `_MERGE_HINT` fails closed on an UNPARSEABLE command that mentions `gh` plus a
-    gh-api merge token — a deliberate widening of the safe-direction over-block. Locked in so the
-    accepted behaviour is pinned (Opus review round 4)."""
+def test_unparseable_non_gh_prose_mentioning_gh_api_merge_token_is_allowed(monkeypatch):
+    """An unparseable non-gh command mentioning a merge token remains argv-anchored (#289)."""
     out, _err, code = _run("echo gh docs on mergePullRequest don't forget", monkeypatch)
-    assert code == hook.BLOCK_EXIT_CODE
-    assert _decision(out) == "block"
+    assert code == 0
+    assert _decision(out) == "allow"
 
 
 def test_unparseable_prose_without_merge_token_is_allowed(monkeypatch):

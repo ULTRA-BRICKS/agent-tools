@@ -49,13 +49,12 @@
 #                          fast-track: a trivial/urgent merge that doesn't need review latency).
 #   --resolve-addressed-threads  before the unresolved-threads gate, auto-close review threads that
 #                          are SAFE without a human: unresolved + isOutdated + authored entirely by
-#                          bots. NOTE: isOutdated only means the anchored code CHANGED since the
-#                          comment (a heuristic that the nit was addressed) — NOT a verified fix, so
-#                          a still-valid bot finding on rewritten/rebased code can be auto-closed.
-#                          Use only when you trust the bot threads are genuinely addressed. Human or
-#                          still-current threads are never touched and still block. Also
-#                          SHIP_RESOLVE_ADDRESSED_THREADS=1. A bot thread with >100 comments is
-#                          fail-closed (never auto-resolved).
+#                          bots, with no P0/P1/critical/blocker/security marker in any comment
+#                          (#285). NOTE: isOutdated only means the anchored code CHANGED since the
+#                          comment, not that the finding was fixed. Human, high-severity,
+#                          unreadable-body, or still-current threads are never touched and still
+#                          block. Also SHIP_RESOLVE_ADDRESSED_THREADS=1. A bot thread with >100
+#                          comments is fail-closed (never auto-resolved).
 #   --screenshot P [D]     attach a local screenshot P (desc D) via SHIP_IMAGE_UPLOAD_CMD,
 #                          then post it as a PR comment. Repeatable.
 #
@@ -128,8 +127,9 @@ PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""; REPO
 SHOT_PATHS=(); SHOT_DESCS=()
 # Auto-resolve addressed bot-nit review threads before the unresolved-threads gate (opt-in, #268).
 # Enabled by --resolve-addressed-threads or SHIP_RESOLVE_ADDRESSED_THREADS=1; only ever closes a
-# thread that is unresolved, OUTDATED (its code changed = a later commit addressed it), and authored
-# ENTIRELY by bots — a human thread or an unaddressed one is never touched (see the gate below).
+# thread that is unresolved, OUTDATED (its code changed), authored ENTIRELY by bots, and has no
+# high-severity marker in any readable comment (#285) — a human, high-severity, uncertain-body, or
+# current thread is never touched (see the gate below).
 RESOLVE_THREADS=0
 case "${SHIP_RESOLVE_ADDRESSED_THREADS:-}" in 1|true|yes) RESOLVE_THREADS=1 ;; esac
 USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--screenshot <path> [desc]]...'
@@ -691,27 +691,37 @@ _empty_rollup_is_ci_outage() {
 # Runs BEFORE every review-thread gate — the main unresolved-threads gate below AND the CI-down local
 # fallback (`_local_review_threads_check`) — so the flag works on both paths. It closes only the
 # threads that are SAFE to resolve without a human: unresolved AND isOutdated (the code the thread
-# anchored to has changed — a later commit addressed it) AND authored ENTIRELY by automated reviewers.
-# A thread with ANY human comment, or one still current (not addressed), is NEVER touched — it falls
-# through and still blocks the merge. This lets a shipping agent close its own bot nits through
+# anchored to has changed) AND authored ENTIRELY by automated reviewers, with no P0/P1/critical/
+# blocker/security marker in any comment (#285). A thread with ANY human comment, high-severity
+# marker, unreadable body, or one still current is NEVER touched — it falls through and still blocks
+# the merge. This lets a shipping agent close its own bot nits through
 # `gh ship` instead of hand-running the resolveReviewThread mutation the block-raw-pr-merge hook used
 # to false-block (#268). ship runs these gh calls as a child process, so the agent-hook never sees
 # them; the hook fix is for an agent resolving threads directly. It runs during preflight, so if a
 # LATER gate (CI-green, review-dwell, version-bump, quorum, clean-worktree) then refuses, some
 # eligible bot nits may already be resolved on a PR that does not merge this run — accepted, because
 # those nits are genuinely addressed and would need resolving next run anyway.
-RESOLVE_THREAD_Q='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated comments(first:100){totalCount nodes{author{login}}}}}}}}'
-# jq: emit the thread IDs eligible for auto-resolution, one per line. Fail-CLOSED on two edge cases a
+RESOLVE_THREAD_Q='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated comments(first:100){totalCount nodes{author{login} body}}}}}}}'
+# jq: emit the thread IDs eligible for auto-resolution, one per line. Fail-CLOSED on edge cases
 # reviewer flagged: (a) if the thread has MORE than the 100 fetched comments (totalCount > fetched),
 # a human reply could hide on an unfetched page, so a truncated thread is NOT eligible; (b) a
 # null/ghost author login coalesces to "" (never a bot), so one deleted-account comment makes the
-# thread ineligible instead of crashing jq — both keep the "never auto-close a human/uncertain
-# thread" invariant.
-RESOLVE_ELIGIBLE_JQ='[.data.repository.pullRequest.reviewThreads.nodes[]
+# thread ineligible instead of crashing jq; (c) a null/non-string body or one empty after removing
+# whitespace/markdown is unreadable; and (d) ANY comment with a standalone high-severity marker
+# excludes the whole thread. Hyphens count as marker boundaries, deliberately over-excluding
+# compounds such as "security-first" rather than risking a missed "P1-blocking" finding (#285).
+# All keep the "never auto-close a human/high-severity/uncertain thread" invariant.
+RESOLVE_ELIGIBLE_JQ='def readable_body:
+    if type == "string" then (gsub("[^[:alnum:]]"; "") | length) > 0 else false end;
+  def has_high_severity_marker:
+    test("(^|[^[:alnum:]])(p0|p1|critical|blocker|security)($|[^[:alnum:]])"; "i");
+  [.data.repository.pullRequest.reviewThreads.nodes[]
   | select(.isResolved == false and .isOutdated == true)
   | select((.comments.nodes | length) > 0)
   | select(.comments.totalCount != null and (.comments.nodes | length) >= .comments.totalCount)
   | select([.comments.nodes[].author.login // ""] | all(. as $l | ($l | endswith("[bot]")) or ($l == "chatgpt-codex-connector") or ($l == "codex-review-bot")))
+  | select([.comments.nodes[].body | readable_body] | all)
+  | select([.comments.nodes[].body | has_high_severity_marker] | any | not)
   | .id] | .[]'
 
 _resolve_one_thread() {  # $1 = thread node id
