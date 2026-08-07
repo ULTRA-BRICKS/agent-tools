@@ -871,9 +871,11 @@ def _block_message(kind: str) -> str:
         "self-grant via ALLOW_GIT_RESET_HARD or a `# no-reset-guard:` comment — both were "
         "removed (an agent setting its own bypass is security theater; removed per Alex "
         "tg#6554). If you genuinely need this, ASK the human directly (your usual channel to "
-        "Alex) — asking is fine, self-granting is not. A repo owner can wire a real "
-        "external-approval path via agent_hooks.approval_cmd in rig.yaml; unconfigured means "
-        "denied."
+        "Alex), or request a one-time Telegram approval by setting "
+        'RIG_HATCH_REQUEST_BLOCK_RESET_HARD="<written justification>" (deny-by-default; a '
+        "bare 1 is rejected) — asking is fine, self-granting is not. A repo owner can also "
+        "wire a real external-approval path via agent_hooks.approval_cmd in rig.yaml; "
+        "unconfigured means denied."
     )
 
 

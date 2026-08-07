@@ -448,6 +448,16 @@ def test_clean_force_env_bypass_dead(monkeypatch, tmp_path):
     assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+def test_block_message_mentions_hatch_escalation(monkeypatch, tmp_path):
+    """The refusal text must tell the agent the RIG_HATCH_REQUEST_BLOCK_RESET_HARD path exists
+    — not just approval_cmd — so an agent reading only the block message (not the hook's own
+    source) can find the real, working escalation route instead of concluding none exists."""
+    out, _err, code = _run("git reset --hard", monkeypatch, cwd=_rig_dir(tmp_path))
+    assert code == hook.BLOCK_EXIT_CODE
+    message = json.loads(out)["message"]
+    assert "RIG_HATCH_REQUEST_BLOCK_RESET_HARD" in message
+
+
 def test_approval_unconfigured_denies_no_subprocess(monkeypatch, tmp_path):
     """No approval_cmd → deny, and no approval subprocess spawned. The approval path uses
     subprocess.Popen(shell=True), so patch Popen (not run) to actually catch a stray spawn."""

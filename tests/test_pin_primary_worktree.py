@@ -120,6 +120,17 @@ def test_primary_checkout_to_feature_denies(tmp_path, monkeypatch):
     assert "primary worktree" in json.loads(out)["message"].lower()
 
 
+def test_block_message_mentions_hatch_escalation(tmp_path, monkeypatch):
+    """The refusal text must tell the agent the RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE path
+    exists — not just approval_cmd — so an agent reading only the block message (not the
+    hook's own source) can find the real, working escalation route instead of concluding none
+    exists."""
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "git checkout feat/x", monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE
+    assert "RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE" in json.loads(out)["message"]
+
+
 def test_primary_switch_to_feature_denies(tmp_path, monkeypatch):
     repo = _make_repo(tmp_path)
     out, code = _run(repo, "git switch feat/x", monkeypatch)

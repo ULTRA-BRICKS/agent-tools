@@ -153,8 +153,11 @@ MESSAGE = (
     "NOT try to self-grant via any environment variable — RIG_ALLOW_MAIN_EDIT no longer opens "
     "this hook (an agent setting its own bypass is security theater; removed per Alex tg#6554). "
     "If you have a genuine reason for an exception, ASK the human directly (your usual channel "
-    "to Alex) — asking is fine, self-granting is not. A repo owner can wire a real "
-    "external-approval path via agent_hooks.approval_cmd in rig.yaml; unconfigured means denied."
+    "to Alex), or request a one-time Telegram approval by setting "
+    'RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE="<written justification>" (deny-by-default; a '
+    "bare 1 is rejected) — asking is fine, self-granting is not. A repo owner can also wire a "
+    "real external-approval path via agent_hooks.approval_cmd in rig.yaml; unconfigured means "
+    "denied."
 )
 
 
