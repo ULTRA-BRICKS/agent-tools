@@ -39,6 +39,211 @@ the handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, 
 
 ---
 
+## 2026-08-15 — two new provisioning targets scoped (⏳ design done via `review brainstorm`, nothing shipped)
+
+*Answers two direct CTO questions: does the roadmap cover performance checks (no — the only prior
+mention is the task-cli classifier's own p50/p95 latency benchmark, see the "task-cli classifier"
+entry further down; nothing at the ecosystem/CI-gate level), and can rig configure task-cli's
+ticket template/work logic (not yet — the read side already exists, the write side doesn't, see
+below). A `review brainstorm` (5 rounds, claude:claude-opus-4-8 + codex:gpt-5.6-terra +
+zai:glm-5.2, moderated) ran against rig-cli's actual current code
+(`riglib/schema.py`/`config.py`/`config_schema.py`, task-cli's `tasklib/config.py`); the diff
+recording it then went through two rounds of this repo's own `review diff` gate, which caught and
+corrected one factual error in the brainstorm's own assumption plus several internal
+contradictions the first write-up introduced while fixing that error. Both tracked under
+rig-cli#270 (attach the full transcript there instead of the local log path this entry no longer
+carries). **This entry is a directional design snapshot, not a spec — the "Known open design
+questions" subsections below are real, review-caught gaps that the implementing PR must resolve,
+not oversights to re-litigate here.***
+
+### (1) Performance-check provisioning — not started, design converged on stateless A/B
+
+- ⏳ **No perf/benchmark CI gate slot exists in `agent-tools/ci/` today.** `rig apply` provisions
+  secret-scan / dependency-review / license-policy / tests as reconciled targets via
+  `riglib/catalog.py`, but none of them carry state across runs (pass/fail per run). Perf
+  regression is different — the panel's first instinct (a checked-in `bench-baseline.json`,
+  hyperfine/criterion-style) was **rejected in round 4** in favor of something cheaper.
+- ⏳ **Adopted design: same-job interleaved A/B, not a stored baseline.** Check out the PR's
+  merge-base into a worktree in the *same* CI job, interleave `base, head, base, head, …`, compare
+  the median of per-pair ratios. This deletes the entire stored-baseline trust surface in one move
+  — no baseline storage, no staleness/rebasing, no cross-runner keying, no "a fork PR could
+  overwrite the trusted baseline" risk. Cost: ~1.2–1.5× a normal run *when setup is shared between
+  base and head* — which only holds if their dependency sets match. A PR that touches a lockfile
+  breaks that assumption (merge-base code would run against head's deps). The design must diff the
+  merge-base/head lockfiles first and declare the run **inconclusive** (not a false regression) on
+  any mismatch, or pay full dual setup and drop the 1.2–1.5× claim for that run.
+- ⏳ **This is a new catalog-provisioned target type, not a bespoke one-off workflow file** — a
+  reconciled `ci.performance` slot in `agent-tools/ci/` consumed via `riglib/catalog.py`, same
+  shape as the existing gates. "Don't fan this out via the catalog to other repos" (below) is
+  about the *rollout* being deliberately gated to one pilot repo first, not about the provisioning
+  mechanism being different from the other CI gates.
+- ⏳ **Advisory-first, ship the failure UX as the actual product.** Report-only on first rollout —
+  a hosted CI runner is noisy enough that a hard latency gate false-fails, gets muted, and trains
+  everyone to ignore it. The verdict goes in the check's **title/summary text**, not its name —
+  GitHub branch protection matches required checks by *exact name*, so a name that encodes the
+  verdict could never become a required check, which forecloses the enforce-mode path this same
+  section commits to below. Map every non-regression outcome (inconclusive / bypassed / disabled /
+  dependency-skew) to a terminal GitHub `neutral` conclusion under one **stable** check name — **a
+  kill switch that just stops the job freezes every required check instead of disabling the
+  gate**, which is the opposite of what a kill switch is for.
+- ⏳ **Fork-PR safety boundary:** advisory-only on ephemeral hosted runners for fork PRs (running
+  fork code on a self-hosted runner is a known compromise vector); blocking/"enforce" mode is
+  same-repo branches only, and only after real false-positive-rate + cost-per-signal data exists.
+- ⏳ **Pilot workload, singular:** rig-cli's own large-catalog plan construction (`plan.build`) —
+  every-`apply`-invocation frequency, deterministic, setup-dominated, and it's the one repo with
+  an obvious hot path users actually feel. Do not fan the *rollout* out to other repos until the
+  pilot has proven the variance is manageable.
+- ⏳ **Explicitly NOT building (for now):** a benchmark-storage service, stored-baseline
+  infrastructure, canary tiering (only bites once a gate can block merges — quarters away at
+  advisory-only), a general monotonic perf-policy engine.
+- ⏳ **Known open design questions (review-caught, not resolved by this entry):**
+  - The `neutral`-conclusion design as stated needs a Checks-API check run, which needs
+    `checks: write` — but `pull_request` events from a fork PR get a read-only `GITHUB_TOKEN`.
+    The flagship advisory path (fork PRs on hosted runners) can't publish the verdict-in-summary
+    check this design depends on as written. The fix is a `workflow_run`-style trusted-reporter
+    split, **not** `pull_request_target` — this gate executes fork head code (the benchmark
+    itself), and running untrusted code in a `pull_request_target` context (which carries a write
+    token) is the canonical Actions vulnerability, not a security-review-later alternative. A
+    materially different, separately-designed provisioning shape from the existing gate workflows
+    either way — not "same catalog shape as the other gates."
+  - **As specified (required check + `neutral`-satisfies-it + advisory-only for forks), the
+    enforce-mode gate is trivially bypassable by opening from a fork** — a fork PR always lands on
+    the advisory `neutral` path, satisfying the required check with no real measurement. Possibly
+    an acceptable trade-off for a perf (not security) gate, but it undercuts the "required check"
+    framing and needs to be a named, explicit trade-off before enforce mode ships, not an emergent
+    surprise discovered after.
+  - Promoting the gate to a required check isn't automatic just because it's catalog-provisioned:
+    rig-cli's ruleset promotion only recognizes slots listed in a fixed registry
+    (`github_ruleset.CI_GATE_CHECK_CONTEXTS`, currently just `pr-checklist`/`review-threads`).
+    The stable job/check name and its registry entry need to be specified as part of the
+    enforce-mode work, not assumed.
+  - Where the per-repo benchmark spec (command, warmup, threshold) actually lives — `rig.yaml`
+    (landing on the same schema surface section 2 is extending), a repo-local file, or the
+    catalog — is unspecified. Design once, not twice, if it ends up in `rig.yaml`.
+
+### (2) task-cli template/logic configurability via `rig.yaml`'s `task:` block — read side exists, write side doesn't
+
+- ⏳ **Confirmed, live, currently one-sided.** `task-cli`'s `tasklib/config.py::rig_task_overlay()`
+  (called from `load()`, not dead code) already reads a `rig.yaml` `task:` block and applies
+  `enforce` (the ticket template: `acceptance_criteria`/`motivation`/`user_impact`/
+  `cost_of_inaction`/`formatting`/`screenshots`) and `classify` (the work logic: the classifier's
+  model fallback chain + its `change`-vs-`justAsk` bias) as an overlay on task-cli's own
+  `task.yaml` defaults. `riglib/schema.py` and `riglib/config_schema.py` in rig-cli have **zero**
+  knowledge of a `task:` key at all.
+- ⏳ **Correction to the brainstorm's own working assumption (caught by `review diff`, not the
+  panel):** rig-cli's config validator is already **strict**, not lenient — `riglib/config.py`'s
+  `validate()` calls `_reject_unknown_keys(data, "")` unconditionally (`config.py:539`), fail-closed
+  before anything is written. So a hand-added `task:` block does **not** get silently clobbered on
+  the next `rig apply` — it makes every `rig apply`/`rig config`/wizard call on that repo hard-fail
+  with an unknown-key error until `task:` is added to the schema. There is no data-loss bug and no
+  strict-vs-lenient question left to resolve with a preservation test; the fix is simply **add
+  `task:` to `riglib/config_schema.py`'s accepted key set** — that one change is what unblocks
+  everything else in this section.
+- ⏳ **`task.code_prefix` (rig-cli#217, still open, unmerged — `.ship-config`'s
+  `SHIP_TASK_CODE_PREFIX` does not exist on `main` today, only on #217's own branch) is proposed
+  to NOT route through `rig_task_overlay()`, and the roadmap must not describe it as if it already
+  did.** The overlay's passthrough set is `{backend, github, linear, projects, enforce, classify,
+  session}` (`tasklib/config.py:71`) — `code_prefix` is not in it, so once #217 lands and a repo
+  sets `task.code_prefix`, task-cli's overlay hits the forward-compat branch and logs a `WARN` +
+  skips on *every* invocation in *every* repo using it, forever — a **noisy** no-op, not a silent
+  one. `code_prefix`'s design is a **separate consumption path**: rig-cli writes it into
+  `.ship-config`'s `SHIP_TASK_CODE_PREFIX`, read by `ship.sh` directly, not through task-cli's
+  runtime config cascade. Both keys can live as siblings under the same `rig.yaml` `task:` block,
+  and #217 needs no task-cli code change to work as designed — but silencing the chronic warning
+  does need one (teach task-cli's known-key set that `code_prefix` is intentionally foreign);
+  that's a real, separate follow-up, not automatic.
+- ⏳ **Precedence gap for the planned overlay editor:** task-cli's real layer order (later wins) is
+  `defaults → global → rig.yaml task: block → task.yaml → --config P` (`tasklib/config.py:319`).
+  A repo with its own hand-tuned `task.yaml` — or one invoked with `--config` — silently shadows
+  whatever the `rig.yaml` overlay sets. The editor must surface this: `rig status`/`rig config get`
+  should warn when a `task.*` value it thinks it's controlling is actually overridden by a native
+  `task.yaml`, or a CTO will see a successful `rig config set` that task-cli never actually honors.
+- ⏳ **Recommended sequencing** (not started):
+  1. **Now, rig-cli-only:** add `task:` to `riglib/config_schema.py`'s accepted top-level keys so
+     a `rig.yaml` carrying one stops hard-failing. Whether the *nested* shape is strict or lenient
+     is an open ownership-boundary question (see below) — resolve that as part of this step, not
+     by default-matching this repo's existing schema style. A round-trip preservation test is
+     still needed for the *write* path once the key is admitted (also below) — the earlier
+     strict-vs-clobber question this entry originally reached for a preservation test to answer is
+     separately resolved: rejection, not clobbering, is what happens today.
+  2. **Merge #217** (`task.code_prefix`) under that named `task:` block — not a speculative
+     generic external-tool-config registry, and not routed through `rig_task_overlay()` (see
+     above; it goes to `.ship-config` instead).
+  3. **Separate follow-up PR — the overlay editor**, scoped to `task.enforce.*` **only**
+     (`rig setup` / `rig config set task.enforce.acceptance_criteria …`): tristate writes
+     (`inherit` / `required` / `forbidden`, with a real `rig config unset`, never materializing a
+     default "for completeness" — an absent `task:` block must stay absent), a vendored flat
+     key-list in rig-cli + a grep-based contract test against a pinned task-cli ref (rejected: a
+     shared-schema-import abstraction or a foreign-namespace config registry — both premature at
+     N=1 consumer; "extract from the *second* real consumer, not the first"), provenance surfaced
+     in `rig status`/`rig config get` output including the `task.yaml`-shadow warning above.
+     **Framing matters:** a branch-local `rig.yaml` edit is not an authority boundary — `rig
+     setup` editing `task.enforce.*` is "repo convention, task-cli enforces," never presented as
+     CTO-mandated org policy. True enforcement needs a higher-trust managed policy floor that does
+     not exist yet; don't ship a toggle that *looks* like a mandate before building the enforcement
+     it implies.
+  4. **`task.classify.*` gets no `rig config set` / wizard write path** — not because rig can
+     stop it from taking effect (once step 1 admits `task:` to the schema, a *hand-edited*
+     `task.classify` block passes validation and `rig_task_overlay()` honors it exactly like
+     `enforce`; the read-capability is already live and step 1 doesn't and can't change that), but
+     because rig-cli itself should not offer ergonomics for locally overriding a global
+     classification policy. This is a narrower, more honest claim than "no exceptions" — it
+     withholds the *convenience*, not the *capability*. If that capability gap turns out to matter
+     in practice, closing it is a deliberate, separate decision (e.g. rejecting `classify` in the
+     schema entirely), not a side effect of this sequencing.
+- ⏳ **Explicitly NOT building:** the foreign-namespace config registry, a task-cli-published
+  versioned schema contract (blocks on another repo's release cadence), and any `rig config
+  set`/wizard write path for `task.classify.*` (see step 4 above).
+- ⏳ **Known open design questions (review-caught, not resolved by this entry):**
+  - **Strict-vs-lenient is an ownership-boundary question, not a style-consistency one.**
+    Matching "this repo's existing schema style" (closed/strict) for the `task:` block's *nested*
+    shape means every new key task-cli's own overlay learns later breaks `rig apply`/`rig config`
+    on repos using it, until rig-cli ships a matching schema update — making rig-cli a
+    release-gating validator for a namespace it doesn't own. That's the exact cross-repo coupling
+    the "explicitly not building" bullet already rejects for a shared schema contract, just
+    reached from the other direction. Needs an explicit decision: lenient over the *nested*
+    `task:` shape (rig validates presence/type of the block, not its contents) with strictness
+    reserved for keys rig itself writes (`code_prefix`), vs. accepting the coupling deliberately.
+  - **"No preservation test needed" only holds for the read path, not the write path.** The
+    fail-closed `validate()` proves a `task:` block can't be silently dropped *while the key stays
+    rejected* — rejection is what's protecting it. Once step 1 admits the key, the risk moves to
+    rig's own serializers: the wizard, or `rig config set` on an unrelated key, deserializing and
+    re-emitting `rig.yaml` could drop hand-set `task:` sub-keys rig doesn't model (e.g.
+    `task.session`, `task.backend`, if the step-3 editor only models `task.enforce.*`). A
+    round-trip preservation test for the *post-step-1 write path* is still needed — just not for
+    the strict/lenient question this entry originally raised it for.
+  - **`task.enforce.*` is not uniformly tristate-shaped.** `screenshots` is a nested
+    label-policy object, not a boolean-like toggle, and the enforcement policy may grow numeric
+    fields (e.g. a minimum-count style setting) alongside the scalar ones. A flat
+    `inherit`/`required`/`forbidden` editor fits the scalar boolean-like keys
+    (`acceptance_criteria`, `motivation`, `user_impact`, `cost_of_inaction`, `formatting`); the
+    step-3 editor needs to either scope itself explicitly to those, or define a separate typed
+    editor + contract test for the nested/numeric ones. Don't build one flat editor and assume it
+    covers the whole `enforce` shape.
+  - **"Add `task:` to the accepted key set" is schema admission, not full validation.**
+    `riglib/config.py::validate()` has no `task`-shaped runtime check today (no type/mapping
+    validator for its contents) — step 1 needs its own validator (mapping type, nested-key
+    policy per the strict/lenient decision above), not just a schema-registry entry, or a
+    malformed `task:` value passes rig's validation and is silently dropped by task-cli's own
+    foreign-`rig.yaml` fallback instead.
+  - **The `task.yaml`-shadow warning (step 3) requires rig to parse task-cli's native config
+    shape** — which is the exact cross-tool coupling the rest of this section avoids — and even
+    then can't see the `--config P` layer (invisible to rig entirely), so the warning can never be
+    complete. A CTO could still see a "successful" `rig config set` that task-cli silently ignores.
+    The boundary-preserving alternative is task-cli exposing its own effective-config provenance
+    (e.g. a `task config --explain`) rather than rig reverse-engineering `task.yaml`'s shape — but
+    that's a cross-repo dependency of its own kind, so treat this as unresolved, not a
+    straightforward step-3 deliverable.
+  - **Mixed ownership inside one `task:` namespace has a cost that "both keys can live as
+    siblings" glosses over:** task-cli must learn to ignore rig's key (`code_prefix`, the chronic
+    warning) while rig must be lenient about task-cli's keys but strict about its own — two tools
+    each special-casing the other's keys in the same block. A `task.rig.*` sub-namespace for
+    rig-owned keys (or moving `code_prefix` out of `task:` entirely, since it doesn't flow through
+    task-cli's cascade anyway) would avoid this; the sequencing below merges #217 under `task:`
+    before this ownership question is actually decided.
+
+---
+
 ## 2026-07-18 → 07-23 — multi-day autonomous backlog marathon (🔬 under CTO review)
 
 *A long multi-day autonomous shipping run across the whole ecosystem, tracked live via `gh` throughout.
