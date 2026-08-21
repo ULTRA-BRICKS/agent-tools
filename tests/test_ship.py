@@ -5002,6 +5002,10 @@ esac
 #   SHIP_TEST_REVIEW_MIN_ITER_ECHO      if set, emit THIS as the JSON `min_iter`/`min_models` echo
 #                                       instead of the flag values, so a test can inspect the floor
 #                                       ship actually passed to review-cli.
+#   SHIP_TEST_REVIEW_STALLED_JSON       if set, emit THIS verbatim as the JSON `stalled_models`
+#                                       array value (review-cli#221) — lets a test forge review-cli
+#                                       naming a specific chronically-failing seat, so ship's own
+#                                       refusal-message plumbing (QSTALLED) can be proven end to end.
 #
 # The JSON keys match review-cli's real output: `passed_iterations` / `distinct_models_passed`
 # (NOT `iterations` / `distinct_models`, which review-cli never emitted — that key mismatch was
@@ -5042,14 +5046,15 @@ else
 fi
 echo_min="${SHIP_TEST_REVIEW_MIN_ITER_ECHO:-}"
 [ -n "$echo_min" ] && { minit="$echo_min"; minmodels="$echo_min"; }
+stalled="${SHIP_TEST_REVIEW_STALLED_JSON:-[]}"
 if [ "${SHIP_TEST_REVIEW_LEGACY_KEYS:-0}" = "1" ]; then
   # Emit ONLY the never-emitted legacy key names (`iterations` / `distinct_models`) to prove ship
   # reads the REAL keys and treats a legacy-only payload as 0/0 -> fail-closed refuse (#242).
   printf '{"task_code":"%s","iterations":%s,"distinct_models":%s,"models":["claude","codex","gemini"],"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
     "$code" "$iterations" "$models_n" "$minit" "$minmodels" "$passed"
 else
-  printf '{"task_code":"%s","passed_iterations":%s,"total_iterations":%s,"distinct_models_passed":%s,"models":["claude","codex","gemini"],"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
-    "$code" "$iterations" "$iterations" "$models_n" "$minit" "$minmodels" "$passed"
+  printf '{"task_code":"%s","passed_iterations":%s,"total_iterations":%s,"distinct_models_passed":%s,"models":["claude","codex","gemini"],"min_iter":%s,"min_models":%s,"passed":%s,"stalled_models":%s}\\n' \\
+    "$code" "$iterations" "$iterations" "$models_n" "$minit" "$minmodels" "$passed" "$stalled"
 fi
 """
 
@@ -5173,6 +5178,49 @@ def test_review_quorum_blocks_when_bar_short(tmp_path):
     # No self-service override exists; the refusal must point at the hatch env var instead.
     assert "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM" in r.stderr, r.stderr
     assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_refusal_names_the_stalled_model(tmp_path):
+    """review-cli#221: a short bar refusal must name the SPECIFIC model review-cli
+    reports as currently unavailable/timing out (its `stalled_models` diagnostic),
+    not just a bare N/M count — an operator staring at 'bar NOT met' should not have
+    to go dig through run-stats.jsonl themselves to find the actual problem seat."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-221",
+            "SHIP_TEST_REVIEW_ITER": "2",
+            "SHIP_TEST_REVIEW_MODELS": "2",
+            "SHIP_TEST_REVIEW_STALLED_JSON": (
+                '[{"model":"oc:zai/glm-5.2","reason":"timed out",'
+                '"consecutive_failures":3,"remaining_seconds":1800}]'
+            ),
+        },
+    )
+    assert r.returncode != 0, f"a short quorum must be refused\n{r.stdout}\n{r.stderr}"
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "oc:zai/glm-5.2" in r.stderr, r.stderr
+    assert "timed out" in r.stderr, r.stderr
+    assert "3x" in r.stderr, r.stderr
+
+
+def test_review_quorum_refusal_omits_stalled_note_when_nothing_is_stalled(tmp_path):
+    """The default fake (`stalled_models: []`, review-cli's real shape when the bar just
+    hasn't accumulated enough passes yet and nothing is actively cooling down) must NOT
+    print an empty/misleading 'currently unavailable: ' parenthetical."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"REVIEW_TASK_CODE": "HYP-222", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_MODELS": "1"},
+    )
+    assert r.returncode != 0, r.stdout
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "currently unavailable" not in r.stderr, r.stderr
 
 
 def test_review_quorum_passes_and_authorizes_when_bar_met(tmp_path):

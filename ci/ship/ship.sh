@@ -2052,6 +2052,16 @@ else
       QMODELS_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_models_passed // 0' 2>/dev/null || echo 0)
       QMODELS=$(printf '%s' "$QUORUM_JSON" | jq -r '(.models // []) | join(", ")' 2>/dev/null || echo "")
       QERR=$(printf '%s' "$QUORUM_JSON" | jq -r '.error // empty' 2>/dev/null || echo "")
+      # review-cli#221: name the SPECIFIC model(s) currently unavailable/timing out for
+      # this task (review-cli's own seat-cooldown cache — the same live signal dispatch
+      # itself checks), not just a bare count. Empty when nothing attempted for this task
+      # is currently cooling down (e.g. a genuinely-never-reviewed task, or every seat is
+      # healthy and the bar just hasn't been reached yet by iteration count alone).
+      QSTALLED=$(printf '%s' "$QUORUM_JSON" | jq -r '
+        (.stalled_models // [])
+        | map("\(.model) (\(.reason), \(.consecutive_failures)x, ~\(.remaining_seconds)s left)")
+        | join("; ")
+      ' 2>/dev/null || echo "")
       # Non-numeric / missing counts collapse to 0 so the arithmetic gate below fails closed
       # (jq can hand back "null" as text if a key holds JSON null).
       case "$QITER" in ''|*[!0-9]*) QITER=0 ;; esac
@@ -2069,7 +2079,7 @@ else
         echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QMODELS_N} models for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
         _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" ""
       else
-        _review_quorum_refuse_or_hatch "bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QMODELS_N}/${MIN_MODELS} distinct models${QMODELS:+ (models seen: ${QMODELS})}${QERR:+ (${QERR})}"
+        _review_quorum_refuse_or_hatch "bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QMODELS_N}/${MIN_MODELS} distinct models${QMODELS:+ (models seen: ${QMODELS})}${QSTALLED:+ (currently unavailable: ${QSTALLED})}${QERR:+ (${QERR})}"
       fi
     fi
   fi
