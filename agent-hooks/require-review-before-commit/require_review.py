@@ -139,6 +139,104 @@ CODE_BASENAMES = frozenset({
     "gemfile", "procfile", "brewfile", "justfile", "cmakelists.txt",
 })
 
+# ---------------------------------------------------------------------------------------------
+# Declared-generated data under `docs/`.
+#
+# A machine-generated data dump (e.g. a 5.9 MB Figma node tree) is `.json`, so CODE_EXT above
+# classifies it as code and demands a review it can never receive: the diff runs to hundreds of
+# thousands of lines and exceeds any reviewer's context, so the gate is unsatisfiable rather than
+# strict. But "large" is NOT evidence of un-reviewability (a file can be padded), so size is
+# deliberately not the discriminator here.
+#
+# The discriminator is a DECLARATION: git's own `-diff` attribute (also implied by `binary`) means
+# "this path is not meaningfully diffable". Three conditions must hold together, so the escape
+# stays narrow:
+#   1. the path sits under a `docs/` directory   — never a route around reviewing real source;
+#   2. `git check-attr diff` reports `unset`     — the repo explicitly declared it generated;
+#   3. the extension is a pure serialisation format in the positive list below — never a script,
+#      never a lockfile/env/infra file that carries supply-chain or secret risk.
+# The declaration lives in `.gitattributes`, which is itself NOT a docs path, so adding one is a
+# reviewed commit. That is the control: a repo cannot self-exempt without review seeing it.
+GENERATED_DATA_EXT = re.compile(r"\.(?:json|jsonl|ndjson|csv|tsv|xml)$", re.IGNORECASE)
+
+
+def _local_attr_override_present(cwd: str) -> bool:
+    """True when a NEVER-COMMITTED attributes source could be in play.
+
+    `$GIT_DIR/info/attributes` OUTRANKS in-tree `.gitattributes`, and `core.attributesFile` is a
+    user-global file; neither is reviewed, so either would let the exemption be armed without a
+    reviewed commit. Their mere presence disqualifies the escape. Any error answers True — the
+    fail-closed direction."""
+    try:
+        gd = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            check=False, cwd=cwd, capture_output=True, text=True, timeout=GIT_DIFF_TIMEOUT_S,
+        )
+        if gd.returncode != 0:
+            return True
+        git_dir = gd.stdout.strip()
+        if not os.path.isabs(git_dir):
+            git_dir = os.path.join(cwd, git_dir)
+        if os.path.exists(os.path.join(git_dir, "info", "attributes")):
+            return True
+        cfg = subprocess.run(
+            ["git", "config", "--get", "core.attributesFile"],
+            check=False, cwd=cwd, capture_output=True, text=True, timeout=GIT_DIFF_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return cfg.returncode == 0 and bool(cfg.stdout.strip())
+
+
+def _declared_nondiffable_batch(paths: list[str], cwd: str) -> set[str]:
+    """Subset of `paths` whose COMMITTED attributes mark them non-diffable (`-diff` / `binary`).
+
+    Two properties, both added after review found them missing:
+
+    1. Attributes come from `HEAD` via `--source`, NOT the working tree. Plain `check-attr` reads
+       the on-disk `.gitattributes`, which an agent can write WITHOUT committing — that would have
+       made the "granting the exemption is a reviewed commit" control false. A git too old for
+       `--source` fails the call, and we fail closed.
+    2. ONE subprocess for all paths (`--stdin`), not one per file, which was an N+1 spawn on every
+       commit attempt — including commits destined to block anyway.
+
+    Fails CLOSED throughout: any error, timeout, non-zero exit, malformed output, or a local
+    attribute override yields an empty set."""
+    if not paths or _local_attr_override_present(cwd):
+        return set()
+    try:
+        proc = subprocess.run(
+            ["git", "check-attr", "--source=HEAD", "--stdin", "-z", "diff"],
+            check=False, cwd=cwd, input="\0".join(paths) + "\0",
+            capture_output=True, text=True, timeout=GIT_DIFF_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if proc.returncode != 0:
+        return set()
+    # `-z` output is NUL-separated triples: <path> <attr> <value>. `-diff` yields value "unset".
+    fields = proc.stdout.split("\0")
+    declared: set[str] = set()
+    for i in range(0, len(fields) - 2, 3):
+        if fields[i + 1] == "diff" and fields[i + 2] == "unset":
+            declared.add(fields[i])
+    return declared
+
+
+def _generated_data_candidate(path: str) -> bool:
+    """The cheap, regex-only half: right place, right kind of file. Says nothing about whether the
+    repo declared it — that costs a subprocess and is answered in batch."""
+    if os.path.basename(path).lower() in CODE_BASENAMES:
+        return False
+    return bool(DOCS_DIR.search(path)) and bool(GENERATED_DATA_EXT.search(path))
+
+
+def is_generated_data_path(path: str, cwd: str) -> bool:
+    """True for a declared-generated data file under `docs/` — see GENERATED_DATA_EXT above."""
+    if not _generated_data_candidate(path):
+        return False
+    return path in _declared_nondiffable_batch([path], cwd)
+
 
 def emit(decision: str, message: str | None = None) -> None:
     out = {"hook_api": HOOK_API, "decision": decision}
@@ -617,9 +715,28 @@ def is_docs_path(path: str) -> bool:
     return bool(DOCS_DIR.search(path))
 
 
-def is_docs_only(files: list[str]) -> bool:
-    """True when there is at least one staged file and EVERY staged path is a docs path."""
-    return bool(files) and all(is_docs_path(f) for f in files)
+def is_docs_only(files: list[str], cwd: str | None = None) -> bool:
+    """True when there is at least one staged file and EVERY staged path is exempt from code
+    review: a docs path, or — when `cwd` is supplied — a declared-generated data file under
+    `docs/` (see `is_generated_data_path`). `cwd` is optional so existing callers and tests that
+    only classify by path keep working; without it the generated-data escape simply never fires,
+    which is the safe direction."""
+    if not files:
+        return False
+    # Classify with cheap regexes first and bail on the FIRST non-exempt path, so a commit that
+    # was always going to block costs no subprocess at all. The attribute lookup that remains is a
+    # single batched call rather than one spawn per file.
+    candidates: list[str] = []
+    for f in files:
+        if is_docs_path(f):
+            continue
+        if cwd is not None and _generated_data_candidate(f):
+            candidates.append(f)
+            continue
+        return False
+    if not candidates:
+        return True
+    return set(candidates) <= _declared_nondiffable_batch(candidates, str(cwd))
 
 
 # `git commit` options that consume a SEPARATE following value which is NOT a pathspec. Listing
@@ -786,7 +903,9 @@ def _is_docs_only_commit(seg: CommitSegment, cwd: str) -> bool:
         git_cwd = (seg.target_dir if os.path.isabs(seg.target_dir)
                    else os.path.join(effective_cwd, seg.target_dir))
     files = staged_files(git_cwd)
-    if files is not None and is_docs_only(files):
+    # NOTE: `git_cwd`, not `cwd` — attributes must be read from the SAME repo the staged
+    # files were listed from, or `check-attr` consults an unrelated `.gitattributes`.
+    if files is not None and is_docs_only(files, git_cwd):
         warn("docs-only commit — review not required")
         return True
     return False
