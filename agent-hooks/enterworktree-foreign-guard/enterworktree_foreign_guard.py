@@ -20,13 +20,21 @@ the tool "succeed" and brick the session afterward.
 
 ## How ownership is determined
 
-CC names a dispatched subagent's isolated worktree ``.claude/worktrees/agent-<agent_id>`` —
-that convention is CC's own, not something this hook invents (every observed worktree in this
-project's ``.claude/worktrees/`` follows it). ``cc_hook_bridge`` forwards the CALLING agent's
-own ``agent_id`` at the TOP LEVEL of the event ONLY when the call fires inside a dispatched
-subagent (dispatch.py's T2 precedence: a value inside ``tool_input``/``args`` is
-attacker/prompt-controllable and is dropped whenever the top-level field is absent) — so a
-forged ``args.agent_id`` can never impersonate a different agent's ownership here either.
+This hook presumes CC names a dispatched subagent's isolated worktree
+``.claude/worktrees/agent-<agent_id>`` using the SAME id it forwards in the PreToolUse
+event's own ``agent_id`` field. **This is an inferred correlation, not a documented or
+independently confirmed fact** — see the "UNVERIFIED ASSUMPTION" note on the id-comparison
+branch in ``main()`` below and the hook's README for what to verify before trusting this in
+production; CC's own docs (``/docs/en/worktrees``) describe a DIFFERENT naming scheme for the
+general case (an unnamed ``--worktree`` session gets a readable slug like
+``bright-running-fox``, not a hex id), so the hex-id convention observed on one project's
+machine is either an undocumented Agent/Task-dispatch internal or imposed by that project's
+own tooling. ``cc_hook_bridge`` forwards the CALLING agent's own ``agent_id`` at the TOP LEVEL
+of the event ONLY when the call fires inside a dispatched subagent (dispatch.py's T2
+precedence: a value inside ``tool_input``/``args`` is attacker/prompt-controllable and is
+dropped whenever the top-level field is absent) — so a forged ``args.agent_id`` can never
+impersonate a different agent's ownership here either, independent of the naming-convention
+question above.
 
   - ``path`` embeds ``agent-<id>`` AND the caller's own ``agent_id`` == ``<id>`` → the caller
     is re-entering / switching into a worktree it owns → ALLOW.
@@ -232,9 +240,7 @@ def main() -> int:
 
     own_agent_id = _own_agent_id(event)
     # EXACT, case-sensitive compare — deliberately NOT case-folded, even though
-    # `_WORKTREE_AGENT_SEGMENT_RE` (above) recognizes EITHER case for the path segment. Every
-    # observed CC agent id/worktree name pairs the two verbatim (same casing), so a legitimate
-    # re-entry always compares equal here.
+    # `_WORKTREE_AGENT_SEGMENT_RE` (above) recognizes EITHER case for the path segment.
     #
     # CONSIDERED AND REJECTED twice across review rounds, in BOTH directions — recorded so a
     # future reader doesn't "fix" this back and forth again:
@@ -250,9 +256,24 @@ def main() -> int:
     # through hatch escalation" (safe: fails toward asking a human) and "a foreign agent whose
     # id merely differs in case is silently granted ownership" (unsafe: the exact incident this
     # hook exists to prevent), the exact/case-sensitive comparison is the correct trade-off for
-    # a security gate — deny-by-default beats a convenience-motivated fold. Every real CC
-    # agent_id/worktree-name pair this hook has ever observed shares identical casing anyway
-    # (both are produced by CC in one step), so this is not expected to bite in practice.
+    # a security gate — deny-by-default beats a convenience-motivated fold.
+    #
+    # UNVERIFIED ASSUMPTION, flagged explicitly rather than asserted as fact: this entire
+    # module presumes CC names a dispatched subagent's worktree directory `agent-<agent_id>`
+    # using THE SAME id it forwards in the PreToolUse event's own `agent_id` field. That
+    # correlation was inferred from every worktree directory observed on one project's
+    # machine matching that shape, cross-referenced against agent ids appearing in that
+    # project's own memory/task-history text — NOT from a captured, joined
+    # (worktree-dir-name, live-event-agent_id) pair for the SAME dispatch. CC's own
+    # `/docs/en/worktrees` documents a DIFFERENT naming scheme for the general case — an
+    # unnamed `--worktree` session gets a readable slug like `bright-running-fox`, not a hex
+    # id — so this hex-id convention, wherever it's observed, is either an undocumented
+    # internals detail specific to Agent/Task-tool dispatch, or imposed by something in this
+    # project's own tooling. If the assumption is WRONG, this hook's failure mode is not
+    # "weaker guard" but INVERTED: `own_agent_id` would never equal `target_agent_id`, so
+    # EVERY EnterWorktree(path=...) — including a fully legitimate self re-entry — would
+    # BLOCK and route through Telegram hatch escalation. Verify with a real captured
+    # PreToolUse event before trusting this in production; see the hook's README.
     if own_agent_id is not None and own_agent_id == target_agent_id:
         # Re-entering / switching into a worktree THIS agent owns — legitimate, unaffected.
         emit("allow")

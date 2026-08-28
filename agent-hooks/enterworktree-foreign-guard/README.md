@@ -22,13 +22,12 @@ report success and brick the session afterward.
 
 ## How ownership is determined
 
-CC names a dispatched subagent's isolated worktree `.claude/worktrees/agent-<agent_id>` — its
-own convention, not something this hook invents (every worktree directory observed in the
-incident's project follows it exactly). `cc_hook_bridge` forwards the CALLING agent's own
-`agent_id` at the top level of the event **only** when the call fires inside a dispatched
-subagent, and — per `dispatch.py`'s T2 precedence — drops any copy forged inside
-`args`/`tool_input` whenever that top-level field is absent, so a forged `args.agent_id` can
-never fake ownership here either.
+This hook presumes CC names a dispatched subagent's isolated worktree
+`.claude/worktrees/agent-<agent_id>` using the SAME id it forwards in the PreToolUse event's
+own `agent_id` field. `cc_hook_bridge` forwards the CALLING agent's own `agent_id` at the top
+level of the event **only** when the call fires inside a dispatched subagent, and — per
+`dispatch.py`'s T2 precedence — drops any copy forged inside `args`/`tool_input` whenever that
+top-level field is absent, so a forged `args.agent_id` can never fake ownership here.
 
 | `path` shape | own `agent_id` | Decision |
 | --- | --- | --- |
@@ -40,6 +39,41 @@ never fake ownership here either.
 The orchestrator is treated the same as a mismatched subagent: it never owns a dispatched
 subagent's worktree either, so any orchestrator `EnterWorktree(path=".../agent-<id>")` call is
 blocked just like a foreign subagent-to-subagent one would be.
+
+### ⚠️ UNVERIFIED ASSUMPTION — read before trusting this in production
+
+The `agent-<id>` == worktree-directory-name == event `agent_id` correlation above was
+**inferred, not independently confirmed**: every worktree directory observed on one project's
+machine matched that shape, cross-referenced against agent ids appearing in that project's own
+memory/task-history text — **not** from a captured, joined `(worktree-dir-name,
+live-event-agent_id)` pair for the SAME dispatch. CC's own docs
+(`code.claude.com/docs/en/worktrees`) describe a DIFFERENT naming scheme for the general case
+— an unnamed `--worktree` session gets a readable slug like `bright-running-fox`, not a hex id
+— so wherever the `agent-<hex>` convention comes from, it is either an undocumented
+Agent/Task-tool-dispatch internal, or imposed by something in that project's own tooling
+(rig-cli, task-cli, a custom subagent's `isolation: worktree` frontmatter, or similar).
+
+**If the assumption is wrong, the failure mode is not "weaker guard" — it inverts.**
+`own_agent_id` would then never equal `target_agent_id` for ANY worktree, so this hook would
+BLOCK **every** `EnterWorktree(path=...)` call, including a fully legitimate agent re-entering
+its own worktree, routing each one through Telegram hatch escalation. That is a machine-wide
+false-positive gate once `rig apply` activates it (see "Registration gap" below) — it does not
+manifest until activation, and does not affect anything before that.
+
+**Before treating this guard as trustworthy, verify the correlation directly** — cheapest to
+most invasive:
+
+1. Check whether any known dispatched agent's id (from a session transcript, a memory file, or
+   a fork/subagent-launch result) appears as a `.claude/worktrees/agent-<that-id>` directory on
+   disk. Circumstantial but free.
+2. Grep `~/.claude.json` / its rotating backups under `~/.claude/backups/` for a joined record
+   that ties a specific worktree path to an `agentId`-shaped field. Also circumstantial.
+3. **The decisive check**: install a temporary, LOGGING-ONLY `EnterWorktree` `PreToolUse`
+   matcher (dumps the raw stdin JSON to a file and exits 0 — never blocks, since `PreToolUse`
+   fires *before* the tool runs, so even a call the tool later rejects still yields a captured
+   event) and compare its `agent_id` field against the worktree directory name for a real
+   dispatch. This is the only source of ground truth. **It requires editing the live
+   `settings.json`, so ask the repo/machine owner before installing it — do not self-apply.**
 
 ## The correct alternative
 
