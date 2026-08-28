@@ -123,6 +123,7 @@ The shipped hooks and their points:
 | `pre-write` | `block-secrets-write`, `block-raw-process-env`, `orchestrator-stays-thin` (non-docs code Edit/Write, warn→block, subagent-exempt), `worktree-only-writes` (per-repo `worktree_only` opt-in: blocks an Edit/Write while the checkout sits on the repo's default branch, redirecting to a separate worktree; deny-by-default, `RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES` Telegram hatch only) |
 | `pre-skill` **(live in CC once rig registers the `Skill` matcher; live in opencode via the native `skill` tool; NOT mapped in Codex yet)** | `skills-marker-writer` (touches the freshness marker `skills-read-gate` reads — ADVISORY, never blocks) |
 | `pre-monitor` **(live in CC once rig registers the `Monitor` matcher; Codex/opencode have no Monitor-equivalent tool, so this point is CC-only)** | `subagent-no-monitor` (block a SUBAGENT from calling Monitor AT ALL — Monitor has no harness-tracked child and no foreground mode, unlike an ordinary backgrounded Bash command (the same mechanism the `subagent-no-bg-longproc` entry above states, agent-tools#546), so there's no foreground/background axis to classify; subagent-ONLY) |
+| `pre-worktree-enter` **(live in CC once rig registers the `EnterWorktree` matcher; NOT mapped in Codex/opencode — neither exposes a worktree-switching tool)** | `enterworktree-foreign-guard` (blocks `EnterWorktree(path=...)` into a worktree a DIFFERENT agent created — CC's own validation only confirms the path is a registered repo worktree, never that the caller owns it, and entering a foreign one reports SUCCESS then bricks the calling agent's Bash tool for the rest of its session; deny-by-default) |
 | `post-write` | `format-on-write`, `lint-on-write` (react to the completed write; exit-10 is feedback because the write already landed) |
 | `stop` | Runs in ascending priority order, first BLOCK short-circuits the rest: `chat-dictionary-gate` (priority 10 — blocks a reply containing a banned word from `~/.claude/DICT.json`, the same dictionary the `tg` Telegram-send CLI enforces for outgoing messages, now also covering the Claude Code chat surface itself; must sort ahead of `stop-completion-selfcheck` below or that hook's own block could consume the Stop event first — see its README), `model-error-fallback` (priority 20 — purely advisory, never blocks, so its relative order doesn't matter for the short-circuit above; missing from this table before now, a pre-existing doc gap unrelated to this entry), `stop-completion-selfcheck` (priority 50) |
 
@@ -133,19 +134,20 @@ fail-**open** at the top level (a broken bridge must never wedge every tool call
 individual fail-closed hook still blocks through the shared `agents-hooks/v1` runner.
 
 **Claude Code:** `lib/cc_hook_bridge` is wired by `rig` into `settings.json`. It maps
-`PreToolUse` → `pre-bash`/`pre-write`/`pre-agent`/`pre-skill`/`pre-monitor` (the third for the
-`Agent`/`Task` subagent tools, the fourth for the `Skill` tool, the fifth for the `Monitor`
-tool), `PostToolUse` file-edit tools → `post-write`, and `Stop` → `stop`; it translates exit-10
-BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. The bridge also forwards
-CC's `agent_id`/`agent_type` (present only inside a dispatched subagent) into the v1 event, so
-a subagent-exempt (or, for `subagent-no-monitor`, subagent-ONLY) gate can tell a subagent's own
+`PreToolUse` → `pre-bash`/`pre-write`/`pre-agent`/`pre-skill`/`pre-monitor`/`pre-worktree-enter`
+(the third for the `Agent`/`Task` subagent tools, the fourth for the `Skill` tool, the fifth
+for the `Monitor` tool, the sixth for the `EnterWorktree` tool), `PostToolUse` file-edit tools
+→ `post-write`, and `Stop` → `stop`; it translates exit-10 BLOCK into CC's
+`permissionDecision: "deny"` / `decision: "block"`. The bridge also forwards CC's
+`agent_id`/`agent_type` (present only inside a dispatched subagent) into the v1 event, so a
+subagent-exempt (or, for `subagent-no-monitor`, subagent-ONLY) gate can tell a subagent's own
 tool use apart from the orchestrator's.
 **Two-repo split, both halves required:** the point mapping (which CC `(event, tool)` maps
 to which logical point) lives here; the matcher that makes CC actually *fire* that event —
-an `Agent|Task`, `Skill`, or `Monitor` `PreToolUse` matcher in `settings.json`'s
-`hook_bridge_entries` — is registered by the separate rig-cli repo. Either half alone is
-inert; `pre-agent`, `pre-skill`, and `pre-monitor` are each live only once BOTH sides have
-shipped and `rig apply` has run.
+an `Agent|Task`, `Skill`, `Monitor`, or `EnterWorktree` `PreToolUse` matcher in
+`settings.json`'s `hook_bridge_entries` — is registered by the separate rig-cli repo. Either
+half alone is inert; `pre-agent`, `pre-skill`, `pre-monitor`, and `pre-worktree-enter` are
+each live only once BOTH sides have shipped and `rig apply` has run.
 
 **Codex:** `lib/codex_hook_bridge` is the first bridge for the confirmed Codex hooks
 contract. Codex TOML hooks call it for `PreToolUse` `Bash` (`pre-bash`), `PreToolUse`

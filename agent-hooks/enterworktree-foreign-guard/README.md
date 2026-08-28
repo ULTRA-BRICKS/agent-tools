@@ -68,6 +68,18 @@ executable line), so only the process-env source applies here, matching how the 
 hooks read this var. If unset, no Telegram call is made and the call simply blocks. If present
 but blank/bare (`1`/`true`/`yes`), the hook denies without contacting Telegram.
 
+> **Claude Code outer timeout — a pre-existing, catalog-wide gap, not unique to this hook.**
+> This descriptor sets `timeout_ms: 960000` (960s: `tg-ctl ask`'s 900s cap plus a 30s cleanup
+> margin), but Claude Code's own command-hook `timeout` defaults to 600s. If a `settings.json`
+> matcher for `EnterWorktree` is registered WITHOUT an explicit `timeout` above 960s, CC can
+> kill the bridge process before a full Telegram hatch wait finishes — and because this hook is
+> `on_error: open`, that outer kill (decided by CC, not this script) becomes a SILENT ALLOW
+> instead of the intended deny. This is the identical gap `pin-primary-worktree`'s README
+> documents for its own hatch flow — every hatch-using hook in this catalog shares it, and it
+> is not resolved by this PR: fixing it needs a `timeout` field in rig-cli's
+> `hook_bridge_entries` matcher registration (or the live `settings.json` entry), tracked as
+> catalog-wide follow-up, not something to patch ad hoc for one matcher here.
+
 ## Registration gap (read before assuming this fires)
 
 Mapping `EnterWorktree` → `pre-worktree-enter` in `lib/cc_hook_bridge/dispatch.py` is **not**,
@@ -102,12 +114,26 @@ but inert — CC never calls the bridge for `EnterWorktree` at all, so
   itself created the specific worktree matching its own `agent_id` — it trusts CC's own
   `agent_id` assignment as the source of truth for "whose worktree is this," the same trust
   boundary `subagent-no-bg-longproc`/`subagent-no-monitor` place in CC's `agent_id` forwarding.
+- **Check-then-use race (TOCTOU), inherent to every pre-tool hook in this catalog, not unique
+  here.** This hook resolves `path` (including a symlink) once, decides, and returns; CC's own
+  `EnterWorktree` then resolves the path independently when it actually runs. A concurrent,
+  co-located process with local filesystem write access could in principle repoint a symlinked
+  `path` between this hook's check and the tool's own execution. Closing that would need
+  atomic check-and-use semantics this stateless hook script cannot provide (and `EnterWorktree`
+  itself has the same "must appear in `git worktree list`" check-then-act shape). The realistic
+  threat model this guard defends against — an agent's OWN tool call choosing a foreign path —
+  does not require winning a filesystem race; a hostile concurrent process is a different,
+  broader threat class this targeted hook does not attempt to solve, matching every other
+  path/command-based gate in this catalog (e.g. `block-raw-pr-merge`, `pkill-guard`).
 
 ## Fail-open, on purpose
 
 `on_error: "open"`. A crash in this check must never wedge an agent's ability to call a
-legitimate `EnterWorktree`. An unparseable event, a `path` that doesn't match the understood
-naming convention, and an unset hatch env var all resolve to `allow`.
+legitimate `EnterWorktree`. An unparseable event and a `path` that doesn't match the
+understood naming convention both resolve to `allow`. This is otherwise a deny-by-default
+gate: an unset hatch env var does NOT resolve to `allow` — it simply means no Telegram call
+is made, and the plain `block` for a genuinely foreign worktree still stands (see "No
+self-service bypass" above).
 
 ## Test
 
@@ -124,7 +150,7 @@ echo '{"args":{"path":"/repo/.claude/worktrees/agent-deadbeef01","agent_id":"sub
 rc=$?; echo "exit=$rc"   # → "decision":"block" ...  exit=10
 
 # a subagent re-enters its OWN worktree → allow
-echo '{"args":{"path":"/repo/.claude/worktrees/agent-sub-1","agent_id":"sub-1"}}' \
+echo '{"args":{"path":"/repo/.claude/worktrees/agent-deadbeef01","agent_id":"deadbeef01"}}' \
   | ./enterworktree_foreign_guard.py
 rc=$?; echo "exit=$rc"   # → "decision":"allow"  exit=0
 

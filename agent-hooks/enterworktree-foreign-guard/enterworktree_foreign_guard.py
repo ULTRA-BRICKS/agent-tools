@@ -108,7 +108,16 @@ HOOK_ID = "enterworktree-foreign-guard"
 
 # CC's own convention for a dispatched subagent's isolated worktree directory name. Anchored
 # to the whole path-segment (no partial match) so e.g. "agent-foo-extra" never partially
-# matches; case-insensitive because a hex agent id could plausibly appear either case.
+# matches. RECOGNIZING the shape is case-INSENSITIVE (a hex id could plausibly surface in
+# either case, and a filesystem can itself be case-insensitive) — a review pass proved that
+# making recognition case-SENSITIVE was its own bypass: an uppercase-hex worktree simply fell
+# outside the pattern and was granted the "unfamiliar naming shape" fail-open ALLOW, skipping
+# the ownership check entirely rather than being subject to it. Recognition and OWNERSHIP are
+# two separate questions, deliberately handled differently: `_own_agent_id`'s comparison below
+# stays EXACT / case-sensitive (never folded) — folding a hex id belonging to two DIFFERENT
+# agents that merely differ in case would turn distinct identities into a match. So: any
+# case variant of `agent-<hex>` is recognized as CC's worktree-naming convention and therefore
+# gated (never silently waved through), but only an EXACT id match grants ownership.
 _WORKTREE_AGENT_SEGMENT_RE = re.compile(r"^agent-([0-9a-f]{6,64})$", re.IGNORECASE)
 
 
@@ -130,13 +139,33 @@ def _extract_worktree_agent_id(path_str: str) -> str | None:
     Walks EVERY path segment (not just the last) so a path like
     `/repo/.claude/worktrees/agent-abc123/nested/dir` still resolves to `abc123` even when
     EnterWorktree's `path` points somewhere inside the worktree rather than at its root.
-    Deliberately requires the LITERAL `.claude/worktrees/` parent segments — a directory that
-    merely happens to be named `agent-<hex>` elsewhere on disk (outside that convention) is not
-    treated as an owned/foreign worktree signal.
+    Deliberately requires the LITERAL `.claude`/`worktrees` parent segments (case-insensitive,
+    see below) — a directory that merely happens to be named `agent-<hex>` elsewhere on disk
+    (outside that convention) is not treated as an owned/foreign worktree signal.
+
+    `os.path.realpath` resolves the path FIRST — both symlinks AND `.`/`..` lexically — before
+    segment-scanning. A review pass proved this is required, not cosmetic, and caught it twice:
+      - `..`-laundering: `/repo/.claude/not-worktrees/../worktrees/agent-<id>` resolves to
+        exactly `/repo/.claude/worktrees/agent-<id>` on any real filesystem lookup
+        EnterWorktree itself would do, but the raw segments never contain the literal
+        `.claude`/`worktrees` adjacency this scan requires.
+      - a symlink alias pointing AT a foreign worktree resolves to its real target the same way
+        EnterWorktree's own filesystem lookup would see it. `realpath` is safe to call
+        unconditionally: on a path that doesn't exist (or doesn't exist yet) it degrades to the
+        same LEXICAL normalization `normpath` would do for the nonexistent trailing component,
+        never raises, and never touches the network/blocks — it's a superset of `normpath`,
+        not an added risk.
+    Segment comparison for `.claude`/`worktrees` is deliberately case-INSENSITIVE too (parallel
+    to `_WORKTREE_AGENT_SEGMENT_RE`, also `re.IGNORECASE`) — on a case-insensitive filesystem
+    `/.CLAUDE/WORKTREES/agent-<id>` is the SAME directory `git worktree list` would report, and
+    an exact-case-only comparison here was itself a review-caught bypass: it fell through to
+    the "unfamiliar shape" fail-open ALLOW instead of being recognized and gated. As with the
+    `agent-<id>` id itself, RECOGNIZING the shape is permissive; only the id comparison in
+    `main()` stays exact.
     """
-    parts = PurePath(path_str).parts
+    parts = PurePath(os.path.realpath(path_str)).parts
     for i in range(len(parts) - 2):
-        if parts[i] == ".claude" and parts[i + 1] == "worktrees":
+        if parts[i].lower() == ".claude" and parts[i + 1].lower() == "worktrees":
             match = _WORKTREE_AGENT_SEGMENT_RE.match(parts[i + 2])
             if match:
                 return match.group(1)
@@ -202,6 +231,28 @@ def main() -> int:
         return 0
 
     own_agent_id = _own_agent_id(event)
+    # EXACT, case-sensitive compare — deliberately NOT case-folded, even though
+    # `_WORKTREE_AGENT_SEGMENT_RE` (above) recognizes EITHER case for the path segment. Every
+    # observed CC agent id/worktree name pairs the two verbatim (same casing), so a legitimate
+    # re-entry always compares equal here.
+    #
+    # CONSIDERED AND REJECTED twice across review rounds, in BOTH directions — recorded so a
+    # future reader doesn't "fix" this back and forth again:
+    #   1. Case-sensitive segment RECOGNITION (an earlier version) let an uppercase-hex foreign
+    #      worktree fall through the "unfamiliar shape" fail-open ALLOW entirely, skipping the
+    #      ownership check — closed by making RECOGNITION case-insensitive (above).
+    #   2. Case-FOLDED id comparison (tried next) would let a case-VARIANT id belonging to a
+    #      DIFFERENT agent pass as an ownership match — a real bypass, not hypothetical.
+    #   3. Verified empirically (not assumed) that `os.path.realpath` does NOT canonicalize
+    #      case on this machine's case-insensitive-but-case-preserving APFS volume — it returns
+    #      whatever case the caller passed in, unresolved — so realpath does not rescue #2 either.
+    # Between "a same-agent re-entry spelled in an unexpected case gets BLOCKED and has to go
+    # through hatch escalation" (safe: fails toward asking a human) and "a foreign agent whose
+    # id merely differs in case is silently granted ownership" (unsafe: the exact incident this
+    # hook exists to prevent), the exact/case-sensitive comparison is the correct trade-off for
+    # a security gate — deny-by-default beats a convenience-motivated fold. Every real CC
+    # agent_id/worktree-name pair this hook has ever observed shares identical casing anyway
+    # (both are produced by CC in one step), so this is not expected to bite in practice.
     if own_agent_id is not None and own_agent_id == target_agent_id:
         # Re-entering / switching into a worktree THIS agent owns — legitimate, unaffected.
         emit("allow")

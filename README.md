@@ -154,8 +154,8 @@ exit `10` = block, other = error → `on_error` policy). To install one:
 2. Set the descriptor's `cmd` to the script's **absolute path** (the runner rejects
    relative/bare commands).
 3. Drop the descriptor into your harness's hook directory for the matching point
-   (`pre-bash`, `pre-write`, `pre-agent`, `pre-skill`, `pre-monitor`, `post-write`, `stop` —
-   map to your harness's real event names).
+   (`pre-bash`, `pre-write`, `pre-agent`, `pre-skill`, `pre-monitor`, `pre-worktree-enter`,
+   `post-write`, `stop` — map to your harness's real event names).
 
 `rig apply` does all three for you (it rewrites the `cmd` placeholder to the script's
 absolute path in your agent-tools checkout). See [`agent-hooks/README.md`](agent-hooks/README.md)

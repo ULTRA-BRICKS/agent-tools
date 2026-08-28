@@ -103,6 +103,82 @@ def test_block_nested_path_inside_foreign_worktree(monkeypatch):
     assert _decision(out) == "block"
 
 
+def test_block_dot_dot_laundered_path_is_still_recognized(monkeypatch):
+    """A `..`-laundered path that lexically resolves to a foreign `.claude/worktrees/agent-<id>`
+    path must still be caught — a review pass proved the raw, unnormalized segment scan let
+    `/repo/.claude/not-worktrees/../worktrees/agent-<id>` slip past (no literal `.claude`/
+    `worktrees` adjacency in the raw parts) straight into the fail-open "unfamiliar shape"
+    ALLOW, even though it resolves to exactly the gated path on any real filesystem lookup."""
+    out, _e, code = _run(
+        monkeypatch,
+        path="/repo/.claude/not-worktrees/../worktrees/agent-deadbeef01",
+        agent_id="sub-1",
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_block_dot_segment_path_is_still_recognized(monkeypatch):
+    """A `.`-segment path (`/.claude/worktrees/./agent-<id>`) is likewise recognized — PurePath
+    already drops bare `.` components on its own, but this pins the combined normalize+scan
+    behavior rather than relying on that being true forever."""
+    out, _e, code = _run(
+        monkeypatch,
+        path="/repo/.claude/worktrees/./agent-deadbeef01",
+        agent_id="sub-1",
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_block_uppercase_claude_worktrees_segments_is_still_recognized(monkeypatch):
+    """RECOGNIZING `.claude`/`worktrees` is case-insensitive, not just the `agent-<id>` segment
+    — a review pass proved an exact-case-only comparison on those two parent segments was
+    itself a bypass: `/.CLAUDE/WORKTREES/agent-<id>` (a case-insensitive filesystem's own
+    spelling of the SAME directory `git worktree list` would report) fell through to the
+    "unfamiliar shape" fail-open ALLOW instead of being recognized and gated."""
+    out, _e, code = _run(
+        monkeypatch,
+        path="/repo/.CLAUDE/WORKTREES/agent-deadbeef01",
+        agent_id="sub-1",
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_block_symlink_alias_to_foreign_worktree(monkeypatch, tmp_path):
+    """A symlink whose REAL target resolves into a foreign `.claude/worktrees/agent-<id>` path
+    must be recognized just like the literal path would be — a review pass proved
+    `os.path.normpath` alone (lexical `.`/`..` collapsing, no filesystem access) doesn't
+    resolve an actual symlink, so an alias path bypassed the guard entirely. `os.path.realpath`
+    (used now) follows the symlink to its real target before the segment scan."""
+    real_worktrees = tmp_path / "repo" / ".claude" / "worktrees"
+    real_worktrees.mkdir(parents=True)
+    foreign = real_worktrees / "agent-deadbeef01"
+    foreign.mkdir()
+    alias = tmp_path / "alias-to-foreign"
+    alias.symlink_to(foreign)
+
+    out, _e, code = _run(monkeypatch, path=str(alias), agent_id="sub-1")
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_allow_symlink_alias_to_own_worktree(monkeypatch, tmp_path):
+    """The symlink-resolution fix must not turn a legitimate re-entry into a false block: an
+    alias resolving to the CALLER'S OWN worktree still allows."""
+    real_worktrees = tmp_path / "repo" / ".claude" / "worktrees"
+    real_worktrees.mkdir(parents=True)
+    own = real_worktrees / "agent-deadbeef01"
+    own.mkdir()
+    alias = tmp_path / "alias-to-own"
+    alias.symlink_to(own)
+
+    out, _e, code = _run(monkeypatch, path=str(alias), agent_id="deadbeef01")
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
 def test_block_message_names_the_safe_alternative(monkeypatch):
     out, _e, _c = _run(monkeypatch, agent_id="sub-1")
     msg = json.loads(out)["message"]
@@ -121,8 +197,45 @@ def test_agent_id_top_level_event_fallback(monkeypatch):
 # ── ALLOW: legitimate EnterWorktree uses ──────────────────────────────────────────────────
 
 def test_allow_reentering_own_worktree(monkeypatch):
+    """A valid hex id (`_WORKTREE_AGENT_SEGMENT_RE` requires `[0-9a-f]{6,64}`) is required here
+    so this genuinely exercises the OWNERSHIP-MATCH branch, not the unfamiliar-shape fail-open
+    branch — an earlier version of this test used the non-hex `agent-sub-1`, which never
+    matched the pattern at all and passed for the wrong reason (review-caught)."""
     out, _e, code = _run(
-        monkeypatch, path="/repo/.claude/worktrees/agent-sub-1", agent_id="sub-1"
+        monkeypatch, path="/repo/.claude/worktrees/agent-deadbeef01", agent_id="deadbeef01"
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_block_uppercase_hex_foreign_worktree_is_still_recognized(monkeypatch):
+    """RECOGNIZING the `agent-<id>` shape is case-insensitive — an uppercase-hex worktree name
+    must NOT fall through the "unfamiliar naming shape" fail-open path (that was itself a
+    bypass: a review pass proved a case-sensitive-only pattern let a mismatched-case foreign
+    worktree through unblocked). It must still be BLOCKED like any other foreign worktree."""
+    out, _e, code = _run(
+        monkeypatch, path="/repo/.claude/worktrees/agent-DEADBEEF01", agent_id="deadbeef01"
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_block_case_variant_id_is_not_treated_as_ownership(monkeypatch):
+    """A lowercase-hex target with a DIFFERENT own agent_id is BLOCKED even though the two
+    strings would collide under case-folding — OWNERSHIP comparison is exact, never folded,
+    even though shape RECOGNITION is case-insensitive (the two are deliberately separate)."""
+    out, _e, code = _run(
+        monkeypatch, path="/repo/.claude/worktrees/agent-deadbeef01", agent_id="DEADBEEF01"
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_allow_reentering_own_worktree_matching_uppercase(monkeypatch):
+    """An exact (not merely case-folded) match still allows re-entry even when both the
+    worktree segment and the caller's own agent_id happen to share uppercase casing."""
+    out, _e, code = _run(
+        monkeypatch, path="/repo/.claude/worktrees/agent-DEADBEEF01", agent_id="DEADBEEF01"
     )
     assert code == 0
     assert _decision(out) == "allow"

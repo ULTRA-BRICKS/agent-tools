@@ -125,6 +125,9 @@ dispatcher rig points at. Manual equivalent (what rig writes):
           "command": "python3 -m cc_hook_bridge PreToolUse" }] },
       { "matcher": "Workflow",
         "hooks": [{ "type": "command",
+          "command": "python3 -m cc_hook_bridge PreToolUse" }] },
+      { "matcher": "EnterWorktree",
+        "hooks": [{ "type": "command",
           "command": "python3 -m cc_hook_bridge PreToolUse" }] }
     ],
     "PostToolUse": [

@@ -773,7 +773,10 @@ def test_pre_worktree_enter_foreign_worktree_is_blocked_clean_room(tmp_path):
 
 def test_pre_worktree_enter_own_worktree_passes_clean_room(tmp_path):
     """The same guard, but re-entering a worktree whose embedded id matches the caller's own
-    top-level agent_id is NOT blocked."""
+    top-level agent_id is NOT blocked. Uses a valid hex id (`_WORKTREE_AGENT_SEGMENT_RE`
+    requires `[0-9a-f]{6,64}`) so this genuinely exercises the OWNERSHIP-MATCH branch, not the
+    unfamiliar-shape fail-open branch — an earlier version used the non-hex `agent-sub-1`,
+    which never matched the pattern at all and passed for the wrong reason (review-caught)."""
     home = tmp_path / "home"
     hooks = home / ".claude" / "hooks"
     _install_descriptor(hooks, hook_id="enterworktree-foreign-guard", point="pre-worktree-enter",
@@ -781,8 +784,8 @@ def test_pre_worktree_enter_own_worktree_passes_clean_room(tmp_path):
     cc_event = {
         "hook_event_name": "PreToolUse",
         "tool_name": "EnterWorktree",
-        "tool_input": {"path": "/repo/.claude/worktrees/agent-sub-1"},
-        "agent_id": "sub-1",
+        "tool_input": {"path": "/repo/.claude/worktrees/agent-deadbeef01"},
+        "agent_id": "deadbeef01",
         "cwd": str(tmp_path),
     }
     proc = _run_dispatch("PreToolUse", cc_event, home=home)
