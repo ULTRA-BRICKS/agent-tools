@@ -12,11 +12,42 @@ What counts as user-visible (staged file inspection):
   - OR a path under components/ ui/ pages/ app/ views/ public/ assets/
   If NO user-visible file is staged → allow (nothing to prove).
 
-The marker contract (how it knows a screenshot was looked at):
-  The visual-proof-cycle skill / a screenshot-capture step touches a file in:
-      ~/.cache/agent-tools/visual-proof/<key>     (mtime = "looked at it" time)
-  Any fresh file in that dir (within VISUAL_PROOF_WINDOW_S, default 3600s) satisfies the gate.
-  Configure the dir with VISUAL_PROOF_DIR.
+The marker contract (how it knows a screenshot was looked at — agent-tools#475):
+  Two kinds of marker, both scanned from ~/.cache/agent-tools/visual-proof/ (configure the dir
+  with VISUAL_PROOF_DIR), both must be FRESH (within VISUAL_PROOF_WINDOW_S, default 3600s):
+
+  1. PRIMARY — a dev-cli `dev shot <url> --out /tmp/shot.png` attestation (`attest-*.json`,
+     written by dev-cli's `write_attestation()`; the output path MUST be OUTSIDE the repo — see
+     the README for why). This gate accepts the record only when ALL of:
+     `repo` is this commit's resolved git toplevel; `staged_sha256` is the sha256 of THIS
+     commit's `git diff --cached` right now; `worktree_dirty` was recorded as exactly `False`
+     (a dirty worktree at capture time means the browser may have rendered content that was
+     never staged at all); and `capture_sha256` matches a FRESH re-hash of the file at
+     `capture_path` (proves an actual capture file exists, not just two `git`-derived facts a
+     forger could type by hand). A record failing any one of these does not satisfy the gate.
+  2. FALLBACK (no URL to shoot — a docs-only visual change, a generated image, a schematic per
+     visual-proof-cycle) — `visual_proof_gate.py --write-marker` writes a plain marker whose
+     content is this commit's resolved git toplevel path. Weaker than (1) — it is not bound to
+     the staged diff — but still repo-scoped and content-checked, unlike the old bare `touch`.
+
+  BOTH close the same hole: previously ANY fresh file, of ANY content, anywhere in the shared
+  marker directory satisfied EVERY repo's gate machine-wide (agent-tools#475) — an agent
+  screenshotting repo A silently satisfied repo B's unrelated commit for up to an hour, and a
+  junk file dropped there by anything else worked just as well as a real screenshot. See
+  `_proof_fresh` for the validation.
+
+  KNOWN, ACCEPTED GAP (review finding, round 4): this hook is a `pre-bash` hook — it inspects
+  the command about to run and returns a verdict BEFORE the shell actually executes `git
+  commit`. There is no lock between "this hook approved the currently-staged diff" and "the
+  shell's `git commit` reads the index a moment later" — a concurrent `git add`/`git reset` in
+  that gap can change what actually gets committed after the check already passed. This is not
+  specific to the diff-hash binding added here; it is inherent to every check this whole file
+  performs (`staged_files`, the skip-flag parse, all of it) and to the pre-bash hook model in
+  general — a hook that only sees an event over stdin has no way to make the subsequent shell
+  execution atomic with its own check. Closing it would need the actual `git commit` process
+  itself to be wrapped/locked, which is out of a pre-bash hook's reach. Matches this file's
+  stated doctrine (`on_error: "open"`: process discipline, not a security boundary) — accepted
+  here rather than silently ignored.
 
 This gate straight-BLOCKs (doctrine: "block a commit ... with no attached screenshot"), but
 is satisfiable (touch the marker after you VIEW the capture).
@@ -41,13 +72,16 @@ never wedge committing.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
 import re
 import shlex
+import stat
 import subprocess  # noqa: S404 — listing staged files is the whole job
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -724,18 +758,317 @@ def visual_staged(files: list[str]) -> list[str]:
     return [f for f in files if VISUAL_EXT.search(f) or VISUAL_DIR.search(f)]
 
 
-def _proof_fresh() -> bool:
-    """True if any marker in PROOF_DIR is fresh (a screenshot was looked at recently)."""
+# Every path this hook reads MARKER CONTENT from — a file in the shared PROOF_DIR, or a
+# `capture_path` referenced from inside a JSON attestation — is untrusted, attacker/agent-
+# controlled input (review finding, round 3). A FIFO (or a symlink to one) placed at such a
+# path makes a naive `read_bytes()`/`read_text()` BLOCK FOREVER waiting for a writer that never
+# comes; this hook's own descriptor is `on_error: "open"`, so a hook that hangs past its
+# timeout is treated as a CRASHED hook, which ALLOWS the commit — the exact bypass this whole
+# fix exists to close, reached by making the CHECK itself hang instead of defeating its logic.
+# A character device (`/dev/zero`) risks unbounded memory instead. `_MAX_MARKER_BYTES` bounds a
+# plain-text fallback marker or a JSON attestation (both are small structured text).
+#
+# `_MAX_CAPTURE_BYTES` must not reject a capture dev-cli's own producer would legitimately
+# permit (review finding, round 5): dev-cli's `visual_proof.MAX_PIXELS` is 40,000,000 and
+# `MAX_DIMENSION` is 60,000 — a full-page capture at that ceiling is up to 160MB as raw RGBA
+# (40M px * 4 bytes), and PNG's DEFLATE never expands data by more than a small constant
+# factor even on a near-incompressible (photo/noise-heavy) page, so 200MB comfortably covers
+# even a pathological worst-case capture dev-cli would still accept — not just the common case
+# (an ordinary UI screenshot, mostly flat colour/text, compresses far smaller than this). Still
+# a firm, bounded ceiling for the DoS concern this whole helper exists for.
+_MAX_MARKER_BYTES = 1_000_000
+_MAX_CAPTURE_BYTES = 200_000_000
+
+# A per-file size cap alone doesn't bound TOTAL work when there are many files (review finding,
+# round 6): an agent can drop thousands of fresh, valid-SHAPED `.json` markers in PROOF_DIR,
+# each pointing `capture_path` at a large (up to `_MAX_CAPTURE_BYTES`) regular file with a
+# deliberately wrong hash — every one still costs a real read-and-hash before it's rejected.
+# Enough of them can push total scan time past this hook's own timeout, and `on_error: "open"`
+# turns a timed-out hook into an allowed commit — the same class of bypass the FIFO/size guards
+# above exist to close, reached by volume instead of a single hostile file. Capping the number
+# of FRESH candidates actually inspected bounds worst-case work to a small, fixed multiple of
+# one file's cost, independent of how many junk files exist in the directory. Exceeding the cap
+# does NOT fail open: `_proof_fresh` simply stops looking and returns False (BLOCK/hatch), the
+# same as if none of the remaining candidates had validated — plenty of markers is not itself
+# proof, and this hook has no reason to trust a directory this cluttered.
+_MAX_MARKERS_SCANNED = 200
+
+# dev-cli's `visual_proof.ATTEST_VERSION` (review finding, round 4). dev-cli's own docstring
+# for that constant says v1 measured blankness with plain exact-pixel-equality (scored a
+# gradient-disguised blank page 0% featureless) and recorded the INVOCATION directory as
+# `repo` rather than the resolved toplevel — both silently different from what this gate
+# assumes a record means. An older/foreign producer's record must not be treated as if it
+# carried today's guarantees just because its `repo`/`staged_sha256` happen to still line up
+# (invoking from the repo root makes v1's invocation-dir `repo` value identical to the
+# toplevel, so that alone would NOT have caught it). Exact-match, not `>=`: a hypothetical
+# future version's semantics are unknown until dev-cli's producer and this constant are
+# updated together — same "keep both sides in step" discipline as this repo's other
+# cross-file/cross-repo SYNC contracts.
+_EXPECTED_ATTESTATION_VERSION = 2
+_EXPECTED_ATTESTATION_TOOL = "dev shot"
+
+
+def _safe_regular_file_bytes(path: Path, max_bytes: int) -> bytes | None:
+    """Read `path` ONLY if it IS (at the moment of the read, not a moment earlier) a REGULAR
+    file no larger than `max_bytes`; else None without ever blocking on a read.
+
+    Deliberately NOT `stat()`-then-`read_bytes()` (review finding, round 4 — TOCTOU): checking
+    the type first and opening separately leaves a gap where a concurrent process can swap a
+    checked regular file for a FIFO between the two calls, reintroducing the exact hang this
+    function exists to prevent. Instead: open the SAME fd with `O_NONBLOCK` (so opening a FIFO
+    with no writer returns immediately instead of blocking — the effect this flag exists for;
+    it is a no-op for a regular file) and without following a symlink (`O_NOFOLLOW`, since a
+    regular file reached only by resolving a symlink is a target this function was never asked
+    to trust), THEN `fstat` that exact fd. A file swapped in after the open() call is opening a
+    DIFFERENT inode — this fd's `fstat` still describes what was actually opened, so the type
+    check is authoritative for the bytes actually read next, not for some earlier or later state
+    of the path.
+
+    Also NOT a bare `f.read()` after the size check passes (review finding, round 5 — a second
+    TOCTOU on the SAME fd): `fstat`'s reported size is a snapshot, but a concurrent writer can
+    keep appending to that exact file WHILE `read()` is still consuming it, so an unbounded read
+    can grow past `max_bytes` anyway if the append race outruns us to EOF. Reading exactly
+    `max_bytes + 1` bytes bounds the read regardless of what happens after the size check —
+    getting back more than `max_bytes` (impossible for a genuinely `<= max_bytes` file, since
+    there's nothing left to read past its true end) is itself treated as a rejection, not a
+    truncation-and-accept."""
+    fd = None
+    nofollow = getattr(os, "O_NOFOLLOW", 0)  # not defined on non-POSIX platforms; 0 is a no-op
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | nofollow)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            return None
+        with os.fdopen(fd, "rb") as f:
+            fd = None  # ownership transferred to the file object; don't double-close below
+            data = f.read(max_bytes + 1)
+            return None if len(data) > max_bytes else data
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _repo_toplevel(cwd: str) -> str | None:
+    """The real (symlink-resolved) git repo toplevel containing `cwd`, or None if git can't
+    answer. Used to scope the proof marker to a REPO, not a bare directory — a screenshot
+    looked at from the repo root still scopes the same as a commit made from a subdirectory
+    (monorepo packages, `vscode-extension/`, …), because both resolve to the same toplevel;
+    matches dev-cli's own `_git_toplevel` binding in `write_attestation` (agent-tools#475)."""
+    try:
+        proc = subprocess.run(  # noqa: S603,S607 — fixed git argv, trusted
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=GIT_DIFF_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    top = proc.stdout.strip()
+    return os.path.realpath(top) if top else None
+
+
+def _resolved_repo_root(cwd: str, session_cwd: str) -> str | None:
+    """`_repo_toplevel(cwd)`, falling back to `session_cwd` in the SAME shape as
+    `_resolve_staged_files` — try the resolved commit target first, then the session's own
+    cwd when the target doesn't exist on disk. Keeps the proof-marker scope aligned with
+    whichever directory `staged_files` actually succeeded against."""
+    top = _repo_toplevel(cwd)
+    if top is not None:
+        return top
+    if cwd != session_cwd and not os.path.isdir(cwd):
+        return _repo_toplevel(session_cwd)
+    return None
+
+
+def _staged_diff_hash(repo_root: str) -> str | None:
+    """sha256 of the FULL `git diff --cached` (not `--name-only`) for `repo_root`, or None if
+    git can't be queried or nothing is staged. Deliberately reproduces dev-cli's own
+    `staged_diff_hash` computation exactly (same argv, same raw-bytes hash) — this is the
+    value a `dev shot` attestation's `staged_sha256` field must match to be accepted. An empty
+    staged diff hashes to a real, stable value that would trivially match a repo's frequent
+    "nothing staged" state, so that case is treated as unbound (None), same as dev-cli does."""
+    try:
+        proc = subprocess.run(  # noqa: S603,S607 — fixed git argv, trusted
+            ["git", "-C", repo_root, "diff", "--cached"],
+            capture_output=True, timeout=GIT_DIFF_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return hashlib.sha256(proc.stdout).hexdigest()
+
+
+def _attestation_satisfies(record: object, repo_root: str, staged_hash: str) -> bool:
+    """True if a parsed `dev shot` attestation JSON (`write_attestation`'s record shape) is
+    bound to EXACTLY this repo, EXACTLY this staged diff, AND an actual capture file that still
+    exists with the exact bytes it was recorded for.
+
+    `repo` + `staged_sha256` alone are NOT enough (review finding, round 1): both are plain
+    `git` queries any agent can run directly, so a record built from just those two fields is a
+    forgery an agent can hand-write with zero screenshot involved — no stronger than the manual
+    fallback marker below, despite claiming to be. Recomputing `capture_sha256` from the file at
+    `capture_path` right now closes that: passing requires a real file on disk whose bytes hash
+    to the recorded digest, not just knowledge of two `git` outputs. `record["repo"]` is
+    realpath-normalized the same way `_repo_toplevel` normalizes ours, so the comparison isn't
+    defeated by a trailing slash or an unresolved symlink component. (This still cannot judge
+    whether the capture was BLANK/degenerate — that verdict lives in dev-cli's own
+    `verdict_for`/`measure_png`, which only runs at capture time and is not re-run here; a
+    forger who fabricates a plausible-looking non-blank PNG and hand-computes every field still
+    gets through. That is a materially higher bar than "type two git commands", and matches
+    this whole marker family's stated honesty-contract, not cryptographic-proof, doctrine.)
+
+    `worktree_dirty` must be exactly `False` (review finding, round 2): dev-cli's `write_attestation`
+    records it because the BROWSER renders the WORKING TREE, but the binding is to the INDEX
+    (`git diff --cached`) — if the worktree had already diverged from the index at capture time
+    (an unstaged edit made after staging, or an untracked asset), the screenshot may show content
+    that was never staged at all, even though `repo` and `staged_sha256` both still check out
+    (they describe the index at capture time, not what the browser actually rendered). Missing,
+    `None`, or `True` are all rejected — only a positively-confirmed clean worktree passes.
+
+    Every field is UNTRUSTED, attacker/agent-controlled JSON — the whole point of this function
+    is judging a record an adversarial caller may have hand-crafted to defeat the gate (review
+    finding, round 3). Two distinct hazards follow from that, both closed here rather than left
+    to propagate:
+      - A `capture_path` containing an embedded NUL (`"\\u0000"`) makes `os.path.realpath` /
+        `Path(...)` raise `ValueError`, not `OSError`. Left uncaught, that propagates out of
+        this function, `_proof_fresh`, and `main()` entirely — and this hook's descriptor is
+        `on_error: "open"`, so a CRASHED gate is an ALLOWED commit, the exact bypass this whole
+        fix exists to close, just reached by a different route than a wrong field value. Every
+        extraction/read here catches `ValueError` alongside the expected `KeyError`/`TypeError`.
+      - A `capture_path` pointing at a FIFO (or a symlink to one) makes a naive read BLOCK
+        FOREVER; past this hook's own timeout that is ALSO an allowed commit (a hung hook is a
+        crashed hook, same `on_error: "open"` consequence). `_safe_regular_file_bytes` rejects
+        anything that isn't a plain, size-bounded regular file before ever attempting to read
+        it — see its own docstring.
+
+    Requires `tool == "dev shot"` and `version == _EXPECTED_ATTESTATION_VERSION` exactly
+    (review finding, round 4): an older/foreign producer's record measured blankness and
+    `worktree_dirty` differently (see the constant's own comment) — accepting it just because
+    its `repo`/`staged_sha256` happen to line up would silently trust guarantees it never
+    actually made."""
+    if not isinstance(record, dict):
+        return False
+    if (
+        record.get("tool") != _EXPECTED_ATTESTATION_TOOL
+        or record.get("version") != _EXPECTED_ATTESTATION_VERSION
+    ):
+        return False
+    try:
+        rec_repo = os.path.realpath(str(record["repo"]))
+        rec_hash = str(record["staged_sha256"])
+        capture_path = str(record["capture_path"])
+        rec_capture_hash = str(record["capture_sha256"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if rec_repo != repo_root or rec_hash != staged_hash:
+        return False
+    if record.get("worktree_dirty") is not False:
+        return False
+    try:
+        capture_bytes = _safe_regular_file_bytes(Path(capture_path), _MAX_CAPTURE_BYTES)
+    except ValueError:
+        return False  # e.g. an embedded NUL byte — Path() itself can raise before .stat()
+    if capture_bytes is None:
+        return False  # missing, a FIFO/device/symlink target, or oversized — see the helper
+    return hashlib.sha256(capture_bytes).hexdigest() == rec_capture_hash
+
+
+def _manual_marker_satisfies(path: Path, repo_root: str) -> bool:
+    """Fallback path for when no `dev shot` capture exists (no URL to shoot — docs-only visual
+    change, a generated image, a schematic). The marker's FIRST LINE must equal `repo_root`
+    exactly — this is what kills the junk-file case a bare `touch` used to pass: an empty file,
+    or any unrelated file that happens to land in this shared directory, no longer satisfies
+    the gate. It does NOT bind to the staged diff (there is no attestation to draw that hash
+    from), so it is strictly weaker than `_attestation_satisfies` — `--write-marker` is meant
+    as the exception, `dev shot` as the norm whenever a URL exists.
+
+    Reads via `_safe_regular_file_bytes` (not a bare `read_text`), for the same reason
+    `_attestation_satisfies` does: `path` is a filesystem entry from a shared, world-writable-
+    by-any-local-agent directory, so it could be a FIFO/device/oversized file, not just a plain
+    marker."""
+    data = _safe_regular_file_bytes(path, _MAX_MARKER_BYTES)
+    if data is None:
+        return False
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    return bool(lines) and lines[0].strip() == repo_root
+
+
+def _proof_fresh(repo_root: str | None) -> bool:
+    """True if a FRESH, correctly-bound proof marker exists for `repo_root` (agent-tools#475).
+
+    `repo_root` is None only when `_resolved_repo_root` itself failed after `staged_files`
+    already succeeded against this same directory — a narrow, self-inflicted git-environment
+    failure, not the common path (see its docstring). Unlike the rest of this hook's git
+    queries, that is NOT treated as fail-open here: this function's whole job is proving a
+    marker is bound to a specific repo, and a None repo means there is nothing to bind against
+    — silently allowing would hand back exactly the "any file, anywhere, satisfies every repo"
+    hole this exists to close. It falls through to the normal BLOCK/hatch path instead, which
+    still isn't a wedge — the Telegram hatch is always available.
+
+    Every fresh (mtime-windowed) file in PROOF_DIR is inspected — `.json` files as a `dev shot`
+    attestation (see `_attestation_satisfies`), everything else as a manual marker (see
+    `_manual_marker_satisfies`) — and this returns True on the first one that validates against
+    `repo_root`. The staged-diff hash is computed at most once per call (lazily, only if a
+    `.json` marker is actually present), since it costs a `git diff --cached` subprocess.
+
+    Freshness requires `0 <= age <= PROOF_WINDOW_S`, not just `age <= PROOF_WINDOW_S` (review
+    finding, round 4): a marker whose mtime is set in the FUTURE has a NEGATIVE age, which the
+    one-sided check would treat as fresh forever — right up until that future date actually
+    arrives. A future mtime is never legitimate (nothing in this hook's own writers, nor
+    dev-cli's, ever backdates or postdates a marker), so it is rejected the same as a stale
+    one rather than silently trusted.
+
+    Inspects at most `_MAX_MARKERS_SCANNED` FRESH candidates, not every file in PROOF_DIR
+    (review finding, round 6): a per-file size cap alone doesn't bound TOTAL work when there
+    are many files — thousands of fresh, valid-shaped `.json` markers, each pointing at a large
+    regular file with a deliberately wrong hash, each still costs a real read-and-hash before
+    being rejected, and enough of them can push total scan time past this hook's own timeout
+    (`on_error: "open"` turns THAT into an allowed commit too). Exceeding the cap does not fail
+    open — it just stops looking and returns False, same as if nothing further had validated."""
+    if repo_root is None:
+        return False
     try:
         if not PROOF_DIR.is_dir():
             return False
         now = time.time()
+        scanned = 0
+        staged_hash: str | None = None
+        staged_hash_tried = False
         for child in PROOF_DIR.iterdir():
             try:
-                if (now - child.stat().st_mtime) <= PROOF_WINDOW_S:
-                    return True
+                age = now - child.stat().st_mtime
+                if age < 0 or age > PROOF_WINDOW_S:
+                    continue
             except OSError:
                 continue
+            scanned += 1
+            if scanned > _MAX_MARKERS_SCANNED:
+                return False  # too many candidates to keep inspecting — stop, don't fail open
+            if child.suffix == ".json":
+                if not staged_hash_tried:
+                    staged_hash = _staged_diff_hash(repo_root)
+                    staged_hash_tried = True
+                if staged_hash is None:
+                    continue  # nothing staged / git unavailable → no diff to bind against
+                # _safe_regular_file_bytes (not a bare read_text): `child` is a filesystem
+                # entry from a shared, world-writable-by-any-local-agent directory, so a
+                # `.json`-named FIFO/device/oversized file is exactly as possible as a real
+                # attestation — see its docstring for why a naive read is a hang-then-fail-open
+                # hazard, not just a parse-error one.
+                data = _safe_regular_file_bytes(child, _MAX_MARKER_BYTES)
+                if data is None:
+                    continue
+                try:
+                    record = json.loads(data)
+                except ValueError:
+                    continue
+                if _attestation_satisfies(record, repo_root, staged_hash):
+                    return True
+            elif _manual_marker_satisfies(child, repo_root):
+                return True
     except OSError:
         return False
     return False
@@ -747,10 +1080,16 @@ def _block_message(visual: list[str]) -> str:
     return (
         f"This commit changes user-visible files ({sample}) but no screenshot was captured "
         "and looked at. Per visual-proof-cycle: capture the rendered result, read the capture "
-        f"back, verify it, THEN commit. Touch a file under {PROOF_DIR} when you've reviewed a "
-        "screenshot. No self-service bypass. ASK the human, or request a one-time Telegram "
-        'approval via RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="<justification>" (deny-by-default; '
-        "bare 1 rejected)."
+        "back, verify it, THEN commit. PRIMARY: `dev shot '<url>' --out /tmp/shot.png` (output "
+        "path OUTSIDE the repo — see README) — it writes "
+        "a proof record bound to THIS repo and THIS staged diff, no manual marker needed. "
+        "FALLBACK (no URL to shoot): `python3 "
+        f"{Path(__file__).resolve()} --write-marker` from inside the repo, after you've "
+        f"actually reviewed a capture some other way — a bare `touch` under {PROOF_DIR} no "
+        "longer satisfies this gate (agent-tools#475: it used to be content-blind and "
+        "machine-global). No self-service bypass. ASK the human, or request a one-time "
+        'Telegram approval via RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="<justification>" '
+        "(deny-by-default; bare 1 rejected)."
     )
 
 
@@ -811,12 +1150,53 @@ def main() -> int:
         emit("allow")  # no user-visible files staged → nothing to prove
         return 0
 
-    if _proof_fresh():
-        emit("allow")  # a screenshot was captured and looked at recently → satisfied
+    repo_root = _resolved_repo_root(cwd, session_cwd)
+    if _proof_fresh(repo_root):
+        emit("allow")  # a correctly-scoped, correctly-bound marker is fresh → satisfied
         return 0
 
     return _decide_block(command, cwd, visual)
 
 
+def _cli_write_marker(argv: list[str]) -> int:
+    """`visual_proof_gate.py --write-marker [cwd]` — the FALLBACK way to satisfy this gate when
+    there is no URL to `dev shot` (docs-only visual change, a generated image, a schematic per
+    visual-proof-cycle). Writes a marker whose content is the resolved repo toplevel of `cwd`
+    (default: current directory) — the same binding `_manual_marker_satisfies` checks for.
+
+    Uses `tempfile.mkstemp` (`O_CREAT|O_EXCL`, an unpredictable random suffix, auto-retry on a
+    name collision) rather than a predictable `looked-<millisecond-timestamp>` name written
+    with a plain, symlink-following create (review finding, round 6): PROOF_DIR is a directory
+    shared by every local agent, so a millisecond-granularity filename is guessable/sprayable —
+    another process could pre-create `looked-<ts>` as a symlink pointing at an arbitrary
+    user-writable file, and a plain create would follow it and overwrite that target instead of
+    writing a marker. `O_EXCL` refuses to open ANY existing path (including a symlink, even a
+    dangling one) when combined with `O_CREAT` — POSIX-specified, not a NOFOLLOW nuance — so
+    this can only ever create a brand-new, never-before-existing regular file.
+
+    This is a CLI entry point, not the pre-bash hook contract (agents-hooks/v1 events arrive on
+    stdin with no argv) — the harness never invokes the script this way, so this branch is
+    inert for every normal `pre-bash` dispatch and only runs when explicitly invoked by hand."""
+    cwd = argv[0] if argv else os.getcwd()
+    top = _repo_toplevel(cwd)
+    if top is None:
+        warn(f"could not resolve a git repo toplevel for {cwd} — nothing written")
+        return 1
+    try:
+        PROOF_DIR.mkdir(parents=True, exist_ok=True)
+        fd, marker_path = tempfile.mkstemp(prefix="looked-", dir=str(PROOF_DIR))
+        try:
+            os.write(fd, (top + "\n").encode())
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        warn(f"could not write proof marker: {exc}")
+        return 1
+    sys.stderr.write(f"visual-proof-gate: wrote proof marker for {top} -> {marker_path}\n")
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--write-marker":
+        sys.exit(_cli_write_marker(sys.argv[2:]))
     sys.exit(main())

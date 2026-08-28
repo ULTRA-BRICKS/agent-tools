@@ -21,8 +21,10 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -78,8 +80,78 @@ def _decision(out: str) -> str:
 
 
 def _touch_proof(proof_dir: Path) -> None:
+    """The OLD, now-invalid contract: a blind, content-free touch. Kept as a helper because it
+    is exactly the shape agent-tools#475's regression tests need to prove no longer works."""
     proof_dir.mkdir(parents=True, exist_ok=True)
     (proof_dir / "looked").write_text("x")
+
+
+def _write_manual_marker(proof_dir: Path, repo: Path, *, name: str = "looked") -> Path:
+    """A correctly-scoped FALLBACK marker: first line is the repo's real toplevel path — the
+    shape `--write-marker` / `_manual_marker_satisfies` expect."""
+    proof_dir.mkdir(parents=True, exist_ok=True)
+    top = str(Path(subprocess.run(  # noqa: S603,S607
+        ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout.strip()).resolve())
+    marker = proof_dir / name
+    marker.write_text(top + "\n")
+    return marker
+
+
+def _staged_diff_sha256(repo: Path) -> str:
+    """The exact hash `_staged_diff_hash`/dev-cli's `staged_diff_hash` compute, for building a
+    genuine (or deliberately stale) attestation in tests."""
+    import hashlib as _hashlib
+    proc = subprocess.run(["git", "-C", str(repo), "diff", "--cached"],  # noqa: S603,S607
+                          capture_output=True, timeout=10, check=True)
+    return _hashlib.sha256(proc.stdout).hexdigest()
+
+
+def _write_attestation(
+    proof_dir: Path, repo: Path, *, staged_sha256: str | None = None,
+    repo_override: str | None = None, name: str | None = None,
+    worktree_dirty: object = False, capture_sha256: str | None = None,
+    write_capture_file: bool = True, omit_fields: tuple[str, ...] = (),
+    version: object = 2, tool: object = "dev shot",
+) -> Path:
+    """A `dev shot`-shaped attestation JSON. Defaults to a GENUINE, fully-valid record (real
+    repo toplevel, real current staged-diff hash, worktree_dirty=False, version 2, tool "dev
+    shot", and a real on-disk capture file whose sha256 matches `capture_sha256`) — every knob
+    below exists to build a deliberately INVALID variant for the negative tests:
+    `staged_sha256`/`repo_override` for a repo/diff mismatch, `worktree_dirty=True`/`None` for
+    a dirty-worktree-at-capture-time record, `capture_sha256=`/`write_capture_file=False` for a
+    forged-without-a-real-file record, `version=`/`tool=` for a foreign/legacy-producer record,
+    `omit_fields` for a record missing a required key entirely."""
+    import hashlib as _hashlib
+    proof_dir.mkdir(parents=True, exist_ok=True)
+    top = repo_override or str(Path(subprocess.run(  # noqa: S603,S607
+        ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout.strip()).resolve())
+    capture_path = proof_dir / f"shot-{int(time.time() * 1000)}.png"
+    capture_bytes = b"not a real png, just needs a stable hash for the test"
+    if write_capture_file:
+        capture_path.write_bytes(capture_bytes)
+    record = {
+        "version": version,
+        "tool": tool,
+        "captured_at": int(time.time()),
+        "repo": top,
+        "staged_sha256": staged_sha256 if staged_sha256 is not None else _staged_diff_sha256(repo),
+        "worktree_dirty": worktree_dirty,
+        "capture_path": str(capture_path),
+        "capture_sha256": (
+            capture_sha256 if capture_sha256 is not None
+            else _hashlib.sha256(capture_bytes).hexdigest()
+        ),
+        "url": "http://localhost:5173/",
+    }
+    for field in omit_fields:
+        record.pop(field, None)
+    marker = proof_dir / (name or f"attest-{int(time.time() * 1000)}.json")
+    marker.write_text(json.dumps(record))
+    return marker
 
 
 def _fake_tg_ctl(path: Path, body: str) -> Path:
@@ -638,14 +710,378 @@ def test_fail_open_when_cwd_is_not_a_git_repo(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
 
 
-# ── SATISFIED MARKER ───────────────────────────────────────────────────────────────────
+# ── SATISFIED MARKER (agent-tools#475: scoped + content-checked, not just "a file exists") ──
 
 def test_allow_when_proof_marker_fresh(tmp_path, monkeypatch):
+    """(c) A genuine, correctly-scoped FALLBACK marker (repo toplevel as content) DOES still
+    satisfy the gate — the legitimate manual path keeps working."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    _write_manual_marker(proof, repo)
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_bare_touch_junk_marker_no_longer_satisfies_the_gate(tmp_path, monkeypatch):
+    """(b) The OLD contract — any fresh file, any content — must no longer satisfy the gate.
+    A blind `touch` (empty content, doesn't name any repo) is exactly the shape agent-tools#475
+    describes as a junk file that used to pass."""
     repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
     proof = tmp_path / "proof"
     _touch_proof(proof)
     out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_arbitrary_content_marker_no_longer_satisfies_the_gate(tmp_path, monkeypatch):
+    """(b) A file with unrelated, non-junk-but-still-wrong content (not a repo path, not valid
+    attestation JSON) must not satisfy the gate either — content is actually CHECKED, not just
+    "non-empty"."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True)
+    (proof / "looked").write_text("I definitely looked at a screenshot, I promise\n")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_manual_marker_scoped_to_a_different_repo_does_not_satisfy(tmp_path, monkeypatch):
+    """(a) A marker whose content names a DIFFERENT repo's toplevel must not satisfy THIS
+    repo's gate — the core agent-tools#475 cross-repo leak: repo A's marker satisfying repo
+    B's commit, machine-wide, via a shared marker directory."""
+    repo_a = _mk_repo_with_staged(tmp_path, "unused.tsx")
+    repo_b_root = tmp_path / "repo_b"
+    repo_b_root.mkdir()
+    repo_b = _mk_repo_with_staged(repo_b_root, "src/Button.tsx")  # distinct repo, own subdir
+    proof = tmp_path / "proof"  # ONE shared marker dir, as it is in real machine-global usage
+    _write_manual_marker(proof, repo_a)  # marker names repo A's toplevel
+    out, _e, c = _run("git commit -m x", repo_b, monkeypatch, proof_dir=proof)  # commit in B
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_dev_shot_attestation_matching_repo_and_staged_diff_satisfies(tmp_path, monkeypatch):
+    """(c) A genuine `dev shot` attestation — repo toplevel AND staged-diff hash both correct —
+    satisfies the gate. This is the PRIMARY path."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    _write_attestation(proof, repo)  # defaults: real repo + real current staged-diff hash
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
     assert c == 0 and _decision(out) == "allow"
+
+
+def test_dev_shot_attestation_for_a_different_repo_does_not_satisfy(tmp_path, monkeypatch):
+    """(a) An attestation whose `repo` field names a DIFFERENT repo must not satisfy THIS
+    repo's gate, even with a byte-identical staged diff (both repos stage the same file)."""
+    repo_a = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    repo_b_root = tmp_path / "repo_b"
+    repo_b_root.mkdir()
+    repo_b = _mk_repo_with_staged(repo_b_root, "src/Button.tsx")  # identical staged content
+    proof = tmp_path / "proof"
+    _write_attestation(proof, repo_a)  # attests repo A's diff
+    out, _e, c = _run("git commit -m x", repo_b, monkeypatch, proof_dir=proof)  # commit in B
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_dev_shot_attestation_with_stale_staged_hash_does_not_satisfy(tmp_path, monkeypatch):
+    """(a)/(b) An attestation for the RIGHT repo but a staged-diff hash that no longer matches
+    (the staged content moved on since the screenshot was taken) must not satisfy the gate —
+    the binding is to a specific diff, not just a specific repo."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    _write_attestation(proof, repo, staged_sha256="0" * 64)  # correct repo, wrong/stale hash
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_dev_shot_attestation_malformed_json_does_not_satisfy(tmp_path, monkeypatch):
+    """(b) A `.json`-suffixed junk file (invalid JSON, or valid JSON missing the required
+    fields) must not satisfy the gate — parsing/field failure is treated as "not a marker",
+    not as a free pass."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True)
+    (proof / "attest-junk.json").write_text("not even json {{{")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+# ── review findings (round 4): legacy version/tool, and a future-dated marker ──────────────
+
+def test_dev_shot_attestation_with_wrong_version_does_not_satisfy(tmp_path, monkeypatch):
+    """An otherwise-perfect record from a producer version OTHER than
+    `_EXPECTED_ATTESTATION_VERSION` must not satisfy the gate — dev-cli's own docs say an
+    older version measured blankness and worktree-dirt differently, so its guarantees are not
+    equivalent even when its repo/staged-hash happen to still line up."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    _write_attestation(proof, repo, version=1)
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_dev_shot_attestation_with_wrong_tool_does_not_satisfy(tmp_path, monkeypatch):
+    """A record claiming a different (or absent) producer tool must not satisfy the gate — the
+    attestation contract is specific to dev-cli's `dev shot`, not an open schema any producer
+    can claim to speak."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    _write_attestation(proof, repo, tool="some other tool")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_future_dated_marker_does_not_satisfy_the_gate(tmp_path, monkeypatch):
+    """(b) A marker whose mtime is set in the FUTURE has a NEGATIVE age — a one-sided freshness
+    check (`age <= WINDOW`) would treat it as fresh forever, right up until that future date
+    actually arrives. Must be rejected the same as a stale marker."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    marker = _write_manual_marker(proof, repo)
+    future = time.time() + 10 * vpg.PROOF_WINDOW_S
+    os.utime(marker, (future, future))
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+# ── review findings (round 2): repo+staged-hash alone is a forgeable "primary" path ────────
+
+def test_dev_shot_attestation_missing_capture_fields_does_not_satisfy(tmp_path, monkeypatch):
+    """A record with the CORRECT repo and staged-diff hash but missing `capture_path` /
+    `capture_sha256` must not satisfy the gate — those two fields are exactly what an agent
+    CANNOT produce by just running `git rev-parse`/`git diff --cached` itself, so accepting a
+    record without them would make the 'primary' path no stronger than typing two git
+    commands (the review finding this closes)."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    _write_attestation(proof, repo, omit_fields=("capture_path", "capture_sha256"))
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_dev_shot_attestation_with_no_real_capture_file_does_not_satisfy(tmp_path, monkeypatch):
+    """A record naming a `capture_path` that doesn't actually exist on disk — the exact shape
+    of a hand-typed forgery that knows the right repo/diff/hash values but never ran `dev
+    shot` — must not satisfy the gate."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    _write_attestation(proof, repo, write_capture_file=False)
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_dev_shot_attestation_with_embedded_nul_capture_path_blocks_not_crashes(
+    tmp_path, monkeypatch,
+):
+    """(b) A `capture_path` containing an embedded NUL byte makes `Path(...).read_bytes()`
+    raise `ValueError`, not `OSError` — an uncaught `ValueError` would unwind out of `main()`
+    entirely, and this hook's descriptor is `on_error: "open"`, so a CRASHED gate would be an
+    ALLOWED commit: the exact bypass this fix exists to close, reached via a different route
+    (review finding, round 3). This must resolve to a normal BLOCK, not an exception."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True)
+    record = {
+        "version": 2, "tool": "dev shot", "captured_at": int(time.time()),
+        "repo": str(vpg._repo_toplevel(str(repo))),
+        "staged_sha256": _staged_diff_sha256(repo),
+        "worktree_dirty": False,
+        "capture_path": "\x00",
+        "capture_sha256": "0" * 64,
+        "url": "http://localhost:5173/",
+    }
+    (proof / "attest-nul.json").write_text(json.dumps(record))
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)  # must not raise
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_dev_shot_attestation_with_wrong_capture_hash_does_not_satisfy(tmp_path, monkeypatch):
+    """A record whose `capture_sha256` does NOT match the actual bytes at `capture_path` —
+    someone edited the file after attesting, or fabricated the digest — must not satisfy."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    _write_attestation(proof, repo, capture_sha256="0" * 64)
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_dev_shot_attestation_with_dirty_worktree_does_not_satisfy(tmp_path, monkeypatch):
+    """A record with `worktree_dirty: true` — the worktree had already diverged from the index
+    when the screenshot was taken, so the browser may have rendered content that was never
+    staged at all — must not satisfy the gate, even with a correct repo/staged-hash/capture."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    _write_attestation(proof, repo, worktree_dirty=True)
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_dev_shot_attestation_with_missing_worktree_dirty_field_does_not_satisfy(
+    tmp_path, monkeypatch,
+):
+    """`worktree_dirty` absent entirely (an older/foreign producer's record) must be treated
+    the same as `true` — unknown is not proof of clean, so it does not satisfy the gate."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    _write_attestation(proof, repo, omit_fields=("worktree_dirty",))
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_fully_genuine_dev_shot_attestation_still_satisfies_the_gate(tmp_path, monkeypatch):
+    """(c) The FULL positive path, now with every field the tightened checks require: correct
+    repo, correct staged-diff hash, worktree_dirty=False, and a real capture file whose hash
+    matches. This must still pass — the tightening must not have broken the honest case."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    _write_attestation(proof, repo)  # all defaults are the fully-valid shape
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX-only")
+def test_fifo_manual_marker_does_not_hang_and_does_not_satisfy(tmp_path, monkeypatch):
+    """(b), review finding round 3: a FIFO placed at a marker path — with no writer, so a naive
+    `read_text()` would block FOREVER — must resolve to BLOCK promptly, not hang. A hang past
+    this hook's timeout is treated as a crash, and the descriptor is `on_error: "open"`, so a
+    hang IS a bypass by a different route. pytest's own default (no timeout plugin) means a
+    real hang here would wedge the whole test run, which is itself the strongest possible
+    proof this regression is closed if the test completes at all."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True)
+    os.mkfifo(str(proof / "looked"))  # a manual-marker-shaped FIFO, never opened by a writer
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX-only")
+def test_fifo_capture_path_in_attestation_does_not_hang_and_does_not_satisfy(
+    tmp_path, monkeypatch,
+):
+    """Same hazard, reached through an attestation's `capture_path` instead of the marker file
+    itself — a fully-valid-looking record pointing `capture_path` at a FIFO must also resolve
+    to BLOCK promptly."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True)
+    fifo = proof / "shot.png"
+    os.mkfifo(str(fifo))
+    _write_attestation(proof, repo, write_capture_file=False, capture_sha256="0" * 64)
+    # Overwrite capture_path in the just-written record to point at the FIFO instead.
+    marker = next(proof.glob("attest-*.json"))
+    record = json.loads(marker.read_text())
+    record["capture_path"] = str(fifo)
+    marker.write_text(json.dumps(record))
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_manual_marker_rejects_oversized_file(tmp_path, monkeypatch):
+    """(b) A fallback marker larger than `_MAX_MARKER_BYTES` must not satisfy the gate, even if
+    its first line would otherwise be a valid repo path — bounds a maliciously (or
+    accidentally) huge file, not just its content shape."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True)
+    top = str(vpg._repo_toplevel(str(repo)))
+    padding = "\n" + ("x" * (vpg._MAX_MARKER_BYTES + 1))
+    (proof / "looked").write_text(top + padding)
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_safe_regular_file_bytes_rejects_growth_racing_past_the_stat_check(tmp_path, monkeypatch):
+    """review finding round 5: even when `fstat` reports a size WITHIN the limit, if the
+    actual read comes back with MORE bytes than that (the shape a concurrent writer
+    appending between the stat and the read completing would produce), the result must be
+    rejected outright — not silently truncated-and-accepted. Simulates the race by making
+    `os.fstat` under-report the real file's size, rather than relying on genuine concurrent
+    timing (which would be flaky here)."""
+    p = tmp_path / "grown.bin"
+    p.write_bytes(b"x" * 100)  # the REAL size — bigger than the limit below
+    real_fstat = os.fstat
+
+    def lying_fstat(fd):
+        real = real_fstat(fd)
+        fields = (real.st_mode, real.st_ino, real.st_dev, real.st_nlink, real.st_uid,
+                  real.st_gid, 10, real.st_atime, real.st_mtime, real.st_ctime)
+        return os.stat_result(fields)  # reports 10 bytes, well within the limit
+
+    monkeypatch.setattr(vpg.os, "fstat", lying_fstat)
+    assert vpg._safe_regular_file_bytes(p, 10) is None
+
+
+def test_marker_scan_cap_stops_before_validating_a_marker(tmp_path, monkeypatch):
+    """review finding round 6: unbounded per-file size caps don't bound TOTAL work when there
+    can be many files — thousands of fresh, valid-shaped candidates could each cost a real
+    read-and-hash before being rejected, pushing total scan time past this hook's own timeout
+    (which fails open). `_MAX_MARKERS_SCANNED` bounds the number of candidates inspected.
+    Verify it's actually WIRED (not a decorative unused constant) by dropping the cap to 0 —
+    even a single, fully-valid marker must then no longer satisfy the gate, since the very
+    first candidate encountered already exceeds a zero budget regardless of file order."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    _write_manual_marker(proof, repo)  # genuinely valid — would satisfy at the real cap
+    monkeypatch.setattr(vpg, "_MAX_MARKERS_SCANNED", 0)
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_many_junk_markers_resolve_promptly_not_unboundedly(tmp_path, monkeypatch):
+    """A directory flooded with more fresh junk markers than `_MAX_MARKERS_SCANNED` must still
+    resolve (BLOCK, since none of them validate) rather than working through an unbounded
+    pile — a basic throughput sanity check for the cap added above."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True)
+    for i in range(vpg._MAX_MARKERS_SCANNED + 10):
+        (proof / f"junk-{i}").write_text("not a repo path")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_write_marker_cli_produces_a_marker_that_satisfies_the_gate(tmp_path, monkeypatch):
+    """The `--write-marker` CLI fallback (the sanctioned replacement for a bare `touch`,
+    documented in the README and the BLOCK message) actually produces a marker the gate
+    accepts, end to end."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    monkeypatch.setattr(vpg, "PROOF_DIR", proof)
+    rc = vpg._cli_write_marker([str(repo)])
+    assert rc == 0
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_write_marker_cli_uses_unpredictable_names_and_never_writes_through_a_symlink(
+    tmp_path, monkeypatch,
+):
+    """review finding round 6: the OLD implementation wrote to a predictable
+    `looked-<millisecond-timestamp>` name with a plain, symlink-following create — in a
+    directory shared by every local agent, another process could pre-plant a symlink at a
+    guessable name pointing at an arbitrary user-writable file, and the write would silently
+    clobber that target instead of creating a marker. `tempfile.mkstemp` (`O_CREAT|O_EXCL`)
+    refuses to open ANY pre-existing path, symlink or not. Proof: a symlink already sitting in
+    PROOF_DIR, pointing at a "victim" file OUTSIDE it, is left completely untouched — its
+    target's content is unchanged — after `_cli_write_marker` runs, and the marker it actually
+    writes is a distinct, freshly-created regular file, not a name that could plausibly have
+    collided with the pre-planted symlink."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not touch me")
+    decoy_symlink = proof / "looked-decoy"
+    os.symlink(str(victim), str(decoy_symlink))
+    monkeypatch.setattr(vpg, "PROOF_DIR", proof)
+    rc = vpg._cli_write_marker([str(repo)])
+    assert rc == 0
+    assert victim.read_text() == "do not touch me"  # the pre-planted symlink's target: intact
+    assert decoy_symlink.is_symlink()  # the symlink itself: still just a symlink, never opened
+    written = [p for p in proof.iterdir() if p.name != "looked-decoy"]
+    assert len(written) == 1 and written[0].is_file() and not written[0].is_symlink()
+    top = str(vpg._repo_toplevel(str(repo)))
+    assert written[0].read_text().strip() == top
 
 
 # ── regression: the OLD self-service escape hatch is DEAD (env AND inline sentinel) ───────
