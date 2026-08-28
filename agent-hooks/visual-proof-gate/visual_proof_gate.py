@@ -786,11 +786,17 @@ _MAX_CAPTURE_BYTES = 200_000_000
 # Enough of them can push total scan time past this hook's own timeout, and `on_error: "open"`
 # turns a timed-out hook into an allowed commit — the same class of bypass the FIFO/size guards
 # above exist to close, reached by volume instead of a single hostile file. Capping the number
-# of FRESH candidates actually inspected bounds worst-case work to a small, fixed multiple of
-# one file's cost, independent of how many junk files exist in the directory. Exceeding the cap
-# does NOT fail open: `_proof_fresh` simply stops looking and returns False (BLOCK/hatch), the
-# same as if none of the remaining candidates had validated — plenty of markers is not itself
-# proof, and this hook has no reason to trust a directory this cluttered.
+# of FRESH candidates actually inspected bounds worst-case work to `_MAX_MARKERS_SCANNED`
+# reads/hashes AT MOST — a fixed count, independent of how many junk files exist in the
+# directory — NOT a fixed byte total: each of those reads can still be up to
+# `_MAX_CAPTURE_BYTES`, so the true worst case is `_MAX_MARKERS_SCANNED *
+# _MAX_CAPTURE_BYTES` of I/O, not "one file's cost". That is still a finite, known ceiling
+# (unlike the pre-fix unbounded case), just not as tight as "a small multiple" might suggest;
+# lowering either constant trades against the legitimate multi-marker / large-capture cases
+# this fix is not trying to break. Exceeding the cap does NOT fail open: `_proof_fresh` simply
+# stops looking and returns False (BLOCK/hatch), the same as if none of the remaining
+# candidates had validated — plenty of markers is not itself proof, and this hook has no
+# reason to trust a directory this cluttered.
 _MAX_MARKERS_SCANNED = 200
 
 # dev-cli's `visual_proof.ATTEST_VERSION` (review finding, round 4). dev-cli's own docstring

@@ -121,8 +121,11 @@ echo '{"cwd":"'"$PWD"'","args":{"command":"git commit -m x"}}' | ./visual_proof_
 rc=$?; echo "exit=$rc"   # → exit=10 (block)
 
 # write a correctly-scoped marker after looking at a screenshot → allow (fallback path; a bare
-# `touch` no longer works — see "The marker contract" above)
-./visual_proof_gate.py --write-marker "$PWD"
+# `touch` no longer works — see "The marker contract" above). No argument needed when run FROM
+# the repo (defaults to the current directory) — deliberately not `--write-marker "$PWD"`: a
+# bare `$VAR` trips Claude Code's worktree-isolation Bash guard (anthropics/claude-code#88776,
+# see PR #433's investigation), so the block message and this recipe both avoid it.
+./visual_proof_gate.py --write-marker
 echo '{"cwd":"'"$PWD"'","args":{"command":"git commit -m x"}}' | ./visual_proof_gate.py
 rc=$?; echo "exit=$rc"   # → exit=0 (marker fresh and repo-scoped → allow)
 ```
