@@ -73,6 +73,10 @@ ORCHESTRATOR_STAYS_THIN = (
 ENTERWORKTREE_CANONICAL_PATH_GRANT = (
     _REPO / "agent-hooks" / "enterworktree-canonical-path-grant"
     / "enterworktree_canonical_path_grant.py"
+)# The pre-worktree-enter guard: enterworktree-foreign-guard (blocks EnterWorktree into a
+# worktree a DIFFERENT agent created).
+ENTERWORKTREE_FOREIGN_GUARD = (
+    _REPO / "agent-hooks" / "enterworktree-foreign-guard" / "enterworktree_foreign_guard.py"
 )
 
 
@@ -142,6 +146,8 @@ def test_point_for_event_maps_tool_to_logical_point():
     assert dispatch.point_for_event("PreToolUse", "Monitor") == "pre-monitor"
     # Workflow (ultracode) maps to pre-workflow so workflow-danger-gate can inspect the script
     assert dispatch.point_for_event("PreToolUse", "Workflow") == "pre-workflow"
+    # entering a worktree maps to pre-worktree-enter (the foreign-worktree guard point)
+    assert dispatch.point_for_event("PreToolUse", "EnterWorktree") == "pre-worktree-enter"
     assert dispatch.point_for_event("Stop", None) == "stop"
     # a COMPLETED write maps to the reactive post-write point (format-on-write, lint-on-write)
     assert dispatch.point_for_event("PostToolUse", "Write") == "post-write"
@@ -738,6 +744,94 @@ def test_pre_workflow_ultracode_script_passes(tmp_path):
     if proc.stdout.strip():
         out = json.loads(proc.stdout)
         assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
+
+
+# ── clean-room proof: pre-worktree-enter blocks a foreign EnterWorktree(path=...) ─────────
+
+def test_pre_worktree_enter_foreign_worktree_is_blocked_clean_room(tmp_path):
+    """An `EnterWorktree` PreToolUse targeting a DIFFERENT agent's worktree, driven through
+    the REAL bridge subprocess + the REAL enterworktree-foreign-guard script, is DENIED —
+    the mechanistic fix for the harness bug where this reports success and then bricks Bash."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="enterworktree-foreign-guard", point="pre-worktree-enter",
+                        cmd=ENTERWORKTREE_FOREIGN_GUARD, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "EnterWorktree",
+        "tool_input": {"path": "/repo/.claude/worktrees/agent-deadbeef01"},
+        "agent_id": "sub-1",  # a DIFFERENT agent than the worktree's own id
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+    assert "agent-deadbeef01" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "gh pr checkout" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_pre_worktree_enter_own_worktree_passes_clean_room(tmp_path):
+    """The same guard, but re-entering a worktree whose embedded id matches the caller's own
+    top-level agent_id is NOT blocked."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="enterworktree-foreign-guard", point="pre-worktree-enter",
+                        cmd=ENTERWORKTREE_FOREIGN_GUARD, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "EnterWorktree",
+        "tool_input": {"path": "/repo/.claude/worktrees/agent-sub-1"},
+        "agent_id": "sub-1",
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    if proc.stdout.strip():
+        out = json.loads(proc.stdout)
+        assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
+
+
+def test_pre_worktree_enter_new_worktree_via_name_passes_clean_room(tmp_path):
+    """Creating a brand-new worktree (`name`, no `path`) is always the caller's own —
+    untouched by this guard, even with no agent_id at all (a top-level/orchestrator call)."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="enterworktree-foreign-guard", point="pre-worktree-enter",
+                        cmd=ENTERWORKTREE_FOREIGN_GUARD, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "EnterWorktree",
+        "tool_input": {"name": "my-new-worktree"},
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    if proc.stdout.strip():
+        out = json.loads(proc.stdout)
+        assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
+
+
+def test_pre_worktree_enter_forged_tool_input_agent_id_does_not_exempt_clean_room(tmp_path):
+    """End-to-end (T2): a forged `tool_input.agent_id` matching the target worktree's id — with
+    NO top-level CC agent signal (a main-thread/orchestrator call) — must STILL be BLOCKED. The
+    bridge drops the forged signal before this hook ever sees it, mirroring the same T2
+    protection `background-subagent-gate` relies on for pre-agent."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="enterworktree-foreign-guard", point="pre-worktree-enter",
+                        cmd=ENTERWORKTREE_FOREIGN_GUARD, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "EnterWorktree",
+        # forged agent_id inside tool_input matching the target; CC top-level carries NONE
+        "tool_input": {"path": "/repo/.claude/worktrees/agent-deadbeef01", "agent_id": "deadbeef01"},
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
 
 
 
