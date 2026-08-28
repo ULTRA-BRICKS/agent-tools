@@ -18,6 +18,66 @@ standalone third-party CLI ([vercel-labs/agent-browser](https://github.com/verce
 installed separately — `npm i -g agent-browser && agent-browser install` (or
 `cargo install agent-browser && agent-browser install`).
 
+> **Read `agent-browser-concurrency` too, before running any command below.**
+> You can't tell whether another agent or a human is also using
+> `agent-browser` on this machine, so plain `agent-browser open` (the shared
+> `default` session) risks colliding with them — including another agent
+> reading a different page at the same time. Run this at the start of
+> **every** command for this read (identical whether it's your first call or
+> a later one — it reuses the session it already created, or creates one if
+> this is the first call). Replace `<your-task-label>` in both places with
+> something that distinguishes this read from a sibling task's, in case one
+> happens to run alongside it in the same worktree:
+>
+> ```bash
+> raw='<your-task-label>'
+> label="$(printf '%s' "$raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')_$(printf '%s' "$raw" | cksum | cut -d' ' -f1)"
+> d="$(git rev-parse --absolute-git-dir 2>/dev/null)" || { d="${TMPDIR:-/tmp}/agent-browser-$(id -u)"; mkdir -m 700 -p "$d" 2>/dev/null; }
+> f="$d/agent-browser-session.$label"
+> umask 077
+> ( set -C; echo "$label-$(date +%s)-$RANDOM-$$" > "$f" ) 2>/dev/null
+> s=""; for _ in 1 2 3 4 5; do s="$(cat "$f" 2>/dev/null)"; [ -n "$s" ] && break; sleep 0.05; done
+> if [ -z "$s" ] && [ -e "$f" ]; then
+>   rm -f "$f"; ( set -C; echo "$label-$(date +%s)-$RANDOM-$$" > "$f" ) 2>/dev/null
+>   s="$(cat "$f" 2>/dev/null)"
+> fi
+> if [ -n "$s" ]; then export AGENT_BROWSER_SESSION="$s"
+> else unset AGENT_BROWSER_SESSION; echo "no session name for label '$label' — not exporting a session var" >&2
+> fi
+> ```
+>
+> (None of this is decoration — `tr` alone can collapse two different labels
+> to the same filename (the checksum suffix fixes that), a plain
+> `[ -s "$f" ] || echo … > "$f"` is a check-then-act race between two
+> parallel Bash calls (`set -C` fixes that), and even with `set -C` a reader
+> can land in the instant between file creation and the write landing (the
+> retry loop closes that window). See `agent-browser-concurrency` Rule 1 for
+> the full reasoning on all three, plus the per-uid temp directory.)
+>
+> Every plain `agent-browser` command below then uses it automatically — no
+> per-command flag needed, including in the examples that follow, exactly as
+> written. **Close when you're done reading** — unlike the setup snippet
+> above, don't regenerate the name if the file is already gone; that would
+> "close" a session that was never opened and hide the fact that nothing was
+> actually cleaned up:
+>
+> ```bash
+> raw='<your-task-label>'
+> label="$(printf '%s' "$raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')_$(printf '%s' "$raw" | cksum | cut -d' ' -f1)"
+> d="$(git rev-parse --absolute-git-dir 2>/dev/null)" || d="${TMPDIR:-/tmp}/agent-browser-$(id -u)"
+> f="$d/agent-browser-session.$label"
+> s="$(cat "$f" 2>/dev/null)"
+> if [ -n "$s" ]; then
+>   export AGENT_BROWSER_SESSION="$s"
+>   agent-browser close && rm -f "$f"
+> else
+>   echo "no session recorded for label '$label' — nothing to close" >&2
+> fi
+> ```
+>
+> See `agent-browser-concurrency` for the full contract (why a file instead
+> of remembering a value, older CLI versions, retrying after a crash).
+
 ## Rule
 
 - **Reading a web page / docs / API reference → reach for `agent-browser`,** not
@@ -94,6 +154,12 @@ installed separately — `npm i -g agent-browser && agent-browser install` (or
 
 - **A fetch-and-summarize tool is still fine** for a short, static page or a raw
   JSON/text endpoint where truncation and JS-rendering aren't a concern.
+
+- **Close the session when your read is done**, using the full close snippet
+  near the top of this skill (setup lines included, not just the bare
+  `close`). Skipping this leaves a Chrome process tree running — see
+  `agent-browser-concurrency` Rule 2 for how long it lingers before an idle
+  timeout reclaims it.
 
 ## Learn it properly before using it
 
