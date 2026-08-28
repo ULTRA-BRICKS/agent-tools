@@ -706,6 +706,81 @@ def test_hatch_justification_exit1_blocks_citing_denial(tmp_path, monkeypatch):
     assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
+def _read_overrides_log(log_path: Path) -> list[dict]:
+    if not log_path.exists():
+        return []
+    return [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+
+
+# ── agent-tools#464 regression: every hatch USE is auditable even when the gate never
+# reaches `request_hatch_approval` at all — a fail-open branch elsewhere in `main()`/`_decide`
+# (git could not be queried) or an outright crash mid-decision must still leave a trace,
+# instead of the commit going through exactly as if a live Telegram approval had happened. ──
+
+def test_hatch_requested_but_git_unreachable_is_still_logged(tmp_path, monkeypatch):
+    """`_resolve_staged_files` failing (git could not be queried anywhere, e.g. a
+    GIT_DIFF_TIMEOUT_S timeout under contention) fails the gate open WITHOUT ever calling
+    `request_hatch_approval` — before this fix that meant a hatch requested on this exact
+    invocation left zero trace in overrides.log, identical to no hatch use at all."""
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    log_path = tmp_path / "overrides.log"
+    out, _e, c = _run(
+        "git commit -m x", not_a_repo, monkeypatch, proof_dir=tmp_path / "proof",
+        env={
+            "RIG_HATCH_REQUEST_VISUAL_PROOF_GATE": "a real written justification",
+            "AGENT_TOOLS_OVERRIDES_LOG": str(log_path),
+        },
+    )
+    assert c == 0 and _decision(out) == "allow"  # fail-open policy unchanged
+    entries = _read_overrides_log(log_path)
+    assert len(entries) == 1
+    assert entries[0]["decision"] == "fail-open-error"
+    assert entries[0]["hatch"] == vpg.HOOK_ID
+    assert "git could not be queried" in entries[0]["detail"]
+
+
+def test_hatch_not_requested_and_fail_open_branch_stays_quiet(tmp_path, monkeypatch):
+    """The SAME fail-open branch as above, but with no hatch requested at all — must NOT write
+    to overrides.log. The audit sink exists to track escape-hatch use, not every ordinary
+    fail-open a busy session's git subprocess can hit."""
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    log_path = tmp_path / "overrides.log"
+    out, _e, c = _run(
+        "git commit -m x", not_a_repo, monkeypatch, proof_dir=tmp_path / "proof",
+        env={"AGENT_TOOLS_OVERRIDES_LOG": str(log_path)},
+    )
+    assert c == 0 and _decision(out) == "allow"
+    assert _read_overrides_log(log_path) == []
+
+
+def test_hatch_requested_but_gate_crashes_mid_decision_is_still_logged(tmp_path, monkeypatch):
+    """A bug anywhere in the decision logic (simulated here in `effective_cwd`) must not let the
+    commit through as a silent, untraceable fail-open — even though `main()`'s own `on_error`
+    doctrine is still "allow", the crash is now recorded instead of vanishing into the bridge's
+    own on_error=open resolution."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    log_path = tmp_path / "overrides.log"
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated internal crash")
+
+    monkeypatch.setattr(vpg, "effective_cwd", _boom)
+    out, _e, c = _run(
+        "git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof",
+        env={
+            "RIG_HATCH_REQUEST_VISUAL_PROOF_GATE": "a real written justification",
+            "AGENT_TOOLS_OVERRIDES_LOG": str(log_path),
+        },
+    )
+    assert c == 0 and _decision(out) == "allow"  # fail-open policy unchanged
+    entries = _read_overrides_log(log_path)
+    assert len(entries) == 1
+    assert entries[0]["decision"] == "fail-open-error"
+    assert "simulated internal crash" in entries[0]["detail"]
+
+
 # ── B2: the GIT_COMMIT regex must NOT match `git`+`commit` in plain prose ────────────────
 
 def test_git_commit_prose_is_not_a_commit(tmp_path, monkeypatch):

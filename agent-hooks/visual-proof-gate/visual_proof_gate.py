@@ -37,6 +37,14 @@ Contract (agents-hooks/v1):
 on_error is "open": process discipline, not a security boundary. The `git diff --cached`
 subprocess is timeout-bounded and fails OPEN (if git errors, allow) — a broken stat must
 never wedge committing.
+
+AUDIT GUARANTEE (agent-tools#464): whenever `RIG_HATCH_REQUEST_VISUAL_PROOF_GATE` carried a
+value on an invocation, `~/.config/agent-tools/overrides.log` gains a line either way — either
+via `hatch_escalation.request_hatch_approval`'s own unconditional logging (the normal path,
+reached through `_decide_block`), or, when THIS gate fails open for some earlier, unrelated
+reason before ever reaching that call (git could not be queried, an internal crash), via
+`_log_hatch_unconsulted` / `hatch_escalation.log_gate_error_fail_open` instead. A hatch
+request must never vanish with zero trace, indistinguishable from a real live approval.
 """
 
 from __future__ import annotations
@@ -752,20 +760,22 @@ def _decide_block(command: str, cwd: str, visual: list[str]) -> int:
     return BLOCK_EXIT_CODE
 
 
-def main() -> int:
-    try:
-        event = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError) as exc:
-        warn(f"could not parse event: {exc} — allowing (fail-open)")
-        emit("allow")
-        return 0
+def _log_hatch_unconsulted(command: str, cwd: str, detail: str) -> None:
+    """If `RIG_HATCH_REQUEST_VISUAL_PROOF_GATE` carried a value on this invocation but the
+    decision logic is about to fail the gate open for a DIFFERENT, earlier reason — never
+    reaching `_decide_block` / `hatch_escalation.request_hatch_approval`, whose own logging
+    never runs either — still record the attempt. Without this, a hatch request made during a
+    commit that happens to trip an unrelated fail-open branch (git could not be queried, an
+    internal crash, ...) leaves `overrides.log` silently blank: the commit goes through exactly
+    as if a live Telegram approval had happened, but nothing ever asked (agent-tools#464). A
+    no-op when the hatch wasn't requested at all, so ordinary hatch-free commits that merely hit
+    a fail-open branch don't flood the audit sink."""
+    if hatch_escalation.hatch_requested_value(HOOK_ID, command=command) is None:
+        return
+    hatch_escalation.log_gate_error_fail_open(HOOK_ID, command=command, cwd=cwd, detail=detail)
 
-    args = event.get("args") or {}
-    command = args.get("command") or args.get("cmd") or event.get("command") or ""
-    if not isinstance(command, str):
-        command = str(command)
-    session_cwd = str(event.get("cwd") or os.getcwd())
 
+def _decide(command: str, session_cwd: str) -> int:
     # Strip leading inline env first (so `RIG_HATCH_REQUEST_…="why" git commit` still trips the
     # gate), then detect the commit on the comment-stripped command and judge skip-ness from the
     # parsed argv — so a skip token in a trailing comment / commit message can't bypass the gate.
@@ -780,7 +790,14 @@ def main() -> int:
 
     files = _resolve_staged_files(cwd, session_cwd)
     if files is None:
-        emit("allow")  # git could not be queried anywhere → fail open
+        # git could not be queried anywhere → fail open. This is the one fail-open branch a
+        # concurrent, high-agent-load session can realistically hit on a legitimate repo (the
+        # GIT_DIFF_TIMEOUT_S-bounded `git diff --cached` timing out under contention) — a hatch
+        # requested on THIS invocation would otherwise vanish with no trace (agent-tools#464).
+        _log_hatch_unconsulted(
+            command, cwd, "git could not be queried; fail-open before reaching the hatch",
+        )
+        emit("allow")
         return 0
 
     visual = visual_staged(files)
@@ -793,6 +810,38 @@ def main() -> int:
         return 0
 
     return _decide_block(command, cwd, visual)
+
+
+def main() -> int:
+    try:
+        event = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError) as exc:
+        warn(f"could not parse event: {exc} — allowing (fail-open)")
+        emit("allow")
+        return 0
+
+    if not isinstance(event, dict):
+        warn(f"event is not a JSON object ({type(event).__name__}) — allowing (fail-open)")
+        emit("allow")
+        return 0
+
+    args = event.get("args")
+    if not isinstance(args, dict):
+        args = {}
+    command = args.get("command") or args.get("cmd") or event.get("command") or ""
+    if not isinstance(command, str):
+        command = str(command)
+    session_cwd = str(event.get("cwd") or os.getcwd())
+
+    try:
+        return _decide(command, session_cwd)
+    except Exception as exc:  # noqa: BLE001 - a gate crash must still leave an audit trail,
+        # not vanish into the bridge's own silent on_error=open resolution (agent-tools#464).
+        detail = f"visual-proof-gate crashed mid-decision: {exc!r}"
+        warn(f"{detail} — allowing (fail-open)")
+        _log_hatch_unconsulted(command, session_cwd, detail)
+        emit("allow", detail)
+        return 0
 
 
 if __name__ == "__main__":

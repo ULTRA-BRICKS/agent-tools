@@ -92,6 +92,29 @@ def hatch_env_var(hook_id: str) -> str:
     return f"RIG_HATCH_REQUEST_{canonical}"
 
 
+def hatch_requested_value(
+    hook_id: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    command: str | None = None,
+) -> str | None:
+    """The raw hatch value for `hook_id`, checked in the same precedence
+    `request_hatch_approval` uses (process env first, then a leading inline `VAR=value` on
+    `command`), or None when the hatch was not requested at all. Exposed as its own function so
+    a caller can cheaply ask "was a hatch requested here?" WITHOUT going through the full
+    `request_hatch_approval` round trip (live tg-ctl call, `overrides.log` write) — the specific
+    need is a gate script that fails open on an EARLIER, unrelated error (e.g. it could not even
+    list staged files) and still wants to record that a hatch request existed but was never
+    reached, via `log_gate_error_fail_open` below."""
+
+    env_map = env if env is not None else os.environ
+    env_var = hatch_env_var(hook_id)
+    raw = env_map.get(env_var)
+    if raw is None and command is not None:
+        raw = _parse_inline_hatch_value(env_var, command)
+    return raw
+
+
 def _parse_inline_hatch_value(env_var: str, command: str) -> str | None:
     """Extract the value of a leading inline `<env_var>=<value>` assignment from a Bash command.
 
@@ -217,9 +240,7 @@ def request_hatch_approval(
     env_map = env if env is not None else os.environ
     env_var = hatch_env_var(hook_id)
     ctx = context or {}
-    raw = env_map.get(env_var)
-    if raw is None and command is not None:
-        raw = _parse_inline_hatch_value(env_var, command)
+    raw = hatch_requested_value(hook_id, env=env_map, command=command)
     if raw is None:
         return HatchApprovalResult(
             requested=False,
@@ -394,26 +415,86 @@ def _append_overrides_log(
     `ci/ship/ship.sh`'s own `_review_quorum_audit_log` best-effort contract.
     """
 
+    entry = {
+        "ts": _utc_now_iso(),
+        "session": _resolve_session_id(context, env_map),
+        "hatch": hook_id,
+        "env_var": env_var,
+        # Fall back to context["command"] when the caller didn't also pass the command=
+        # kwarg — most hook call sites pass both (redundantly), but a caller that only
+        # threads it through `context` (e.g. a future hook) must not ship a blank audit
+        # `command` field just because the kwarg was omitted.
+        "command": str(command or context.get("command") or "")[:_DETAIL_CAP],
+        "reason": justification.strip()[:_DETAIL_CAP],
+        "decision": "approved" if result.approved else "denied",
+        "detail": result.reason[:_DETAIL_CAP],
+        "cwd": cwd,
+    }
+    _write_overrides_entry(entry, overrides_log_path)
+
+
+def log_gate_error_fail_open(
+    hook_id: str,
+    *,
+    command: str | None,
+    cwd: str,
+    detail: str,
+    env: Mapping[str, str] | None = None,
+    context: Mapping[str, object] | None = None,
+    overrides_log_path: Path | str | None = None,
+) -> None:
+    """Record a hatch USE that never reached `request_hatch_approval`'s own unconditional
+    logging, because the calling gate script fell through to a fail-open decision for a
+    DIFFERENT, earlier reason (an internal exception, a subprocess it depends on erroring or
+    timing out, malformed input, ...) before ever consulting the hatch.
+
+    `request_hatch_approval` already guarantees a log line for every attempt where its OWN
+    round trip runs, including when `_request_present_hatch_approval` itself raises (see its
+    `except Exception` branch). What it CANNOT see is a caller that never invokes it at all —
+    e.g. `visual_proof_gate.py`'s `git diff --cached` subprocess timing out under contention,
+    which fails the WHOLE gate open via a code path that returns before `_decide_block` (and
+    therefore `request_hatch_approval`) is ever reached. From the outside this looked
+    identical to a genuine live Telegram approval — the commit went through — but
+    `overrides.log` gained nothing, because nothing ever asked (agent-tools#464).
+
+    Call this ONLY when `hatch_requested_value(hook_id, ...)` returned non-None for the same
+    invocation — an unconditional call here for every ordinary, hatch-free commit would flood
+    the audit sink with noise unrelated to its actual purpose (auditing escape-hatch use).
+    `decision` is always the literal string `"fail-open-error"`, distinct from the
+    `"approved"`/`"denied"` values `_append_overrides_log` writes, so a reader can tell "the
+    hatch was requested but the gate never got to ask" apart from a real tg-ctl outcome.
+    Best-effort / never raises, matching `_append_overrides_log`'s own contract."""
+
+    env_map = env if env is not None else os.environ
+    ctx = context or {}
+    entry = {
+        "ts": _utc_now_iso(),
+        "session": _resolve_session_id(ctx, env_map),
+        "hatch": hook_id,
+        "env_var": hatch_env_var(hook_id),
+        "command": str(command or ctx.get("command") or "")[:_DETAIL_CAP],
+        "reason": "",
+        "decision": "fail-open-error",
+        "detail": detail[:_DETAIL_CAP],
+        "cwd": cwd,
+    }
+    _write_overrides_entry(entry, overrides_log_path)
+
+
+def _write_overrides_entry(
+    entry: dict[str, object], overrides_log_path: Path | str | None,
+) -> None:
+    """Shared best-effort writer behind both `_append_overrides_log` (a resolved hatch outcome)
+    and `log_gate_error_fail_open` (a hatch request the gate never got to resolve). MUST NEVER
+    raise or block the caller: an audit-log failure (disk full, read-only home, permissions)
+    must not become a hatch outage, mirroring `ci/ship/ship.sh`'s own `_review_quorum_audit_log`
+    best-effort contract."""
+
     try:
         path = _resolve_overrides_log_path(overrides_log_path)
         if path is None:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        entry = {
-            "ts": _utc_now_iso(),
-            "session": _resolve_session_id(context, env_map),
-            "hatch": hook_id,
-            "env_var": env_var,
-            # Fall back to context["command"] when the caller didn't also pass the command=
-            # kwarg — most hook call sites pass both (redundantly), but a caller that only
-            # threads it through `context` (e.g. a future hook) must not ship a blank audit
-            # `command` field just because the kwarg was omitted.
-            "command": str(command or context.get("command") or "")[:_DETAIL_CAP],
-            "reason": justification.strip()[:_DETAIL_CAP],
-            "decision": "approved" if result.approved else "denied",
-            "detail": result.reason[:_DETAIL_CAP],
-            "cwd": cwd,
-        }
         _append_json_line_0600(path, entry)
     except Exception:  # noqa: BLE001 - audit logging must never break the hatch flow.
         return
@@ -699,6 +780,8 @@ __all__ = [
     "MAX_TG_CTL_TIMEOUT_S",
     "default_overrides_log_path",
     "hatch_env_var",
+    "hatch_requested_value",
+    "log_gate_error_fail_open",
     "request_hatch_approval",
     "resolve_home",
 ]
