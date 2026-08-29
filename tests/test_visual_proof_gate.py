@@ -87,15 +87,16 @@ def _touch_proof(proof_dir: Path) -> None:
 
 
 def _write_manual_marker(proof_dir: Path, repo: Path, *, name: str = "looked") -> Path:
-    """A correctly-scoped FALLBACK marker: first line is the repo's real toplevel path — the
-    shape `--write-marker` / `_manual_marker_satisfies` expect."""
+    """A correctly-scoped FALLBACK marker: content is `json.dumps(repo_toplevel)` — the shape
+    `--write-marker` / `_manual_marker_satisfies` expect (round 10: JSON-encoded, not a raw
+    line, so an embedded newline or non-UTF-8 byte in the path round-trips unambiguously)."""
     proof_dir.mkdir(parents=True, exist_ok=True)
     top = str(Path(subprocess.run(  # noqa: S603,S607
         ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
         check=True, capture_output=True, text=True, timeout=10,
     ).stdout.strip()).resolve())
     marker = proof_dir / name
-    marker.write_text(top + "\n")
+    marker.write_text(json.dumps(top))
     return marker
 
 
@@ -750,6 +751,60 @@ def test_repo_toplevel_preserves_trailing_whitespace_in_path(monkeypatch):
     assert result is not None and result.endswith("space-repo ")
 
 
+def test_repo_toplevel_strips_exactly_one_trailing_newline(monkeypatch):
+    """Regression, review round 10 (PR #484): the round-9 fix replaced `.strip()` with
+    `rstrip(b"\n")` — but `rstrip` removes EVERY trailing occurrence of the byte, not just
+    git's single output terminator. A repo whose path itself legitimately ends in a newline
+    (POSIX allows any byte but NUL and `/` in a filename) makes git emit `<path>\n\n` (the
+    path's own trailing `\n` plus git's terminator); `rstrip(b"\n")` strips BOTH, collapsing
+    `repo` and `repo\n` to the identical `repo_root` — the same collision class round 9 closed
+    for trailing spaces, just one byte-count off. Fixed: slice off exactly one trailing `\n`,
+    leaving any newline that's genuinely part of the path untouched."""
+
+    class _FakeCompletedProcess:
+        returncode = 0
+        stdout = b"/tmp/newline-repo\n\n"  # the path's own "\n" + git's own terminator "\n"
+
+    monkeypatch.setattr(vpg.subprocess, "run", lambda *a, **kw: _FakeCompletedProcess())
+    result = vpg._repo_toplevel("/tmp")
+    assert result is not None and result.endswith("newline-repo\n")
+
+
+def test_attestation_json_parse_survives_recursion_error(tmp_path, monkeypatch):
+    """Regression, review round 10 (PR #484): a deeply-nested JSON `.json` marker (300,000
+    nested arrays here — ~600KB, comfortably under `_MAX_MARKER_BYTES`'s 1MB cap; reliably
+    triggers RecursionError on CPython's C-accelerated json scanner, where the exact threshold
+    depth is interpreter/stack-state dependent — Codex's own finding cited ~100,000/200KB as
+    triggering it, which this file picks a larger, more robust depth well above) makes
+    `json.loads` raise `RecursionError`, a `RuntimeError` subclass NOT caught by the
+    `except ValueError` this hook used around its attestation parse. An uncaught
+    `RecursionError` would escape `_proof_fresh` and `main()` entirely, crashing the hook into
+    `on_error: "open"` — an allowed commit reached via a hostile marker shape rather than a
+    wrong field value, the same bypass class this whole file exists to close. Must resolve to
+    BLOCK, not crash."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True)
+    depth = 300_000
+    (proof / "attest-evil.json").write_text("[" * depth + "]" * depth)
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_manual_marker_json_parse_survives_recursion_error(tmp_path, monkeypatch):
+    """Same as `test_attestation_json_parse_survives_recursion_error` above, for the OTHER
+    `json.loads` call this fix added in round 10 — `_manual_marker_satisfies`'s own JSON
+    decode (the round-10 rewrite of the fallback-marker format). A deeply-nested JSON payload
+    dropped as a non-`.json`-suffixed fallback marker must not crash the hook either."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    top = str(vpg._repo_toplevel(str(repo)))
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True)
+    depth = 300_000
+    (proof / "looked").write_text("[" * depth + "]" * depth)
+    assert vpg._manual_marker_satisfies(proof / "looked", top) is False
+
+
 def test_write_marker_round_trips_non_utf8_repo_root(tmp_path, monkeypatch):
     """Regression, review round 9 (PR #484): after the round-8 fix, `_repo_toplevel` decodes a
     non-UTF-8 repo path with `os.fsdecode` (surrogateescape), producing a string with lone
@@ -1236,7 +1291,7 @@ def test_write_marker_cli_uses_unpredictable_names_and_never_writes_through_a_sy
     written = [p for p in proof.iterdir() if p.name != "looked-decoy"]
     assert len(written) == 1 and written[0].is_file() and not written[0].is_symlink()
     top = str(vpg._repo_toplevel(str(repo)))
-    assert written[0].read_text().strip() == top
+    assert json.loads(written[0].read_text()) == top
 
 
 # ── regression: the OLD self-service escape hatch is DEAD (env AND inline sentinel) ───────

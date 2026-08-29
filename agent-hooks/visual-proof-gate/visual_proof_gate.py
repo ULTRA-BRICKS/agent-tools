@@ -902,8 +902,17 @@ def _repo_toplevel(cwd: str) -> str | None:
     a single newline, but a blanket whitespace strip also eats any SPACE (or other whitespace)
     that is legitimately part of the path itself — a repo at `/tmp/repo ` (trailing space,
     rare but legal on POSIX) would collapse to the same `repo_root` as `/tmp/repo`, letting a
-    marker written for one satisfy the other's completely unrelated commit. `rstrip(b"\n")`
-    removes only what git actually appends."""
+    marker written for one satisfy the other's completely unrelated commit.
+
+    Removes EXACTLY ONE trailing `\n` byte, not `rstrip(b"\n")` (review finding, round 10 on
+    the round-9 fix): `rstrip` removes EVERY trailing occurrence of the byte, not just git's
+    single terminator — a repo whose path itself legitimately ends in a newline (POSIX allows
+    any byte except NUL and `/` in a filename) would have git emit `<path>\n\n` (the path's own
+    trailing `\n` plus git's terminator), and `rstrip(b"\n")` strips BOTH, collapsing `repo` and
+    `repo\n` to the identical `repo_root` — the exact same class of collision the round-9 fix
+    was trying to close, just one byte-count off. Slicing off a single trailing `\n` (present
+    or not; git always appends one on success) leaves any newline that is genuinely part of the
+    path untouched."""
     try:
         proc = subprocess.run(  # noqa: S603,S607 — fixed git argv, trusted
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
@@ -913,7 +922,8 @@ def _repo_toplevel(cwd: str) -> str | None:
         return None
     if proc.returncode != 0:
         return None
-    top = os.fsdecode(proc.stdout.rstrip(b"\n"))
+    raw = proc.stdout
+    top = os.fsdecode(raw[:-1] if raw.endswith(b"\n") else raw)
     return os.path.realpath(top) if top else None
 
 
@@ -1026,7 +1036,7 @@ def _attestation_satisfies(record: object, repo_root: str, staged_hash: str) -> 
 
 def _manual_marker_satisfies(path: Path, repo_root: str) -> bool:
     """Fallback path for when no `dev shot` capture exists (no URL to shoot — docs-only visual
-    change, a generated image, a schematic). The marker's FIRST LINE must equal `repo_root`
+    change, a generated image, a schematic). The marker's content must decode to `repo_root`
     exactly — this is what kills the junk-file case a bare `touch` used to pass: an empty file,
     or any unrelated file that happens to land in this shared directory, no longer satisfies
     the gate. It does NOT bind to the staged diff (there is no attestation to draw that hash
@@ -1038,22 +1048,31 @@ def _manual_marker_satisfies(path: Path, repo_root: str) -> bool:
     by-any-local-agent directory, so it could be a FIFO/device/oversized file, not just a plain
     marker.
 
-    Decodes the first line with `os.fsdecode`, NOT `.decode("utf-8", errors="replace")`
-    (review finding, round 9): `repo_root` itself comes from `_repo_toplevel`'s `os.fsdecode`
-    (surrogateescape) for a non-UTF-8 path — `errors="replace"` collapses those same bytes to
-    literal U+FFFD replacement characters instead, so a marker genuinely written for that repo
-    could never equal `repo_root` again; the two decode strategies must match for the
-    comparison to mean anything. Splits on the raw `\n` byte (not `str.splitlines()`, which
-    also breaks on `\r`, `\v`, `\x1c`-`\x1e`, U+2028/U+2029, and more) and takes everything
-    before it verbatim, with no extra `.strip()` — `_cli_write_marker` writes exactly
-    `os.fsencode(repo_root) + b"\n"`, so an exact byte-for-byte round trip needs no further
-    trimming, and any additional stripping would reopen the same trailing-whitespace collision
-    `_repo_toplevel`'s own `rstrip(b"\n")` fix (above) exists to close."""
+    The marker's ENTIRE content is a single JSON-encoded string (`_cli_write_marker` writes
+    `json.dumps(repo_root)` — see its docstring), decoded here with `json.loads`, NOT a raw
+    line-based read (review finding, round 10 on the round-9 fix): `repo_root` can legitimately
+    contain an embedded newline (POSIX allows any byte but NUL and `/` in a path) or non-UTF-8
+    bytes (surrogate-escaped by `_repo_toplevel`'s `os.fsdecode`). A raw `data.split(b"\n",
+    1)[0]` line-read truncates at the FIRST such embedded newline, silently comparing only a
+    PREFIX of the real value — two genuinely different repos, one a prefix of the other's path,
+    could then be confused. JSON's `ensure_ascii=True` string escaping (the `json.dumps`
+    default) represents any embedded newline as the two-character sequence `\n` (backslash-n),
+    never a raw `0x0A` byte, and any non-ASCII/surrogate codepoint as a backslash-u escape — so the
+    ENTIRE encoded value is guaranteed pure ASCII with zero raw newline bytes, making the
+    round-trip exact and unambiguous regardless of what `repo_root` contains. `RecursionError`
+    is caught alongside `ValueError` for the same reason `_proof_fresh`'s own `json.loads` call
+    does (round 10): a maliciously deeply-nested (but still small, well under
+    `_MAX_MARKER_BYTES`) JSON payload can exhaust Python's recursion limit inside the decoder,
+    and an uncaught `RecursionError` would crash this hook into `on_error: "open"` the same as
+    any other unhandled exception here."""
     data = _safe_regular_file_bytes(path, _MAX_MARKER_BYTES)
     if data is None:
         return False
-    first_line = data.split(b"\n", 1)[0]
-    return bool(first_line) and os.fsdecode(first_line) == repo_root
+    try:
+        candidate = json.loads(data)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(candidate, str) and candidate == repo_root
 
 
 def _proof_fresh(repo_root: str | None) -> bool:
@@ -1136,7 +1155,16 @@ def _proof_fresh(repo_root: str | None) -> bool:
                     continue
                 try:
                     record = json.loads(data)
-                except ValueError:
+                except (ValueError, RecursionError):
+                    # RecursionError (review finding, round 10): a deeply-nested JSON payload
+                    # (e.g. 100,000 nested arrays, ~200KB — comfortably under
+                    # `_MAX_MARKER_BYTES`) blows Python's recursion limit inside the JSON
+                    # decoder. `RecursionError` is a `RuntimeError` subclass, NOT a
+                    # `ValueError`, so the bare `except ValueError` above did not catch it —
+                    # the exception escaped this function (and `main()`), crashing the hook
+                    # into `on_error: "open"` (an allowed commit), the exact bypass class this
+                    # whole file exists to close, reached via a hostile marker shape instead of
+                    # a wrong field value.
                     continue
                 if _attestation_satisfies(record, repo_root, staged_hash):
                     return True
@@ -1251,15 +1279,21 @@ def _cli_write_marker(argv: list[str]) -> int:
     stdin with no argv) — the harness never invokes the script this way, so this branch is
     inert for every normal `pre-bash` dispatch and only runs when explicitly invoked by hand.
 
-    Writes with `os.fsencode`, NOT a bare `.encode()` (review finding, round 9): `top` comes
-    from `_repo_toplevel`, which now `os.fsdecode`s (surrogateescape) a non-UTF-8 repo path
-    into a string containing lone surrogate codepoints. The default `.encode()` uses the
-    strict UTF-8 encoder, which raises `UnicodeEncodeError` on a lone surrogate — a
-    `ValueError` subclass, NOT `OSError`, so it is NOT caught by the `except OSError` below and
-    crashes this CLI entry point outright instead of writing the fallback marker, leaving an
-    agent with a legitimately non-UTF-8 repo path unable to ever satisfy the gate via this
-    path. `os.fsencode` is the exact inverse of `os.fsdecode` and round-trips any string that
-    function could have produced without raising."""
+    Writes `json.dumps(top)`, NOT a bare `.encode()` (review finding, round 9, revised in
+    round 10): `top` comes from `_repo_toplevel`, which `os.fsdecode`s (surrogateescape) a
+    non-UTF-8 repo path into a string containing lone surrogate codepoints, and can also
+    legitimately contain an embedded newline (POSIX allows any byte but NUL and `/` in a path).
+    A bare `.encode()` uses the strict UTF-8 encoder, which raises `UnicodeEncodeError` on a
+    lone surrogate — a `ValueError` subclass, NOT `OSError`, so it would NOT be caught by the
+    `except OSError` below and would crash this CLI entry point outright. An intermediate fix
+    (round 9) used `os.fsencode` plus a raw `\n` line terminator, which round-tripped a
+    non-UTF-8 path but reopened the SAME class of bug for an embedded-newline path: reading the
+    marker back as "everything before the first raw `\n`" truncates at the path's own embedded
+    newline, silently comparing only a prefix. `json.dumps` (default `ensure_ascii=True`)
+    encodes ANY string — embedded newlines as the two-character `\n` escape, non-ASCII/
+    surrogate codepoints as a backslash-u escape — into a result that is always pure ASCII with zero raw
+    newline bytes, so `.encode("ascii")` on it can never raise and `_manual_marker_satisfies`'s
+    `json.loads` round-trips it exactly, unambiguous regardless of what `top` contains."""
     cwd = argv[0] if argv else os.getcwd()
     top = _repo_toplevel(cwd)
     if top is None:
@@ -1269,7 +1303,7 @@ def _cli_write_marker(argv: list[str]) -> int:
         PROOF_DIR.mkdir(parents=True, exist_ok=True)
         fd, marker_path = tempfile.mkstemp(prefix="looked-", dir=str(PROOF_DIR))
         try:
-            os.write(fd, os.fsencode(top) + b"\n")
+            os.write(fd, json.dumps(top).encode("ascii"))
         finally:
             os.close(fd)
     except OSError as exc:
