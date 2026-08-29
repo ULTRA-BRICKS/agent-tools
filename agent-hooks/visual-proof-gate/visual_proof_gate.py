@@ -895,7 +895,15 @@ def _repo_toplevel(cwd: str) -> str | None:
     decode error instead of a wrong field value or a hanging read. `os.fsdecode` uses the
     same `surrogateescape` handling the OS itself uses for non-decodable path bytes and never
     raises, so an exotic path degrades to a merely-unmatchable `repo_root` (fails the later
-    equality check, same as any other legitimate mismatch) rather than crashing the hook."""
+    equality check, same as any other legitimate mismatch) rather than crashing the hook.
+
+    Strips only git's own trailing `\n` output terminator, not a blanket `.strip()` (review
+    finding, round 9): `git rev-parse --show-toplevel` always emits exactly one line ending in
+    a single newline, but a blanket whitespace strip also eats any SPACE (or other whitespace)
+    that is legitimately part of the path itself — a repo at `/tmp/repo ` (trailing space,
+    rare but legal on POSIX) would collapse to the same `repo_root` as `/tmp/repo`, letting a
+    marker written for one satisfy the other's completely unrelated commit. `rstrip(b"\n")`
+    removes only what git actually appends."""
     try:
         proc = subprocess.run(  # noqa: S603,S607 — fixed git argv, trusted
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
@@ -905,7 +913,7 @@ def _repo_toplevel(cwd: str) -> str | None:
         return None
     if proc.returncode != 0:
         return None
-    top = os.fsdecode(proc.stdout.strip())
+    top = os.fsdecode(proc.stdout.rstrip(b"\n"))
     return os.path.realpath(top) if top else None
 
 
@@ -1028,12 +1036,24 @@ def _manual_marker_satisfies(path: Path, repo_root: str) -> bool:
     Reads via `_safe_regular_file_bytes` (not a bare `read_text`), for the same reason
     `_attestation_satisfies` does: `path` is a filesystem entry from a shared, world-writable-
     by-any-local-agent directory, so it could be a FIFO/device/oversized file, not just a plain
-    marker."""
+    marker.
+
+    Decodes the first line with `os.fsdecode`, NOT `.decode("utf-8", errors="replace")`
+    (review finding, round 9): `repo_root` itself comes from `_repo_toplevel`'s `os.fsdecode`
+    (surrogateescape) for a non-UTF-8 path — `errors="replace"` collapses those same bytes to
+    literal U+FFFD replacement characters instead, so a marker genuinely written for that repo
+    could never equal `repo_root` again; the two decode strategies must match for the
+    comparison to mean anything. Splits on the raw `\n` byte (not `str.splitlines()`, which
+    also breaks on `\r`, `\v`, `\x1c`-`\x1e`, U+2028/U+2029, and more) and takes everything
+    before it verbatim, with no extra `.strip()` — `_cli_write_marker` writes exactly
+    `os.fsencode(repo_root) + b"\n"`, so an exact byte-for-byte round trip needs no further
+    trimming, and any additional stripping would reopen the same trailing-whitespace collision
+    `_repo_toplevel`'s own `rstrip(b"\n")` fix (above) exists to close."""
     data = _safe_regular_file_bytes(path, _MAX_MARKER_BYTES)
     if data is None:
         return False
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    return bool(lines) and lines[0].strip() == repo_root
+    first_line = data.split(b"\n", 1)[0]
+    return bool(first_line) and os.fsdecode(first_line) == repo_root
 
 
 def _proof_fresh(repo_root: str | None) -> bool:
@@ -1229,7 +1249,17 @@ def _cli_write_marker(argv: list[str]) -> int:
 
     This is a CLI entry point, not the pre-bash hook contract (agents-hooks/v1 events arrive on
     stdin with no argv) — the harness never invokes the script this way, so this branch is
-    inert for every normal `pre-bash` dispatch and only runs when explicitly invoked by hand."""
+    inert for every normal `pre-bash` dispatch and only runs when explicitly invoked by hand.
+
+    Writes with `os.fsencode`, NOT a bare `.encode()` (review finding, round 9): `top` comes
+    from `_repo_toplevel`, which now `os.fsdecode`s (surrogateescape) a non-UTF-8 repo path
+    into a string containing lone surrogate codepoints. The default `.encode()` uses the
+    strict UTF-8 encoder, which raises `UnicodeEncodeError` on a lone surrogate — a
+    `ValueError` subclass, NOT `OSError`, so it is NOT caught by the `except OSError` below and
+    crashes this CLI entry point outright instead of writing the fallback marker, leaving an
+    agent with a legitimately non-UTF-8 repo path unable to ever satisfy the gate via this
+    path. `os.fsencode` is the exact inverse of `os.fsdecode` and round-trips any string that
+    function could have produced without raising."""
     cwd = argv[0] if argv else os.getcwd()
     top = _repo_toplevel(cwd)
     if top is None:
@@ -1239,7 +1269,7 @@ def _cli_write_marker(argv: list[str]) -> int:
         PROOF_DIR.mkdir(parents=True, exist_ok=True)
         fd, marker_path = tempfile.mkstemp(prefix="looked-", dir=str(PROOF_DIR))
         try:
-            os.write(fd, (top + "\n").encode())
+            os.write(fd, os.fsencode(top) + b"\n")
         finally:
             os.close(fd)
     except OSError as exc:

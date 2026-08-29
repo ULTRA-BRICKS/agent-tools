@@ -732,6 +732,52 @@ def test_repo_toplevel_survives_non_utf8_git_output(monkeypatch):
     assert isinstance(result, str) and result  # some surrogate-escaped string, not a crash
 
 
+def test_repo_toplevel_preserves_trailing_whitespace_in_path(monkeypatch):
+    """Regression, review round 9 (PR #484): `_repo_toplevel` used a blanket `.strip()` on
+    git's stdout, which removes ALL leading/trailing whitespace, not just git's own trailing
+    newline terminator. A repo path that legitimately ends in a space (rare but legal on
+    POSIX) collided with the same path minus the space — `/tmp/space-repo ` and
+    `/tmp/space-repo` both resolved to the identical `repo_root`, letting a marker written for
+    one repo satisfy a completely different repo's unrelated commit. Fixed: strip only the
+    trailing `\n` git always appends (`rstrip(b"\n")`), not generic whitespace."""
+
+    class _FakeCompletedProcess:
+        returncode = 0
+        stdout = b"/tmp/space-repo \n"  # trailing space is part of the path, not padding
+
+    monkeypatch.setattr(vpg.subprocess, "run", lambda *a, **kw: _FakeCompletedProcess())
+    result = vpg._repo_toplevel("/tmp")
+    assert result is not None and result.endswith("space-repo ")
+
+
+def test_write_marker_round_trips_non_utf8_repo_root(tmp_path, monkeypatch):
+    """Regression, review round 9 (PR #484): after the round-8 fix, `_repo_toplevel` decodes a
+    non-UTF-8 repo path with `os.fsdecode` (surrogateescape), producing a string with lone
+    surrogate codepoints. `_cli_write_marker` used to `.encode()` that string with the default
+    STRICT UTF-8 encoder, which raises `UnicodeEncodeError` on a lone surrogate — a `ValueError`
+    subclass, not `OSError`, so it was NOT caught and crashed the CLI outright instead of
+    writing the fallback marker. Separately, `_manual_marker_satisfies` used to
+    `.decode("utf-8", errors="replace")` when reading a marker back, which collapses those same
+    surrogates to literal U+FFFD characters — even a successfully-written marker could then
+    never compare equal to `repo_root` again. Fixed: write with `os.fsencode` (the exact
+    inverse of `os.fsdecode`), read back with `os.fsdecode` too, so the two round-trip.
+    Simulates the non-UTF-8 repo (not reproducible via a real on-disk path on this test
+    machine's own filesystem, which requires valid UTF-8 names) by monkeypatching
+    `_repo_toplevel` to return a string with a genuine lone surrogate — exactly what
+    `os.fsdecode` hands back for a raw 0xFF byte."""
+    fake_root = "/tmp/repo-\udcff-name"  # os.fsdecode's surrogateescape encoding of byte 0xFF
+    monkeypatch.setattr(vpg, "_repo_toplevel", lambda cwd: fake_root)
+    proof = tmp_path / "proof"
+    monkeypatch.setattr(vpg, "PROOF_DIR", proof)
+
+    rc = vpg._cli_write_marker(["/anything"])
+    assert rc == 0  # must not raise UnicodeEncodeError
+
+    written = list(proof.iterdir())
+    assert len(written) == 1
+    assert vpg._manual_marker_satisfies(written[0], fake_root) is True
+
+
 # ── SATISFIED MARKER (agent-tools#475: scoped + content-checked, not just "a file exists") ──
 
 def test_allow_when_proof_marker_fresh(tmp_path, monkeypatch):
