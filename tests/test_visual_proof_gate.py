@@ -710,6 +710,28 @@ def test_fail_open_when_cwd_is_not_a_git_repo(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
 
 
+def test_repo_toplevel_survives_non_utf8_git_output(monkeypatch):
+    """Regression, review round 8 (PR #484): `_repo_toplevel` used to capture git's stdout with
+    `text=True`, which decodes using the strict error handler by default — a repo toplevel path
+    containing bytes that aren't valid UTF-8 (a legal POSIX path; not reproducible via a real
+    on-disk directory on this test machine's own filesystem, which requires valid UTF-8 names,
+    so it's injected directly at the subprocess boundary instead) then raised an uncaught
+    `UnicodeDecodeError` that escaped `_repo_toplevel`, `_resolved_repo_root`, and `main()`
+    entirely. This hook's descriptor is `on_error: "open"`, so a CRASHED hook is an ALLOWED
+    commit — the exact bypass class this whole file exists to close, reached via a decode
+    error instead of a wrong field value. Must not raise; `os.fsdecode`'s `surrogateescape`
+    handling degrades an exotic path to a merely-unmatchable string instead of crashing the
+    hook."""
+
+    class _FakeCompletedProcess:
+        returncode = 0
+        stdout = b"/tmp/repo-\xff\xfe-name"  # not valid UTF-8
+
+    monkeypatch.setattr(vpg.subprocess, "run", lambda *a, **kw: _FakeCompletedProcess())
+    result = vpg._repo_toplevel("/tmp")  # must not raise UnicodeDecodeError
+    assert isinstance(result, str) and result  # some surrogate-escaped string, not a crash
+
+
 # ── SATISFIED MARKER (agent-tools#475: scoped + content-checked, not just "a file exists") ──
 
 def test_allow_when_proof_marker_fresh(tmp_path, monkeypatch):
@@ -1043,17 +1065,23 @@ def test_many_junk_markers_resolve_promptly_not_unboundedly(tmp_path, monkeypatc
 def test_scan_cap_bounds_stale_entries_too(tmp_path, monkeypatch):
     """Regression, review round 7 (PR #484): `scanned += 1` used to run only AFTER the
     freshness `continue`, so entries filtered out as stale (or whose `stat()` raised OSError)
-    never counted toward `_MAX_MARKERS_SCANNED` — a directory flooded with expired/broken
-    markers still cost one real `stat()` per entry, completely unbounded, defeating the whole
-    point of the cap (only FRESH candidates were ever bounded). Flood PROOF_DIR with far more
-    STALE entries than the cap and assert the number of `stat()` calls made is bounded by the
-    cap, not by the directory size — under the pre-fix code this would call `stat()` once per
-    flooded file (cap + 500 calls); after the fix it stops at the cap."""
+    never counted toward the scan budget — a directory flooded with expired/broken markers
+    still cost one real `stat()` per entry, completely unbounded, defeating the whole point of
+    the cap (only FRESH candidates were ever bounded). Flood PROOF_DIR with far more STALE
+    entries than `_MAX_ENTRIES_SCANNED` and assert the number of `stat()` calls made is bounded
+    by that cap, not by the directory size — under the pre-round-7 code this would call
+    `stat()` once per flooded file; after round 7 it stops at a cap.
+
+    Bounds against `_MAX_ENTRIES_SCANNED` (the cheap-pass cap), not `_MAX_MARKERS_SCANNED` (the
+    round 8 fix, PR #484): these used to be the SAME shared counter, but round 8 split them —
+    see `test_fresh_marker_after_many_stale_entries_is_still_found` for why a single small
+    counter shared across both cheap and expensive work made a genuinely fresh marker
+    unreachable on a long-lived, cluttered PROOF_DIR."""
     repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
     proof = tmp_path / "proof"
     proof.mkdir(parents=True)
     stale_mtime = time.time() - vpg.PROOF_WINDOW_S - 3600
-    flood = vpg._MAX_MARKERS_SCANNED + 500
+    flood = vpg._MAX_ENTRIES_SCANNED + 500
     for i in range(flood):
         p = proof / f"stale-{i}"
         p.write_text("stale")
@@ -1076,8 +1104,49 @@ def test_scan_cap_bounds_stale_entries_too(tmp_path, monkeypatch):
     ).stdout.strip()
 
     assert vpg._proof_fresh(top) is False
-    assert calls <= vpg._MAX_MARKERS_SCANNED
+    assert calls <= vpg._MAX_ENTRIES_SCANNED
     assert calls < flood  # proves the flood didn't get fully traversed
+
+
+def test_fresh_marker_after_many_stale_entries_is_still_found(tmp_path, monkeypatch):
+    """Regression, review round 8 (PR #484): the round-7 fix above bounded a stale-entry flood
+    by charging EVERY iterated entry (fresh or stale) against the SAME small
+    `_MAX_MARKERS_SCANNED` (200) budget. On a long-lived, never-pruned PROOF_DIR that
+    accumulates more than 200 stale entries, that made a genuinely fresh, valid marker landing
+    AFTER them in `iterdir()`'s arbitrary order unreachable — the scan gave up before ever
+    inspecting it, and a commit with a REAL, correctly-reviewed screenshot got BLOCKED anyway.
+
+    Reproduces exactly that shape deterministically: write more than `_MAX_MARKERS_SCANNED`
+    stale entries, then a genuinely valid, fresh manual marker, and FORCE iteration to visit
+    every stale entry before the real one — `iterdir()`'s actual order is filesystem-dependent
+    and not guaranteed to reproduce the worst case on its own, so this pins it rather than
+    leaving the regression to chance. Must still resolve to ALLOW: the split cheap/expensive
+    budget (`_MAX_ENTRIES_SCANNED` vs `_MAX_MARKERS_SCANNED`) means the stale entries only cost
+    cheap `stat()` calls and don't consume the expensive-validation budget the real marker
+    needs. Against the pre-round-8 code (one shared 200-entry counter) this exact ordering
+    would BLOCK instead."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True)
+    stale_mtime = time.time() - vpg.PROOF_WINDOW_S - 3600
+    for i in range(vpg._MAX_MARKERS_SCANNED + 50):
+        p = proof / f"stale-{i:05d}"
+        p.write_text("stale")
+        os.utime(p, (stale_mtime, stale_mtime))
+    real_marker = _write_manual_marker(proof, repo, name="real-marker")
+
+    real_iterdir = Path.iterdir
+
+    def stale_entries_first_iterdir(self):
+        entries = list(real_iterdir(self))
+        if self == proof:
+            entries.sort(key=lambda p: p == real_marker)  # False (stale) sorts before True
+        return iter(entries)
+
+    monkeypatch.setattr(Path, "iterdir", stale_entries_first_iterdir)
+
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert c == 0 and _decision(out) == "allow"
 
 
 def test_write_marker_cli_produces_a_marker_that_satisfies_the_gate(tmp_path, monkeypatch):

@@ -797,7 +797,29 @@ _MAX_CAPTURE_BYTES = 200_000_000
 # stops looking and returns False (BLOCK/hatch), the same as if none of the remaining
 # candidates had validated — plenty of markers is not itself proof, and this hook has no
 # reason to trust a directory this cluttered.
+#
+# This cap applies ONLY to candidates that already passed the (cheap) freshness check — i.e.
+# it bounds the EXPENSIVE work (JSON parse + capture-file read+hash, or a manual-marker byte
+# read), not raw directory traversal. See `_MAX_ENTRIES_SCANNED` below for the separate cap on
+# total entries iterated, and `_proof_fresh`'s docstring for why the two are deliberately not
+# the same budget (review finding, round 8).
 _MAX_MARKERS_SCANNED = 200
+
+# Bounds the CHEAP part of the scan — directory iteration + one `stat()` per entry for the
+# freshness check — separately from `_MAX_MARKERS_SCANNED` above, which bounds only the
+# EXPENSIVE part (review finding, round 8): a shared, single budget applied to every entry
+# regardless of freshness (the round-7 fix) means a long-lived, never-pruned PROOF_DIR with
+# more than `_MAX_MARKERS_SCANNED` accumulated STALE entries can place a genuinely fresh,
+# valid marker AFTER that many entries in `iterdir()`'s arbitrary order — the scan gives up
+# before ever reaching it, and a real screenshot that was actually captured and reviewed
+# still gets BLOCKED. A bare `stat()` is orders of magnitude cheaper than the expensive
+# per-candidate work `_MAX_MARKERS_SCANNED` exists to bound (no file content is read), so this
+# ceiling can be — and needs to be — much higher: high enough that an ordinary accumulation of
+# expired markers on a shared, long-lived machine doesn't starve a legitimate fresh one, while
+# still bounding worst-case total iteration for a truly pathological (multi-million-entry)
+# flood. Exceeding EITHER cap does not fail open — both stop looking and return False, same as
+# a directory with no valid markers at all.
+_MAX_ENTRIES_SCANNED = 5_000
 
 # dev-cli's `visual_proof.ATTEST_VERSION` (review finding, round 4). dev-cli's own docstring
 # for that constant says v1 measured blankness with plain exact-pixel-equality (scored a
@@ -862,17 +884,28 @@ def _repo_toplevel(cwd: str) -> str | None:
     answer. Used to scope the proof marker to a REPO, not a bare directory — a screenshot
     looked at from the repo root still scopes the same as a commit made from a subdirectory
     (monorepo packages, `vscode-extension/`, …), because both resolve to the same toplevel;
-    matches dev-cli's own `_git_toplevel` binding in `write_attestation` (agent-tools#475)."""
+    matches dev-cli's own `_git_toplevel` binding in `write_attestation` (agent-tools#475).
+
+    Captures RAW BYTES and decodes with `os.fsdecode` — NOT `text=True` (review finding,
+    round 8): on a POSIX filesystem a repo path is an arbitrary byte string, not guaranteed
+    valid UTF-8. `text=True` decodes with the strict error handler by default, so a non-UTF-8
+    toplevel path raises an uncaught `UnicodeDecodeError` that escapes this function (and
+    `main()`), crashing the hook — `on_error: "open"` then turns that crash into an ALLOWED
+    commit, the exact bypass class this whole file exists to close, just reached through a
+    decode error instead of a wrong field value or a hanging read. `os.fsdecode` uses the
+    same `surrogateescape` handling the OS itself uses for non-decodable path bytes and never
+    raises, so an exotic path degrades to a merely-unmatchable `repo_root` (fails the later
+    equality check, same as any other legitimate mismatch) rather than crashing the hook."""
     try:
         proc = subprocess.run(  # noqa: S603,S607 — fixed git argv, trusted
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=GIT_DIFF_TIMEOUT_S,
+            capture_output=True, timeout=GIT_DIFF_TIMEOUT_S,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
         return None
-    top = proc.stdout.strip()
+    top = os.fsdecode(proc.stdout.strip())
     return os.path.realpath(top) if top else None
 
 
@@ -1028,37 +1061,45 @@ def _proof_fresh(repo_root: str | None) -> bool:
     dev-cli's, ever backdates or postdates a marker), so it is rejected the same as a stale
     one rather than silently trusted.
 
-    Inspects at most `_MAX_MARKERS_SCANNED` directory entries total, not every file in
-    PROOF_DIR (review finding, round 6, tightened in round 7): a per-file size cap alone
-    doesn't bound TOTAL work when there are many files — thousands of fresh, valid-shaped
-    `.json` markers, each pointing at a large regular file with a deliberately wrong hash,
-    each still costs a real read-and-hash before being rejected, and enough of them can push
-    total scan time past this hook's own timeout (`on_error: "open"` turns THAT into an
-    allowed commit too). The budget is applied to every iterated entry BEFORE the freshness
-    check, not only to entries that pass it — a directory flooded with stale or broken-symlink
-    entries still costs a real `stat()` per entry, and skipping the increment for anything a
-    `continue` filters out let that flood bypass the cap entirely (round 7 finding: the cap
-    only ever bounded fresh candidates, never total traversal). Exceeding the cap does not fail
-    open — it just stops looking and returns False, same as if nothing further had validated."""
+    Inspects at most `_MAX_ENTRIES_SCANNED` directory entries total (the cheap stat-only pass,
+    review finding round 7) and, within that, expensively validates at most
+    `_MAX_MARKERS_SCANNED` of the ones that pass the freshness check (round 6). These are TWO
+    SEPARATE budgets, not one shared counter (round 8 finding on the round-7 fix): applying a
+    single small cap to every iterated entry regardless of freshness closed round 7's
+    stale-flood DoS, but on a long-lived, never-pruned PROOF_DIR it also meant a genuinely
+    fresh, valid marker sitting after `_MAX_MARKERS_SCANNED` STALE entries in `iterdir()`'s
+    arbitrary order was never reached — the scan gave up before finding a real screenshot that
+    really was captured and reviewed. Splitting the budgets fixes that: the outer, much larger
+    `_MAX_ENTRIES_SCANNED` still bounds total `stat()` calls against a flood of any kind
+    (fresh, stale, or broken-symlink entries all count against it), while the inner, smaller
+    `_MAX_MARKERS_SCANNED` bounds only the entries that actually reach the expensive
+    read-and-hash/parse step — restoring round 6's original intent (bound expensive work) as
+    its own independent limit rather than conflating it with round 7's traversal limit.
+    Exceeding EITHER cap does not fail open — both just stop looking and return False, same as
+    if nothing further had validated."""
     if repo_root is None:
         return False
     try:
         if not PROOF_DIR.is_dir():
             return False
         now = time.time()
-        scanned = 0
+        entries_scanned = 0
+        markers_validated = 0
         staged_hash: str | None = None
         staged_hash_tried = False
         for child in PROOF_DIR.iterdir():
-            scanned += 1
-            if scanned > _MAX_MARKERS_SCANNED:
-                return False  # too many candidates to keep inspecting — stop, don't fail open
+            entries_scanned += 1
+            if entries_scanned > _MAX_ENTRIES_SCANNED:
+                return False  # too many total entries to keep iterating — stop, don't fail open
             try:
                 age = now - child.stat().st_mtime
                 if age < 0 or age > PROOF_WINDOW_S:
                     continue
             except OSError:
                 continue
+            markers_validated += 1
+            if markers_validated > _MAX_MARKERS_SCANNED:
+                return False  # too many FRESH candidates to keep expensively validating — stop
             if child.suffix == ".json":
                 if not staged_hash_tried:
                     staged_hash = _staged_diff_hash(repo_root)
