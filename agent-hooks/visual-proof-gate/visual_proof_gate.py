@@ -840,8 +840,9 @@ def _safe_regular_file_bytes(path: Path, max_bytes: int) -> bytes | None:
     truncation-and-accept."""
     fd = None
     nofollow = getattr(os, "O_NOFOLLOW", 0)  # not defined on non-POSIX platforms; 0 is a no-op
+    nonblock = getattr(os, "O_NONBLOCK", 0)  # not defined on Windows; 0 is a no-op (no FIFO guard)
     try:
-        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | nofollow)
+        fd = os.open(str(path), os.O_RDONLY | nonblock | nofollow)
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
             return None
@@ -1027,12 +1028,17 @@ def _proof_fresh(repo_root: str | None) -> bool:
     dev-cli's, ever backdates or postdates a marker), so it is rejected the same as a stale
     one rather than silently trusted.
 
-    Inspects at most `_MAX_MARKERS_SCANNED` FRESH candidates, not every file in PROOF_DIR
-    (review finding, round 6): a per-file size cap alone doesn't bound TOTAL work when there
-    are many files — thousands of fresh, valid-shaped `.json` markers, each pointing at a large
-    regular file with a deliberately wrong hash, each still costs a real read-and-hash before
-    being rejected, and enough of them can push total scan time past this hook's own timeout
-    (`on_error: "open"` turns THAT into an allowed commit too). Exceeding the cap does not fail
+    Inspects at most `_MAX_MARKERS_SCANNED` directory entries total, not every file in
+    PROOF_DIR (review finding, round 6, tightened in round 7): a per-file size cap alone
+    doesn't bound TOTAL work when there are many files — thousands of fresh, valid-shaped
+    `.json` markers, each pointing at a large regular file with a deliberately wrong hash,
+    each still costs a real read-and-hash before being rejected, and enough of them can push
+    total scan time past this hook's own timeout (`on_error: "open"` turns THAT into an
+    allowed commit too). The budget is applied to every iterated entry BEFORE the freshness
+    check, not only to entries that pass it — a directory flooded with stale or broken-symlink
+    entries still costs a real `stat()` per entry, and skipping the increment for anything a
+    `continue` filters out let that flood bypass the cap entirely (round 7 finding: the cap
+    only ever bounded fresh candidates, never total traversal). Exceeding the cap does not fail
     open — it just stops looking and returns False, same as if nothing further had validated."""
     if repo_root is None:
         return False
@@ -1044,15 +1050,15 @@ def _proof_fresh(repo_root: str | None) -> bool:
         staged_hash: str | None = None
         staged_hash_tried = False
         for child in PROOF_DIR.iterdir():
+            scanned += 1
+            if scanned > _MAX_MARKERS_SCANNED:
+                return False  # too many candidates to keep inspecting — stop, don't fail open
             try:
                 age = now - child.stat().st_mtime
                 if age < 0 or age > PROOF_WINDOW_S:
                     continue
             except OSError:
                 continue
-            scanned += 1
-            if scanned > _MAX_MARKERS_SCANNED:
-                return False  # too many candidates to keep inspecting — stop, don't fail open
             if child.suffix == ".json":
                 if not staged_hash_tried:
                     staged_hash = _staged_diff_hash(repo_root)
@@ -1090,7 +1096,7 @@ def _block_message(visual: list[str]) -> str:
         "path OUTSIDE the repo — see README) — it writes "
         "a proof record bound to THIS repo and THIS staged diff, no manual marker needed. "
         "FALLBACK (no URL to shoot): `python3 "
-        f"{Path(__file__).resolve()} --write-marker` from inside the repo, after you've "
+        f"{shlex.quote(str(Path(__file__).resolve()))} --write-marker` from inside the repo, after you've "
         f"actually reviewed a capture some other way — a bare `touch` under {PROOF_DIR} no "
         "longer satisfies this gate (agent-tools#475: it used to be content-blind and "
         "machine-global). No self-service bypass. ASK the human, or request a one-time "

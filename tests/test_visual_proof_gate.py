@@ -1040,6 +1040,46 @@ def test_many_junk_markers_resolve_promptly_not_unboundedly(tmp_path, monkeypatc
     assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+def test_scan_cap_bounds_stale_entries_too(tmp_path, monkeypatch):
+    """Regression, review round 7 (PR #484): `scanned += 1` used to run only AFTER the
+    freshness `continue`, so entries filtered out as stale (or whose `stat()` raised OSError)
+    never counted toward `_MAX_MARKERS_SCANNED` — a directory flooded with expired/broken
+    markers still cost one real `stat()` per entry, completely unbounded, defeating the whole
+    point of the cap (only FRESH candidates were ever bounded). Flood PROOF_DIR with far more
+    STALE entries than the cap and assert the number of `stat()` calls made is bounded by the
+    cap, not by the directory size — under the pre-fix code this would call `stat()` once per
+    flooded file (cap + 500 calls); after the fix it stops at the cap."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True)
+    stale_mtime = time.time() - vpg.PROOF_WINDOW_S - 3600
+    flood = vpg._MAX_MARKERS_SCANNED + 500
+    for i in range(flood):
+        p = proof / f"stale-{i}"
+        p.write_text("stale")
+        os.utime(p, (stale_mtime, stale_mtime))
+
+    calls = 0
+    real_stat = Path.stat
+
+    def counting_stat(self, *a, **kw):
+        nonlocal calls
+        if self.parent == proof:
+            calls += 1
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", counting_stat)
+    monkeypatch.setattr(vpg, "PROOF_DIR", proof)
+    top = subprocess.run(  # noqa: S603,S607
+        ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout.strip()
+
+    assert vpg._proof_fresh(top) is False
+    assert calls <= vpg._MAX_MARKERS_SCANNED
+    assert calls < flood  # proves the flood didn't get fully traversed
+
+
 def test_write_marker_cli_produces_a_marker_that_satisfies_the_gate(tmp_path, monkeypatch):
     """The `--write-marker` CLI fallback (the sanctioned replacement for a bare `touch`,
     documented in the README and the BLOCK message) actually produces a marker the gate
