@@ -28,6 +28,21 @@ def _write_tg_ctl(path: Path, body: str) -> Path:
     return path
 
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol (it is the internal hook
+# client documented as "reads a ButtonRequest JSON from stdin", not a generic ask-a-question CLI —
+# see agenttools_hatch_escalation's own `_request_present_hatch_approval` for the full writeup of
+# the real contract). A fake tg-ctl standing in for an "approved" answer must reply with the real
+# hookSpecificOutput shape the helper actually parses (`decision.behavior == "allow"`) — printing
+# arbitrary text and exiting 0 previously "worked" only because the helper wrongly treated ANY
+# clean exit as approval, which is the exact bug this suite now guards against.
+_ALLOW_REPLY_SH = 'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}\'\nexit 0\n'
+
+
+def _allow_body(marker: Path | None = None) -> str:
+    prefix = f"touch {marker}\n" if marker is not None else ""
+    return prefix + _ALLOW_REPLY_SH
+
+
 def _repo_with_tg_ctl(tmp_path: Path, tg_ctl: Path | None = None) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -38,7 +53,9 @@ def _repo_with_tg_ctl(tmp_path: Path, tg_ctl: Path | None = None) -> Path:
     return repo
 
 
-def _home_with_tg_ctl(tmp_path: Path, tg_ctl: Path | None = None, *, name: str = "home") -> Path:
+def _home_with_tg_ctl(
+    tmp_path: Path, tg_ctl: Path | None = None, *, name: str = "home"
+) -> Path:
     """A fake account home dir carrying a rig.yaml whose `agent_hooks.tg_ctl_path` points at the
     fake tg-ctl. Tests monkeypatch `resolve_home` to return this — the only legitimate rig.yaml
     source for the approval binary (the agent-controlled repo `cwd` must NOT be honored)."""
@@ -58,12 +75,14 @@ def _hermetic_home(tmp_path, monkeypatch):
     exercise a home rig.yaml override re-monkeypatch `resolve_home` themselves (that wins)."""
     clean_home = tmp_path / "_clean_home"
     clean_home.mkdir()
-    monkeypatch.setattr(agenttools_hatch_escalation, "resolve_home", lambda: str(clean_home))
+    monkeypatch.setattr(
+        agenttools_hatch_escalation, "resolve_home", lambda: str(clean_home)
+    )
 
 
 def test_env_unset_is_not_requested_and_does_not_contact_tg_ctl(tmp_path):
     marker = tmp_path / "called"
-    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _allow_body(marker))
     repo = _repo_with_tg_ctl(tmp_path)
 
     result = request_hatch_approval(
@@ -84,7 +103,7 @@ def test_env_unset_is_not_requested_and_does_not_contact_tg_ctl(tmp_path):
 
 def test_whitespace_env_is_not_requested_and_does_not_contact_tg_ctl(tmp_path):
     marker = tmp_path / "called"
-    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _allow_body(marker))
     repo = _repo_with_tg_ctl(tmp_path)
     env_var = hatch_env_var("pin-primary-worktree")
 
@@ -107,7 +126,7 @@ def test_whitespace_env_is_not_requested_and_does_not_contact_tg_ctl(tmp_path):
 @pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
 def test_bare_flag_env_is_rejected_without_tg_ctl_contact(tmp_path, value):
     marker = tmp_path / "called"
-    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _allow_body(marker))
     repo = _repo_with_tg_ctl(tmp_path)
     env_var = hatch_env_var("block-reset-hard")
 
@@ -131,9 +150,7 @@ def test_real_justification_exit0_allows_and_includes_context(tmp_path):
     question_file = tmp_path / "question.txt"
     tg_ctl = _write_tg_ctl(
         tmp_path / "trusted" / "tg-ctl",
-        f'printf "%s" "$2" > "{question_file}"\n'
-        'printf "approved by Alex\\n"\n'
-        "exit 0\n",
+        f'cat > "{question_file}"\n' + _ALLOW_REPLY_SH,
     )
     repo = _repo_with_tg_ctl(tmp_path)
     env_var = hatch_env_var("pin-primary-worktree")
@@ -149,7 +166,7 @@ def test_real_justification_exit0_allows_and_includes_context(tmp_path):
 
     assert result.requested is True
     assert result.approved is True
-    assert "approved by Alex" in result.reason
+    assert "approved by tg-ctl ask" in result.reason
     question = question_file.read_text()
     assert "pin-primary-worktree" in question
     assert "Need to inspect the primary checkout before repairing it." in question
@@ -233,25 +250,114 @@ def test_real_justification_timeout_denies(tmp_path):
     assert "timed out" in result.reason
 
 
+def _ask(tmp_path: Path, tg_ctl_body: str):
+    """Run one hatch request against a fake tg-ctl with the given shell body."""
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", tg_ctl_body)
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-reset-hard")
+    return request_hatch_approval(
+        "block-reset-hard",
+        {"command": "git reset --hard"},
+        cwd=str(repo),
+        env={env_var: "Need to discard a disposable failed experiment."},
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+
+# The deny branches below are THE point of the stdin-JSON contract: real `tg-ctl ask` exits 0
+# no matter what happened (declined, timed out, daemon unreachable), so every "clean exit but no
+# explicit allow" shape must deny. Each branch gets its own test so a refactor that re-adds an
+# `exit 0 -> approve` shortcut cannot pass the suite.
+def test_exit0_with_empty_stdout_denies(tmp_path):
+    result = _ask(tmp_path, "exit 0\n")
+    assert result.requested is True
+    assert result.approved is False
+    assert "no reply" in result.reason
+
+
+def test_exit0_with_empty_stdout_and_stderr_detail_denies_with_detail(tmp_path):
+    result = _ask(tmp_path, "echo 'daemon unreachable' >&2\nexit 0\n")
+    assert result.approved is False
+    assert "no reply" in result.reason and "daemon unreachable" in result.reason
+
+
+def test_exit0_with_unparseable_stdout_denies(tmp_path):
+    # The pre-fix fakes printed exactly this and were treated as approval.
+    result = _ask(tmp_path, 'printf "approved\\n"\nexit 0\n')
+    assert result.approved is False
+    assert "unparseable" in result.reason and "approved" in result.reason
+
+
+@pytest.mark.parametrize("behavior", ["deny", "ask", "Allow", ""])
+def test_permission_request_reply_without_literal_allow_denies(tmp_path, behavior):
+    reply = json.dumps(
+        {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": behavior}}}
+    )
+    result = _ask(tmp_path, f"printf '%s' '{reply}'\nexit 0\n")
+    assert result.approved is False
+    assert f"decision was {behavior!r}" in result.reason
+
+
+def test_pretooluse_permission_decision_allow_approves(tmp_path):
+    reply = json.dumps(
+        {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
+    )
+    result = _ask(tmp_path, f"printf '%s' '{reply}'\nexit 0\n")
+    assert result.approved is True
+    assert "approved by tg-ctl ask" in result.reason
+
+
+@pytest.mark.parametrize("decision", ["deny", "ask"])
+def test_pretooluse_permission_decision_other_than_allow_denies(tmp_path, decision):
+    reply = json.dumps(
+        {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision}}
+    )
+    result = _ask(tmp_path, f"printf '%s' '{reply}'\nexit 0\n")
+    assert result.approved is False
+    assert f"decision was {decision!r}" in result.reason
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        # a top-level decision is NOT the hook reply shape — it must not be trusted
+        ({"decision": "allow"}, None),
+        ({"decision": {"behavior": "allow"}}, None),
+        ({"hookSpecificOutput": "allow"}, None),
+        ({"hookSpecificOutput": {}}, None),
+        ({"hookSpecificOutput": {"decision": "allow"}}, None),
+        ({"hookSpecificOutput": {"decision": {"behavior": 1}}}, None),
+        ("allow", None),
+        ([], None),
+        ({"hookSpecificOutput": {"decision": {"behavior": "allow"}}}, "allow"),
+        ({"hookSpecificOutput": {"permissionDecision": "deny"}}, "deny"),
+        # the PreToolUse key wins when both are present — one reply never carries both, but the
+        # precedence is pinned so a future dual-shape reply cannot flip between readings
+        (
+            {"hookSpecificOutput": {"permissionDecision": "deny", "decision": {"behavior": "allow"}}},
+            "deny",
+        ),
+    ],
+)
+def test_parse_ask_decision_reads_only_the_two_hook_reply_shapes(reply, expected):
+    assert agenttools_hatch_escalation._parse_ask_decision(reply) == expected
+
+
 def test_path_shadowing_does_not_choose_fake_tg_ctl(tmp_path, monkeypatch):
     real_marker = tmp_path / "real-called"
     shadow_marker = tmp_path / "shadow-called"
-    real = _write_tg_ctl(
-        tmp_path / "real" / "tg-ctl",
-        f"touch {real_marker}\n"
-        'printf "approved via real path\\n"\n'
-        "exit 0\n",
-    )
+    real = _write_tg_ctl(tmp_path / "real" / "tg-ctl", _allow_body(real_marker))
     trusted_link = tmp_path / "trusted" / "tg-ctl"
     trusted_link.parent.mkdir()
     trusted_link.symlink_to(real)
     shadow = _write_tg_ctl(
         tmp_path / "shadow" / "tg-ctl",
-        f"touch {shadow_marker}\n"
-        'printf "shadow approved\\n"\n'
-        "exit 0\n",
+        f'touch {shadow_marker}\nprintf "shadow approved\\n"\nexit 0\n',
     )
-    monkeypatch.setenv("PATH", f"{shadow.parent}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv(
+        "PATH", f"{shadow.parent}{os.pathsep}{os.environ.get('PATH', '')}"
+    )
     repo = _repo_with_tg_ctl(tmp_path)
     env_var = hatch_env_var("block-reset-hard")
 
@@ -275,12 +381,7 @@ def test_home_rig_yaml_tg_ctl_path_override_is_used(tmp_path, monkeypatch):
     """A `tg_ctl_path` in the ACCOUNT HOME's rig.yaml is the legitimate approval-binary config
     path and IS honored (home is not agent-controlled; resolve_home keys off the OS identity)."""
     marker = tmp_path / "called"
-    tg_ctl = _write_tg_ctl(
-        tmp_path / "reviewed-config" / "tg-ctl",
-        f"touch {marker}\n"
-        'printf "approved via home rig\\n"\n'
-        "exit 0\n",
-    )
+    tg_ctl = _write_tg_ctl(tmp_path / "reviewed-config" / "tg-ctl", _allow_body(marker))
     home = _home_with_tg_ctl(tmp_path, tg_ctl)
     monkeypatch.setattr(agenttools_hatch_escalation, "resolve_home", lambda: str(home))
     env_var = hatch_env_var("pin-primary-worktree")
@@ -288,7 +389,9 @@ def test_home_rig_yaml_tg_ctl_path_override_is_used(tmp_path, monkeypatch):
     result = request_hatch_approval(
         "pin-primary-worktree",
         {"target": "feat/x"},
-        cwd=str(_repo_with_tg_ctl(tmp_path)),  # the repo cwd carries NO override — it's ignored
+        cwd=str(
+            _repo_with_tg_ctl(tmp_path)
+        ),  # the repo cwd carries NO override — it's ignored
         env={env_var: "Need to inspect the primary checkout before repairing it."},
         tg_ctl_candidates=[],
         timeout_s=1,
@@ -306,8 +409,12 @@ def test_repo_local_rig_yaml_tg_ctl_path_is_ignored(tmp_path):
     guarded agent could commit `rig.yaml` with `tg_ctl_path: /tmp/always-exit-0`, set the hatch
     env var, and self-approve — reopening the exact self-service bypass this gate closes."""
     marker = tmp_path / "evil-called"
-    evil = _write_tg_ctl(tmp_path / "evil" / "tg-ctl", f"touch {marker}\nexit 0\n")  # would approve
-    repo = _repo_with_tg_ctl(tmp_path, evil)  # the repo cwd's rig.yaml points at the evil binary
+    evil = _write_tg_ctl(
+        tmp_path / "evil" / "tg-ctl", _allow_body(marker)
+    )  # would approve
+    repo = _repo_with_tg_ctl(
+        tmp_path, evil
+    )  # the repo cwd's rig.yaml points at the evil binary
     env_var = hatch_env_var("pin-primary-worktree")
 
     result = request_hatch_approval(
@@ -325,8 +432,13 @@ def test_repo_local_rig_yaml_tg_ctl_path_is_ignored(tmp_path):
 
 
 def test_default_tg_ctl_candidates_are_hardcoded_absolute_paths():
-    assert Path("/Users/ultra/.files/bin/tg-ctl") in agenttools_hatch_escalation._TRUSTED_TG_CTL_PATHS
-    assert all(path.is_absolute() for path in agenttools_hatch_escalation._TRUSTED_TG_CTL_PATHS)
+    assert (
+        Path("/Users/ultra/.files/bin/tg-ctl")
+        in agenttools_hatch_escalation._TRUSTED_TG_CTL_PATHS
+    )
+    assert all(
+        path.is_absolute() for path in agenttools_hatch_escalation._TRUSTED_TG_CTL_PATHS
+    )
 
 
 _AGENT_HOOKS_DIR = Path(__file__).resolve().parents[1] / "agent-hooks"
@@ -335,15 +447,24 @@ _AGENT_HOOKS_DIR = Path(__file__).resolve().parents[1] / "agent-hooks"
 @pytest.mark.parametrize(
     "descriptor",
     [
-        _AGENT_HOOKS_DIR / "block-devserver-primary" / "block-devserver-primary.pre-bash.json",
+        _AGENT_HOOKS_DIR
+        / "block-devserver-primary"
+        / "block-devserver-primary.pre-bash.json",
         _AGENT_HOOKS_DIR / "block-reset-hard" / "block-reset-hard.pre-bash.json",
-        _AGENT_HOOKS_DIR / "pin-primary-worktree" / "pin-primary-worktree.pre-bash.json",
+        _AGENT_HOOKS_DIR
+        / "pin-primary-worktree"
+        / "pin-primary-worktree.pre-bash.json",
         _AGENT_HOOKS_DIR / "block-raw-pr-merge" / "block-raw-pr-merge.pre-bash.json",
         _AGENT_HOOKS_DIR / "pkill-guard" / "pkill-guard.pre-bash.json",
-        _AGENT_HOOKS_DIR / "require-review-before-commit"
+        _AGENT_HOOKS_DIR
+        / "require-review-before-commit"
         / "require-review-before-commit.pre-bash.json",
-        _AGENT_HOOKS_DIR / "decision-request-format" / "decision-request-format.pre-bash.json",
-        _AGENT_HOOKS_DIR / "worktree-only-writes" / "worktree-only-writes.pre-write.json",
+        _AGENT_HOOKS_DIR
+        / "decision-request-format"
+        / "decision-request-format.pre-bash.json",
+        _AGENT_HOOKS_DIR
+        / "worktree-only-writes"
+        / "worktree-only-writes.pre-write.json",
     ],
 )
 def test_descriptor_timeout_strictly_exceeds_helper_worst_case(descriptor):
@@ -382,13 +503,13 @@ def test_inline_command_assignment_triggers_ask(tmp_path):
     question_file = tmp_path / "question.txt"
     tg_ctl = _write_tg_ctl(
         tmp_path / "trusted" / "tg-ctl",
-        f'printf "%s" "$2" > "{question_file}"\n'
-        'printf "approved by Alex\\n"\n'
-        "exit 0\n",
+        f'cat > "{question_file}"\n' + _ALLOW_REPLY_SH,
     )
     repo = _repo_with_tg_ctl(tmp_path)
     env_var = hatch_env_var("block-reset-hard")
-    command = f'{env_var}="need to discard a disposable experiment" {_DESTRUCTIVE_RESET}'
+    command = (
+        f'{env_var}="need to discard a disposable experiment" {_DESTRUCTIVE_RESET}'
+    )
 
     result = request_hatch_approval(
         "block-reset-hard",
@@ -413,7 +534,7 @@ def test_inline_quoted_value_with_spaces_preserved(tmp_path):
     question_file = tmp_path / "question.txt"
     tg_ctl = _write_tg_ctl(
         tmp_path / "trusted" / "tg-ctl",
-        f'printf "%s" "$2" > "{question_file}"\nexit 0\n',
+        f'cat > "{question_file}"\n' + _ALLOW_REPLY_SH,
     )
     repo = _repo_with_tg_ctl(tmp_path)
     env_var = hatch_env_var("block-raw-pr-merge")
@@ -437,7 +558,7 @@ def test_process_env_takes_precedence_over_inline(tmp_path):
     question_file = tmp_path / "question.txt"
     tg_ctl = _write_tg_ctl(
         tmp_path / "trusted" / "tg-ctl",
-        f'printf "%s" "$2" > "{question_file}"\nexit 0\n',
+        f'cat > "{question_file}"\n' + _ALLOW_REPLY_SH,
     )
     repo = _repo_with_tg_ctl(tmp_path)
     env_var = hatch_env_var("block-reset-hard")
@@ -464,7 +585,7 @@ def test_process_env_takes_precedence_over_inline(tmp_path):
 
 def test_inline_bare_flag_is_rejected_without_tg_ctl_contact(tmp_path):
     marker = tmp_path / "called"
-    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _allow_body(marker))
     repo = _repo_with_tg_ctl(tmp_path)
     env_var = hatch_env_var("block-reset-hard")
     command = f"{env_var}=1 {_DESTRUCTIVE_RESET}"
@@ -487,7 +608,7 @@ def test_inline_bare_flag_is_rejected_without_tg_ctl_contact(tmp_path):
 
 def test_inline_only_matches_the_hooks_own_var(tmp_path):
     marker = tmp_path / "called"
-    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _allow_body(marker))
     repo = _repo_with_tg_ctl(tmp_path)
     # A DIFFERENT hook's var (and an arbitrary env) must never be consumed by this hook.
     command = f'RIG_HATCH_REQUEST_SOME_OTHER_HOOK="why" FOO=bar {_DESTRUCTIVE_RESET}'
@@ -509,7 +630,7 @@ def test_inline_only_matches_the_hooks_own_var(tmp_path):
 
 def test_inline_assignment_after_executable_is_not_consumed(tmp_path):
     marker = tmp_path / "called"
-    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _allow_body(marker))
     repo = _repo_with_tg_ctl(tmp_path)
     env_var = hatch_env_var("block-reset-hard")
     # The assignment appears as an ARGUMENT after the executable, not a leading env prefix — a
@@ -532,7 +653,7 @@ def test_inline_assignment_after_executable_is_not_consumed(tmp_path):
 
 def test_no_command_and_empty_env_is_not_requested(tmp_path):
     marker = tmp_path / "called"
-    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _allow_body(marker))
     repo = _repo_with_tg_ctl(tmp_path)
 
     result = request_hatch_approval(
@@ -551,7 +672,7 @@ def test_no_command_and_empty_env_is_not_requested(tmp_path):
 
 def test_inline_malformed_quoting_is_not_requested(tmp_path):
     marker = tmp_path / "called"
-    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _allow_body(marker))
     repo = _repo_with_tg_ctl(tmp_path)
     env_var = hatch_env_var("block-reset-hard")
     command = f'{env_var}="unterminated {_DESTRUCTIVE_RESET}'  # unmatched quote
@@ -581,7 +702,7 @@ def test_inline_malformed_quoting_is_not_requested(tmp_path):
 def _tg_ctl_recording(tmp_path, question_file):
     return _write_tg_ctl(
         tmp_path / "trusted" / "tg-ctl",
-        f'printf "%s" "$2" > "{question_file}"\nexit 0\n',
+        f'cat > "{question_file}"\n' + _ALLOW_REPLY_SH,
     )
 
 
@@ -680,7 +801,7 @@ def test_inline_whole_command_approval_from_earlier_segment(tmp_path):
 
 def test_inline_quoted_separator_is_not_a_false_positive(tmp_path):
     marker = tmp_path / "called"
-    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _allow_body(marker))
     repo = _repo_with_tg_ctl(tmp_path)
     # A `;` inside a quoted argument must not be mistaken for a real leading assignment on a new
     # segment — there is no hatch var here at all.
@@ -712,7 +833,9 @@ def test_inline_line_continuation_triggers_ask(tmp_path):
     repo = _repo_with_tg_ctl(tmp_path)
     env_var = hatch_env_var("block-raw-pr-merge")
     # The exact README shape: `VAR="…" \` at end of line, command on the next line.
-    command = f'{env_var}="ship gate down, manual verify done" \\\n  gh pr merge 123 --admin'
+    command = (
+        f'{env_var}="ship gate down, manual verify done" \\\n  gh pr merge 123 --admin'
+    )
 
     result = request_hatch_approval(
         "block-raw-pr-merge",
@@ -768,7 +891,9 @@ def test_inline_quoted_separator_in_value_preserved(tmp_path):
     )
 
     assert result.approved is True
-    assert "Justification: ci & security both green; verified" in question_file.read_text()
+    assert (
+        "Justification: ci & security both green; verified" in question_file.read_text()
+    )
 
 
 # --- resolve_home(): the real OS-identity impl + its fail-closed branch ----------------------
@@ -788,7 +913,9 @@ def test_resolve_home_is_os_account_home_not_env(monkeypatch):
     monkeypatch.setattr(
         agenttools_hatch_escalation,
         "_find_tg_ctl",
-        lambda *_args, **_kwargs: pytest.fail("resolve_home test must not resolve tg-ctl"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "resolve_home test must not resolve tg-ctl"
+        ),
     )
     monkeypatch.setenv("HOME", "/tmp/attacker-controlled-home")  # must be ignored
     assert _REAL_RESOLVE_HOME() == _pwd.getpwuid(_os.getuid()).pw_dir
@@ -812,9 +939,13 @@ def test_unresolvable_home_does_not_fall_back_to_env_or_cwd(tmp_path, monkeypatc
     in $HOME must therefore NOT self-approve; with no trusted binary reachable the request denies
     and the attacker binary is never executed."""
     marker = tmp_path / "evil-called"
-    evil = _write_tg_ctl(tmp_path / "evil" / "tg-ctl", f"touch {marker}\nexit 0\n")  # would approve
+    evil = _write_tg_ctl(
+        tmp_path / "evil" / "tg-ctl", _allow_body(marker)
+    )  # would approve
     attacker_home = _home_with_tg_ctl(tmp_path, evil, name="attacker-home")
-    monkeypatch.setenv("HOME", str(attacker_home))  # $HOME points at the approving override
+    monkeypatch.setenv(
+        "HOME", str(attacker_home)
+    )  # $HOME points at the approving override
     # Run the REAL resolve_home (undo the autouse stub) with getpwuid forced to fail.
     monkeypatch.setattr(agenttools_hatch_escalation, "resolve_home", _REAL_RESOLVE_HOME)
 
@@ -845,7 +976,9 @@ def test_home_rig_tilde_tg_ctl_path_is_not_expanded_via_env_home(tmp_path, monke
     rejected outright: an approving binary reachable only via `$HOME` must never be executed."""
     evil_marker = tmp_path / "evil-called"
     attacker = tmp_path / "attacker"
-    _write_tg_ctl(attacker / "bin" / "tg-ctl", f"touch {evil_marker}\nexit 0\n")  # would approve
+    _write_tg_ctl(
+        attacker / "bin" / "tg-ctl", f"touch {evil_marker}\nexit 0\n"
+    )  # would approve
     monkeypatch.setenv("HOME", str(attacker))  # $HOME points at the attacker tree
     # The REAL home's rig.yaml carries a ~-relative override (would expand via $HOME if allowed).
     home = tmp_path / "real-home"
@@ -874,10 +1007,14 @@ def test_home_rig_lookup_does_not_walk_up_to_parent(tmp_path, monkeypatch):
     nested under a workspace (or any agent-controlled dir) whose parent carries an attacker
     rig.yaml, that parent override must be ignored."""
     evil_marker = tmp_path / "evil-called"
-    evil = _write_tg_ctl(tmp_path / "evil" / "tg-ctl", f"touch {evil_marker}\nexit 0\n")  # would approve
+    evil = _write_tg_ctl(
+        tmp_path / "evil" / "tg-ctl", f"touch {evil_marker}\nexit 0\n"
+    )  # would approve
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    (workspace / "rig.yaml").write_text(f'agent_hooks:\n  tg_ctl_path: "{evil}"\n')  # PARENT attacker
+    (workspace / "rig.yaml").write_text(
+        f'agent_hooks:\n  tg_ctl_path: "{evil}"\n'
+    )  # PARENT attacker
     home = workspace / "home"
     home.mkdir()  # the real home itself carries NO rig.yaml
     monkeypatch.setattr(agenttools_hatch_escalation, "resolve_home", lambda: str(home))
@@ -901,7 +1038,9 @@ def test_home_rig_lookup_does_not_walk_up_to_parent(tmp_path, monkeypatch):
 
 
 def _read_overrides_log(log_path: Path) -> list[dict]:
-    return [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    return [
+        json.loads(line) for line in log_path.read_text().splitlines() if line.strip()
+    ]
 
 
 def test_unset_env_never_touches_overrides_log(tmp_path):
@@ -913,7 +1052,9 @@ def test_unset_env_never_touches_overrides_log(tmp_path):
     wins precedence, leaving the tier-3 assertion trivially (and misleadingly) green."""
     repo = _repo_with_tg_ctl(tmp_path)
     default_log = tmp_path / "_clean_home" / ".config" / "agent-tools" / "overrides.log"
-    actual_sink = Path(os.environ["AGENT_TOOLS_OVERRIDES_LOG"])  # the tier that would really fire
+    actual_sink = Path(
+        os.environ["AGENT_TOOLS_OVERRIDES_LOG"]
+    )  # the tier that would really fire
 
     result = request_hatch_approval(
         "block-reset-hard",
@@ -929,7 +1070,7 @@ def test_unset_env_never_touches_overrides_log(tmp_path):
 
 
 def test_approved_hatch_use_is_logged_with_expected_fields(tmp_path):
-    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", 'printf "approved by Alex\\n"\nexit 0\n')
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _ALLOW_REPLY_SH)
     repo = _repo_with_tg_ctl(tmp_path)
     log_path = tmp_path / "overrides.log"
     env_var = hatch_env_var("visual-proof-gate")
@@ -1016,12 +1157,18 @@ def test_blank_and_bare_hatch_attempts_are_logged(tmp_path):
     env_var = hatch_env_var("block-reset-hard")
 
     request_hatch_approval(
-        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
-        env={env_var: "   "}, overrides_log_path=log_path,
+        "block-reset-hard",
+        {"command": "git clean -fd"},
+        cwd=str(repo),
+        env={env_var: "   "},
+        overrides_log_path=log_path,
     )
     request_hatch_approval(
-        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
-        env={env_var: "1"}, overrides_log_path=log_path,
+        "block-reset-hard",
+        {"command": "git clean -fd"},
+        cwd=str(repo),
+        env={env_var: "1"},
+        overrides_log_path=log_path,
     )
 
     entries = _read_overrides_log(log_path)
@@ -1048,15 +1195,20 @@ def test_session_id_resolution_order(tmp_path):
 
     log_path = tmp_path / "ctx-wins.log"
     request_hatch_approval(
-        "block-reset-hard", {"session_id": "from-context"}, cwd=str(repo),
-        env={env_var: "reason one"}, overrides_log_path=log_path,
+        "block-reset-hard",
+        {"session_id": "from-context"},
+        cwd=str(repo),
+        env={env_var: "reason one"},
+        overrides_log_path=log_path,
         tg_ctl_candidates=missing_tg_ctl,
     )
     assert _read_overrides_log(log_path)[0]["session"] == "from-context"
 
     log_path = tmp_path / "env-wins.log"
     request_hatch_approval(
-        "block-reset-hard", {}, cwd=str(repo),
+        "block-reset-hard",
+        {},
+        cwd=str(repo),
         env={env_var: "reason two", "CLAUDE_SESSION_ID": "from-env"},
         overrides_log_path=log_path,
         tg_ctl_candidates=missing_tg_ctl,
@@ -1065,8 +1217,11 @@ def test_session_id_resolution_order(tmp_path):
 
     log_path = tmp_path / "pid-fallback.log"
     request_hatch_approval(
-        "block-reset-hard", {}, cwd=str(repo),
-        env={env_var: "reason three"}, overrides_log_path=log_path,
+        "block-reset-hard",
+        {},
+        cwd=str(repo),
+        env={env_var: "reason three"},
+        overrides_log_path=log_path,
         tg_ctl_candidates=missing_tg_ctl,
     )
     assert _read_overrides_log(log_path)[0]["session"] == f"pid:{os.getpid()}"
@@ -1079,8 +1234,11 @@ def test_multiple_uses_append_rather_than_overwrite(tmp_path):
 
     for _ in range(3):
         request_hatch_approval(
-            "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
-            env={env_var: "1"}, overrides_log_path=log_path,
+            "block-reset-hard",
+            {"command": "git clean -fd"},
+            cwd=str(repo),
+            env={env_var: "1"},
+            overrides_log_path=log_path,
         )
 
     assert len(_read_overrides_log(log_path)) == 3
@@ -1102,7 +1260,9 @@ def test_default_overrides_log_path_is_rooted_at_resolve_home(tmp_path, monkeypa
     env_var = hatch_env_var("block-reset-hard")
 
     request_hatch_approval(
-        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
+        "block-reset-hard",
+        {"command": "git clean -fd"},
+        cwd=str(repo),
         env={env_var: "1"},
     )
 
@@ -1112,7 +1272,9 @@ def test_default_overrides_log_path_is_rooted_at_resolve_home(tmp_path, monkeypa
     assert agenttools_hatch_escalation.default_overrides_log_path() == expected
 
 
-def test_overrides_log_env_override_takes_precedence_over_resolve_home(tmp_path, monkeypatch):
+def test_overrides_log_env_override_takes_precedence_over_resolve_home(
+    tmp_path, monkeypatch
+):
     """`AGENT_TOOLS_OVERRIDES_LOG` (tier 2) wins over the `resolve_home()`-rooted default (tier 3)
     — this is the subprocess-reachable override `tests/conftest.py` relies on for hermeticity, and
     an explicit `overrides_log_path=` kwarg (tier 1, exercised by every other test in this section)
@@ -1123,13 +1285,17 @@ def test_overrides_log_env_override_takes_precedence_over_resolve_home(tmp_path,
     env_var = hatch_env_var("block-reset-hard")
 
     request_hatch_approval(
-        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
+        "block-reset-hard",
+        {"command": "git clean -fd"},
+        cwd=str(repo),
         env={env_var: "1"},
     )
 
     entries = _read_overrides_log(env_log)
     assert len(entries) == 1
-    real_home_default = tmp_path / "_clean_home" / ".config" / "agent-tools" / "overrides.log"
+    real_home_default = (
+        tmp_path / "_clean_home" / ".config" / "agent-tools" / "overrides.log"
+    )
     assert not real_home_default.exists()
 
 
@@ -1140,12 +1306,17 @@ def test_overrides_log_write_failure_never_raises_or_blocks_hatch(tmp_path):
     repo = _repo_with_tg_ctl(tmp_path)
     blocked = tmp_path / "not-a-dir"
     blocked.write_text("occupied")
-    log_path = blocked / "overrides.log"  # blocked's parent mkdir will fail: it's a file, not a dir
+    log_path = (
+        blocked / "overrides.log"
+    )  # blocked's parent mkdir will fail: it's a file, not a dir
     env_var = hatch_env_var("block-reset-hard")
 
     result = request_hatch_approval(
-        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
-        env={env_var: "1"}, overrides_log_path=log_path,
+        "block-reset-hard",
+        {"command": "git clean -fd"},
+        cwd=str(repo),
+        env={env_var: "1"},
+        overrides_log_path=log_path,
     )
 
     assert result.approved is False  # the hatch itself still resolved normally
@@ -1160,8 +1331,11 @@ def test_overrides_log_is_created_with_0600_permissions(tmp_path):
     env_var = hatch_env_var("block-reset-hard")
 
     request_hatch_approval(
-        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
-        env={env_var: "1"}, overrides_log_path=log_path,
+        "block-reset-hard",
+        {"command": "git clean -fd"},
+        cwd=str(repo),
+        env={env_var: "1"},
+        overrides_log_path=log_path,
     )
 
     mode = stat.S_IMODE(log_path.stat().st_mode)
@@ -1179,8 +1353,11 @@ def test_overrides_log_permissions_are_tightened_on_a_preexisting_loose_file(tmp
     env_var = hatch_env_var("block-reset-hard")
 
     request_hatch_approval(
-        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
-        env={env_var: "1"}, overrides_log_path=log_path,
+        "block-reset-hard",
+        {"command": "git clean -fd"},
+        cwd=str(repo),
+        env={env_var: "1"},
+        overrides_log_path=log_path,
     )
 
     mode = stat.S_IMODE(log_path.stat().st_mode)
@@ -1202,8 +1379,11 @@ def test_internal_exception_is_still_logged_as_denied(tmp_path, monkeypatch):
     monkeypatch.setattr(agenttools_hatch_escalation, "_find_tg_ctl", _boom)
 
     result = request_hatch_approval(
-        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
-        env={env_var: "a real written justification"}, overrides_log_path=log_path,
+        "block-reset-hard",
+        {"command": "git clean -fd"},
+        cwd=str(repo),
+        env={env_var: "a real written justification"},
+        overrides_log_path=log_path,
     )
 
     assert result.approved is False

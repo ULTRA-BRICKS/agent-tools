@@ -113,6 +113,16 @@ def _fake_tg_ctl(path: Path, body: str) -> Path:
     return path
 
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol; a fake standing in for an
+# "approved" answer must reply with the hookSpecificOutput shape the hatch helper parses
+# (`decision.behavior == "allow"`). Printing arbitrary text and exiting 0 is a DENY now — the
+# helper no longer treats a clean exit as approval.
+_ALLOW_REPLY_SH = (
+    "printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\","
+    "\"decision\":{\"behavior\":\"allow\"}}}'\nexit 0\n"
+)
+
+
 def _run_hook_inproc(command: str, *, env_extra: dict | None = None, tg_ctl: Path) -> dict:
     """Run the hook in-process so the trusted tg-ctl path can be patched to a fake binary."""
 
@@ -473,7 +483,7 @@ class EndToEnd(unittest.TestCase):
     def test_dash_F_dash_hatch_approved_allows(self):
         # The sanctioned hatch is consulted before the unreadable-stdin block.
         with tempfile.TemporaryDirectory() as tmp:
-            tg_ctl = _fake_tg_ctl(Path(tmp) / "tg-ctl", 'printf "approved\\n"\nexit 0\n')
+            tg_ctl = _fake_tg_ctl(Path(tmp) / "tg-ctl", _ALLOW_REPLY_SH)
             out = _run_hook_inproc(
                 "git commit -F -",
                 env_extra={_HATCH_ENV: "one-off backfill, no ticket"},
@@ -500,7 +510,7 @@ class EndToEnd(unittest.TestCase):
         # Pre-bash hooks must parse the documented inline prefix from the command string because
         # the shell has not exported it to the hook process yet.
         with tempfile.TemporaryDirectory() as tmp:
-            tg_ctl = _fake_tg_ctl(Path(tmp) / "tg-ctl", 'printf "approved\\n"\nexit 0\n')
+            tg_ctl = _fake_tg_ctl(Path(tmp) / "tg-ctl", _ALLOW_REPLY_SH)
             out = _run_hook_inproc(
                 f'{_HATCH_ENV}="one-off backfill, no ticket" git commit -F -',
                 tg_ctl=tg_ctl,

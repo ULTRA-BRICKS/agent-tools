@@ -88,6 +88,15 @@ def _fake_tg_ctl(path: Path, body: str) -> Path:
     return path
 
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol; a fake standing in for an
+# "approved" answer must reply with the real hookSpecificOutput shape the helper parses
+# (`decision.behavior == "allow"`) — printing arbitrary text and exiting 0 no longer approves.
+_ALLOW_REPLY_SH = (
+    'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest",'
+    '"decision":{"behavior":"allow"}}}\'\nexit 0\n'
+)
+
+
 # ── EFFECTIVE_CWD (cross-repo `cd`/`-C` resolution) ────────────────────────────────────
 #
 # `effective_cwd` decides WHICH repo's staged files get checked when the commit command
@@ -685,7 +694,7 @@ def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
 
 def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     """A written justification + tg-ctl exit 0 (the human approved) → allow."""
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved by tap\\n"\nexit 0\n')
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", _ALLOW_REPLY_SH)
     monkeypatch.setattr(vpg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
     out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof",
@@ -859,7 +868,9 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     """The justification supplied as an inline command PREFIX (env var NOT exported) must reach
     tg-ctl via the new `command=` contract. Regression for the documented inline form (Codex #233)."""
     question = tmp_path / "q.txt"
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f'printf "%s" "$2" > "{question}"\nprintf approved\nexit 0\n')
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl", f'cat > "{question}"\n' + _ALLOW_REPLY_SH
+    )
     monkeypatch.setattr(vpg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
     out, _e, c = _run(

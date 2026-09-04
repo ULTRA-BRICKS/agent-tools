@@ -650,6 +650,15 @@ def _fake_tg_ctl(path: Path, body: str) -> Path:
     return path
 
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol; a fake standing in for an
+# "approved" answer must reply with the real hookSpecificOutput shape the helper parses
+# (`decision.behavior == "allow"`) — printing arbitrary text and exiting 0 no longer approves.
+_ALLOW_REPLY_SH = (
+    'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest",'
+    '"decision":{"behavior":"allow"}}}\'\nexit 0\n'
+)
+
+
 def test_hatch_unset_denies(monkeypatch):
     out, _err, code = _run("pkill -f node", monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
@@ -677,7 +686,7 @@ def test_hatch_exit0_allows(monkeypatch, tmp_path):
     marker = tmp_path / "asked"
     tg_ctl = _fake_tg_ctl(
         tmp_path / "tg-ctl",
-        f"touch {marker}\nprintf 'approved by Telegram tap\\n'\nexit 0\n",
+        f"touch {marker}\n" + _ALLOW_REPLY_SH,
     )
     monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     out, _err, code = _run(

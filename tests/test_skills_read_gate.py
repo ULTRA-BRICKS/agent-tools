@@ -72,6 +72,15 @@ def _fake_tg_ctl(path: Path, body: str) -> Path:
     return path
 
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol; a fake standing in for an
+# "approved" answer must reply with the real hookSpecificOutput shape the helper parses
+# (`decision.behavior == "allow"`) — printing arbitrary text and exiting 0 no longer approves.
+_ALLOW_REPLY_SH = (
+    'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest",'
+    '"decision":{"behavior":"allow"}}}\'\nexit 0\n'
+)
+
+
 def _touch_all_skills(invoked: Path, *, session_id: str | None = None) -> None:
     base = invoked / session_id if session_id else invoked
     base.mkdir(parents=True, exist_ok=True)
@@ -327,7 +336,7 @@ def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
 def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     """A written justification + tg-ctl exit 0 (human approved) → allow, even on the first
     action and with no fresh markers."""
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved\\n"\nexit 0\n')
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", _ALLOW_REPLY_SH)
     monkeypatch.setattr(srg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     invoked, tier = tmp_path / "inv", tmp_path / "tier"
     out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier,
@@ -655,7 +664,9 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     """The justification supplied as an inline command PREFIX (env var NOT exported) must reach
     tg-ctl via the new `command=` contract. Regression for the documented inline form (Codex #233)."""
     question = tmp_path / "q.txt"
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f'printf "%s" "$2" > "{question}"\nprintf approved\nexit 0\n')
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl", f'cat > "{question}"\n' + _ALLOW_REPLY_SH
+    )
     monkeypatch.setattr(srg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     invoked, tier = tmp_path / "inv", tmp_path / "tier"
     out, _e, c = _run(

@@ -105,6 +105,15 @@ def _fake_tg_ctl(path: Path, body: str) -> Path:
     return path
 
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol; a fake standing in for an
+# "approved" answer must reply with the real hookSpecificOutput shape the helper parses
+# (`decision.behavior == "allow"`) — printing arbitrary text and exiting 0 no longer approves.
+_ALLOW_REPLY_SH = (
+    'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest",'
+    '"decision":{"behavior":"allow"}}}\'\nexit 0\n'
+)
+
+
 # ── BLOCK — a real authoring commit with code staged and no marker ───────────────────────
 
 def test_block_code_commit_with_no_marker(tmp_path, monkeypatch):
@@ -1012,10 +1021,8 @@ def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     justification = f'Need "hotfix"; pipe | amp & redir < > backtick `date`; $(touch {injected}); review is $pending.'
     tg_ctl = _fake_tg_ctl(
         tmp_path / "tg-ctl",
-        f'printf "%s" "$2" > "{question}"\n'
-        f"touch {marker}\n"
-        'printf "approved by Telegram tap\\n"\n'
-        "exit 0\n",
+        f'cat > "{question}"\n'
+        f"touch {marker}\n" + _ALLOW_REPLY_SH,
     )
     monkeypatch.setattr(rr.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     repo = _mk_repo_with_staged(tmp_path, "src/util.py")
@@ -1024,7 +1031,7 @@ def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert not injected.exists()
-    assert justification in question.read_text()
+    assert justification in json.loads(question.read_text())["question"]
 
 
 def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
@@ -1035,10 +1042,8 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     justification = f'Need "hotfix"; pipe | amp & redir < > backtick `date`; $(touch {injected}); review is $pending.'
     tg_ctl = _fake_tg_ctl(
         tmp_path / "tg-ctl",
-        f'printf "%s" "$2" > "{question}"\n'
-        f"touch {asked}\n"
-        'printf "approved by Telegram tap\\n"\n'
-        "exit 0\n",
+        f'cat > "{question}"\n'
+        f"touch {asked}\n" + _ALLOW_REPLY_SH,
     )
     clean_home = tmp_path / "_clean_home"
     clean_home.mkdir()
@@ -1053,7 +1058,7 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
     assert asked.exists()
     assert not injected.exists()
-    assert justification in question.read_text()
+    assert justification in json.loads(question.read_text())["question"]
 
 
 def test_hatch_justification_exit1_blocks_citing_denied(tmp_path, monkeypatch):

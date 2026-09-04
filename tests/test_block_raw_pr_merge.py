@@ -67,6 +67,15 @@ def _fake_tg_ctl(path: Path, body: str) -> Path:
     return path
 
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol; a fake standing in for an
+# "approved" answer must reply with the real hookSpecificOutput shape the helper parses
+# (`decision.behavior == "allow"`) — printing arbitrary text and exiting 0 no longer approves.
+_ALLOW_REPLY_SH = (
+    'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest",'
+    '"decision":{"behavior":"allow"}}}\'\nexit 0\n'
+)
+
+
 # ── True positives — should BLOCK ──────────────────────────────────────────────────────────
 
 def test_block_basic_gh_pr_merge(monkeypatch):
@@ -238,7 +247,7 @@ def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     marker = tmp_path / "asked"
     tg_ctl = _fake_tg_ctl(
         tmp_path / "tg-ctl",
-        f"touch {marker}\n" 'printf "approved by Telegram tap\\n"\n' "exit 0\n",
+        f"touch {marker}\n" + _ALLOW_REPLY_SH,
     )
     monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     out, _err, code = _run(
@@ -359,7 +368,9 @@ def test_hatch_inline_line_continuation_reaches_tg_ctl(tmp_path, monkeypatch):
     exported). If the `\\`-newline still hid the merge, the hook would `emit("allow")` WITHOUT
     ever calling the mocked tg-ctl, so the question file would not be written."""
     question = tmp_path / "q.txt"
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f'printf "%s" "$2" > "{question}"\nexit 0\n')
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl", f'cat > "{question}"\n' + _ALLOW_REPLY_SH
+    )
     monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     command = (
         'RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="ship gate down, manual verify done" \\\n'

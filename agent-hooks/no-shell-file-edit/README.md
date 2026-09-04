@@ -149,8 +149,11 @@ too and takes precedence over an inline value.
 If the env var is unset, no Telegram call is made and the command simply blocks. If it is
 present but blank, whitespace-only, or a bare flag value (`1`/`true`/`yes`/`on`), the hook does
 not contact Telegram and denies — a bare `1` is not a justification. A real justification runs
-`tg-ctl ask` through a trusted absolute path (never ambient `PATH`); exit 0 allows, and any
-nonzero exit, launch error, or timeout denies. An agent can *request*, not self-grant.
+`tg-ctl ask` through a trusted absolute path (never ambient `PATH`) with the question as a JSON
+ButtonRequest on stdin; only a reply on stdout whose decision is explicitly `allow` allows — an
+empty or unparseable reply, an explicit deny, any nonzero exit, launch error, or timeout denies
+(`tg-ctl ask` exits 0 regardless of outcome, so a clean exit alone is never approval). An agent
+can *request*, not self-grant.
 
 ## Fail-open, on purpose
 

@@ -57,6 +57,15 @@ def _fake_tg_ctl(path: Path, body: str) -> Path:
     return path
 
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol; a fake standing in for an
+# "approved" answer must reply with the real hookSpecificOutput shape the helper parses
+# (`decision.behavior == "allow"`) — printing arbitrary text and exiting 0 no longer approves.
+_ALLOW_REPLY_SH = (
+    'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest",'
+    '"decision":{"behavior":"allow"}}}\'\nexit 0\n'
+)
+
+
 def _run(
     command: str,
     *,
@@ -237,7 +246,7 @@ def test_hatch_bare_flag_denies_without_tg_call(tmp_path):
 
 def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     """A written justification + tg-ctl exit 0 (the human approved) → allow."""
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved by tap\\n"\nexit 0\n')
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", _ALLOW_REPLY_SH)
     r = _run_inproc('git commit -m "feat: x"', monkeypatch, tmp_path,
                     env_extra={_HATCH_ENV: "one-off backfill, no ticket warranted"}, tg_ctl=tg_ctl)
     assert r["code"] == 0 and r["decision"] == "allow"
@@ -318,7 +327,7 @@ def test_dash_F_stdin_hatch_approved_allows(tmp_path, monkeypatch):
     # THE spec requirement: the hatch is consulted BEFORE the `-F -` stdin block, so an approved
     # hatch lets a genuinely ticketless `-F -` commit through (read from the command env + tg-ctl,
     # never git's unreadable stdin).
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved\\n"\nexit 0\n')
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", _ALLOW_REPLY_SH)
     r = _run_inproc("git commit -F -", monkeypatch, tmp_path,
                     env_extra={_HATCH_ENV: "one-off backfill, no ticket"}, tg_ctl=tg_ctl)
     assert r["code"] == 0, f"an approved hatch must allow a `-F -` commit ({r['message']})"
@@ -668,7 +677,7 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     tg-ctl — a pre-bash hook parses the leading RIG_HATCH_REQUEST_… assignment out of the command
     string the event carries. Regression guard for the documented inline form being unusable
     (Codex P1 on #233): before the fix the var was only read from os.environ and this blocked."""
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved by tap\\n"\nexit 0\n')
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", _ALLOW_REPLY_SH)
     command = (
         'RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="one-off backfill, no ticket warranted" '
         'git commit -m "feat: x"'
@@ -681,7 +690,7 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
 
 def test_hatch_inline_command_justification_allows_dash_F_stdin(tmp_path, monkeypatch):
     """The inline prefix also works for `-F -`, proving the hatch is consulted before stdin blocks."""
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved by tap\\n"\nexit 0\n')
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", _ALLOW_REPLY_SH)
     command = (
         'RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="one-off backfill, no ticket warranted" '
         "git commit -F -"
@@ -693,7 +702,7 @@ def test_hatch_inline_command_justification_allows_dash_F_stdin(tmp_path, monkey
 
 def test_hatch_inline_command_after_separator_allows(tmp_path, monkeypatch):
     """The inline prefix is honored even when the commit is not the first command on the line."""
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 0\n")
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", _ALLOW_REPLY_SH)
     command = (
         'echo staging '
         '&& RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="one-off backfill" '

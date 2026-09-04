@@ -137,8 +137,11 @@ The Telegram hatch is intentionally not a self-service bypass. `RIG_HATCH_REQUES
 must contain a nonblank written justification. If the env var is unset, the hook does not contact
 Telegram and falls through to `approval_cmd` / default deny. If the env var is present but blank,
 whitespace-only, or a bare flag value such as `1`, `true`, `yes`, or `on`, the hook does not contact
-Telegram and denies. A real justification runs `tg-ctl ask <question> --timeout 900`; exit 0 allows,
-and exit 1, any other nonzero exit, launch errors, and timeouts all deny. The helper never resolves
+Telegram and denies. A real justification runs `tg-ctl ask` with the question as a JSON
+ButtonRequest on stdin; only a well-formed reply on stdout whose decision is explicitly `allow`
+allows — an empty or unparseable reply, an explicit deny, any nonzero exit, launch errors, and
+timeouts all deny (a clean exit alone is NOT approval: `tg-ctl ask` exits 0 regardless of
+outcome). The helper never resolves
 `tg-ctl` from ambient `PATH`. **The approval binary is a trust anchor: it is resolved from the
 account's REAL home only** (`agent_hooks.tg_ctl_path` in the home `rig.yaml`, home located via
 `pwd.getpwuid` — never `$HOME`, never the repo/`cwd` the hook runs in), then the hardcoded absolute

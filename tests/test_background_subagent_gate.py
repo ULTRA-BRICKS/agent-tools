@@ -34,6 +34,14 @@ _spec.loader.exec_module(gate)
 
 _LONG = "x" * 300  # a clearly non-trivial single-line prompt (> 200 chars)
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol; a fake standing in for an
+# "approved" answer must reply with the real hookSpecificOutput shape the helper parses
+# (`decision.behavior == "allow"`) — printing arbitrary text and exiting 0 no longer approves.
+_ALLOW_REPLY_SH = (
+    'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest",'
+    '"decision":{"behavior":"allow"}}}\'\nexit 0\n'
+)
+
 
 def _run(event, monkeypatch, env: dict | None = None) -> tuple[str, str, int]:
     out, err = io.StringIO(), io.StringIO()
@@ -196,7 +204,7 @@ def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
 
 def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     marker = tmp_path / "asked"
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nprintf approved\nexit 0\n")
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\n" + _ALLOW_REPLY_SH)
     monkeypatch.setattr(gate.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     out, _err, code = _run(
         {"args": {"prompt": _LONG}}, monkeypatch,

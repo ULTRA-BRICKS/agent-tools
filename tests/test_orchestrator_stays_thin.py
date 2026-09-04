@@ -173,6 +173,15 @@ def _fake_tg_ctl(path: Path, body: str):
     return path
 
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol; a fake standing in for an
+# "approved" answer must reply with the real hookSpecificOutput shape the helper parses
+# (`decision.behavior == "allow"`) — printing arbitrary text and exiting 0 no longer approves.
+_ALLOW_REPLY_SH = (
+    'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest",'
+    '"decision":{"behavior":"allow"}}}\'\nexit 0\n'
+)
+
+
 def _repeat_event() -> dict:
     return {"point": "pre-write", "cwd": "/repo", "args": {"file_path": "/repo/src/a.ts"}}
 
@@ -199,7 +208,7 @@ def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
 
 def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     marker = tmp_path / "asked"
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nprintf approved\nexit 0\n")
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\n" + _ALLOW_REPLY_SH)
     monkeypatch.setattr(ost.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     event = _repeat_event()
     _run(event, monkeypatch, tmp_path / "m")  # warn
@@ -2259,7 +2268,7 @@ def test_pre_bash_inline_command_triggers_hatch(tmp_path, monkeypatch):
     question = tmp_path / "q.txt"
     tg_ctl = _fake_tg_ctl(
         tmp_path / "tg-ctl",
-        f'touch {marker}\nprintf "%s" "$2" > "{question}"\nprintf approved\nexit 0\n',
+        f'touch {marker}\ncat > "{question}"\n' + _ALLOW_REPLY_SH,
     )
     monkeypatch.setattr(ost.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     impl = "sed -i 's/a/b/' f && npm run build && echo done"

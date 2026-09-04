@@ -81,6 +81,15 @@ def _fake_tg_ctl(path: Path, body: str) -> Path:
     return path
 
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol; a fake standing in for an
+# "approved" answer must reply with the real hookSpecificOutput shape the helper parses
+# (`decision.behavior == "allow"`) — printing arbitrary text and exiting 0 no longer approves.
+_ALLOW_REPLY_SH = (
+    'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest",'
+    '"decision":{"behavior":"allow"}}}\'\nexit 0\n'
+)
+
+
 # A body that mentions none of the three dimensions and has no table — the bare "A or B?".
 # This is the ONLY class that BLOCKS.
 _BARE = "should we go with A or B?"
@@ -471,7 +480,7 @@ def test_hatch_justification_forces_bare_through(tmp_path, monkeypatch):
     """A written justification + tg-ctl exit 0 (the human approved) forces the bare send THROUGH
     → allow (exit 0), and the tg-ctl round-trip actually happened."""
     marker = tmp_path / "asked"
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\n" + _ALLOW_REPLY_SH)
     monkeypatch.setattr(drf.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     out, _, code = _run(f'tg --tag decision "{_BARE}"', monkeypatch, cwd=tmp_path,
                         env={_HATCH_ENV: "Terse follow-up to an already-detailed thread."})

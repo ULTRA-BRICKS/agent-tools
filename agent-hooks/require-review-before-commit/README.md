@@ -41,8 +41,10 @@ For a genuine one-time exception, **ask the human** — or request a single appr
 Telegram approval request to Alex (deny-by-default): the env var must carry a real
 justification — unset means the hook never contacts Telegram, and a blank or bare
 `1`/`true`/`yes`/`on` is rejected without a Telegram call. A real justification runs the
-trusted `tg-ctl ask`; **exit 0 allows**, and any nonzero exit / launch error / timeout denies
-(the block then leads with `hatch escalation denied: <reason>`).
+trusted `tg-ctl ask` with the question as a JSON ButtonRequest on stdin; **only a reply whose
+decision is explicitly `allow` allows**, and an empty or unparseable reply, an explicit deny, any
+nonzero exit, launch error, or timeout denies (the block then leads with
+`hatch escalation denied: <reason>`).
 
 You can supply the justification either as an inline prefix on the gated command
 (`RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT="…" git commit …`) or by exporting the var into

@@ -84,6 +84,15 @@ def _fake_tg_ctl(path: Path, body: str) -> Path:
     return path
 
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol; a fake standing in for an
+# "approved" answer must reply with the real hookSpecificOutput shape the helper parses
+# (`decision.behavior == "allow"`) — printing arbitrary text and exiting 0 no longer approves.
+_ALLOW_REPLY_SH = (
+    'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest",'
+    '"decision":{"behavior":"allow"}}}\'\nexit 0\n'
+)
+
+
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -579,7 +588,7 @@ def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
 
 
 def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved by tap\\n"\nexit 0\n')
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", _ALLOW_REPLY_SH)
     monkeypatch.setattr(bdp.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     repo = _make_repo(tmp_path, branch="main")
     out, code = _run(repo, monkeypatch, "npm run dev", {
@@ -599,8 +608,11 @@ def test_hatch_question_shows_full_command_not_just_label(tmp_path, monkeypatch)
     unclassified dev-server launch later in the same string would get silently waved through
     on an approval that only ever displayed the first, innocuous-looking launch."""
     capture = tmp_path / "captured-argv"
-    # `tg-ctl ask <question> --timeout <n>` — argv[2] (bash $2) is the question text.
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f'printf "%s" "$2" > {capture}\nexit 0\n')
+    # `tg-ctl ask` reads the ButtonRequest JSON (question included) on stdin — the fake
+    # captures that stream; there is no positional question argument.
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl", f'cat > "{capture}"\n' + _ALLOW_REPLY_SH
+    )
     monkeypatch.setattr(bdp.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     repo = _make_repo(tmp_path, branch="main")
     command = "npm run dev; cd /some/other/shared-checkout && vite"
@@ -634,7 +646,7 @@ def test_inline_hatch_form_reaches_full_command_not_label(tmp_path, monkeypatch)
     form embeds the justification directly on the gated command line
     (`RIG_HATCH_REQUEST_X="..." npm run dev`), which a label like "npm run dev" can never
     contain, so passing the label would make the inline form permanently unusable."""
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved by tap\\n"\nexit 0\n')
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", _ALLOW_REPLY_SH)
     monkeypatch.setattr(bdp.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     repo = _make_repo(tmp_path, branch="main")
     command = 'RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY="One-off, worktree busy." npm run dev'

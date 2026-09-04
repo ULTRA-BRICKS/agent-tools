@@ -5696,6 +5696,19 @@ def _write_fake_tg_ctl(tmp_path: Path, *, name: str, body: str) -> Path:
     return fp
 
 
+# Real `tg-ctl ask` speaks a stdin-JSON-in / stdout-JSON-out protocol; a fake standing in for an
+# "approved" answer must reply with the real hookSpecificOutput shape the helper parses
+# (`decision.behavior == "allow"`) — printing arbitrary text and exiting 0 no longer approves.
+# Note: on approval, `agenttools_hatch_escalation`'s own `result.reason` is now the fixed string
+# "approved by tg-ctl ask (request <id>)" — it no longer echoes whatever the fake printed to
+# stdout (that was the pre-fix behavior); assertions on the audited `override_reason` must check
+# for that fixed prefix, not for text the fake happens to print.
+_ALLOW_REPLY_SH = (
+    'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest",'
+    '"decision":{"behavior":"allow"}}}\'\nexit 0\n'
+)
+
+
 def _fake_home_with_tg_ctl(tmp_path: Path, tg_ctl: Path, *, name: str = "fake-home") -> Path:
     """A fake HOME dir carrying a rig.yaml whose `agent_hooks.tg_ctl_path` points at the fake
     tg-ctl. The hatch helper resolves tg-ctl from the OS account's real home (pwd.getpwuid), so
@@ -6703,7 +6716,7 @@ def test_hatch_reason_triggers_tg_ask_and_approval_returns_0(tmp_path, monkeypat
     question_file = tmp_path / "question.txt"
     tg = _write_fake_tg_ctl(
         tmp_path, name="tg-ctl",
-        body=f'printf "%s" "$2" > "{question_file}"\nprintf "approved by Alex\\n"\nexit 0\n',
+        body=f'cat > "{question_file}"\n' + _ALLOW_REPLY_SH,
     )
     home = _fake_home_with_tg_ctl(tmp_path, tg)
     audit = tmp_path / "audit.jsonl"
@@ -6719,7 +6732,7 @@ def test_hatch_reason_triggers_tg_ask_and_approval_returns_0(tmp_path, monkeypat
     assert "HYP-200" in question, question
     rec = json.loads(audit.read_text().strip())
     assert rec["decision"] == "bypass:approved", rec
-    assert "approved by Alex" in rec.get("override_reason", ""), rec
+    assert "approved by tg-ctl ask" in rec.get("override_reason", ""), rec
 
 
 def test_hatch_denial_returns_1_and_audits(tmp_path, monkeypatch):
@@ -7256,7 +7269,7 @@ def test_skip_ci_hatch_reason_triggers_tg_ask_and_approval_returns_0(tmp_path, m
     question_file = tmp_path / "question.txt"
     tg = _write_fake_tg_ctl(
         tmp_path, name="tg-ctl",
-        body=f'printf "%s" "$2" > "{question_file}"\nprintf "approved by Alex\\n"\nexit 0\n',
+        body=f'cat > "{question_file}"\n' + _ALLOW_REPLY_SH,
     )
     home = _fake_home_with_tg_ctl(tmp_path, tg)
     audit = tmp_path / "audit.jsonl"
@@ -7271,7 +7284,7 @@ def test_skip_ci_hatch_reason_triggers_tg_ask_and_approval_returns_0(tmp_path, m
     assert "CI Actions billing suspended" in question, question
     rec = json.loads(audit.read_text().strip())
     assert rec["decision"] == "skipci:bypass:approved", rec
-    assert "approved by Alex" in rec.get("override_reason", ""), rec
+    assert "approved by tg-ctl ask" in rec.get("override_reason", ""), rec
 
 
 def test_skip_ci_hatch_denial_returns_1_and_audits(tmp_path, monkeypatch):
@@ -7547,7 +7560,7 @@ def test_external_review_hatch_reason_triggers_tg_ask_and_approval_returns_0(tmp
     question_file = tmp_path / "question.txt"
     tg = _write_fake_tg_ctl(
         tmp_path, name="tg-ctl",
-        body=f'printf "%s" "$2" > "{question_file}"\nprintf "approved by Alex\\n"\nexit 0\n',
+        body=f'cat > "{question_file}"\n' + _ALLOW_REPLY_SH,
     )
     home = _fake_home_with_tg_ctl(tmp_path, tg)
     audit = tmp_path / "audit.jsonl"
@@ -7562,7 +7575,7 @@ def test_external_review_hatch_reason_triggers_tg_ask_and_approval_returns_0(tmp
     assert "reviewer unreachable" in question, question
     rec = json.loads(audit.read_text().strip())
     assert rec["decision"] == "external-review:bypass:approved", rec
-    assert "approved by Alex" in rec.get("override_reason", ""), rec
+    assert "approved by tg-ctl ask" in rec.get("override_reason", ""), rec
 
 
 def test_external_review_hatch_denial_returns_1_and_audits(tmp_path, monkeypatch):

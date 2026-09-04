@@ -142,5 +142,5 @@ echo '{"args":{"command":"gh ship 123"}}' | ./block_raw_pr_merge.py; echo "exit=
 ```
 
 A one-time exception is an external Telegram approval — set
-`RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="<why>"` (deny-by-default; only an approved `tg-ctl ask`
-exit 0 allows the raw merge).
+`RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="<why>"` (deny-by-default; only a `tg-ctl ask` reply whose
+decision is explicitly `allow` permits the raw merge — a clean exit with no such reply denies).
