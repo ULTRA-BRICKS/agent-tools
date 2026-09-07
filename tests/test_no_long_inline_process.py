@@ -34,12 +34,15 @@ nlip = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(nlip)
 
 
-def _run(command, monkeypatch, *, agent_id=None, env: dict | None = None) -> tuple[str, str, int]:
+def _run(command, monkeypatch, *, agent_id=None, harness=None, env: dict | None = None) -> tuple[str, str, int]:
     args = {"command": command}
     if agent_id is not None:
         args["agent_id"] = agent_id
+    event = {"args": args}
+    if harness is not None:
+        event["harness"] = harness
     out, err = io.StringIO(), io.StringIO()
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"args": args})))
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
     for k in ("ALLOW_INLINE_PROCESS", "ALLOW_INLINE_PROCESS_REASON",
@@ -92,6 +95,33 @@ def test_block_long_running(command, monkeypatch):
     payload = json.loads(out)
     assert payload["decision"] == "block"
     assert "BACKGROUND" in payload["message"]
+
+
+# ── per-harness delegation recipe (agent-tools#573) ──────────────────────────────────────
+
+@pytest.mark.parametrize("harness,fragment", [
+    (None, "Agent with `subagent_type"),               # missing harness -> Claude Code fallback
+    ("claude-code", "Agent with `subagent_type"),
+    ("codex", "rig-detached-codex"),
+    ("opencode", "rig-detached-opencode"),
+    ("omp", "rig-detached-omp"),
+    ("some-future-harness", "Agent with `subagent_type"),  # unrecognized -> same fallback
+])
+def test_block_message_names_correct_recipe_for_harness(monkeypatch, harness, fragment):
+    """A live codex session collected 184 refusals with CC-only advice it could not follow
+    (agent-tools#573's motivating incident) — the block message must name a recipe the ACTUAL
+    firing harness can act on."""
+    out, _e, code = _run("npm test", monkeypatch, harness=harness)
+    assert code == nlip.BLOCK_EXIT_CODE
+    assert fragment in json.loads(out)["message"]
+
+
+def test_codex_harness_still_governed_no_carveout(monkeypatch):
+    """This hook never had a harness exemption — a codex-tagged long process still BLOCKs,
+    now with codex-actionable advice instead of CC's Agent tool."""
+    out, _e, code = _run("review -C /repo", monkeypatch, harness="codex")
+    assert code == nlip.BLOCK_EXIT_CODE
+    assert "rig-detached-codex" in json.loads(out)["message"]
 
 
 # ── ALLOW ──────────────────────────────────────────────────────────────────────────────

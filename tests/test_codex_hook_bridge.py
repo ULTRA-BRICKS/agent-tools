@@ -18,6 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO = Path(__file__).resolve().parent.parent
 _LIB = _REPO / "lib"
 if str(_LIB) not in sys.path:
@@ -30,6 +32,9 @@ BLOCK_RAW_PR_MERGE = (
 )
 BLOCK_SECRETS_WRITE = (
     _REPO / "agent-hooks" / "block-secrets-write" / "block_secrets_write.py"
+)
+NO_LONG_INLINE_PROCESS = (
+    _REPO / "agent-hooks" / "no-long-inline-process" / "no_long_inline_process.py"
 )
 
 
@@ -319,6 +324,160 @@ def test_to_v1_event_drops_forged_tool_input_agent_id_for_bash():
 
     assert "agent_id" not in v1["args"]
     assert "agent_type" not in v1["args"]
+
+
+@pytest.fixture(autouse=True)
+def _no_host_agent_markers(monkeypatch):
+    """Module-wide: a rig-dispatched test run (this process) may carry RIG_AGENT_ID /
+    RIG_DETACHED_AGENT; strip them for every test so in-process to_v1_event asserts never
+    see an injected agent_id. Subprocess tests pass markers explicitly via `env=`."""
+    _clear_agent_env_markers(monkeypatch)
+
+
+def _clear_agent_env_markers(monkeypatch) -> None:
+    """Drop the detached-agent env markers — mandatory before any to_v1_event test,
+    because a rig-dispatched codex test run (the very process pytest lives in) carries
+    them and the dispatcher injects args.agent_id from process env."""
+    monkeypatch.delenv("RIG_AGENT_ID", raising=False)
+    monkeypatch.delenv("RIG_DETACHED_AGENT", raising=False)
+
+
+def test_to_v1_event_injects_agent_id_from_env_marker(monkeypatch):
+    """agent-tools#573: the ONE trusted subagent identity source for Codex — ported unchanged
+    from `opencode_hook_bridge._detached_agent_id` (agent-tools#476) — is the launcher
+    process environment, since Codex's own PreToolUse/PostToolUse payload exposes none."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "probe")
+    codex_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo ok"},
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(codex_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "probe"
+
+
+def test_to_v1_event_without_env_marker_has_no_agent_id(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    codex_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo ok"},
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(codex_event, point="pre-bash")
+
+    assert "agent_id" not in v1["args"]
+
+
+def test_to_v1_event_env_marker_wins_over_forged_agent_id(monkeypatch):
+    """Strip-then-inject order: a forged tool_input.agent_id is dropped FIRST, then the
+    env marker (the only authority) supplies the identity — never the payload."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "probe")
+    codex_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "echo ok",
+            "agent_id": "forged",
+            "agent_type": "forged-type",
+        },
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(codex_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "probe"
+    assert "agent_type" not in v1["args"]
+
+
+def test_to_v1_event_detached_marker_without_id_yields_anonymous_identity(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_DETACHED_AGENT", "1")
+    codex_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo ok"},
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(codex_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "detached"
+
+
+def test_to_v1_event_blank_env_marker_is_not_an_identity(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "   ")
+    monkeypatch.setenv("RIG_DETACHED_AGENT", "")
+    codex_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo ok"},
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(codex_event, point="pre-bash")
+
+    assert "agent_id" not in v1["args"]
+
+
+def test_codex_bridge_env_marker_makes_long_process_subagent_exempt_end_to_end(tmp_path, monkeypatch):
+    """End-to-end pre-bash pipeline: with the launcher-set env marker present, the real
+    no-long-inline-process descriptor sees a trusted agent_id and allows a long-running
+    command it would otherwise hard-block for the orchestrator."""
+    _clear_agent_env_markers(monkeypatch)
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir, hook_id="no-long-inline-process", point="pre-bash",
+        cmd=NO_LONG_INLINE_PROCESS, on_error="closed",
+    )
+    codex_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "sleep 30"},
+        "cwd": "/repo",
+    }
+    env = dict(os.environ)
+    env["CODEX_HOOKS_DIR"] = str(hooks_dir)
+    env["PYTHONPATH"] = str(_LIB) + os.pathsep + env.get("PYTHONPATH", "")
+    env["RIG_AGENT_ID"] = "LauncherChild"
+    proc = subprocess.run(
+        [sys.executable, "-m", "codex_hook_bridge", "PreToolUse"],
+        input=json.dumps(codex_event),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""  # empty stdout == allow
+
+
+def test_codex_bridge_without_env_marker_still_blocks_long_process_end_to_end(tmp_path, monkeypatch):
+    """Same pipeline, no launcher marker: the orchestrator-level call stays governed."""
+    _clear_agent_env_markers(monkeypatch)
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir, hook_id="no-long-inline-process", point="pre-bash",
+        cmd=NO_LONG_INLINE_PROCESS, on_error="closed",
+    )
+    codex_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "sleep 30"},
+        "cwd": "/repo",
+    }
+    proc = _run_dispatch("PreToolUse", codex_event, hooks_dir=hooks_dir)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["decision"] == "block"
+    assert "rig-detached-codex" in out["reason"]
 
 
 def test_to_v1_event_exposes_apply_patch_command_as_write_content():

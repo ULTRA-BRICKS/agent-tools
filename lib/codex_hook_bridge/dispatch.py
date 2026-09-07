@@ -20,12 +20,17 @@ from pathlib import Path
 HOOK_API = "agents-hooks/v1"
 # The v1 event's `harness` tag for every event this bridge produces — a MODULE LITERAL, not
 # derived from `codex_event`, so it cannot be forged via tool_input the way `args.harness` could
-# be. Codex exposes no TRUSTED per-tool-call subagent identity today (`args.agent_id` is stripped
-# below and never repopulated — there is no top-level Codex field to restore it from, unlike CC's
-# `agent_id`/`agent_type`). A hook can read `event["harness"]` to scope a policy to (or exempt)
-# this whole harness instead of relying on a subagent identity Codex doesn't give it — see
-# `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer
-# (agent-tools#533).
+# be. A hook that wants to tailor a message (or otherwise branch) on the source harness reads
+# `event["harness"]` — see `agent-hooks/orchestrator-stays-thin`'s per-harness delegation-recipe
+# text for a consumer (agent-tools#573). Codex exposes no TRUSTED per-tool-call subagent
+# identity of its OWN in the confirmed `PreToolUse`/`PostToolUse` payload (`tool_input`,
+# `cwd`, `model`, `permission_mode`, the `_ID_KEYS` family — no parent/child session marker);
+# `SubagentStart`/`SubagentStop` exist but this bridge does not map them to a v1 point yet (see
+# "Not mapped yet: pre-agent" in README.md) and no captured fixture confirms a trustworthy
+# per-call linkage even if it did. So a forged `agent_id`/`agent_type` is stripped below and
+# restored ONLY from the launcher process environment via `_detached_agent_id` — the same
+# trust boundary `opencode_hook_bridge._detached_agent_id` uses (agent-tools#476), ported here
+# unchanged (agent-tools#573).
 HARNESS = "codex"
 _KNOWN_EVENTS = frozenset(
     {"PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop"}
@@ -40,6 +45,34 @@ _METADATA_KEYS = (
     "permission_mode",
     *_ID_KEYS,
 )
+
+
+def _detached_agent_id() -> str:
+    """The ONE authoritative subagent identity source for Codex sessions (agent-tools#573).
+
+    The forge-strip in ``to_v1_event`` removes any model/tool-supplied ``agent_id``; Codex's
+    own ``PreToolUse``/``PostToolUse`` hook payload carries no field to restore it from (see
+    ``HARNESS``'s module comment — confirmed absent, same finding
+    ``opencode_hook_bridge._detached_agent_id`` made for opencode's plugin payload). The
+    sanctioned source is the Codex PROCESS ENVIRONMENT, read at launch:
+    ``RIG_AGENT_ID=<name>`` (identity) or ``RIG_DETACHED_AGENT=1`` (anonymous marker), set by
+    the ``rig-detached-codex`` launcher skill. Codex's hook command inherits the parent
+    process environment, so a marker set when the child ``codex exec`` was launched is visible
+    here on every hook invocation for that session.
+
+    Trust reasoning (ported unchanged from ``opencode_hook_bridge._detached_agent_id``,
+    agent-tools#476): a running orchestrator cannot retroactively mutate its own process
+    environment — it can only set these vars for a CHILD process it dispatches, which is
+    exactly the sanctioned act of dispatching a subagent. Cooperative-orchestrator threat
+    model, on_error=open: discipline, not a security boundary. A bare/whitespace value is not
+    a marker.
+    """
+    val = os.environ.get("RIG_AGENT_ID", "").strip()
+    if val:
+        return val
+    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
+        return "detached"
+    return ""
 
 
 def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
@@ -77,6 +110,9 @@ def to_v1_event(codex_event: dict, *, point: str) -> dict:
     for key in _METADATA_KEYS:
         if codex_event.get(key) is not None:
             args[key] = codex_event[key]
+    detached_id = _detached_agent_id()
+    if detached_id:
+        args["agent_id"] = detached_id
 
     command = _tool_command(tool_input)
     if command:

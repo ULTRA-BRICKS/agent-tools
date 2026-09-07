@@ -52,6 +52,13 @@ shared parser (follow-up, not this change). Pinned by `test_quoted_token_equal_t
 Subagent-exempt: a dispatched subagent (``agent_id`` present) is EXPECTED to run these in
 the background, so it is always allowed — this gate governs the orchestrator only.
 
+Harness-aware remediation (agent-tools#573): this hook has ALWAYS governed every harness (it
+never had a `codex`/`opencode`/`omp` carve-out), but its BLOCK message named only Claude
+Code's `Agent` tool — a live codex session collected 184 refusals with no delegation path it
+could actually follow (the motivating incident for agent-tools#573). The message now reads
+`event["harness"]` (bridge-set, unforgeable) and names that harness's own delegation recipe
+instead.
+
 External approval (deny-by-default): there is NO self-service bypass. For a genuine exception,
 ASK the human, or request a one-time Telegram approval by setting
 `RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="<written justification>"` — the hook asks via a
@@ -521,6 +528,38 @@ def _matched_long_process(command: str) -> str | None:
     return None
 
 
+# Per-harness delegation recipe named in the block message (agent-tools#573): this hook has
+# ALWAYS governed every harness (no EXEMPT_HARNESSES carve-out here), but its block message
+# named only Claude Code's `Agent` tool — a live codex session collected 184 refusals with no
+# delegation path it could actually follow. SYNC: the same recipe map is duplicated in
+# `agent-hooks/orchestrator-stays-thin` and `agent-hooks/background-subagent-gate` (each
+# agent-hook is self-contained, no shared import across agent-hooks/ dirs) — keep the four
+# harness values in step if a new one is added.
+_HARNESS_RECIPES = {
+    "claude-code": (
+        "Dispatch it as an Agent with `subagent_type: \"fork\"` or `isolation: \"remote\"` "
+        "(both run in the background)"
+    ),
+    "codex": (
+        "Dispatch it via the `rig-detached-codex` launcher skill for a truly detached child, "
+        "or the native `spawn_agent` tool where your build has one"
+    ),
+    "opencode": (
+        "Dispatch it with Task (subagent_type general or explore), or the "
+        "rig-detached-opencode launcher for a truly detached child"
+    ),
+    "omp": (
+        "Dispatch it with the task tool, or the rig-detached-omp launcher for a truly "
+        "detached child"
+    ),
+}
+
+
+def _delegation_recipe(harness) -> str:
+    """The delegation recipe text for `harness`, falling back to Claude Code's."""
+    return _HARNESS_RECIPES.get(str(harness or "").strip(), _HARNESS_RECIPES["claude-code"])
+
+
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -548,9 +587,8 @@ def main() -> int:
     block_message = (
         f"Run this in a BACKGROUND subagent, not the orchestrator: `{matched}` is a "
         "long-running process (review / --watch / build-or-test suite / long sleep) that "
-        "would block the main thread. Dispatch it as an Agent with `subagent_type: \"fork\"` "
-        "or `isolation: \"remote\"` (both run in the background). There is NO self-service "
-        "bypass. For a genuine exception, ASK the human, or "
+        f"would block the main thread. {_delegation_recipe(event.get('harness'))}. There is "
+        "NO self-service bypass. For a genuine exception, ASK the human, or "
         "request a one-time Telegram approval by setting "
         "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS=\"<written justification>\" "
         "(deny-by-default; a bare 1 is rejected)."

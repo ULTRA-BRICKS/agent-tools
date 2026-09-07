@@ -162,7 +162,8 @@ def test_isolation_worktree_combined_with_fork_still_allows(monkeypatch):
 
 def test_plain_nontrivial_dispatch_without_fork_or_remote_still_blocks(monkeypatch):
     """A non-fork, non-remote, non-trivial dispatch with no run_in_background must still
-    block — this gate still enforces backgrounding, it just recognizes the real allow paths."""
+    block — this gate still enforces backgrounding, it just recognizes the real allow paths.
+    No `harness` set → falls back to the Claude Code recipe (agent-tools#573)."""
     out, _err, code = _run(
         {"args": {"subagent_type": "general-purpose", "prompt": _LONG}}, monkeypatch
     )
@@ -171,33 +172,55 @@ def test_plain_nontrivial_dispatch_without_fork_or_remote_still_blocks(monkeypat
     assert _decision(out) == "block"
     assert "fork" in message
     assert "NOT a real field" in message
-    assert "general or explore" in message
 
 
 def test_reminder_states_the_opencode_truth(monkeypatch):
     """The opencode line of the reminder must match the verified 1.18.20 facts (#476):
     no background field in a default build, the native field only behind
     OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS, and the canonical detached launcher as
-    the sanctioned mechanism — never the old false 'set its native background: true'."""
-    out, _err, _code = _run({"args": {"prompt": _LONG}}, monkeypatch)
+    the sanctioned mechanism — never the old false 'set its native background: true'.
+    Requires `harness: "opencode"` (agent-tools#573: the reminder is now per-harness, not
+    always-concatenated)."""
+    out, _err, _code = _run({"harness": "opencode", "args": {"prompt": _LONG}}, monkeypatch)
     message = json.loads(out)["message"]
+    assert "general or explore" in message
     assert "NO background field" in message
     assert "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS" in message
     assert "~/.agents/skills/rig-detached-opencode/rig-detached-opencode" in message
     assert "set its native background: true flag" not in message
 
 
+@pytest.mark.parametrize("harness,fragment", [
+    (None, "Agent tool"),
+    ("claude-code", "Agent tool"),
+    ("codex", "rig-detached-codex"),
+    ("opencode", "rig-detached-opencode"),
+    ("omp", "rig-detached-omp"),
+    ("some-future-harness", "Agent tool"),
+])
+def test_reminder_names_correct_recipe_for_harness(monkeypatch, harness, fragment):
+    """agent-tools#573: the reminder must name the delegation recipe for the ACTUAL firing
+    harness, not always Claude Code's."""
+    event = {"args": {"subagent_type": "general-purpose", "prompt": _LONG}}
+    if harness is not None:
+        event["harness"] = harness
+    out, _err, code = _run(event, monkeypatch)
+    assert code == gate.BLOCK_EXIT_CODE
+    assert fragment in json.loads(out)["message"]
+
+
 def test_reminder_launcher_reference_matches_the_skill_carrier():
-    """The REMINDER's launcher path must be a rig-discovered carrier (P1, PR #497).
+    """The opencode reminder's launcher path must be a rig-discovered carrier (P1, PR #497).
 
     `bin/` is NOT a catalog carrier: nothing in rig scans or provisions it, so a
-    REMINDER naming `bin/rig-detached-opencode` recommends a command that does not
+    reminder naming `bin/rig-detached-opencode` recommends a command that does not
     exist on a provisioned machine. The launcher now ships as the
     `rig-detached-opencode` UNIVERSAL SKILL: rig copies the whole skill dir (launcher
     included) to `<skills_target>/rig-detached-opencode/` (default
     `~/.agents/skills`, default-on via `skills.universal.all`) — the dir opencode
-    scans natively — so the REMINDER's named path exists after `rig apply` on any
-    provisioned machine. This test pins the REMINDER text to that carrier."""
+    scans natively — so the reminder's named path exists after `rig apply` on any
+    provisioned machine. This test pins the opencode reminder text to that carrier
+    (agent-tools#573: `REMINDER` is now `_reminder_for(harness)`)."""
     repo_root = Path(__file__).resolve().parents[1]
     skill_dir = repo_root / "skills" / "universal" / "rig-detached-opencode"
     launcher = skill_dir / "rig-detached-opencode"
@@ -206,7 +229,7 @@ def test_reminder_launcher_reference_matches_the_skill_carrier():
     assert launcher.is_file(), f"launcher missing from skill carrier: {launcher}"
 
     # 2. the skill is discoverable + default-on: SKILL.md frontmatter name matches the
-    #    dir name, so the provisioned path segment the REMINDER names is the one rig
+    #    dir name, so the provisioned path segment the reminder names is the one rig
     #    installs (`skills.universal.all: true` includes every universal skill).
     skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
     assert skill_md.lstrip().startswith("---")
@@ -225,11 +248,12 @@ def test_reminder_launcher_reference_matches_the_skill_carrier():
         [str(launcher.relative_to(repo_root)), str((skill_dir / "SKILL.md").relative_to(repo_root))]
     ), f"skill carrier files not tracked: {tracked}"
 
-    # 4. the REMINDER names the provisioned path, not the undiscovered bin/ location.
-    #    This direct-constant assert intentionally overlaps the black-box REMINDER and
-    #    bridge-reason asserts elsewhere: THIS one is the carrier<->REMINDER pin.
-    assert "~/.agents/skills/rig-detached-opencode/rig-detached-opencode" in gate.REMINDER
-    assert "bin/rig-detached-opencode" not in gate.REMINDER
+    # 4. the opencode reminder names the provisioned path, not the undiscovered bin/ location.
+    #    This direct-constant assert intentionally overlaps the black-box reminder and
+    #    bridge-reason asserts elsewhere: THIS one is the carrier<->reminder pin.
+    opencode_reminder = gate._reminder_for("opencode")
+    assert "~/.agents/skills/rig-detached-opencode/rig-detached-opencode" in opencode_reminder
+    assert "bin/rig-detached-opencode" not in opencode_reminder
 
     # 5. the stale non-carrier location is gone entirely
     assert not (repo_root / "bin" / "rig-detached-opencode").exists()
