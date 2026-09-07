@@ -17,11 +17,19 @@ tool_result  (post-execution)
 It default-exports a single factory function, `(pi) => { pi.on("tool_call", ...); pi.on("tool_result", ...); }`
 — the shape omp's extension loader expects (docs/hooks.md / docs/extension-loading.md).
 
-For each event it invokes:
+For each event it invokes, and **awaits**:
 
 ```
 python3 -m omp_hook_bridge <event>
 ```
+
+The spawn is asynchronous (`node:child_process`'s `spawn`, awaited to the child's `close`),
+never synchronous. omp is single-threaded, so a synchronous spawn froze the whole interface —
+no repaints, no keypresses — for the entire dispatch, up to the full Telegram-approval window
+of a hatch-capable descriptor (agent-tools#558). omp's `emitToolCall` awaits whatever the
+handler returns, so the decision still arrives before the tool runs. The dispatcher's stderr is
+streamed through as it arrives instead of being buffered to the end, so a hook that explains
+itself while it waits is visible while it is still waiting.
 
 The Python dispatcher reads the extension's payload from stdin, maps it to a logical v1
 point, runs matching descriptors from `~/.omp/agent/hooks/*.json`, and returns plain block
@@ -226,6 +234,38 @@ call is the rare case; three or more serial approval waits in ONE tool call rema
 documented residual of the fail-open design. Overridable via `OMP_HOOK_BRIDGE_TIMEOUT_MS`.
 Re-verify this default against `agent-hooks/*/*.json` if a future descriptor ships a larger
 `timeout_ms`.
+
+### omp's own handler timeout is the real ceiling — raise it
+
+omp bounds a `tool_call` handler independently of this bridge, with the setting
+`extensionHandlers.toolCallTimeoutMs` (**default 30,000 ms**). When it fires, omp resolves the
+tool call to `{block: true, reason: "Extension <path> timed out after 30000ms"}` — it fails
+**CLOSED**, the opposite direction from this bridge, and the dispatcher child is left running.
+
+The old synchronous spawn evaded that timeout by accident: a blocked event loop cannot run
+omp's own timer, so the handler always won the race. The awaited spawn does not evade it. So
+the budgets must be ordered:
+
+```
+longest descriptor timeout_ms (960,000)  <  OMP_HOOK_BRIDGE_TIMEOUT_MS (2,000,000)  <  extensionHandlers.toolCallTimeoutMs
+```
+
+Set the last one in `~/.omp/agent/config.yml`
+([rig-cli#363](https://github.com/alex-mextner/rig-cli/issues/363) tracks provisioning it):
+
+```yaml
+extensionHandlers:
+  toolCallTimeoutMs: 2100000
+```
+
+**Without that setting, any hook that holds a call longer than 30 s — i.e. every Telegram
+approval hatch — ends as an omp-generated block naming this extension's path, not as the
+hook's own decision.** That is the safe direction (a fail-closed hook still does not become an
+allow) but it is not the hook's verdict, and the human's later approval tap lands on a call omp
+has already refused. Do NOT "fix" it by lowering `OMP_HOOK_BRIDGE_TIMEOUT_MS` under 30 s: this
+bridge fails OPEN, so that turns a denied hatch into an allow — strictly worse. The extension
+prints a one-shot stderr line naming this setting once a dispatch passes 10 s, so a user who
+hits the ceiling is told why.
 
 On the Python side, `main()` keeps the same fail-open contract as the codex/opencode
 dispatchers: malformed stdin, a missing `agent_hooks_v1` import, or any dispatcher-internal
