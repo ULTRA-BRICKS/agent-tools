@@ -1,0 +1,9 @@
+{
+  "id": "require-task-cli-for-tickets",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/require-task-cli-for-tickets/require_task_cli_for_tickets.py",
+  "priority": 26,
+  "timeout_ms": 960000,
+  "on_error": "open",
+  "description": "On `gh issue create/edit/close/reopen/comment/delete/transfer/lock/unlock/pin/unpin` or a `gh api` call to a repos/<owner>/<repo>/issues... REST path with a mutating method/field, BLOCKS by default (strict) when task-cli (`task`) is available (on PATH, cwd inside a git repo) — tickets must be created/edited through `task new`/`task classify`, the enforced interface that requires acceptance criteria, motivation, user-impact, and screenshots for UI changes. `gh issue view/list/status` and a read-only `gh api` call are never gated. No self-service bypass: request a one-time Telegram approval via RIG_HATCH_REQUEST_REQUIRE_TASK_CLI_FOR_TICKETS='<justification>' (deny-by-default; bare 1 rejected) — allows only on the human's tg-ctl approval, which is why timeout_ms is 960000. REQUIRE_TASK_CLI_STRICT=0 is the repo-level warn-only opt-out. on_error=open: a crash in the check fails open so a bug never wedges every gh issue/gh api call."
+}

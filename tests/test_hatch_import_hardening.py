@@ -31,6 +31,7 @@ HATCH_HOOKS = (
     "agent-hooks/pin-primary-worktree/pin_primary_worktree.py",
     "agent-hooks/pkill-guard/pkill_guard.py",
     "agent-hooks/require-review-before-commit/require_review.py",
+    "agent-hooks/require-task-cli-for-tickets/require_task_cli_for_tickets.py",
     "agent-hooks/require-ticket-before-commit/require_ticket_before_commit.py",
     "agent-hooks/skills-read-gate/skills_read_gate.py",
     "agent-hooks/subagent-no-bg-longproc/subagent_no_bg_longproc.py",
