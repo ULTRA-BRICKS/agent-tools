@@ -13,6 +13,17 @@ Denies a shell command that irreversibly wipes uncommitted/untracked work with n
 Both are the same failure class — a destructive rewrite of the working tree git cannot undo
 afterward — which is why one hook and one escape hatch cover both.
 
+**`git clean -X` (capital X: delete ONLY git-ignored files) with an explicit pathspec — e.g.
+`git clean -fdX -- node_modules` to clear a corrupted install — is gated exactly like `-x`.**
+This is deliberate, not a parser gap (decided 2026-09-07 while triaging the codex-session
+refusals, agent-tools#580): ignored files are still un-recreatable local state — a `.env`, an
+untracked cache the ignore rules happen to cover, a local database — and a pathspec typo
+(`node_modules` vs `node_module*`) widens the blast radius silently. The hook has no way to
+know which ignored paths are disposable. The sanctioned path for the `node_modules` case is the
+same one-time hatch every other destructive clean uses (`RIG_HATCH_REQUEST_BLOCK_RESET_HARD="…"
+git clean -fdX -- node_modules`), or a non-git removal of the one directory you mean
+(`rm -rf node_modules`), which names exactly one path and is not this hook's business.
+
 Lets the safe, reversible alternatives through:
 
 - `git checkout -- <file>` / `git restore <file>` (discard specific tracked files, scoped)

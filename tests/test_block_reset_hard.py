@@ -736,3 +736,59 @@ def test_empty_command_allows(monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ── #580: a heredoc SCRIPT that names no reset/clean invocation must not fail closed ─────────
+#
+# The two python heredocs below are verbatim from the codex sessions in ~/work/private
+# (2026-09-05/06). Their bodies defeat the line tokenizer (a known limitation, #478), and the
+# OLD fail-closed hint — `git … clean … -f` matched anywhere across the whole text under DOTALL —
+# found `['git','show',…]`, the English word "clean" in a status string, and the `-f` inside a
+# filename such as `GL239-fixed-git-proof.json`. Neither script runs `git reset` or `git clean`.
+
+from codex_private_refusals import (  # noqa: E402
+    BLOCK_RESET_HARD_GIT_CLEAN_FDX,
+    BLOCK_RESET_HARD_PY_HEREDOC_1,
+    BLOCK_RESET_HARD_PY_HEREDOC_2,
+)
+
+
+@pytest.mark.parametrize("command", [BLOCK_RESET_HARD_PY_HEREDOC_1, BLOCK_RESET_HARD_PY_HEREDOC_2])
+def test_benign_python_heredoc_is_allowed_even_when_unparseable(command, monkeypatch):
+    """The exact refused scripts ALLOW: no reset/clean invocation ⇒ no fail-closed verdict."""
+    assert "reset --hard" not in command and "git clean" not in command  # the premise
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0 and json.loads(out)["decision"] == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    "git clean -fd '",                          # a REAL clean -f with an unbalanced quote
+    "git clean -xdf '",                         # force clustered elsewhere in the short flags
+    "git clean --force -d '",                   # long form
+    "git reset --hard '",                       # reset --hard with an unbalanced quote
+    "git clean \\\n  -fd '",                     # backslash-newline continuation joined first
+    "cd /repo\ngit clean -fd '",                # the dangerous form on its own later line
+])
+def test_unparseable_real_destructive_forms_still_fail_closed(command, monkeypatch):
+    """Tightening the hint must not let a genuinely dangerous unparseable command through."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE and json.loads(out)["decision"] == "block"
+    assert "could not verify" in json.loads(out)["message"]
+
+
+@pytest.mark.parametrize("command", [
+    "git show HEAD '\necho clean\nls GL239-fixed.json '",       # words split across lines
+    "git log; echo 'clean up' '",                                  # a separator between them
+    "echo 'git clean --forced-marketing '",                        # `--force` glued to a word
+    "git clean -n 'oops",                                          # a dry run, never gated
+])
+def test_unparseable_text_that_merely_mentions_the_words_is_safe(command, monkeypatch):
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0 and json.loads(out)["decision"] == "allow"
+
+
+def test_git_clean_ignored_only_with_pathspec_is_still_gated(monkeypatch):
+    """Policy (README, agent-tools#580): `-X` + pathspec is a destructive clean like any other —
+    documented as deliberate, not loosened."""
+    out, _err, code = _run(BLOCK_RESET_HARD_GIT_CLEAN_FDX, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE and json.loads(out)["decision"] == "block"

@@ -259,8 +259,30 @@ _GIT_GLOBAL_VALUE_FLAGS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--
 # benign command with an unbalanced quote is NOT blocked just because shlex can't parse it.
 # Only if the raw string plausibly contains a reset --hard or clean -f invocation do we
 # treat a parse error as fail-closed.
-_RESET_HARD_HINT = re.compile(r"\bgit\b.*\breset\b.*\bhard\b", re.DOTALL)
-_CLEAN_FORCE_HINT = re.compile(r"\bgit\b.*\bclean\b.*(-f|--force)", re.DOTALL)
+#
+# "Plausibly" means the three words sit in ONE shell segment — no newline and no `;`/`&`/`|`
+# between them — and the flag is a real FLAG TOKEN (`-f`, `-fd`, `-xdf`, `--force`, `--hard`),
+# not a substring. The previous form (`\bgit\b.*\bclean\b.*(-f|--force)` under DOTALL) matched
+# ACROSS a whole multi-line python heredoc: `['git','show',…]` on one line, the English word
+# "clean" in a status string two lines later, and the `-f` inside a filename like
+# `GL239-fixed-git-proof.json` — so a benign evidence-hashing script whose only parse problem
+# was a tokenizer limitation was refused as a destructive clean (agent-tools#580, two refusals
+# in the codex sessions of 2026-09-05/06). A script that names no `git reset --hard`/`git clean
+# -f` INVOCATION must not be refused on the fail-closed path.
+_SAME_SEGMENT = r"[^\n;&|]*"
+_RESET_HARD_HINT = re.compile(
+    r"\bgit\b" + _SAME_SEGMENT + r"\breset\b" + _SAME_SEGMENT + r"(?<=\s)--hard(?![\w-])"
+)
+_CLEAN_FORCE_HINT = re.compile(
+    r"\bgit\b" + _SAME_SEGMENT + r"\bclean\b" + _SAME_SEGMENT
+    + r"(?<=\s)(?:-[A-Za-z]*f[A-Za-z]*|--force)(?![\w-])"
+)
+
+
+def _hint_text(command: str) -> str:
+    """The raw command as the hint regexes should see it: backslash-newline continuations
+    joined (as `_tokenize` does), so `git clean \\<newline> -fd` stays one segment."""
+    return command.replace("\r\n", "\n").replace("\r", "\n").replace("\\\n", "")
 
 def emit(decision: str, message: str | None = None) -> None:
     out: dict[str, str] = {"hook_api": HOOK_API, "decision": decision}
@@ -626,9 +648,10 @@ def _classify(command: str) -> tuple[str, list[tuple[str, str | None]]]:
     try:
         segments = _split_segments(command)
     except ValueError:
-        if _RESET_HARD_HINT.search(command):
+        hint_text = _hint_text(command)
+        if _RESET_HARD_HINT.search(hint_text):
             return "unparseable", [("reset --hard", None)]
-        if _CLEAN_FORCE_HINT.search(command):
+        if _CLEAN_FORCE_HINT.search(hint_text):
             return "unparseable", [("clean -f...", None)]
         return "safe", []
     findings: list[tuple[str, str | None]] = []
