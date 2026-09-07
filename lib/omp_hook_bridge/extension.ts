@@ -46,6 +46,33 @@ const DEFAULT_SLOW_DISPATCH_NOTICE_MS = 10000;
 // SIGTERM first matches what the previous synchronous spawn did on timeout (Node's default
 // `killSignal`), so a dispatcher that cleans up after itself still gets to.
 const KILL_GRACE_MS = 2000;
+// omp's own default for `extensionHandlers.toolCallTimeoutMs` (see the README section above).
+// Quoted in the slow-dispatch notice so the number is stated once.
+const OMP_DEFAULT_TOOL_CALL_TIMEOUT_MS = 30000;
+
+type BridgeEvent = "tool_call" | "tool_result";
+type DispatcherChild = ReturnType<typeof spawn>;
+
+// Every dispatcher child still running. omp leaving mid-dispatch (Ctrl-C, /exit, a crash) must not
+// orphan a `python3 -m omp_hook_bridge` that may be holding a Telegram hatch open. The budget
+// timers below are unref'd on purpose — a dispatch nobody waits for must not hold omp's exit
+// hostage — so once omp is going down they never fire; this reaper is what ends the child instead
+// (SIGTERM, the same first signal the budget sends, so the dispatcher can clean up). The old
+// synchronous spawn never had the problem only because omp could not exit at all mid-dispatch.
+// Reached from `session_shutdown` (omp's own teardown, bounded at 2 s) and, for a crash or a
+// signal that skips it, from the process `exit` event — both are synchronous paths, and
+// `child.kill` is synchronous. omp reloads an edited extension module under a cache-buster query,
+// so a long-lived session can register this listener more than once; each copy only reaps its
+// own set, so a duplicate is harmless.
+const inFlight = new Set<DispatcherChild>();
+process.on("exit", () => reapInFlight("omp is exiting"));
+
+function reapInFlight(why: string): void {
+  if (inFlight.size === 0) return;
+  console.error(`omp-hook-bridge: ${why} — sending SIGTERM to ${inFlight.size} in-flight dispatcher(s)`);
+  for (const child of inFlight) child.kill("SIGTERM");
+  inFlight.clear();
+}
 
 // Read per call, not once at module load: a test (and a one-off debugging run) must be able to
 // set a small budget for a single dispatch without defeating omp's extension module cache.
@@ -83,11 +110,7 @@ interface DispatcherOutcome {
 // failure here always resolves to "no opinion" (return undefined => allow); only an EXPLICIT
 // `{"decision":"block","reason":...}` from the dispatcher becomes a real block. See README.md
 // "Fail policy" for the full reasoning.
-async function runBridge(
-  eventName: "tool_call" | "tool_result",
-  event: any,
-  ctx: any,
-): Promise<BridgeResult | undefined> {
+async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<BridgeResult | undefined> {
   let outcome: DispatcherOutcome;
   try {
     const payload = JSON.stringify({
@@ -97,7 +120,7 @@ async function runBridge(
       cwd: ctx?.cwd || process.cwd(),
       toolCallId: event?.toolCallId,
     });
-    outcome = await spawnDispatcher(eventName, payload);
+    outcome = await spawnDispatcher(eventName, payload, event?.toolCallId);
   } catch (error: any) {
     console.error(`omp-hook-bridge: dispatcher setup failed, allowing call: ${error?.message}`);
     return undefined;
@@ -116,8 +139,9 @@ async function runBridge(
 // blocking the loop. That is fine: nothing here is shared between calls (each gets its own
 // child, buffer and timers), and the descriptors already run concurrently under claude-code,
 // whose bridge has never serialized them either. Two simultaneous dispatchers do interleave
-// their stderr on the one stream, which is why each bridge line names its event.
-function spawnDispatcher(eventName: string, payload: string): Promise<DispatcherOutcome> {
+// their stderr on the one stream, which is why every forwarded line is tagged with its event and
+// tool-call id (`stderrForwarder`) — two hatches both explaining a wait stay attributable.
+function spawnDispatcher(eventName: BridgeEvent, payload: string, toolCallId: unknown): Promise<DispatcherOutcome> {
   const python = process.env.OMP_HOOK_BRIDGE_PYTHON || "python3";
   const priorPythonPath = process.env.PYTHONPATH || "";
   return new Promise((resolveOutcome) => {
@@ -128,13 +152,17 @@ function spawnDispatcher(eventName: string, payload: string): Promise<Dispatcher
         PYTHONPATH: priorPythonPath ? `${libDir}${delimiter}${priorPythonPath}` : libDir,
       },
     });
+    inFlight.add(child);
     let stdout = "";
     let settled = false;
     const timers = armDispatchTimers(child, eventName);
+    const forward = stderrForwarder(`omp-hook-bridge[${eventName} ${String(toolCallId ?? "-")}]`);
     const finish = (outcome: DispatcherOutcome) => {
       if (settled) return;
       settled = true;
+      inFlight.delete(child);
       timers.disarm();
+      forward.flush();
       resolveOutcome({ ...outcome, timedOut: timers.timedOut() });
     };
     child.stdout?.setEncoding("utf8");
@@ -142,7 +170,7 @@ function spawnDispatcher(eventName: string, payload: string): Promise<Dispatcher
       stdout += chunk;
     });
     child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (chunk: string) => process.stderr.write(chunk));
+    child.stderr?.on("data", forward.write);
     child.on("error", (error: Error) => finish({ stdout, status: null, signal: null, error }));
     // `close` (not `exit`): stdout must be fully drained before the decision is read.
     child.on("close", (status, signal) => finish({ stdout, status, signal }));
@@ -151,6 +179,30 @@ function spawnDispatcher(eventName: string, payload: string): Promise<Dispatcher
     child.stdin?.on("error", () => undefined);
     child.stdin?.end(payload);
   });
+}
+
+interface StderrForwarder {
+  write: (chunk: string) => void;
+  flush: () => void;
+}
+
+// The dispatcher's own stderr, forwarded as it arrives but LINE by line under `tag`, so a chunk
+// boundary never splits a line and the tag lands once per line. `flush` writes a trailing
+// unterminated fragment when the child closes.
+function stderrForwarder(tag: string): StderrForwarder {
+  let pending = "";
+  return {
+    write: (chunk) => {
+      pending += chunk;
+      const lines = pending.split("\n");
+      pending = lines.pop() ?? "";
+      for (const line of lines) process.stderr.write(`${tag} ${line}\n`);
+    },
+    flush: () => {
+      if (pending) process.stderr.write(`${tag} ${pending}\n`);
+      pending = "";
+    },
+  };
 }
 
 interface DispatchTimers {
@@ -162,7 +214,7 @@ interface DispatchTimers {
 // Plain global timers, not `ctx.setTimeout` (omp clears its managed timers wholesale on
 // extension teardown, silently dropping the budget), but `unref`'d so a dispatch nobody is
 // waiting for any more cannot hold the process open on shutdown.
-function armDispatchTimers(child: ReturnType<typeof spawn>, eventName: string): DispatchTimers {
+function armDispatchTimers(child: DispatcherChild, eventName: BridgeEvent): DispatchTimers {
   let timedOut = false;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   const budgetTimer = setTimeout(() => {
@@ -190,17 +242,18 @@ function armDispatchTimers(child: ReturnType<typeof spawn>, eventName: string): 
   };
 }
 
-function warnSlowDispatch(eventName: string): void {
+function warnSlowDispatch(eventName: BridgeEvent): void {
   const seconds = Math.round(resolveSlowDispatchNotice() / 1000);
+  const ompDefaultSeconds = Math.round(OMP_DEFAULT_TOOL_CALL_TIMEOUT_MS / 1000);
   console.error(
     `omp-hook-bridge[${eventName}]: a hook has been holding this call for ${seconds}s — usually a ` +
       "Telegram approval hatch waiting for a human, sometimes just a slow multi-file dispatch. omp " +
       "stays responsive, but it refuses the call at its own extensionHandlers.toolCallTimeoutMs " +
-      "(30s by default) unless that setting is raised — see lib/omp_hook_bridge/README.md.",
+      `(${ompDefaultSeconds}s by default) unless that setting is raised — see lib/omp_hook_bridge/README.md.`,
   );
 }
 
-function interpretDispatcherResult(eventName: string, outcome: DispatcherOutcome): BridgeResult | undefined {
+function interpretDispatcherResult(eventName: BridgeEvent, outcome: DispatcherOutcome): BridgeResult | undefined {
   if (outcome.timedOut) {
     console.error(`omp-hook-bridge[${eventName}]: dispatcher timed out, allowing call`);
     return undefined;
@@ -235,6 +288,11 @@ function interpretDispatcherResult(eventName: string, outcome: DispatcherOutcome
 }
 
 export default function (pi: any): void {
+  // omp's own teardown: end any dispatcher still waiting (see `inFlight`).
+  pi.on("session_shutdown", async () => {
+    reapInFlight("session shutdown");
+  });
+
   pi.on("tool_call", async (event: any, ctx: any) => {
     try {
       return await runBridge("tool_call", event, ctx);

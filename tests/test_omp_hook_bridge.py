@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1066,7 +1067,9 @@ def test_extension_ts_async_path_fails_open_when_the_dispatcher_crashes(tmp_path
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out == {"threw": None, "result": None}
-    assert "boom" in proc.stderr, "the dispatcher's own stderr must still reach the user"
+    # The dispatcher's own stderr still reaches the user — tagged per line with the event and the
+    # tool-call id, so two overlapping dispatches stay attributable.
+    assert "omp-hook-bridge[tool_call c1] boom" in proc.stderr.splitlines(), proc.stderr
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
@@ -1217,3 +1220,60 @@ def test_extension_ts_timeout_escalates_to_sigkill_when_sigterm_is_ignored(tmp_p
     assert "timed out" in proc.stderr
     # Must outlast the 2000 ms grace (SIGTERM alone did nothing) but never the stub's 30 s sleep.
     assert 2000 <= out["elapsedMs"] < 10000, f"SIGKILL did not follow the grace: {out['elapsedMs']} ms"
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_ts_reaps_in_flight_dispatcher_when_the_process_exits(tmp_path):
+    """omp can now EXIT mid-dispatch (the loop is no longer frozen), and the budget timers are
+    unref'd, so nothing would end the child: the extension must SIGTERM every in-flight dispatcher
+    on process exit instead of orphaning one that may be holding a Telegram hatch open."""
+    pid_file = tmp_path / "stub.pid"
+    stub = _write_stub_dispatcher(
+        tmp_path,
+        "import os, pathlib\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n",
+    )
+    proc = _run_bun_driver(
+        tmp_path,
+        "void handlers['tool_call'](event, ctx);\n"
+        "setTimeout(() => process.exit(0), 500);\n",
+        {"OMP_HOOK_BRIDGE_PYTHON": str(stub)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "in-flight dispatcher" in proc.stderr
+    pid = int(pid_file.read_text())
+    assert _pid_gone_within(pid, seconds=3), f"dispatcher {pid} was orphaned by the exiting host"
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_ts_reaps_in_flight_dispatcher_on_session_shutdown(tmp_path):
+    """omp's own teardown path: a `session_shutdown` handler ends the running dispatcher too, so
+    the awaited `tool_call` settles (fail-open) instead of outliving the session."""
+    stub = _write_stub_dispatcher(tmp_path, "time.sleep(30)\n")
+    proc = _run_bun_driver(
+        tmp_path,
+        "const started = Date.now();\n"
+        "const pending = handlers['tool_call'](event, ctx);\n"
+        "setTimeout(() => handlers['session_shutdown']({}, ctx), 300);\n"
+        "const result = (await pending) ?? null;\n"
+        "console.log(JSON.stringify({ elapsedMs: Date.now() - started, result }));\n",
+        {"OMP_HOOK_BRIDGE_PYTHON": str(stub)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["result"] is None
+    assert out["elapsedMs"] < 5000, f"the dispatcher outlived the session: {out['elapsedMs']} ms"
+    assert "session shutdown" in proc.stderr
+    assert "terminated by SIGTERM" in proc.stderr
+
+
+def _pid_gone_within(pid: int, *, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.1)
+    return False

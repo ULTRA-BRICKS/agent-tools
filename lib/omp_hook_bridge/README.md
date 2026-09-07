@@ -29,7 +29,16 @@ no repaints, no keypresses — for the entire dispatch, up to the full Telegram-
 of a hatch-capable descriptor (agent-tools#558). omp's `emitToolCall` awaits whatever the
 handler returns, so the decision still arrives before the tool runs. The dispatcher's stderr is
 streamed through as it arrives instead of being buffered to the end, so a hook that explains
-itself while it waits is visible while it is still waiting.
+itself while it waits is visible while it is still waiting; every forwarded line is tagged
+`omp-hook-bridge[<event> <toolCallId>]`, because dispatches can now overlap (two tool calls in
+flight at once, each with its own child, buffer and timers) and two hatches both explaining a
+wait must stay attributable.
+
+Because omp stays usable during a dispatch, it can now also **exit** during one (Ctrl-C, `/exit`,
+a crash) — something the frozen loop made impossible. The extension keeps every running
+dispatcher in an in-flight set and SIGTERMs them on omp's `session_shutdown` and, for a path
+that skips it, on the process `exit` event, so a quit mid-hatch never orphans a
+`python3 -m omp_hook_bridge` still holding a Telegram approval open.
 
 The Python dispatcher reads the extension's payload from stdin, maps it to a logical v1
 point, runs matching descriptors from `~/.omp/agent/hooks/*.json`, and returns plain block
