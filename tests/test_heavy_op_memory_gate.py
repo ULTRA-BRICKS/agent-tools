@@ -88,6 +88,35 @@ def test_allows_non_heavy_commands(command):
 
 
 @pytest.mark.parametrize("command", [
+    "review diff --help",
+    "review diff -h",
+    "review quorum --help",
+    "review brainstorm --help",
+    "review just-ask --help",
+    'review diff --help 2>&1 | grep -iE -A3 "role" | head -60',
+    "vsce package --help",
+    "./vscode-extension/hypercanvas-preview/build-and-install.sh --help",
+])
+def test_help_only_invocation_of_a_heavy_command_is_not_heavy(command):
+    """Real-incident regression (2026-09, `landing` session): `review diff
+    --help` was hard-blocked by this gate for 19+ hours even though it never
+    starts a multi-model pass — it just prints usage and exits. `-h`/`--help`
+    short-circuits a real CLI to that behavior regardless of which heavy
+    subcommand comes before it, so it must never classify as heavy."""
+    assert hook.classify_heavy_operation(command) is None, command
+
+
+def test_help_flag_in_a_later_unrelated_pipe_segment_does_not_exempt_a_real_heavy_call():
+    """The false-NEGATIVE guard on the fix above: `-h` belongs to `grep`, not
+    `review`, in this pipeline — the `review diff` segment itself requests no
+    help, so it must still classify as heavy. Scoping the exemption to the
+    matched invocation's OWN shell segment (not "anywhere in the command") is
+    what keeps this the safe direction — see `_segment_requests_help`."""
+    command = "review diff -C . | grep -h pattern"
+    assert hook.classify_heavy_operation(command) == "multi-model review-cli pass"
+
+
+@pytest.mark.parametrize("command", [
     'git commit -m "make all tests green"',
     'gh pr comment 12 --body "gradle verify failed"',
     'task new --title "fix go build flake"',
