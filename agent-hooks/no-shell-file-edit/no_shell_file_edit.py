@@ -878,6 +878,41 @@ def _matched_edit(command: str, cwd: str, *, _depth: int = 0) -> tuple[str | Non
     return None, parse_failed
 
 
+# The harness's NATIVE file-edit tool, named in the block message so the agent is pointed at a
+# tool it actually has: Claude Code has Edit/Write; Codex has `apply_patch` (a codex session told
+# to "use the Edit tool" has no such tool and re-plans around the refusal). Keyed on the
+# TOP-LEVEL `event["harness"]` only — a module literal each bridge stamps, never `args` (see
+# orchestrator-stays-thin's trust-boundary note) — and only ever changes WORDING, never the
+# decision, so a spoofed value buys nothing.
+_NATIVE_EDIT_TOOLS: dict[str, tuple[str, str]] = {
+    # harness → (tools named in the rule text, the one-line "use X" instruction)
+    "codex": ("the apply_patch tool", "Use apply_patch (a single patch that adds or updates the file)."),
+}
+_DEFAULT_EDIT_TOOLS = ("the Edit/Write tools", "Use the Edit tool (or Write to replace the whole file).")
+
+
+def _native_edit_tools(event: dict) -> tuple[str, str]:
+    harness = event.get("harness")
+    key = harness.strip() if isinstance(harness, str) else ""
+    return _NATIVE_EDIT_TOOLS.get(key, _DEFAULT_EDIT_TOOLS)
+
+
+def _block_message(matched: str, tools: tuple[str, str]) -> str:
+    tools_name, use_line = tools
+    return (
+        f"Edit files with {tools_name}, not the shell: {matched}. The hyperide rule "
+        "is 'edits only via Edit/Write; no sed/perl/awk for editing files' — a shell in-place "
+        "edit (`sed -i`/`perl -i`/`gawk -i inplace`) or a `> file` redirect onto a tracked "
+        f"source file leaves no reviewable diff, skips the formatter, and desyncs file-state "
+        f"tracking. {use_line} Read-only "
+        "sed/awk/grep pipelines and writes to /tmp or new files are fine. There is NO "
+        "self-service bypass. For a genuine exception, ASK the human, or request a one-time "
+        "Telegram approval by setting "
+        "RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT=\"<written justification>\" "
+        "(deny-by-default; a bare 1 is rejected)."
+    )
+
+
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -905,18 +940,7 @@ def main() -> int:
         emit("allow")
         return 0
 
-    block_message = (
-        f"Edit files with the Edit/Write tools, not the shell: {matched}. The hyperide rule "
-        "is 'edits only via Edit/Write; no sed/perl/awk for editing files' — a shell in-place "
-        "edit (`sed -i`/`perl -i`/`gawk -i inplace`) or a `> file` redirect onto a tracked "
-        "source file leaves no reviewable diff, skips the formatter, and desyncs file-state "
-        "tracking. Use the Edit tool (or Write to replace the whole file). Read-only "
-        "sed/awk/grep pipelines and writes to /tmp or new files are fine. There is NO "
-        "self-service bypass. For a genuine exception, ASK the human, or request a one-time "
-        "Telegram approval by setting "
-        "RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT=\"<written justification>\" "
-        "(deny-by-default; a bare 1 is rejected)."
-    )
+    block_message = _block_message(matched, _native_edit_tools(event))
 
     ctx = {"hook": "no-shell-file-edit", "command": command}
     hatch = hatch_escalation.request_hatch_approval(

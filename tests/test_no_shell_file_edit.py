@@ -69,8 +69,12 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _run(command, repo: Path, monkeypatch, *, env: dict | None = None) -> tuple[str, str, int]:
+def _run(
+    command, repo: Path, monkeypatch, *, env: dict | None = None, harness: str | None = None,
+) -> tuple[str, str, int]:
     event = {"args": {"command": command}, "cwd": str(repo)}
+    if harness is not None:
+        event["harness"] = harness
     out, err = io.StringIO(), io.StringIO()
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
     monkeypatch.setattr(sys, "stdout", out)
@@ -555,3 +559,54 @@ def test_hatch_inline_command_justification_allows(repo, tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert "vetted bulk codemod, reviewed" in question.read_text()
+
+
+# ── the block message names the harness's NATIVE edit tool (codex has no Edit/Write) ──────────
+#
+# Verbatim from a codex session in ~/work/private (2026-09-06T02:40Z): a heredoc append to a
+# tracked test file. The BLOCK is correct — codex had `apply_patch` and should have used it —
+# but the message told it to "use the Edit tool", which codex does not have.
+
+from codex_private_refusals import NO_SHELL_FILE_EDIT_CAT_APPEND  # noqa: E402
+
+
+def _repo_with_tracked_test_file(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    (repo / "packages/content-api-client/test").mkdir(parents=True)
+    (repo / "packages/content-api-client/test/hooks.test.tsx").write_text("// tracked\n")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    return repo
+
+
+def test_codex_block_message_names_apply_patch(tmp_path, monkeypatch):
+    repo = _repo_with_tracked_test_file(tmp_path)
+    out, _e, code = _run(NO_SHELL_FILE_EDIT_CAT_APPEND, repo, monkeypatch, harness="codex")
+    assert code == nsfe.BLOCK_EXIT_CODE and _decision(out) == "block"
+    msg = json.loads(out)["message"]
+    assert "Edit files with the apply_patch tool" in msg
+    assert "Use apply_patch" in msg
+    assert "Use the Edit tool" not in msg
+
+
+def test_default_block_message_still_names_edit_write(tmp_path, monkeypatch):
+    repo = _repo_with_tracked_test_file(tmp_path)
+    for harness in (None, "claude-code", "  ", 7):
+        event_harness = harness if harness is None else harness
+        out, _e, code = _run(NO_SHELL_FILE_EDIT_CAT_APPEND, repo, monkeypatch, harness=event_harness)
+        assert code == nsfe.BLOCK_EXIT_CODE and _decision(out) == "block", harness
+        msg = json.loads(out)["message"]
+        assert "Edit files with the Edit/Write tools" in msg and "Use the Edit tool" in msg, harness
+
+
+def test_harness_in_args_is_ignored_for_wording(tmp_path, monkeypatch):
+    """Only the top-level `harness` (bridge-stamped) selects the wording — never `args`."""
+    repo = _repo_with_tracked_test_file(tmp_path)
+    event = {"args": {"command": NO_SHELL_FILE_EDIT_CAT_APPEND, "harness": "codex"}, "cwd": str(repo)}
+    out, err = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.delenv("RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT", raising=False)
+    assert nsfe.main() == nsfe.BLOCK_EXIT_CODE
+    assert "Edit files with the Edit/Write tools" in json.loads(out.getvalue())["message"]
