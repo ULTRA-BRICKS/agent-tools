@@ -36,9 +36,18 @@ wait must stay attributable.
 
 Because omp stays usable during a dispatch, it can now also **exit** during one (Ctrl-C, `/exit`,
 a crash) — something the frozen loop made impossible. The extension keeps every running
-dispatcher in an in-flight set and SIGTERMs them on omp's `session_shutdown` and, for a path
-that skips it, on the process `exit` event, so a quit mid-hatch never orphans a
-`python3 -m omp_hook_bridge` still holding a Telegram approval open.
+dispatcher in an in-flight registry (shared across reloads of the module) and stops them on
+omp's `session_shutdown` — SIGTERM, then SIGKILL after 1 s, inside omp's 2 s shutdown-handler
+cap — and, for a crash or signal that skips it, on the process `exit` event (which cannot wait:
+SIGTERM, or SIGKILL for a child already asked to stop). Each dispatcher is spawned as its own
+process-group leader and signalled as a group, so the hook scripts it forks go with it. Out of
+reach by design: a descendant that started a new session — the hatch's `tg-ctl ask` does — which
+the dispatcher's own SIGTERM cleanup must end; SIGTERM therefore always comes first, on every
+path (budget timeout, shutdown, exit).
+
+Output is bounded: a dispatcher that writes more than 1 MiB to stdout is stopped and the call
+resolves through the fail-open path; a stderr line that never ends is flushed in 64 KiB pieces.
+The old `spawnSync` had a bounded buffer for free; an awaited stream needs these caps explicitly.
 
 The Python dispatcher reads the extension's payload from stdin, maps it to a logical v1
 point, runs matching descriptors from `~/.omp/agent/hooks/*.json`, and returns plain block

@@ -50,28 +50,84 @@ const KILL_GRACE_MS = 2000;
 // Quoted in the slow-dispatch notice so the number is stated once.
 const OMP_DEFAULT_TOOL_CALL_TIMEOUT_MS = 30000;
 
+// Grace between the SIGTERM sent on omp's own `session_shutdown` and the SIGKILL that follows —
+// short because omp bounds that handler at 2 s (its SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS).
+const SHUTDOWN_KILL_GRACE_MS = 1000;
+// Output caps. The old `spawnSync` had a bounded output buffer; an awaited stream does not, so a
+// dispatcher (or a hook behind it) that never stops writing would grow omp's memory until it
+// died. A decision is a few hundred bytes of JSON: past the stdout cap the child is stopped and
+// the call resolves through the fail-open path. A stderr line that never ends is flushed in
+// bounded pieces instead of being held for its newline.
+const MAX_STDOUT_BYTES = 1 << 20;
+const MAX_STDERR_LINE_BYTES = 64 << 10;
+
 type BridgeEvent = "tool_call" | "tool_result";
 type DispatcherChild = ReturnType<typeof spawn>;
 
-// Every dispatcher child still running. omp leaving mid-dispatch (Ctrl-C, /exit, a crash) must not
-// orphan a `python3 -m omp_hook_bridge` that may be holding a Telegram hatch open. The budget
-// timers below are unref'd on purpose — a dispatch nobody waits for must not hold omp's exit
-// hostage — so once omp is going down they never fire; this reaper is what ends the child instead
-// (SIGTERM, the same first signal the budget sends, so the dispatcher can clean up). The old
-// synchronous spawn never had the problem only because omp could not exit at all mid-dispatch.
-// Reached from `session_shutdown` (omp's own teardown, bounded at 2 s) and, for a crash or a
-// signal that skips it, from the process `exit` event — both are synchronous paths, and
-// `child.kill` is synchronous. omp reloads an edited extension module under a cache-buster query,
-// so a long-lived session can register this listener more than once; each copy only reaps its
-// own set, so a duplicate is harmless.
-const inFlight = new Set<DispatcherChild>();
-process.on("exit", () => reapInFlight("omp is exiting"));
+// Every dispatcher child still running, shared across reloads of this module. omp leaving
+// mid-dispatch (Ctrl-C, /exit, a crash) must not orphan a `python3 -m omp_hook_bridge` that may be
+// holding a Telegram hatch open. The budget timers below are unref'd on purpose — a dispatch nobody
+// waits for must not hold omp's exit hostage — so once omp is going down they never fire; the
+// reaper is what ends the child instead. The old synchronous spawn never had the problem only
+// because omp could not exit at all mid-dispatch. Two paths reach it: `session_shutdown` (omp's own
+// teardown, where a SIGTERM→SIGKILL escalation fits inside omp's 2 s cap) and, for a crash or a
+// signal that skips it, the process `exit` event, which cannot wait — there a child already asked
+// to stop gets SIGKILL, any other SIGTERM. omp reloads an edited extension module under a
+// cache-buster query, so the registry and the one `exit` listener live on `globalThis` (keyed by a
+// registered symbol) rather than per module instance: a reload neither loses track of the
+// children the previous instance spawned nor stacks another listener on `process`.
+interface InFlightRegistry {
+  children: Set<DispatcherChild>;
+  // Children already sent SIGTERM (by the budget, a shutdown or an overflow), so the exit path
+  // knows to go straight to SIGKILL. `child.killed` cannot serve: a group signal bypasses it.
+  stopping: WeakSet<DispatcherChild>;
+}
+const IN_FLIGHT_KEY = Symbol.for("agent-tools.omp-hook-bridge.in-flight");
+const registry: InFlightRegistry = ((globalThis as any)[IN_FLIGHT_KEY] ??= registerExitReaper());
+const inFlight = registry.children;
+
+function registerExitReaper(): InFlightRegistry {
+  const created: InFlightRegistry = { children: new Set(), stopping: new WeakSet() };
+  process.on("exit", () => {
+    if (created.children.size === 0) return;
+    console.error(`omp-hook-bridge: omp is exiting — stopping ${created.children.size} in-flight dispatcher(s)`);
+    for (const child of created.children) signalDispatcher(child, created.stopping.has(child) ? "SIGKILL" : "SIGTERM");
+    created.children.clear();
+  });
+  return created;
+}
+
+// Deliver a signal to the dispatcher AND everything it started: the child is spawned as its own
+// process-group leader (`detached: true` below), so `kill(-pid)` reaches a hook script and the
+// helpers it forked. Out of reach by design: a descendant that put itself in a NEW session (the
+// hatch's `tg-ctl ask` is started with `start_new_session`), which SIGTERM to the dispatcher must
+// end on its own — that is the dispatcher's cleanup, and why SIGTERM always comes first.
+function signalDispatcher(child: DispatcherChild, signal: NodeJS.Signals): void {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    if (child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    child.kill(signal); // the group is already gone (or not ours): fall back to the child alone
+  }
+}
+
+// SIGTERM first — the previous synchronous spawn also terminated on SIGTERM (Node's default
+// `killSignal`), so a dispatcher that cleans up after itself keeps that chance — then SIGKILL
+// after `graceMs` if it is still alive. Returns the disarm for the grace timer (a child that
+// exits on SIGTERM must not be followed by a pointless SIGKILL to a reused pid).
+function stopDispatcher(child: DispatcherChild, graceMs: number): () => void {
+  registry.stopping.add(child);
+  signalDispatcher(child, "SIGTERM");
+  const killTimer = setTimeout(() => signalDispatcher(child, "SIGKILL"), graceMs);
+  killTimer.unref?.();
+  return () => clearTimeout(killTimer);
+}
 
 function reapInFlight(why: string): void {
   if (inFlight.size === 0) return;
-  console.error(`omp-hook-bridge: ${why} — sending SIGTERM to ${inFlight.size} in-flight dispatcher(s)`);
-  for (const child of inFlight) child.kill("SIGTERM");
-  inFlight.clear();
+  console.error(`omp-hook-bridge: ${why} — stopping ${inFlight.size} in-flight dispatcher(s)`);
+  for (const child of inFlight) stopDispatcher(child, SHUTDOWN_KILL_GRACE_MS);
 }
 
 // Read per call, not once at module load: a test (and a one-off debugging run) must be able to
@@ -99,7 +155,8 @@ interface DispatcherOutcome {
   status: number | null;
   signal: NodeJS.Signals | null;
   error?: Error;
-  timedOut?: boolean;
+  timedOut: boolean;
+  overflowed: boolean;
 }
 
 // Deliberately the OPPOSITE of opencode's `plugin.js`, which THROWS on a `tool.execute.before`
@@ -147,6 +204,7 @@ function spawnDispatcher(eventName: BridgeEvent, payload: string, toolCallId: un
   return new Promise((resolveOutcome) => {
     const child = spawn(python, ["-m", "omp_hook_bridge", eventName], {
       stdio: ["pipe", "pipe", "pipe"],
+      detached: true, // its own process group, so a stop reaches the hook scripts it forks too
       env: {
         ...process.env,
         PYTHONPATH: priorPythonPath ? `${libDir}${delimiter}${priorPythonPath}` : libDir,
@@ -154,20 +212,27 @@ function spawnDispatcher(eventName: BridgeEvent, payload: string, toolCallId: un
     });
     inFlight.add(child);
     let stdout = "";
+    let overflowed = false;
     let settled = false;
     const timers = armDispatchTimers(child, eventName);
     const forward = stderrForwarder(`omp-hook-bridge[${eventName} ${String(toolCallId ?? "-")}]`);
-    const finish = (outcome: DispatcherOutcome) => {
+    const finish = (outcome: Omit<DispatcherOutcome, "timedOut" | "overflowed">) => {
       if (settled) return;
       settled = true;
       inFlight.delete(child);
       timers.disarm();
       forward.flush();
-      resolveOutcome({ ...outcome, timedOut: timers.timedOut() });
+      resolveOutcome({ ...outcome, timedOut: timers.timedOut(), overflowed });
     };
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
+      if (overflowed) return;
       stdout += chunk;
+      if (Buffer.byteLength(stdout) > MAX_STDOUT_BYTES) {
+        overflowed = true;
+        stdout = "";
+        timers.stopNow(); // no decision can follow; end the child and let `close` settle the call
+      }
     });
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", forward.write);
@@ -188,25 +253,32 @@ interface StderrForwarder {
 
 // The dispatcher's own stderr, forwarded as it arrives but LINE by line under `tag`, so a chunk
 // boundary never splits a line and the tag lands once per line. `flush` writes a trailing
-// unterminated fragment when the child closes.
+// unterminated fragment when the child closes — or, for a line that never ends, once it exceeds
+// MAX_STDERR_LINE_BYTES, so an unterminated stream is bounded instead of held.
 function stderrForwarder(tag: string): StderrForwarder {
   let pending = "";
+  const flush = () => {
+    if (pending) process.stderr.write(`${tag} ${pending}\n`);
+    pending = "";
+  };
   return {
     write: (chunk) => {
       pending += chunk;
       const lines = pending.split("\n");
       pending = lines.pop() ?? "";
       for (const line of lines) process.stderr.write(`${tag} ${line}\n`);
+      while (pending.length > MAX_STDERR_LINE_BYTES) {
+        process.stderr.write(`${tag} ${pending.slice(0, MAX_STDERR_LINE_BYTES)}\n`);
+        pending = pending.slice(MAX_STDERR_LINE_BYTES);
+      }
     },
-    flush: () => {
-      if (pending) process.stderr.write(`${tag} ${pending}\n`);
-      pending = "";
-    },
+    flush,
   };
 }
 
 interface DispatchTimers {
   timedOut: () => boolean;
+  stopNow: () => void;
   disarm: () => void;
 }
 
@@ -216,15 +288,13 @@ interface DispatchTimers {
 // waiting for any more cannot hold the process open on shutdown.
 function armDispatchTimers(child: DispatcherChild, eventName: BridgeEvent): DispatchTimers {
   let timedOut = false;
-  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let disarmKill: (() => void) | undefined;
+  const stopNow = () => {
+    disarmKill ??= stopDispatcher(child, KILL_GRACE_MS);
+  };
   const budgetTimer = setTimeout(() => {
     timedOut = true;
-    // SIGTERM first, then SIGKILL only if the dispatcher is still alive: the previous
-    // synchronous spawn also terminated on SIGTERM (Node's default `killSignal`), so a
-    // dispatcher that cleans up after itself keeps that chance.
-    child.kill("SIGTERM");
-    killTimer = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
-    killTimer.unref?.();
+    stopNow();
   }, resolveDispatcherTimeout());
   budgetTimer.unref?.();
   // Only `tool_call` is worth explaining: it is the event omp can refuse, and the one whose
@@ -234,9 +304,10 @@ function armDispatchTimers(child: DispatcherChild, eventName: BridgeEvent): Disp
   noticeTimer?.unref?.();
   return {
     timedOut: () => timedOut,
+    stopNow,
     disarm: () => {
       clearTimeout(budgetTimer);
-      if (killTimer) clearTimeout(killTimer);
+      disarmKill?.();
       if (noticeTimer) clearTimeout(noticeTimer);
     },
   };
@@ -256,6 +327,12 @@ function warnSlowDispatch(eventName: BridgeEvent): void {
 function interpretDispatcherResult(eventName: BridgeEvent, outcome: DispatcherOutcome): BridgeResult | undefined {
   if (outcome.timedOut) {
     console.error(`omp-hook-bridge[${eventName}]: dispatcher timed out, allowing call`);
+    return undefined;
+  }
+  if (outcome.overflowed) {
+    console.error(
+      `omp-hook-bridge[${eventName}]: dispatcher stdout exceeded the ${MAX_STDOUT_BYTES}-byte output limit, allowing call`,
+    );
     return undefined;
   }
   if (outcome.error) {

@@ -985,14 +985,31 @@ _DRIVER_PROLOGUE = (
 
 def _write_stub_dispatcher(tmp_path: Path, body: str) -> Path:
     """A stub that stands in for `python3 -m omp_hook_bridge`: it ignores argv, drains stdin
-    (the extension always writes a JSON payload there), then does whatever `body` says."""
+    (the extension always writes a JSON payload there), then does whatever `body` says. `body`
+    may call `ready()` once its setup (a pid file, a signal handler) is in place — the driver
+    side waits for that marker (`_WAIT_READY`) before acting, because a fixed delay raced
+    python's startup whenever this suite ran alongside other work on the machine."""
     stub = tmp_path / "stub_dispatcher.py"
+    ready = tmp_path / "stub.ready"
     stub.write_text(
-        "#!/usr/bin/env python3\nimport json, sys, time\nsys.stdin.read()\n" + body,
+        "#!/usr/bin/env python3\nimport json, pathlib, sys, time\n"
+        f"def ready():\n    pathlib.Path({str(ready)!r}).touch()\n"
+        "sys.stdin.read()\n" + body,
         encoding="utf-8",
     )
     stub.chmod(0o755)
     return stub
+
+
+# Driver-side: poll for the stub's readiness marker (see `_write_stub_dispatcher`).
+_WAIT_READY = (
+    "const { existsSync } = await import('node:fs');\n"
+    "const waitReady = async () => { const p = process.env.STUB_READY!; const t0 = Date.now();\n"
+    "  while (!existsSync(p)) { if (Date.now() - t0 > 20000) throw new Error('stub never became ready');\n"
+    "    await new Promise((r) => setTimeout(r, 25)); } };\n"
+)
+# A budget long enough that the stub's setup is in place before it fires, even under load.
+_BUDGET_MS = 3000
 
 
 def _run_bun_driver(tmp_path: Path, source: str, env_overrides: dict[str, str]) -> subprocess.CompletedProcess:
@@ -1000,6 +1017,7 @@ def _run_bun_driver(tmp_path: Path, source: str, env_overrides: dict[str, str]) 
     driver.write_text(_DRIVER_PROLOGUE + source, encoding="utf-8")
     env = dict(os.environ)
     env["EXTENSION_PATH"] = str(_EXTENSION_TS)
+    env["STUB_READY"] = str(tmp_path / "stub.ready")
     env.update(env_overrides)
     return subprocess.run(["bun", "run", str(driver)], capture_output=True, text=True, env=env, timeout=60)
 
@@ -1186,15 +1204,15 @@ def test_extension_ts_timeout_sends_sigterm_first_and_lets_the_dispatcher_clean_
         "const started = Date.now();\n"
         "const result = (await handlers['tool_call'](event, ctx)) ?? null;\n"
         "console.log(JSON.stringify({ elapsedMs: Date.now() - started, result }));\n",
-        {"OMP_HOOK_BRIDGE_PYTHON": str(stub), "OMP_HOOK_BRIDGE_TIMEOUT_MS": "500"},
+        {"OMP_HOOK_BRIDGE_PYTHON": str(stub), "OMP_HOOK_BRIDGE_TIMEOUT_MS": str(_BUDGET_MS)},
     )
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out["result"] is None
     assert "stub: got SIGTERM, cleaning up" in proc.stderr
     assert "timed out" in proc.stderr
-    # 500 ms budget + the dispatcher's own exit; well under budget + the 2000 ms SIGKILL grace.
-    assert out["elapsedMs"] < 2200, f"the bridge waited out the SIGKILL grace: {out['elapsedMs']} ms"
+    # budget + the dispatcher's own exit; well under budget + the 2000 ms SIGKILL grace.
+    assert out["elapsedMs"] < _BUDGET_MS + 1500, f"the bridge waited out the SIGKILL grace: {out['elapsedMs']} ms"
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
@@ -1212,14 +1230,14 @@ def test_extension_ts_timeout_escalates_to_sigkill_when_sigterm_is_ignored(tmp_p
         "const started = Date.now();\n"
         "const result = (await handlers['tool_call'](event, ctx)) ?? null;\n"
         "console.log(JSON.stringify({ elapsedMs: Date.now() - started, result }));\n",
-        {"OMP_HOOK_BRIDGE_PYTHON": str(stub), "OMP_HOOK_BRIDGE_TIMEOUT_MS": "500"},
+        {"OMP_HOOK_BRIDGE_PYTHON": str(stub), "OMP_HOOK_BRIDGE_TIMEOUT_MS": str(_BUDGET_MS)},
     )
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out["result"] is None
     assert "timed out" in proc.stderr
-    # Must outlast the 2000 ms grace (SIGTERM alone did nothing) but never the stub's 30 s sleep.
-    assert 2000 <= out["elapsedMs"] < 10000, f"SIGKILL did not follow the grace: {out['elapsedMs']} ms"
+    # Must outlast budget + the 2000 ms grace (SIGTERM alone did nothing), never the 30 s sleep.
+    assert _BUDGET_MS + 2000 <= out["elapsedMs"] < 15000, f"SIGKILL did not follow the grace: {out['elapsedMs']} ms"
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
@@ -1230,14 +1248,16 @@ def test_extension_ts_reaps_in_flight_dispatcher_when_the_process_exits(tmp_path
     pid_file = tmp_path / "stub.pid"
     stub = _write_stub_dispatcher(
         tmp_path,
-        "import os, pathlib\n"
+        "import os\n"
         f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "ready()\n"
         "time.sleep(30)\n",
     )
     proc = _run_bun_driver(
         tmp_path,
-        "void handlers['tool_call'](event, ctx);\n"
-        "setTimeout(() => process.exit(0), 500);\n",
+        _WAIT_READY + "void handlers['tool_call'](event, ctx);\n"
+        "await waitReady();\n"
+        "process.exit(0);\n",
         {"OMP_HOOK_BRIDGE_PYTHON": str(stub)},
     )
     assert proc.returncode == 0, proc.stderr
@@ -1250,20 +1270,21 @@ def test_extension_ts_reaps_in_flight_dispatcher_when_the_process_exits(tmp_path
 def test_extension_ts_reaps_in_flight_dispatcher_on_session_shutdown(tmp_path):
     """omp's own teardown path: a `session_shutdown` handler ends the running dispatcher too, so
     the awaited `tool_call` settles (fail-open) instead of outliving the session."""
-    stub = _write_stub_dispatcher(tmp_path, "time.sleep(30)\n")
+    stub = _write_stub_dispatcher(tmp_path, "ready()\ntime.sleep(30)\n")
     proc = _run_bun_driver(
         tmp_path,
-        "const started = Date.now();\n"
-        "const pending = handlers['tool_call'](event, ctx);\n"
-        "setTimeout(() => handlers['session_shutdown']({}, ctx), 300);\n"
+        _WAIT_READY + "const pending = handlers['tool_call'](event, ctx);\n"
+        "await waitReady();\n"
+        "const shutdownAt = Date.now();\n"
+        "void handlers['session_shutdown']({}, ctx);\n"
         "const result = (await pending) ?? null;\n"
-        "console.log(JSON.stringify({ elapsedMs: Date.now() - started, result }));\n",
+        "console.log(JSON.stringify({ elapsedMs: Date.now() - shutdownAt, result }));\n",
         {"OMP_HOOK_BRIDGE_PYTHON": str(stub)},
     )
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out["result"] is None
-    assert out["elapsedMs"] < 5000, f"the dispatcher outlived the session: {out['elapsedMs']} ms"
+    assert out["elapsedMs"] < 1000, f"the dispatcher outlived the shutdown's SIGTERM: {out['elapsedMs']} ms"
     assert "session shutdown" in proc.stderr
     assert "terminated by SIGTERM" in proc.stderr
 
@@ -1277,3 +1298,103 @@ def _pid_gone_within(pid: int, *, seconds: float) -> bool:
             return True
         time.sleep(0.1)
     return False
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_ts_session_shutdown_escalates_to_sigkill(tmp_path):
+    """Shutdown must not trust SIGTERM alone (the timeout path never did): a dispatcher that
+    ignores it is SIGKILLed after the 1 s shutdown grace — inside omp's 2 s shutdown-handler cap —
+    instead of surviving omp as an orphan holding a hatch open."""
+    stub = _write_stub_dispatcher(
+        tmp_path,
+        "import signal\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "ready()\n"
+        "time.sleep(30)\n",
+    )
+    proc = _run_bun_driver(
+        tmp_path,
+        _WAIT_READY + "const pending = handlers['tool_call'](event, ctx);\n"
+        "await waitReady();\n"
+        "const shutdownAt = Date.now();\n"
+        "void handlers['session_shutdown']({}, ctx);\n"
+        "const result = (await pending) ?? null;\n"
+        "console.log(JSON.stringify({ elapsedMs: Date.now() - shutdownAt, result }));\n",
+        {"OMP_HOOK_BRIDGE_PYTHON": str(stub)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["result"] is None
+    assert 1000 <= out["elapsedMs"] < 4000, f"SIGKILL did not follow the shutdown grace: {out['elapsedMs']} ms"
+    assert "terminated by SIGKILL" in proc.stderr
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_ts_stop_reaches_the_dispatcher_process_group(tmp_path):
+    """A hook script forked by the dispatcher (same process group) goes down with it: the child
+    is spawned as a group leader and signalled as a group, so a budget timeout does not leave the
+    dispatcher's own helpers running after the dispatcher itself is gone."""
+    grandchild_pid = tmp_path / "grandchild.pid"
+    stub = _write_stub_dispatcher(
+        tmp_path,
+        "import subprocess\n"
+        "helper = subprocess.Popen(['sleep', '30'])\n"
+        f"pathlib.Path({str(grandchild_pid)!r}).write_text(str(helper.pid))\n"
+        "helper.wait()\n",
+    )
+    proc = _run_bun_driver(
+        tmp_path,
+        "const result = (await handlers['tool_call'](event, ctx)) ?? null;\n"
+        "console.log(JSON.stringify(result));\n",
+        {"OMP_HOOK_BRIDGE_PYTHON": str(stub), "OMP_HOOK_BRIDGE_TIMEOUT_MS": str(_BUDGET_MS)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout.strip().splitlines()[-1]) is None
+    assert _pid_gone_within(int(grandchild_pid.read_text()), seconds=3), "the forked helper outlived the dispatcher"
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_ts_caps_dispatcher_stdout(tmp_path):
+    """A dispatcher that never stops writing stdout must not grow omp's memory until it dies (the
+    old spawnSync had a bounded buffer): past 1 MiB the child is stopped and the call resolves
+    fail-open, promptly, with the reason on stderr."""
+    stub = _write_stub_dispatcher(
+        tmp_path,
+        "sys.stdout.write('x' * (2 * 1024 * 1024))\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(30)\n",
+    )
+    proc = _run_bun_driver(
+        tmp_path,
+        "const started = Date.now();\n"
+        "const result = (await handlers['tool_call'](event, ctx)) ?? null;\n"
+        "console.log(JSON.stringify({ elapsedMs: Date.now() - started, result }));\n",
+        {"OMP_HOOK_BRIDGE_PYTHON": str(stub)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["result"] is None
+    assert out["elapsedMs"] < 8000, f"the overflowing dispatcher was not stopped: {out['elapsedMs']} ms"
+    assert "output limit" in proc.stderr
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_ts_flushes_a_stderr_line_that_never_ends(tmp_path):
+    """An unterminated stderr stream is forwarded in bounded pieces (64 KiB) rather than held in
+    memory waiting for a newline; each piece still carries the call tag."""
+    stub = _write_stub_dispatcher(
+        tmp_path,
+        "sys.stderr.write('y' * (200 * 1024))\n"
+        "sys.stderr.flush()\n",
+    )
+    proc = _run_bun_driver(
+        tmp_path,
+        "console.log(JSON.stringify((await handlers['tool_call'](event, ctx)) ?? null));\n",
+        {"OMP_HOOK_BRIDGE_PYTHON": str(stub)},
+    )
+    assert proc.returncode == 0
+    assert json.loads(proc.stdout.strip().splitlines()[-1]) is None
+    tagged = [line for line in proc.stderr.splitlines() if line.startswith("omp-hook-bridge[tool_call c1] y")]
+    assert len(tagged) >= 3, f"expected the 200 KiB line in bounded pieces, got {len(tagged)} piece(s)"
+    assert all(len(line) <= 64 * 1024 + 64 for line in tagged)
+    assert sum(line.count("y") for line in tagged) == 200 * 1024
