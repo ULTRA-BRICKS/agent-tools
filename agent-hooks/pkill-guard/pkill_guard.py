@@ -145,13 +145,35 @@ from pathlib import Path
 _HATCH_MODULE = "agenttools_hatch_escalation"
 
 
+class _UnavailableHatchResult:
+    """Hatch result when the repo-local helper cannot be imported.
+
+    should_stop is False so the hook falls through to its own default
+    decision (block a gated event, allow otherwise). Crashing here would
+    let on_error:open fail-open a denial-class hook (#547).
+    """
+
+    requested = False
+    approved = False
+    reason = "hatch helper unavailable"
+    env_var = ""
+    env_present = False
+    should_stop = False
+    tg_ctl_path = None
+
+
+class _UnavailableHatch:
+    def request_hatch_approval(self, *args, **kwargs):
+        return _UnavailableHatchResult()
+
+
 def _load_hatch_escalation():
     hatch_init = Path(__file__).resolve().parents[2] / "lib" / _HATCH_MODULE / "__init__.py"
     if not hatch_init.is_file():
-        raise ImportError(f"cannot load hatch escalation helper from {hatch_init}")
+        return _UnavailableHatch()
     spec = importlib.util.spec_from_file_location(_HATCH_MODULE, hatch_init)
     if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load hatch escalation helper from {hatch_init}")
+        return _UnavailableHatch()
     module = importlib.util.module_from_spec(spec)
     previous_modules = {
         name: sys.modules[name]
@@ -171,11 +193,12 @@ def _load_hatch_escalation():
             if name == _HATCH_MODULE or name.startswith(f"{_HATCH_MODULE}."):
                 sys.modules.pop(name, None)
         sys.modules.update(previous_modules)
-        # A helper that calls sys.exit() at import must not make the hook exit 0 (allow);
-        # convert it to an import failure after cleanup. Ctrl-C still propagates.
+        # A helper that calls sys.exit() at import must not make the hook exit 0
+        # (allow via on_error:open). Ctrl-C still propagates; any other failure
+        # installs a stub so the hook can still classify the event (#547).
         if isinstance(exc, KeyboardInterrupt):
             raise
-        raise ImportError(f"cannot execute hatch escalation helper from {hatch_init}: {exc}") from exc
+        return _UnavailableHatch()
     return module
 
 

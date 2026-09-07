@@ -453,13 +453,12 @@ def test_hatch_justification_exit1_blocks(tmp_path, monkeypatch):
     assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(pytest.main([__file__, "-q"]))
-
 
 def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     """The justification supplied as an inline command PREFIX (env var NOT exported) must reach
-    tg-ctl via the new `command=` contract. Regression for the documented inline form (Codex #232)."""
+    tg-ctl via the `command=` contract. This is the classifier-safe invocation (#336): auto-mode
+    may block exporting RIG_HATCH_REQUEST_* into the harness, so the prefix on the command is
+    the sanctioned path (Codex #232)."""
     marker = tmp_path / "asked"
     question = tmp_path / "q.txt"
     tg_ctl = _fake_tg_ctl(
@@ -473,3 +472,84 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert "one-shot review, output needed now" in question.read_text()
+
+
+_USAGE_BLURB = (
+    'RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="<written justification>"'
+)
+_WRITTEN_JUSTIFICATION = (
+    "one-shot smoke build, output needed now because the orchestrator "
+    "must see the result this turn"
+)
+
+
+def test_inline_written_justification_unreachable_does_not_reprint_usage(
+    tmp_path, monkeypatch
+):
+    """Screenshot 2026-09-08: inline hatch prefix + written justification +
+    unreachable tg-ctl must deny with unreachable/denied, NOT reprint the
+    'set RIG_HATCH_REQUEST_…' usage blurb the agent already followed."""
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl",
+        f"touch {marker}\n"
+        "echo 'Telegram hatch daemon unreachable' >&2\n"
+        "exit 0\n",
+    )
+    monkeypatch.setattr(nlip.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    command = (
+        f'RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="{_WRITTEN_JUSTIFICATION}" '
+        "pytest"
+    )
+    out, _e, code = _run(command, monkeypatch)  # env not exported
+    payload = json.loads(out)
+    message = payload["message"]
+    assert code == nlip.BLOCK_EXIT_CODE and payload["decision"] == "block"
+    assert marker.exists(), "written justification must reach tg-ctl"
+    lowered = message.lower()
+    assert "hatch escalation denied" in lowered
+    assert "unreachable" in lowered
+    assert _USAGE_BLURB not in message
+
+
+def test_inline_written_justification_approve_allows(tmp_path, monkeypatch):
+    """Written justification + tg-ctl ask protocol allow (#513) on the inline
+    prefix must allow the long process."""
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\n" + _ALLOW_REPLY_SH)
+    monkeypatch.setattr(nlip.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    command = (
+        f'RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="{_WRITTEN_JUSTIFICATION}" '
+        "pytest"
+    )
+    out, _e, code = _run(command, monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "hatch escalation" in json.loads(out)["message"].lower()
+
+
+@pytest.mark.parametrize("value", ["1", "pytest"])
+def test_bare_or_too_short_justification_denies_without_telegram(
+    tmp_path, monkeypatch, value
+):
+    """A bare flag or a single token like 'pytest' is not a written
+    justification — deny without Telegram, and say why (screenshot set
+    RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS=pytest)."""
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\n" + _ALLOW_REPLY_SH)
+    monkeypatch.setattr(nlip.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    command = f'RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="{value}" pytest'
+    out, _e, code = _run(command, monkeypatch)
+    payload = json.loads(out)
+    message = payload["message"]
+    assert code == nlip.BLOCK_EXIT_CODE and payload["decision"] == "block"
+    assert not marker.exists(), f"{value!r} must not contact Telegram"
+    lowered = message.lower()
+    assert "hatch escalation denied" in lowered
+    assert "justification" in lowered
+    assert value in message
+    assert _USAGE_BLURB not in message
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(pytest.main([__file__, "-q"]))

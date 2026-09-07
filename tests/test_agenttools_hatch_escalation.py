@@ -146,6 +146,33 @@ def test_bare_flag_env_is_rejected_without_tg_ctl_contact(tmp_path, value):
     assert not marker.exists()
 
 
+
+@pytest.mark.parametrize("value", ["pytest", "review"])
+def test_single_token_is_not_a_written_justification(tmp_path, value):
+    """A single token (the screenshot used `pytest`) is not a justification —
+    deny without contacting Telegram."""
+    marker = tmp_path / "called"
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _allow_body(marker))
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("no-long-inline-process")
+
+    result = request_hatch_approval(
+        "no-long-inline-process",
+        {"command": "pytest"},
+        cwd=str(repo),
+        env={env_var: value},
+        tg_ctl_candidates=[tg_ctl],
+    )
+
+    assert result.requested is True
+    assert result.approved is False
+    assert result.env_present is True
+    assert result.should_stop is True
+    assert "written justification" in result.reason
+    assert value in result.reason
+    assert not marker.exists()
+
+
 def test_real_justification_exit0_allows_and_includes_context(tmp_path):
     question_file = tmp_path / "question.txt"
     tg_ctl = _write_tg_ctl(
