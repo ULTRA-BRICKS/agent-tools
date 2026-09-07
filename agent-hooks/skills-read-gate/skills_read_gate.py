@@ -216,11 +216,18 @@ _LEADING_SHELL_NOISE = frozenset({
 # tokenizing, so a `;npm test` inside a note being written never starts a segment. Matches
 # `<<`, `<<-`, and a quoted/unquoted delimiter; the body runs from the line after the operator
 # to the line that is exactly the delimiter (a missing terminator swallows the rest — data anyway).
+# Only the BODY and terminator go; the rest of the opener line (`cat <<EOF | npm test`) is a
+# real pipeline and is kept (codex review on #587).
 _HEREDOC_RE = re.compile(
-    r"<<-?[ \t]*(?P<q>['\"]?)(?P<delim>[A-Za-z_][\w-]*)(?P=q)[^\n]*\n"
+    r"<<-?[ \t]*(?P<q>['\"]?)(?P<delim>[A-Za-z_][\w-]*)(?P=q)(?P<rest>[^\n]*)\n"
     r"(?:.*?\n)*?[ \t]*(?P=delim)[ \t]*(?:\n|$)",
     re.DOTALL,
 )
+# shlex's punctuation_chars mode coalesces ADJACENT punctuation into one token (`&&(`, `<(`,
+# `>&`), which would never equal a separator entry; such a token is decomposed into the shell
+# operators it is made of before segmenting (codex review on #587).
+_PUNCT_TOKEN_RE = re.compile(r"^[();<>|&]+$")
+_SHELL_OPERATOR_RE = re.compile(r"&&|\|\||;;|\|&|>&|<&|[();<>|&]")
 # A `VAR=value` token at a segment head is an inline env assignment, transparent to WHICH
 # command runs (`CI=1 vitest run` invokes `vitest`).
 _INLINE_ENV_TOKEN = re.compile(r"^[A-Za-z_]\w*=")
@@ -462,6 +469,13 @@ def _segment_head(segment: list[str]) -> list[str]:
     return [_basename(argv[0]), *argv[1:]] if argv else []
 
 
+def _decompose_punctuation(tok: str) -> list[str]:
+    """`&&(` → `&&`, `(`; `<(` → `<`, `(`; a non-punctuation token is returned as itself."""
+    if not _PUNCT_TOKEN_RE.match(tok):
+        return [tok]
+    return _SHELL_OPERATOR_RE.findall(tok)
+
+
 def _strip_function_bodies(tokens: list[str]) -> list[str]:
     """Drop the body of a POSIX function DEFINITION (`f() { npm test; }`): defining `f` runs
     nothing. The runner inside it is gated only when `f` is later called — which this hook
@@ -492,10 +506,11 @@ def _shell_segments(command: str) -> list[list[str]]:
     unbalanced quote."""
     # The body is replaced by a `;` so the command AFTER the terminator starts its own segment
     # (shlex reads a bare newline as whitespace, which would glue it onto `cat`).
-    lex = shlex.shlex(_HEREDOC_RE.sub(" ; ", command), posix=True, punctuation_chars=True)
+    lex = shlex.shlex(_HEREDOC_RE.sub(r"\g<rest> ; ", command), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
+    tokens = [op for tok in lex for op in _decompose_punctuation(tok)]
     segments: list[list[str]] = [[]]
-    for tok in _strip_function_bodies(list(lex)):
+    for tok in _strip_function_bodies(tokens):
         if tok in _SEGMENT_SEPARATORS:
             segments.append([])
         else:

@@ -744,6 +744,11 @@ def test_quoted_pipe_alternation_is_allowed_end_to_end(command, tmp_path, monkey
     "exec npm test",                      # `exec`/`command` peeled like a control keyword
     "command pytest -q",
     "cat <<EOF\nnotes\nEOF\nnpm test",     # a real runner AFTER a heredoc is still found
+    "cat <<EOF | npm test\nnotes\nEOF",     # the opener line's pipeline is kept (codex on #587)
+    "git fetch&&(npm test)",              # coalesced `&&(` decomposed (codex on #587)
+    "cat <(pytest)",                      # process substitution opener `<(`
+    "npm test 2>&1",                      # `>&` decomposition must not lose the head
+    "true;(pytest -q)",                   # `;(`
 ])
 def test_real_runner_at_a_command_head_is_still_work(command):
     """Argv-aware matching must not lose any genuine inline build/test run."""
