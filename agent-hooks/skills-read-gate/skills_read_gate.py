@@ -163,19 +163,37 @@ GIT_COMMIT = re.compile(r"(?:^|[|&;]\s*)git(?:[ \t]+[^\s;&|]+)*?[ \t]+commit\b")
 # a token that only appears in a shell COMMENT (`git commit -m x # --abort`) or in the commit
 # MESSAGE (`git commit -m 'support --skip'`) must NOT exempt a real commit from the skills gate.
 SKIP_FLAGS = frozenset({"--continue", "--abort", "--skip"})
-# A command starts at the line start or right after a &&/;/|/( separator. The build/test
-# runner must be at this command HEAD — not buried inside a string argument — so that
-# `git commit -m "fix: npm test was flaky"` and `echo "see npm test output"` are NOT
-# mis-classified as build/test work. Same anchoring the no-long-inline-process sibling uses (#4).
-_CMD_START = r"(?:^|&&|\|\||;|\||\()\s*"
-BUILD_OR_TEST = re.compile(
-    _CMD_START + r"(?:npm|pnpm|yarn|bun|deno)\b[^&;|]*\b(?:test|build)\b"
-    r"|" + _CMD_START + r"(?:pytest|vitest|jest)\b"
-    r"|" + _CMD_START + r"cargo\b[^&;|]*\b(?:test|build)\b"
-    r"|" + _CMD_START + r"go\b[^&;|]*\b(?:test|build)\b"
-    r"|" + _CMD_START + r"(?:make|rake|msbuild)\b[^&;|]*\b(?:test|build|all)\b"
-    r"|" + _CMD_START + r"(?:mvn|gradle)\b[^&;|]*\b(?:test|build|verify|package)\b"
+# The build/test runner must be the REAL invoked command of a segment — not a word buried in a
+# string argument — so that `git commit -m "fix: npm test was flaky"` and `echo "see npm test
+# output"` are NOT mis-classified as build/test work.
+#
+# This pattern is matched at the HEAD of an already-PARSED segment (see `_is_build_or_test`),
+# never against the raw command string. The raw-string form it replaces anchored each
+# alternative on a shell separator character (`|`, `&&`, `;`, `(`), and those characters appear
+# INSIDE quoted arguments too — so a read-only `rg -n 'storybook|vitest' package.json` had its
+# quoted alternation read as a pipe into a `vitest` command and was BLOCKED as build/test work
+# (agent-tools#578: 31 such refusals across four codex sessions, every one a read-only `rg`,
+# `sed` or `ps`). Deciding from the parsed argv is the same #59-doctrine correction the sibling
+# `no-long-inline-process` already made for its own copy of this problem (agent-tools#60).
+_BUILD_OR_TEST_HEAD = re.compile(
+    r"(?:npm|pnpm|yarn|bun|deno)\b[^&;|]*\b(?:test|build)\b"
+    r"|(?:pytest|vitest|jest)\b"
+    r"|cargo\b[^&;|]*\b(?:test|build)\b"
+    r"|go\b[^&;|]*\b(?:test|build)\b"
+    r"|(?:make|rake|msbuild)\b[^&;|]*\b(?:test|build|all)\b"
+    r"|(?:mvn|gradle)\b[^&;|]*\b(?:test|build|verify|package)\b"
 )
+
+# Leading no-op wrappers peeled off a segment head so the REAL runner beneath is what gets
+# matched (`timeout 600 npm test`, `env CI=1 pytest`). Only wrappers whose own operands we
+# model are listed — peeling one only partway would leave a non-command at the head. Mirrors
+# the sibling hook's `_strip_wrappers` set.
+_WRAPPERS = frozenset({"timeout", "env", "nice", "time", "stdbuf", "nohup", "setsid", "unbuffer"})
+_WRAPPER_VALUE_FLAGS = frozenset({"-s", "-k", "--signal", "--kill-after", "-n", "-u"})
+_MAX_WRAPPER_NESTING = 16
+# A `VAR=value` token at a segment head is an inline env assignment, transparent to WHICH
+# command runs (`CI=1 vitest run` invokes `vitest`).
+_INLINE_ENV_TOKEN = re.compile(r"^[A-Za-z_]\w*=")
 
 # Canonical hook id for the shared Telegram hatch (RIG_HATCH_REQUEST_SKILLS_READ_GATE).
 HOOK_ID = "skills-read-gate"
@@ -363,6 +381,73 @@ def _strip_leading_inline_env(command: str) -> str:
     return _INLINE_ENV_PREFIX.sub(lambda m: m.group("sep"), command)
 
 
+def _basename(tok: str) -> str:
+    """`./node_modules/.bin/vitest` → `vitest`: a path-qualified runner is still the runner."""
+    return tok.rsplit("/", 1)[-1]
+
+
+def _strip_wrappers(argv: list[str]) -> list[str]:
+    """Peel leading no-op wrappers (`timeout 600`, `env CI=1`, `nice -n10`, `time`, …) so the REAL
+    command beneath is what head inspection sees. For a recognized wrapper its option flags (and
+    their separate values), `env`'s `VAR=value` operands and `timeout`'s DURATION positional are
+    skipped; a bare wrapper (`time make build`) is dropped to expose the next token. A non-wrapper
+    head is returned unchanged; a pathological chain stops at the nesting cap (→ no match, the
+    fail-open default of this discipline gate)."""
+    guard = 0
+    while argv and _basename(argv[0]) in _WRAPPERS and guard < _MAX_WRAPPER_NESTING:
+        guard += 1
+        wrapper, rest = _basename(argv[0]), argv[1:]
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok.startswith("-"):
+                if "=" not in tok and tok in _WRAPPER_VALUE_FLAGS:
+                    i += 1  # `--signal SIGTERM` / `-k 5` take a separate value token
+                i += 1
+                continue
+            if wrapper == "env" and "=" in tok:
+                i += 1  # a NAME=VALUE assignment env consumes before the command
+                continue
+            if wrapper == "timeout":
+                i += 1  # the DURATION positional (the wrapped command follows)
+            break
+        if i:
+            argv = rest[i:]  # consumed the wrapper's own args → real command starts here
+        elif rest:
+            argv = rest  # bare wrapper with no args of its own
+        else:
+            break  # wrapper with nothing after it
+    return argv
+
+
+def _segment_head(segment: list[str]) -> list[str]:
+    """The argv a shell would actually EXEC for one segment: inline `VAR=value` assignments and
+    no-op wrappers peeled, argv[0] reduced to its basename."""
+    i = 0
+    while i < len(segment) and _INLINE_ENV_TOKEN.match(segment[i]):
+        i += 1
+    argv = _strip_wrappers(segment[i:])
+    return [_basename(argv[0]), *argv[1:]] if argv else []
+
+
+def _is_build_or_test(command: str) -> bool:
+    """True when some segment's REAL invoked command is a build/test runner.
+
+    Decided from the PARSED argv, never the raw string: `shlex` keeps a quoted `'a|vitest'` as
+    ONE argument, so a runner name inside it can never be read as a command head (#578). A
+    tokenization failure (unbalanced quote) returns False — this gate is process discipline
+    (on_error=open), so a parse failure must never invent a work action."""
+    try:
+        tokens = shlex.split(command, comments=True)
+    except ValueError:
+        return False
+    for segment in _segments(tokens):
+        head = _segment_head(segment)
+        if head and _BUILD_OR_TEST_HEAD.match(" ".join(head)):
+            return True
+    return False
+
+
 def _is_work_action(command: str) -> bool:
     # Strip leading inline env first (so `RIG_HATCH_REQUEST_…="why" git commit` still trips the
     # gate), then detect the commit on the comment-stripped command and judge skip-ness from the
@@ -371,7 +456,7 @@ def _is_work_action(command: str) -> bool:
     stripped = _strip_shell_comment(env_free)
     if GIT_COMMIT.search(stripped) and not is_skip_commit(env_free):
         return True
-    return bool(BUILD_OR_TEST.search(stripped))
+    return _is_build_or_test(command)
 
 
 def _fresh(p: Path) -> bool:

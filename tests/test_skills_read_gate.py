@@ -398,8 +398,8 @@ def test_commit_message_mentioning_npm_test_is_a_commit_not_a_build(tmp_path, mo
     commit), not mis-classified as a build action by the `npm test` substring in the message."""
     invoked, tier = tmp_path / "inv", tmp_path / "tier"
     cmd = 'git commit -m "fix: npm test was flaky"'
-    # the substring `npm test` lives inside the commit message → BUILD_OR_TEST must NOT fire on it
-    assert not srg.BUILD_OR_TEST.search(cmd)
+    # the substring `npm test` lives inside the commit message → the build/test half must NOT fire
+    assert not srg._is_build_or_test(cmd)
     # but it is a real commit, so the gate still fires (warn → block on repeat)
     out1, _e1, c1 = _run(cmd, monkeypatch, invoked=invoked, tier=tier)
     assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
@@ -674,3 +674,60 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
         monkeypatch, invoked=invoked, tier=tier)  # env NOT set — inline only
     assert c == 0 and _decision(out) == "allow"
     assert "docs-only commit, mandatory skills N/A" in question.read_text()
+
+
+# ── #578: a build/test word inside a QUOTED argument is not a command head ───────────────
+#
+# The verbatim commands below are lifted from the codex sessions in ~/work/private on
+# 2026-09-05/06, where each of them was BLOCKED as "build/test work". Every one is a
+# read-only inspection whose only match lived inside a single-quoted ripgrep alternation:
+# the old raw-substring anchor treated the `|` inside those quotes as a shell pipe, so
+# `'storybook|vitest'` read as "a new command `vitest` starts here".
+
+_QUOTED_PIPE_FALSE_POSITIVES = [
+    "rg -n 'storybook|playwright|axe|test:|e2e|vitest' package.json nx.json",
+    "rg -n 'patches|package.json|bun.lock' tooling/git-mirror-paths.txt",
+    "ps -axo pid,ppid,command | rg 'ultra-setup|go build|ttsc'",
+    "rg -n 'prepare|cache-dir|TTSC_CACHE_DIR|go-build|GOCACHE' tooling .github",
+    "rg -n 'test-bun|bun.test|exclude|bun test' package.json tsconfig.spec.json",
+    "rg --files /tmp | rg 'conloca.*(vitest|auth.*config)'",
+    "sed -n '250,335p' package.json; rg -n 'typecheck-tests|vitest' targets/app",
+    "rg -n -A16 -B4 'test|vitest' package.json ../../vitest.config.ts",
+]
+
+
+@pytest.mark.parametrize("command", _QUOTED_PIPE_FALSE_POSITIVES)
+def test_quoted_pipe_alternation_is_not_a_work_action(command):
+    """A runner name inside a quoted argument is not the invoked command (agent-tools#578)."""
+    assert not srg._is_work_action(command)
+
+
+@pytest.mark.parametrize("command", _QUOTED_PIPE_FALSE_POSITIVES)
+def test_quoted_pipe_alternation_is_allowed_end_to_end(command, tmp_path, monkeypatch):
+    """The same commands must ALLOW through the real hook, twice (no warn→block escalation)."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _run(command, monkeypatch, invoked=invoked, tier=tier)
+    out, _e, code = _run(command, monkeypatch, invoked=invoked, tier=tier)
+    assert code == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    "npm test",
+    "npm run build",
+    "pytest -q",
+    "bun test",
+    "cat foo.txt | npm test",             # a REAL pipe still starts a new command
+    "lint && yarn build",                 # a real && separator too
+    "timeout 600 npm test",               # no-op wrapper peeled off the head
+    "CI=1 vitest run",                    # inline env peeled off the head
+    "./node_modules/.bin/vitest run",     # a path-qualified runner is still the runner
+])
+def test_real_runner_at_a_command_head_is_still_work(command):
+    """Argv-aware matching must not lose any genuine inline build/test run."""
+    assert srg._is_work_action(command)
+
+
+def test_unparseable_command_does_not_classify_as_build_or_test():
+    """An unbalanced quote fails OPEN for the build/test half — this gate is process
+    discipline (on_error=open), so a parse failure must never invent a work action."""
+    assert not srg._is_work_action("rg -n 'unterminated vitest")
