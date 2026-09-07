@@ -10,7 +10,8 @@ ONE script binds TWO points via two descriptors; it branches on ``event["point"]
   - pre-write : a CODE Edit/Write (non-docs) by the main thread → warn-then-block
   - pre-bash  : a clearly multi-step / implementation-shaped Bash by the main thread →
                 warn-then-block. Read-only inspection AND sanctioned ORCHESTRATION are NEVER
-                blocked — a single one-liner (git status, ls, cat, grep, find) OR a chain of any
+                blocked — a single one-liner (git status, ls, cat, grep, find, a print-only
+                `sed -n`) OR a chain of any
                 length whose every segment is read-only OR an orchestration command (tg, review,
                 git worktree list). ALMOST ALL `gh` is DELEGATED (Alex tg#7103): CI/PR verification
                 (`gh pr checks/view`, `gh run`, `gh api`) and every other gh subcommand are a
@@ -176,6 +177,13 @@ DOCS_PATH = re.compile(r"\.(?:md|mdx|txt|rst)$", re.IGNORECASE)
 DOCS_DIR = re.compile(r"(?:^|/)docs/", re.IGNORECASE)
 
 # Inspection / read-only one-liners that the orchestrator legitimately runs itself.
+# `sed` is DELIBERATELY ABSENT from this head-only regex (agent-tools#541): a plain `sed\b` would
+# also grant `sed -i` (an in-place EDIT) and `sed 'w file'` (a WRITE command), and this regex has
+# no argument awareness. A read-only `sed` (a `-n`/print-style invocation with no in-place flag
+# and no `w`/`W`/`e` script command) is instead recognized by `_is_read_only_sed`, its own
+# shlex-based predicate, consulted alongside this regex by `_seg_is_allowed` and
+# `_is_all_read_only` — so `sed -n '1,240p' f && git status` is inspection exactly like `head`,
+# while `sed -i` keeps tripping `BUILD_EDIT` as before.
 READ_ONLY_BASH = re.compile(
     r"^\s*(?:git\s+(?:status|log|diff|show|branch)\b|ls\b|cat\b|less\b|head\b|tail\b|"
     r"grep\b|rg\b|find\b|pwd\b|echo\b|which\b|env\b|wc\b|stat\b|tree\b|file\b|jq\b|"
@@ -633,6 +641,278 @@ def _blank_single_quoted(command: str) -> str:
     return "".join(out)
 
 
+# ── read-only `sed` (agent-tools#541) ─────────────────────────────────────────────────────────
+# The ONLY `sed` long options a read-only grant tolerates, spelled out in FULL. GNU sed also
+# accepts any unambiguous PREFIX of a long option (`--in-pla=.bak` is `--in-place`, `--fil=x` is
+# `--file`), so this is an allowlist of exact spellings and EVERY other `--…` token — an
+# abbreviation, `--in-place`, `--file`, a future option — makes the invocation not read-only
+# (review round 1, codex P1). `--expression`/`--line-length` consume the next token when given
+# without `=`.
+_SED_SAFE_LONG_NO_VALUE = frozenset({
+    "--quiet", "--silent", "--regexp-extended", "--posix", "--debug", "--sandbox",
+    "--null-data", "--zero-terminated", "--unbuffered", "--separate", "--binary",
+    "--follow-symlinks", "--help", "--version",
+})
+_SED_SCRIPT_LONG = frozenset({"--expression"})
+_SED_LONG_WITH_VALUE = frozenset({"--expression", "--line-length"})
+# Short flags (as cluster letters) that make a `sed` NOT read-only: `i` (GNU in-place, with any
+# suffix glued on), `I` (BSD/macOS in-place), `f` (script from a file — unknowable). `l` is
+# refused too: GNU `-l N` consumes an operand while BSD `-l` does not, so a cluster with it cannot
+# be tokenized portably — under-granting is the safe direction for a GRANT predicate.
+_SED_REFUSED_SHORT = frozenset("iIfl")
+# Script commands / `s`-flags that write or execute: `w`/`W` (write a file), `e` (GNU: execute).
+_SED_MUTATING_CMDS = frozenset("wWe")
+_SED_MUTATING_S_FLAGS = frozenset("we")
+
+
+def _is_read_only_sed(segment: str) -> bool:
+    """True when a segment's COMMAND head is `sed` used as a read-only PRINT filter (agent-tools#541):
+    no in-place flag (`-i`/`-i.bak`/`--in-place`, BSD `-I`), no script read from a FILE (`-f`,
+    `--file` — its contents are unknowable here), and no script command that writes or executes
+    (`w`/`W` at a command position, incl. after an address or inside a `{` block; the `w`/`e` flags
+    of an `s` command; the GNU `e` command). `sed -n '1,240p' f`, `sed -n '/re/p' f | head`,
+    `sed 's/a/b/' f` are then inspection exactly like `head`/`tail`/`grep`.
+
+    GRANT-direction predicate, so every ambiguity resolves to "not read-only" (which merely leaves
+    the segment to the pre-existing rules — the `sed -i` `BUILD_EDIT` signal, the >=3-segment
+    fallback — exactly as before this predicate existed): an unbalanced-quote segment (shlex
+    raises), a `-l` cluster (GNU/BSD operand mismatch), a script file, a SHELL-EXPANDED script
+    (review round 3, Opus): `shlex` does not expand `$VAR` / `$(…)` / backticks, so `sed -n "$S" f`
+    or `sed -n "$(cat s)" f` is exactly as unknowable as `-f script` and forfeits the grant the
+    same way — only a `$` OUTSIDE single quotes counts (`sed -n '$p' f`, sed's own last-line
+    address, is literal and stays read-only). Script scanning is a small
+    hand-rolled walk over sed's grammar (addresses, `s`/`y` delimiters, bracket expressions in a
+    regex, `a`/`i`/`c` text, `#` comments, labels/filenames to end-of-line) — a discipline
+    heuristic like the rest of this file,
+    not a sed parser; where it cannot tell, it errs toward "writes". Basename-exact head match
+    (`sed`, `/usr/bin/sed`), never `\b`, so `sed-foo` is not `sed`."""
+    expandable = _blank_single_quoted(segment)
+    if "$" in expandable or "`" in expandable:
+        return False
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return False
+    i = 0
+    while i < len(toks) and _ASSIGN_RE.match(toks[i]):
+        i += 1
+    if i >= len(toks) or toks[i].rsplit("/", 1)[-1] != "sed":
+        return False
+    scripts = _sed_scripts(toks[i + 1:])
+    return scripts is not None and not any(_sed_script_mutates(sc) for sc in scripts)
+
+
+def _sed_scripts(argv: list[str]) -> list[str] | None:
+    """The script texts a `sed` argv will run, or None when the invocation is not read-only by
+    its OPTIONS alone (in-place, script file, an untokenizable `-l`). Without any `-e`/`-f`, the
+    first positional is the script (GNU accepts it before OR after options)."""
+    scripts: list[str] = []
+    positionals: list[str] = []
+    has_explicit_script = False
+    j = 0
+    while j < len(argv):
+        tok = argv[j]
+        j += 1
+        if tok == "--":
+            positionals.extend(argv[j:])
+            break
+        if tok.startswith("--"):
+            name, has_eq, value = tok.partition("=")
+            if name not in _SED_SAFE_LONG_NO_VALUE and name not in _SED_LONG_WITH_VALUE:
+                return None  # `--in-place`, `--file`, ANY abbreviation, anything unknown
+            if name in _SED_LONG_WITH_VALUE and not has_eq:
+                if j >= len(argv):
+                    return None
+                value = argv[j]
+                j += 1
+            if name in _SED_SCRIPT_LONG:
+                scripts.append(value)
+                has_explicit_script = True
+            continue
+        if tok.startswith("-") and len(tok) > 1:
+            cluster = tok[1:]
+            if _SED_REFUSED_SHORT & set(cluster):
+                return None
+            e_at = cluster.find("e")
+            if e_at >= 0:
+                has_explicit_script = True
+                glued = cluster[e_at + 1:]
+                if glued:
+                    scripts.append(glued)
+                elif j < len(argv):
+                    scripts.append(argv[j])
+                    j += 1
+                else:
+                    return None
+            continue
+        positionals.append(tok)
+    if not has_explicit_script and positionals:
+        scripts.append(positionals[0])
+    return scripts
+
+
+def _skip_bracket_expression(script: str, i: int) -> int:
+    """From ``script[i] == "["`` inside a REGEX, advance past the whole POSIX bracket expression:
+    an optional `^`, an optional leading literal `]`, and `[:class:]` / `[=equiv=]` / `[.coll.]`
+    members. Returns the index just after the closing `]`, or -1 when it never closes (sed
+    rejects the script: "unterminated address regex")."""
+    n = len(script)
+    i += 1
+    if i < n and script[i] == "^":
+        i += 1
+    if i < n and script[i] == "]":
+        i += 1
+    while i < n:
+        if script[i] == "[" and i + 1 < n and script[i + 1] in ":=.":
+            close = script.find(script[i + 1] + "]", i + 2)
+            if close < 0:
+                return -1
+            i = close + 2
+            continue
+        if script[i] == "]":
+            return i + 1
+        i += 1
+    return -1
+
+
+def _skip_regex(script: str, i: int, delim: str) -> int:
+    """From ``script[i]`` (the first char INSIDE a regex closed by ``delim``), advance past the
+    closing delimiter, honouring backslash escapes and bracket expressions — GNU and BSD sed
+    both accept the bare delimiter inside `[...]` (`/[/]/w out` is ONE address then a write,
+    review round 2). Returns the index just after the delimiter, or -1 when the regex never
+    closes."""
+    n = len(script)
+    while i < n:
+        c = script[i]
+        if c == delim:
+            return i + 1
+        if c == "\\":
+            i += 2
+        elif c == "[":
+            i = _skip_bracket_expression(script, i)
+            if i < 0:
+                return -1
+        else:
+            i += 1
+    return -1
+
+
+def _skip_plain_delimited(script: str, i: int, delim: str) -> int:
+    """From ``script[i]``, advance past the next unescaped ``delim`` — the `s` REPLACEMENT and
+    both `y` operands, where `[` has no meaning (`s/a/[/w out` and `y/[/]/;w out.txt` both
+    write, verified on GNU + BSD). Returns the index just after it, or -1 when absent."""
+    n = len(script)
+    while i < n:
+        if script[i] == delim:
+            return i + 1
+        i += 2 if script[i] == "\\" else 1
+    return -1
+
+
+def _skip_one_sed_address(script: str, i: int) -> int:
+    r"""Advance past ONE address at ``script[i]``: `N`, `$`, `/re/`, `\cREc` (with `I`/`M` flags),
+    plus GNU's `first~step` / `addr,+N` / `addr,~N` numeric forms. -1 for an unterminated regex."""
+    n = len(script)
+    if i < n and (script[i].isdigit() or script[i] in "+~"):
+        while i < n and (script[i].isdigit() or script[i] in "+~"):
+            i += 1
+        return i
+    if i < n and script[i] == "$":
+        return i + 1
+    if i < n and script[i] in "/\\":
+        if script[i] == "\\":
+            if i + 1 >= n:
+                return -1
+            delim, i = script[i + 1], i + 2
+        else:
+            delim, i = "/", i + 1
+        i = _skip_regex(script, i, delim)
+        while 0 <= i < n and script[i] in "IM":
+            i += 1
+    return i
+
+
+def _skip_sed_address_clause(script: str, i: int) -> int:
+    """Advance past the optional `addr1[,addr2]` + optional `!` in front of a sed command.
+    -1 when an address regex is unterminated."""
+    n = len(script)
+    i = _skip_one_sed_address(script, i)
+    if i < 0:
+        return -1
+    while i < n and script[i] in " \t":
+        i += 1
+    if i < n and script[i] == ",":
+        i = _skip_one_sed_address(script, i + 1)
+        if i < 0:
+            return -1
+        while i < n and script[i] in " \t":
+            i += 1
+    while i < n and script[i] in "! \t":
+        i += 1
+    return i
+
+
+def _sed_script_mutates(script: str) -> bool:
+    """True when a sed SCRIPT text contains a command that writes a file or executes: `w`/`W`/`e`
+    at a command position, or a `w`/`e` flag on an `s` command. Walks the grammar just enough to
+    tell a command position from pattern/replacement/address text — `/w/p` (an address) and
+    `s/w/x/` (a pattern) are NOT writes; `1,3w out`, `s/a/b/w out`, `2{w out`, `5q;w out`,
+    `:a;w out`, `/[/]/w out` are. Only a/i/c text, r/R filenames and `#` comments run to end of
+    line; a label/optional-operand command (`: b t T l q Q`) ends at `;`/newline/`}`. A regex
+    (address, `s` pattern) honours bracket expressions, so a delimiter inside `[...]` does not
+    end it; anything sed itself rejects (unterminated regex/bracket/`s`, an address without a
+    command) counts as a write — the grant-direction default."""
+    n, i = len(script), 0
+    while i < n:
+        c = script[i]
+        if c in " \t\n;{}":
+            i += 1
+            continue
+        i = _skip_sed_address_clause(script, i)
+        if i < 0 or i >= n:
+            # An unterminated address regex, or an address with no command: sed rejects both
+            # ("unterminated address regex" / "missing command"). Grant-direction: not read-only.
+            return True
+        c = script[i]
+        if c in _SED_MUTATING_CMDS:
+            return True
+        if c in "sy":
+            # `s<d>pat<d>rep<d>flags` / `y<d>src<d>dst<d>`: the opening delimiter, then TWO more.
+            # Only the `s` PATTERN is a regex (bracket expressions honoured); the replacement and
+            # both `y` operands are plain text.
+            if i + 1 >= n:
+                return True
+            delim = script[i + 1]
+            i = (_skip_regex if c == "s" else _skip_plain_delimited)(script, i + 2, delim)
+            if i >= 0:
+                i = _skip_plain_delimited(script, i, delim)
+            if i < 0:
+                return True  # unterminated `s`/`y` — a sed error; grant-direction
+            if c == "s":
+                while i < n and script[i] not in ";\n}":
+                    if script[i] in _SED_MUTATING_S_FLAGS:
+                        return True
+                    i += 1
+            continue
+        if c in "aic#rR":
+            # a/i/c TEXT, r/R FILENAME, `#` comment: GNU runs these to end of line — a `;` inside
+            # is text/filename, not a separator — so a `w` after one on the same line is not a
+            # command (and `w`/`W` themselves returned True above before reaching here).
+            nl = script.find("\n", i)
+            i = n if nl < 0 else nl + 1
+            continue
+        if c in ":btTlqQ":
+            # label (`:x`, `b x`, `t x`, `T x`) and optional-operand (`l N`, `q N`, `Q N`)
+            # commands END at `;`/newline/`}` — `sed -n '5q;w out'` / `':a;w out'` / `'l;w out'`
+            # DO run the write for every line before the quit/branch (review round 1, Opus +
+            # Sonnet), so the scan must resume at the separator, not skip to end of line.
+            while i < n and script[i] not in ";\n}":
+                i += 1
+            continue
+        i += 1  # a single-letter command (p, d, n, N, g, G, h, H, x, =, z, D, P, F)
+    return False
+
+
 def _seg_is_allowed(segment: str) -> bool:
     """A single (env-stripped) segment head is read-only inspection OR sanctioned orchestration.
 
@@ -682,6 +962,7 @@ def _seg_is_allowed(segment: str) -> bool:
         return False
     if (
         READ_ONLY_BASH.search(segment)
+        or _is_read_only_sed(segment)
         or ORCH_ALLOW.search(segment)
         or _dev_segment_is_allowed(segment)
         or CD_HEAD.match(segment)
@@ -1265,7 +1546,7 @@ def _is_all_read_only(command: str) -> bool:
     if HEREDOC.search(command):
         return False
     segs = _norm_segments(command)
-    return bool(segs) and all(READ_ONLY_BASH.search(s) for s in segs)
+    return bool(segs) and all(READ_ONLY_BASH.search(s) or _is_read_only_sed(s) for s in segs)
 
 
 def _is_all_inline_allowed(command: str) -> bool:

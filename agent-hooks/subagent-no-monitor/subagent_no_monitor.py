@@ -131,6 +131,15 @@ def _is_subagent(event: dict) -> bool:
     return bool(aid and str(aid).strip())
 
 
+# The bounded foreground heartbeat loop both subagent anti-wedge gates point at as the universal
+# alternative to backgrounding. SYNC: identical constant in subagent-no-bg-longproc
+# (tests/test_subagent_no_bg_longproc.py pins the two equal), so the two hooks never drift on the
+# one remedy they share.
+HEARTBEAT_LOOP_EXAMPLE = (
+    "`timeout 540 bash -c 'i=0; until <condition-check> || [ \"$i\" -ge 26 ]; do sleep "
+    "20; i=$((i+1)); echo \"[wait] tick $i ($((i*20))s)\"; done'`"
+)
+
 BLOCK_MESSAGE = (
     "You are a SUBAGENT — do not call Monitor. Monitor is a fire-and-forget background "
     "watch: you start it, then get notified per event LATER. A subagent is NOT re-invoked by "
@@ -147,8 +156,7 @@ BLOCK_MESSAGE = (
     "at once) — block on it "
     "yourself in the FOREGROUND with a heartbeat loop: echo a line at least every ~20s and "
     "keep each Bash call under ~540s, repeating the same bounded call until the wait is over, "
-    "e.g.: `timeout 540 bash -c 'i=0; until <condition-check> || [ \"$i\" -ge 26 ]; do sleep "
-    "20; i=$((i+1)); echo \"[wait] tick $i ($((i*20))s)\"; done'`. There is NO self-service "
+    "e.g.: " + HEARTBEAT_LOOP_EXAMPLE + ". There is NO self-service "
     "bypass. For a genuine exception, ASK the human, or request a one-time Telegram approval "
     "by setting RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR=\"<written justification>\" "
     "(deny-by-default; a bare 1 is rejected)."

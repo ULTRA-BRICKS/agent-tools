@@ -6,12 +6,36 @@ Stops a **dispatched subagent** from **backgrounding a long process** and then w
 forever (agent-tools#52). The wedge, seen ~6× in one session: a subagent runs a multi-model
 `review`, a build/test suite, a `--watch` loop, or a long `sleep` with `run_in_background:
 true` (or a shell `&` / `setsid`), then ends its turn saying *"I'll wait for the completion
-notification."* But a **subagent is NOT re-invoked by a background-completion notification —
-only the main loop is.** So it idles forever with uncommitted work and no PR, and the
-orchestrator has to catch the rest-notification, kill the stray process, and salvage the
-half-done work by hand.
+notification"*. For a shell-detached job or a `--watch` loop that notification never comes (the
+mechanism table below says exactly which shapes resume a subagent and which never do), so it
+idles forever with uncommitted work and no PR, and the orchestrator has to catch the
+rest-notification, kill the stray process, and salvage the half-done work by hand.
 
 This gate makes a subagent run its **own** long work in the **foreground** and block on it.
+
+## Which notifications actually re-invoke a subagent (the precise mechanism)
+
+An earlier revision of this README claimed, as a blanket, that *no background-completion
+notification ever re-invokes a subagent*. That is **false for the general case** — the sibling
+`subagent-no-monitor` gate (agent-tools#439) proved the real split empirically, and
+agent-tools#546 reconciled this hook's wording to it:
+
+| Backgrounding shape | Resumes the subagent when done? |
+| --- | --- |
+| Bash tool call with **`run_in_background: true`** | **Yes** — the harness tracks that child against the agent that started it and re-invokes it with the output once the child exits (verified: a 40 s backgrounded `python3` sleep resumed its subagent after ~43 s with no further message). An ORDINARY, non-labeled command backgrounded this way is a fine shape for a subagent, and this gate allows it. |
+| **Monitor** watch | **Never** — Monitor has no harness-tracked child at all. `subagent-no-monitor` blocks every subagent Monitor call for that reason. |
+| Shell-**detached** job — trailing `&`, `nohup … &`, or a `setsid` that forks (which it does, without `-w`, whenever the caller is a process-group leader; a `setsid` that merely execs is an ordinary foreground run) | **Never** — the harness knows nothing about a job the shell forked behind its back; the Bash call returns at once and no completion ever arrives. |
+| A `--watch` loop | **Never** by any route — it never exits. |
+
+What this gate blocks, given that: a subagent backgrounding a **labeled** long process
+(`review`, `--watch`, a build/test suite, `sleep N>=10`) by **any** of the three backgrounding
+shapes, `run_in_background: true` included. For a detached job or a `--watch` loop the wedge is
+certain. For a *bounded* labeled process under `run_in_background: true` the harness **would**
+resume the subagent; whether that specific case should keep being blocked (the labeled runners are
+minutes-long, and "a subagent waiting on its own `review`" is the classic wedge shape regardless
+of mechanism) is a **scope** question deliberately left to a follow-up ticket
+([agent-tools#559](https://github.com/alex-mextner/agent-tools/issues/559)) rather than folded
+into this wording fix — the gated scope is unchanged from agent-tools#52.
 
 ## Where it sits in the doctrine (the inverse of two sibling gates)
 
@@ -19,11 +43,32 @@ This gate makes a subagent run its **own** long work in the **foreground** and b
 | --- | --- | --- |
 | `no-long-inline-process` (pre-bash) | the **orchestrator** | don't run a long process inline — dispatch it to a **background** subagent (subagent-**exempt**) |
 | `background-subagent-gate` (pre-agent) | the **orchestrator** | dispatch a non-trivial subagent in the **background** |
-| **`subagent-no-bg-longproc`** (pre-bash) | a **subagent** | run your **own** long work in the **foreground** — don't background it, you'll never be told it finished |
+| **`subagent-no-bg-longproc`** (pre-bash) | a **subagent** | run your **own** labeled long work in the **foreground** — don't background it (a detached job / `--watch` never wakes you; see the mechanism table above) |
+| `subagent-no-monitor` (pre-monitor) | a **subagent** | don't call **Monitor** at all — it has no harness-tracked child and no foreground mode |
 
-The orchestrator *delegates* long work to a backgrounded subagent (the main loop *does* get
-the completion notification). A subagent's own long work must be foreground, because the
-worker doesn't.
+The orchestrator *delegates* long work to a backgrounded subagent (the main loop gets the
+completion notification, and `Monitor` is its tool for watching progress). A subagent's own
+labeled long work must be foreground.
+
+## The correct alternative (the same two subagent-no-monitor offers)
+
+Which replacement applies depends on what the subagent is waiting for — the block message names
+both, so a blocked subagent is never pinballed between the two gates with no legal move:
+
+1. **A single ORDINARY command it just started** — one that is NOT itself a labeled long
+   process — `run_in_background: true` on the Bash tool call is fine: the harness auto-resumes
+   the subagent with the output when that command exits. This gate does not fire on it.
+2. **Anything else** — a labeled long process, a condition to become true, a file to appear,
+   several things at once — block on it **synchronously**, in the foreground, with a heartbeat
+   loop: echo a line at least every ~20s and keep each Bash call comfortably under ~540s (well
+   inside the Bash tool's own 600s hard cap), repeating the same bounded call until the wait is
+   over (the literal example is the SYNC'd `HEARTBEAT_LOOP_EXAMPLE` constant both hooks print):
+
+```bash
+timeout 540 bash -c 'i=0; until <condition-check> || [ "$i" -ge 26 ]; do sleep 20; i=$((i+1)); echo "[wait] tick $i ($((i*20))s)"; done'
+```
+
+Never `Monitor` from a subagent (`subagent-no-monitor` blocks it), never `nohup … &`.
 
 ## Fires only on the wedge — never the correct shape
 

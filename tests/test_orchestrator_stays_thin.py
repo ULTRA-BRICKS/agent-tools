@@ -173,14 +173,21 @@ def test_only_args_agent_id_exempts_not_top_level_or_tool_input(tmp_path, monkey
 # The literal repro from the live incident (Alex, 2026-09-05): a review-cli-spawned `codex exec
 # -s read-only` reviewer process ran this exact chain as read-only inspection for ITS OWN review
 # role and got WARN→BLOCK'd by this gate treating it as "the orchestrator doing inline
-# implementation work." `sed -n` (a read-only print) is not in READ_ONLY_BASH (only `sed -i` is,
-# as a build/edit signal), so the chain falls through to the >=3-segment fallback and is judged
-# implementation-shaped on chain length alone — a real, separate READ_ONLY_BASH gap, filed
-# separately; not fixed here. It is used below BOTH as the control (proves the chain trips the
-# classifier at all) and as the harness-exempt case (proves tagging `harness` bypasses that
-# classifier entirely, regardless of what the command looks like).
+# implementation work." TWO separate bugs stacked up: (1) the event carried no usable subagent
+# identity, so a whole Codex/opencode harness looked like the CC orchestrator (agent-tools#533,
+# fixed by the `harness` allowlist), and (2) `sed -n` (a read-only print) was not in
+# READ_ONLY_BASH — only `sed -i` was, as a build/edit signal — so the chain fell through to the
+# >=3-segment fallback and was judged implementation-shaped on chain length alone
+# (agent-tools#541, fixed by `_is_read_only_sed`). With #541 fixed the literal repro is read-only
+# for EVERY harness, so it can no longer serve as the #533 control; `_FALLBACK_CHAIN` below keeps
+# the same shape (an un-allowlisted head + three read-only git segments → chain-length fallback)
+# with `awk`, a head this gate has no read-only entry for, so the #533 tests still prove the
+# harness tag bypasses the classifier regardless of what the command looks like.
 _REPRO_CHAIN = (
     "sed -n '1,240p' SKILL.md && git diff --check && git status --short && git diff -- a.py"
+)
+_FALLBACK_CHAIN = (
+    "awk '{print}' SKILL.md && git diff --check && git status --short && git diff -- a.py"
 )
 
 
@@ -189,7 +196,7 @@ def test_repro_chain_control_warns_then_blocks_with_no_harness(tmp_path, monkeyp
     any future bridge that doesn't set one) the exact repro chain still trips WARN-then-BLOCK —
     proving the chain itself is what got misclassified, not some other cause, and setting up the
     contrast with the harness-exempt cases below."""
-    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": _REPRO_CHAIN}}
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": _FALLBACK_CHAIN}}
     out1, _e, c1 = _run(event, monkeypatch, tmp_path / "m")
     assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
     out2, _e, c2 = _run(event, monkeypatch, tmp_path / "m")
@@ -201,7 +208,7 @@ def test_repro_chain_still_warns_then_blocks_with_harness_claude_code(tmp_path, 
     field) must stay GOVERNED — this is the one positive case the allowlist exists to keep
     blocking, so it needs its own test, not just the omitted-field control above."""
     event = {"point": "pre-bash", "cwd": "/repo", "harness": "claude-code",
-              "args": {"command": _REPRO_CHAIN}}
+              "args": {"command": _FALLBACK_CHAIN}}
     out1, _e, c1 = _run(event, monkeypatch, tmp_path / "m")
     assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
     out2, _e, c2 = _run(event, monkeypatch, tmp_path / "m")
@@ -216,7 +223,7 @@ def test_repro_chain_allowed_silently_for_exempt_harness(tmp_path, monkeypatch, 
     "allow" — only an empty marker dir proves no tier was primed at all (Fable review round 3)."""
     marker_dir = tmp_path / "m"
     event = {"point": "pre-bash", "cwd": "/repo", "harness": harness,
-              "args": {"command": _REPRO_CHAIN}}
+              "args": {"command": _FALLBACK_CHAIN}}
     for _ in range(3):  # would BLOCK by the second call if harness-exemption didn't short-circuit
         out, _e, c = _run(event, monkeypatch, marker_dir)
         assert c == 0 and _decision(out) == "allow"
@@ -240,7 +247,7 @@ def test_unknown_harness_does_not_exempt(tmp_path, monkeypatch):
     """An unrecognized `harness` value (not in EXEMPT_HARNESSES) must NOT relax the gate —
     the allowlist fails closed on anything it doesn't explicitly know."""
     event = {"point": "pre-bash", "cwd": "/repo", "harness": "some-future-harness",
-              "args": {"command": _REPRO_CHAIN}}
+              "args": {"command": _FALLBACK_CHAIN}}
     _run(event, monkeypatch, tmp_path / "m")
     out, _e, c = _run(event, monkeypatch, tmp_path / "m")
     assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
@@ -300,7 +307,7 @@ def test_real_bridge_to_v1_event_output_is_exempt_end_to_end(tmp_path, monkeypat
         raw_event = {
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
-            "tool_input": {"command": _REPRO_CHAIN},
+            "tool_input": {"command": _FALLBACK_CHAIN},
             "cwd": "/repo",
         }
     elif bridge_module == "omp_hook_bridge.dispatch":
@@ -316,7 +323,7 @@ def test_real_bridge_to_v1_event_output_is_exempt_end_to_end(tmp_path, monkeypat
             "hook": "tool.execute.before",
             "cwd": "/repo",
             "input": {"tool": "bash", "sessionID": "ses_1"},
-            "output": {"args": {"command": _REPRO_CHAIN}},
+            "output": {"args": {"command": _FALLBACK_CHAIN}},
         }
     v1_event = dispatch.to_v1_event(raw_event, point="pre-bash")
     assert v1_event["harness"] == dispatch.HARNESS
@@ -334,7 +341,7 @@ def test_real_cc_bridge_to_v1_event_output_stays_governed_end_to_end(tmp_path, m
 
     raw_event = {
         "hook_event_name": "PreToolUse", "tool_name": "Bash",
-        "tool_input": {"command": _REPRO_CHAIN}, "cwd": "/repo",
+        "tool_input": {"command": _FALLBACK_CHAIN}, "cwd": "/repo",
     }
     v1_event = cc_dispatch.to_v1_event(raw_event, point="pre-bash")
     assert v1_event["harness"] == "claude-code"
@@ -2515,3 +2522,161 @@ def test_pre_write_hatch_ignores_target_repo_tg_ctl_path(tmp_path, monkeypatch):
     )
     assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
     assert not marker.exists()  # the repo-local (attacker) binary was NEVER executed
+
+
+# ── READ-ONLY `sed` (agent-tools#541) ──────────────────────────────────────────────────────
+
+def test_literal_repro_chain_with_sed_n_is_read_only_on_first_offense(tmp_path, monkeypatch):
+    """agent-tools#541 acceptance: the literal incident chain (a `sed -n` print chained with
+    `git diff --check`, `git status --short`, `git diff -- path`) is read-only inspection for a
+    plain, un-tagged orchestrator event — allowed on the FIRST call, every call, and never primes
+    a tier marker (an empty marker dir is the proof; a first-offense WARN also says "allow")."""
+    marker_dir = tmp_path / "m"
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": _REPRO_CHAIN}}
+    for _ in range(3):
+        out, err, c = _run(event, monkeypatch, marker_dir)
+        assert c == 0 and _decision(out) == "allow"
+        assert "WARN" not in err
+    assert not marker_dir.exists() or not list(marker_dir.iterdir())
+
+
+@pytest.mark.parametrize("command", [
+    "sed -n '1,240p' SKILL.md",
+    "sed -n '/worktree/p' README.md | head -5",           # a `w` INSIDE an address regex is not `w`
+    "sed -n '/s.w/p' f.txt",                                # ditto — a `w` INSIDE the address regex
+    "sed -n '\\,a/w,p' f.txt",                                # custom-delimiter address containing `/w`
+    "sed 's/a/b/' f.txt | grep b | wc -l",                  # print-style substitution to stdout
+    "sed -ne '1p' -e '5,7p' f.txt",                         # `-e` scripts, `-n` clustered
+    "sed --quiet '2p' f.txt && git status && ls",           # long-form quiet + chain of 3
+    "timeout 5 sed -n 1p f.txt && git status --short && git diff -- a.py",  # wrapped head
+    "sed -E -n 's/(a)/\\1/p' f.txt",                       # extended regex, print flag only
+    "cat f.txt | sed -n '$p' | tail -1",
+    "sed -n '10q;p' f.txt",                                  # `q` is not a write
+    "sed -n '/x/b skip;p;:skip' f.txt",                      # labels chained with `;` — no write
+    "sed -n 'l;p' f.txt",                                    # `l` (list) chained — no write
+    "sed --regexp-extended -n 's/(a)/\\1/p' f.txt",         # a full-spelling safe long option
+    "sed --line-length=40 -n l f.txt",
+    "sed -n 'a\\' f.txt",                                    # `a` text to end of line, no write
+    "sed 's/x/y/g;s/w/z/' f.txt",                           # a `w` in an s PATTERN is not the flag
+    "sed -n 'p' -- f.txt",
+    # review round 2 (Opus): a POSIX bracket expression may carry the bare delimiter — both GNU
+    # and BSD sed accept `/[/]/` as ONE address (and `s/[/]/X/` as one pattern) — so the scan
+    # must not end the regex at a `/` inside `[...]`.
+    "sed -n '/[/]/p' f.txt",
+    "sed -n '/[^/]/p' f.txt",                                # negated set
+    "sed -n '/[]/]/p' f.txt",                                # a leading `]` is a literal member
+    "sed -n '/[[:alpha:]/]/p' f.txt",                        # a `[:class:]` member
+    "sed 's/[/]/X/' f.txt",                                  # bracket in the `s` PATTERN
+    "sed -n '\\,[,],p' f.txt",                               # custom delimiter inside a bracket
+    # review round 3 (Opus): a `$` INSIDE single quotes is literal to the shell — here it is sed's
+    # own last-line address, not an expansion — so the shell-expansion refusal must not fire.
+    "sed -n '$p' f.txt",
+    "sed -n '$=' f.txt",
+])
+def test_read_only_sed_is_inspection(command, tmp_path, monkeypatch):
+    """A `sed` that only prints (no in-place flag, no `w`/`W`/`e` script command, no script file)
+    is read-only exactly like `head`/`tail`/`grep`, at any chain length."""
+    # The predicate itself, not just the end result: a lone unrecognized segment is also "not
+    # implementation-shaped" for the wrong reason (review round 2), so assert the grant directly.
+    sed_segments = [seg for seg in ost._norm_segments(command) if seg.split()[0].endswith("sed")]
+    assert sed_segments and all(ost._is_read_only_sed(seg) for seg in sed_segments), command
+    assert ost._is_implementation_bash(command) is False, command
+    marker_dir = tmp_path / "m"
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    for _ in range(2):
+        out, _e, c = _run(event, monkeypatch, marker_dir)
+        assert c == 0 and _decision(out) == "allow"
+    assert not marker_dir.exists() or not list(marker_dir.iterdir())
+
+
+@pytest.mark.parametrize("command", [
+    "sed -i 's/a/b/' f.txt",                  # GNU in-place
+    "sed -i.bak 's/a/b/' f.txt",              # in-place with a backup suffix
+    "sed -ni 's/a/b/p' f.txt",                # `-i` clustered behind `-n`
+    "sed -n -i 's/a/b/p' f.txt",
+    "sed --in-place=.bak 's/a/b/' f.txt",
+    "sed --in-place 's/a/b/' f.txt",
+    "sed -I '' 's/a/b/' f.txt",               # BSD/macOS in-place spelling
+    "sed -n 'w out.txt' f.txt",               # the `w` WRITE command
+    "sed -n '1,3w out.txt' f.txt",            # ...with a range address
+    "sed -n '/x/,/y/ w out.txt' f.txt",       # ...regex range + space before the command
+    "sed -n 's/a/b/w out.txt' f.txt",         # the `w` flag of an `s` command
+    "sed -n 's/a/b/gw out.txt' f.txt",
+    "sed -n '$W out.txt' f.txt",              # `W` (write first line) is a write too
+    "sed -n 'e rm -rf x' f.txt",              # GNU `e` executes a command
+    "sed 's/a/b/e' f.txt",                    # ...and the `e` flag of `s` does too
+    "sed -f script.sed f.txt",                # a script FILE is unknowable → not read-only
+    "sed -nf script.sed f.txt",
+    "sed --file=script.sed f.txt",
+    "sed --in-plac=.bak 's/a/b/' f.txt",      # review round 1 (Codex P2): GNU accepts any unique
+    "sed --fil=script.sed f.txt",             # long-option PREFIX — exact-spelling allowlist only
+    "sed -n '2{w out.txt' f.txt",             # `w` inside a `{` block
+    "sed -n '1p;w out.txt' f.txt",            # second command after `;`
+    "sed -n '/s/w/p' f.txt",                  # `/s/` address + `w` writing to a file named `/p`
+    # review round 1 (Opus + Sonnet): a `;`-chained write after a label / optional-operand
+    # command — these END at `;`, so the `w` runs for every line before the quit/branch.
+    "sed -n ':x;w /tmp/out' file",           # review round 1 (Codex P2): the literal `:label;w` shape
+    "sed -n '5q;w out.txt' f.txt",
+    "sed -n ':a;w out.txt' f.txt",
+    "sed -n 'l;w out.txt' f.txt",
+    "sed -n 'b end;w out.txt;:end' f.txt",
+    "sed -n 't x;w out.txt;:x' f.txt",
+    "sed -n '2{w out.txt}' f.txt",
+    # review round 1 (codex P1): GNU accepts any unambiguous long-option PREFIX, so an
+    # abbreviation — or any unknown long option at all — forfeits the grant.
+    "sed --in-pla=.bak 's/a/b/' f.txt",
+    "sed --in-pl 's/a/b/' f.txt",
+    "sed --fi script.sed f.txt",
+    "sed --qui '1p' f.txt",                   # even a harmless abbreviation is refused
+    "sed --some-future-option -n '1p' f.txt",
+    # review round 2 (Opus): a bracket expression containing the delimiter used to END the address
+    # scan early, leaving the real `w` invisible — `sed -n '/[/]/w out.txt' f.txt` WRITES out.txt
+    # on both GNU and BSD sed (verified live). Brackets are honoured in a regex address and in the
+    # `s` PATTERN only: the `s` REPLACEMENT and `y` have no bracket semantics (also verified live —
+    # `s/a/[/w out` and `y/[/]/;w out.txt` both write), and an unterminated regex/bracket is a sed
+    # error, which the grant-direction predicate reads as "not read-only".
+    "sed -n '/[/]/w out.txt' f.txt",
+    "sed -n '/[[:alpha:]/]/w out.txt' f.txt",
+    "sed -n 's/[/]/X/w out.txt' f.txt",
+    "sed -n 's/[[:alpha:]]/X/w out.txt' f.txt",
+    "sed -n 's/a/[/w out' f.txt",                # the REPLACEMENT is not a regex: `w out` is the flag
+    "sed -n 'y/[/]/;w out.txt' f.txt",            # `y` is not a regex: `[`→`]`, then the write
+    "sed -n '/[/w out.txt' f.txt",                # unterminated bracket = unterminated address regex
+    "sed -n '/abc' f.txt",                        # unterminated address regex
+    "sed -n '1' f.txt",                           # an address with no command (sed: missing command)
+    # review round 3 (Opus): a SHELL-EXPANDED script is as unknowable as `-f script` — shlex does
+    # not expand, and `S='w /tmp/out'` in the environment would turn the "print" into a write.
+    # Only a `$`/backtick OUTSIDE single quotes counts (see `sed -n '$p'` in the read-only matrix).
+    'sed -n "$S" f.txt',
+    'sed -n "$(cat s)" f.txt',
+    "sed -n `cat s` f.txt",
+    'sed -n "1,${N}p" f.txt',
+    "sed -n $S f.txt",
+])
+def test_sed_that_edits_or_writes_is_not_read_only(command, tmp_path, monkeypatch):
+    """The guard: an in-place edit, a `w`/`W`/`e` script command (or `s///w` / `s///e` flag), or
+    a script read from a FILE forfeits the read-only grant. Proved end-to-end on a 3-segment chain
+    (`git status && <sed> && ls`) — without the grant the chain reaches the >=3-segment fallback or
+    the `sed -i` impl-signal and warns-then-blocks, exactly as today."""
+    assert ost._is_read_only_sed(command) is False, command
+    chain = f"git status && {command} && ls"
+    assert ost._is_implementation_bash(chain) is True, chain
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": chain}}
+    out1, _e, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
+    out2, _e, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_read_only_sed_is_head_anchored_not_a_needle(tmp_path, monkeypatch):
+    """`sed` as an ARGUMENT of a non-read-only head grants nothing (the anchor invariant, #5/#80):
+    `awk` is still un-allowlisted, so a 3-segment chain around it still hits the fallback."""
+    chain = "awk 'sed -n 1p' f.txt && git status && ls"
+    assert ost._is_read_only_sed("awk 'sed -n 1p' f.txt") is False
+    assert ost._is_implementation_bash(chain) is True
+
+
+def test_unparseable_sed_segment_is_not_granted(tmp_path, monkeypatch):
+    """An unbalanced-quote `sed` segment cannot be classified → the GRANT-direction predicate
+    refuses (the `_is_tg_command` precedent), never guesses read-only."""
+    assert ost._is_read_only_sed("sed -n '1p f.txt") is False

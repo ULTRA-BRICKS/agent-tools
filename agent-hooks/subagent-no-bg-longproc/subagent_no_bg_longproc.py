@@ -4,10 +4,37 @@
 The wedge this exists to kill (agent-tools#52, seen ~6x in one session): a dispatched
 subagent runs a long process — a multi-model ``review``, a full build/test suite, a
 ``--watch`` loop, a long ``sleep`` — with ``run_in_background: true`` (or a shell ``&`` /
-``setsid``), then ENDS ITS TURN saying "I'll wait for the completion notification". But a
-SUBAGENT is NOT re-invoked by a background-completion notification — only the main loop is.
-So it idles FOREVER with uncommitted work and no PR, and the orchestrator has to catch the
+``setsid``), then ENDS ITS TURN saying "I'll wait for the completion notification". For a
+detached job or a ``--watch`` loop no completion can ever arrive (the mechanism below), so it
+idles FOREVER with uncommitted work and no PR, and the orchestrator has to catch the
 rest-notification, kill the stray process, and salvage the half-done work by hand.
+
+WHICH notifications re-invoke a subagent (the precise mechanism, agent-tools#546 — an earlier
+revision of this docstring claimed, as a blanket, that no background-completion notification
+ever re-invokes a subagent — FALSE for the general case; the sibling
+``subagent-no-monitor`` gate (agent-tools#439) proved the split empirically):
+  - a Bash tool call with ``run_in_background: true`` DOES resume the calling subagent with the
+    command's output once the child exits — the harness tracks that child against the agent
+    that started it (verified: a 40 s backgrounded ``python3`` sleep resumed its subagent after
+    ~43 s with no further message sent to it). So an ORDINARY, non-labeled command backgrounded
+    this way is a perfectly good shape for a subagent, and this gate allows it.
+  - a **Monitor** watch NEVER resumes a subagent (Monitor has no harness-tracked child at all) —
+    ``subagent-no-monitor`` blocks every subagent Monitor call for exactly that reason.
+  - a shell-DETACHED job — a trailing ``&``, ``nohup … &``, or a ``setsid`` that forks (which
+    it does, without ``-w``, whenever the caller is a process-group leader; a ``setsid`` that
+    merely execs is an ordinary foreground run) — NEVER resumes a subagent either: the harness
+    knows nothing about a job the shell forked behind its back, so the Bash call returns
+    immediately and no completion ever arrives.
+  - a ``--watch`` loop never exits, so no completion can arrive by ANY route.
+
+What this gate BLOCKS, given that: a subagent backgrounding a LABELED long process — ``review``,
+``--watch``, a build/test suite, ``sleep N>=10`` — by ANY of the three backgrounding shapes,
+``run_in_background: true`` included. For a detached job or a ``--watch`` loop the wedge is
+certain; for a bounded labeled process under ``run_in_background: true`` the harness WOULD
+resume the subagent, and whether that case should keep being blocked (the labeled runners are
+long, and a subagent waiting on its own ``review`` is the classic wedge shape regardless of the
+mechanism) is a SCOPE question deliberately left to a follow-up ticket (agent-tools#559) rather than
+folded into this wording fix — the gated scope here is unchanged from agent-tools#52.
 
 This gate is the exact INVERSE of two sibling gates:
   - ``no-long-inline-process`` blocks the ORCHESTRATOR from running a long process inline
@@ -15,7 +42,10 @@ This gate is the exact INVERSE of two sibling gates:
   - ``background-subagent-gate`` (pre-agent) makes the orchestrator dispatch non-trivial
     subagents in the BACKGROUND.
   - THIS gate makes a SUBAGENT run its OWN long work in the FOREGROUND and block on it: a
-    worker must NOT background a long process, because it will never be told it finished.
+    worker must NOT background a labeled long process (see the mechanism above for which
+    backgrounding shapes never wake it).
+  - ``subagent-no-monitor`` (pre-monitor) blocks a SUBAGENT's Monitor call outright — the same
+    wedge via the one tool that has no foreground mode at all.
 
 It fires ONLY for a subagent (``agent_id`` present) AND only when the command is BOTH a
 long-running process AND backgrounded. A subagent that runs ``review`` in the foreground
@@ -177,6 +207,40 @@ _WITHIN_JOB_OPS = frozenset({"|", "|&", "&&", "||"})
 # `setsid` detaches into a new session and the parent returns immediately — a background even
 # without a trailing `&`. (`nohup` does NOT: `nohup cmd` runs foreground and blocks.)
 _DETACHERS = frozenset({"setsid"})
+
+
+# The bounded foreground heartbeat loop both subagent anti-wedge gates point at as the universal
+# alternative to backgrounding. SYNC: identical constant in subagent-no-monitor
+# (tests/test_subagent_no_bg_longproc.py pins the two equal), so the two hooks never drift on the
+# one remedy they share.
+HEARTBEAT_LOOP_EXAMPLE = (
+    "`timeout 540 bash -c 'i=0; until <condition-check> || [ \"$i\" -ge 26 ]; do sleep "
+    "20; i=$((i+1)); echo \"[wait] tick $i ($((i*20))s)\"; done'`"
+)
+
+# `{matched}` is the long-process label the classifier found (`review`, `--watch (...)`, …).
+# The two alternatives are the SAME two subagent-no-monitor offers, so a blocked subagent is never
+# pinballed between the two gates with no legal move (agent-tools#546).
+BLOCK_MESSAGE = (
+    "You are a SUBAGENT — run this long process ({matched}) in the FOREGROUND and BLOCK on it; "
+    "do NOT background it. Remove `run_in_background: true` (and any trailing `&` / `setsid` / "
+    "`nohup … &`) and run it inline so this tool call blocks until it finishes. Why: a shell-"
+    "detached job (`&`/`nohup`/a forking `setsid`) never wakes you — the harness knows nothing about it — "
+    "and a `--watch` loop never exits, so ending your turn on it wedges you FOREVER with "
+    "uncommitted work and no PR; a labeled long process (review/--watch/build-test suite/long "
+    "sleep) is blocked from backgrounding by ANY shape, `run_in_background: true` included. "
+    "Use one of these instead: (1) waiting on a SINGLE ORDINARY command (NOT one of those "
+    "labeled long processes) — `run_in_background: true` on the Bash tool call is fine: the "
+    "harness tracks that child and auto-resumes you with its output when it exits. (2) waiting "
+    "on anything else (a labeled long process, a condition, a file, several things at once) — "
+    "block on it yourself in the FOREGROUND with a heartbeat loop: echo a line at least every "
+    "~20s and keep each Bash call under ~540s, repeating the same bounded call until the wait is "
+    "over, e.g.: " + HEARTBEAT_LOOP_EXAMPLE + ". Never Monitor — subagent-no-monitor blocks it "
+    "for a subagent (it never resumes you). There is NO self-service bypass. For a genuine "
+    "exception, ASK the human, or request a one-time Telegram approval by setting "
+    "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC=\"<written justification>\" "
+    "(deny-by-default; a bare 1 is rejected)."
+)
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -574,18 +638,7 @@ def main() -> int:
         return 0
 
     cwd = str(event.get("cwd") or args.get("cwd") or os.getcwd())
-    block_message = (
-        f"You are a SUBAGENT — run this long process ({matched}) in the FOREGROUND and BLOCK "
-        "on it; do NOT background it. A subagent is NOT re-invoked by a background-completion "
-        "notification "
-        "(only the main loop is), so backgrounding this and ending your turn wedges you "
-        "FOREVER with uncommitted work and no PR. Remove `run_in_background: true` (and any "
-        "trailing `&` / `setsid`) and run it inline so this tool call blocks until it "
-        "finishes. There is NO self-service bypass. For a genuine exception, ASK the human, or "
-        "request a one-time Telegram approval by setting "
-        "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC=\"<written justification>\" "
-        "(deny-by-default; a bare 1 is rejected)."
-    )
+    block_message = BLOCK_MESSAGE.format(matched=matched)
 
     ctx = {"hook": "subagent-no-bg-longproc", "command": command}
     hatch = hatch_escalation.request_hatch_approval(

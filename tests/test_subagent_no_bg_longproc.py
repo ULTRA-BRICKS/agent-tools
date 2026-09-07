@@ -502,3 +502,89 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert "self-managed watchdog, polls inline" in question.read_text()
+
+
+# ── doctrine consistency (agent-tools#546): the stated mechanism must be the VERIFIED one ──
+#
+# The hook used to claim, in its docstring / README / descriptor / block message, that "a
+# subagent is NOT re-invoked by a background-completion notification" — a blanket that
+# subagent-no-monitor (agent-tools#439) empirically narrowed: a Bash `run_in_background: true`
+# child IS harness-tracked and DOES resume the calling subagent with its output; only a Monitor
+# watch and a shell-detached job (`&`, `setsid`, `nohup … &`) never do. Every doctrine surface of
+# this hook must state that precise split, and its block message must offer the same two
+# working alternatives subagent-no-monitor's does.
+
+_HOOK_DIR = Path(__file__).resolve().parents[1] / "agent-hooks" / "subagent-no-bg-longproc"
+_REPO = Path(__file__).resolve().parents[1]
+# Every spelling of the retired blanket claim, checked on EVERY surface (review round 3, Opus +
+# Sonnet: the doctrine and catalog guards used to pin two different literals, and the surfaces
+# quoted the old sentence verbatim across a line wrap — the guard held only by luck of the wrap).
+_BLANKET_CLAIMS = (
+    "not re-invoked by a background-completion notification",
+    "never re-invoked by a background-completion notification",
+    "not re-invoked by a background-completion",
+)
+
+
+def _assert_no_blanket_claim(text: str, surface: str) -> None:
+    folded = " ".join(text.lower().split())  # collapse line wraps so a wrapped quote still matches
+    for claim in _BLANKET_CLAIMS:
+        assert claim not in folded, (surface, claim)
+
+
+def _doctrine_surfaces() -> dict[str, str]:
+    descriptor = json.loads((_HOOK_DIR / "subagent-no-bg-longproc.pre-bash.json").read_text())
+    return {
+        "docstring": hook.__doc__ or "",
+        "README.md": (_HOOK_DIR / "README.md").read_text(),
+        "descriptor": descriptor["description"],
+        "block_message": hook.BLOCK_MESSAGE,
+    }
+
+
+@pytest.mark.parametrize("surface", sorted(_doctrine_surfaces()))
+def test_doctrine_surface_states_the_precise_wake_mechanism(surface):
+    text = _doctrine_surfaces()[surface]
+    _assert_no_blanket_claim(text, surface)
+    # The two halves of the verified mechanism: the tracked child that DOES resume a subagent,
+    # and the two shapes (Monitor, a shell-detached job) that never do.
+    assert "run_in_background" in text, surface
+    assert "Monitor" in text, surface
+    assert "setsid" in text, surface
+
+
+def test_catalog_entries_no_longer_carry_the_blanket_claim():
+    """The hook catalog (agent-hooks/README.md, AGENTS.md) and the sibling's descriptor used to
+    flag this hook's rationale as 'broader than confirmed, tracked as agent-tools#546' — once the
+    wording is reconciled those hedges go, and the blanket claim must not resurface anywhere."""
+    for rel in ("agent-hooks/README.md", "AGENTS.md",
+                "agent-hooks/subagent-no-monitor/subagent-no-monitor.pre-monitor.json"):
+        text = (_REPO / rel).read_text().lower()
+        _assert_no_blanket_claim(text, rel)
+        assert "broader than confirmed" not in text, rel
+        assert "tracks reconciling" not in text, rel
+
+
+def test_block_message_offers_the_same_two_alternatives_as_subagent_no_monitor():
+    """The remedy text is shared BY CONSTANT: both hooks print the identical heartbeat-loop
+    example (SYNC: HEARTBEAT_LOOP_EXAMPLE), and this hook's message names the run_in_background
+    path for an ORDINARY command and the foreground heartbeat loop for everything else."""
+    sib_path = (_REPO / "agent-hooks" / "subagent-no-monitor" / "subagent_no_monitor.py")
+    spec = importlib.util.spec_from_file_location("subagent_no_monitor", sib_path)
+    assert spec and spec.loader
+    sib = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sib)
+    assert hook.HEARTBEAT_LOOP_EXAMPLE == sib.HEARTBEAT_LOOP_EXAMPLE
+    assert hook.HEARTBEAT_LOOP_EXAMPLE in hook.BLOCK_MESSAGE
+    assert hook.HEARTBEAT_LOOP_EXAMPLE in sib.BLOCK_MESSAGE
+    assert "FOREGROUND" in hook.BLOCK_MESSAGE
+    assert "Monitor" in hook.BLOCK_MESSAGE
+
+
+def test_block_output_carries_the_reconciled_message(monkeypatch):
+    out, _e, code = _run("review diff -C /repo", monkeypatch, run_in_background=True)
+    assert code == hook.BLOCK_EXIT_CODE
+    msg = json.loads(out)["message"]
+    assert hook.HEARTBEAT_LOOP_EXAMPLE in msg
+    _assert_no_blanket_claim(msg, "block output")
+    assert "review diff" in msg or "review" in msg
