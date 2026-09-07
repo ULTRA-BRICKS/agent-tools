@@ -25,22 +25,30 @@ command that merely *mentions* those words is not gated):
 
 | Subcommand | Gated? |
 | --- | --- |
-| `create`, `edit`, `close`, `reopen`, `comment`, `delete`, `transfer`, `lock`, `unlock`, `pin`, `unpin` | **yes** — creates or mutates a ticket |
+| `create` (and its gh-documented alias `new`), `edit`, `close`, `reopen`, `comment`, `delete`, `transfer`, `lock`, `unlock`, `pin`, `unpin` | **yes** — creates or mutates a ticket |
 | `view`, `list`, `status` | no — read-only |
 
 `gh api`, scoped to a GitHub REST path that addresses an issue or one of its mutable
 sub-resources — `repos/<owner>/<repo>/issues`, optionally `/<number>` and a trailing `comments`/
-`labels`/`assignees`/`lock` — **and** a mutating signal: an explicit `-X`/`--method` of `POST`/
-`PATCH`/`PUT`/`DELETE`, or any `-f`/`-F`/`--field`/`--raw-field`/`--input` (which makes `gh api`
-default to `POST`). A plain `gh api repos/o/r/issues` with no method/fields is `gh api`'s own GET
-default — a read — and is not gated, matching the `gh issue view`/`list` exclusion. This closes
-the `gh issue create` → `gh api repos/o/r/issues -f title=...` evasion without touching the many
-other legitimate uses of `gh api` (PRs, releases, workflow runs, …).
+`labels`/`assignees`/`lock` (each optionally followed by its own identifier, e.g.
+`issues/42/labels/bug`), **or** the concrete per-comment route `repos/<owner>/<repo>/issues/
+comments/<comment_id>` (which does not nest under an issue number at all) — **and** a mutating
+signal: an explicit `-X`/`--method` of `POST`/`PATCH`/`PUT`/`DELETE`, or — with no explicit
+method — any `-f`/`-F`/`--field`/`--raw-field`/`--input` (which makes `gh api` default to
+`POST`), in either the separate-token form (`-f title=x`) or attached (`-ftitle=x`,
+`--field=title=x`). A plain `gh api repos/o/r/issues` with no method/fields is `gh api`'s own GET
+default — a read — and is not gated, matching the `gh issue view`/`list` exclusion. An explicit
+`--method`/`-X` always wins over field-flag inference: `-X GET -f state=open` is a read (gh's own
+docs: `--method GET` sends fields as a query string, not a body). This closes the `gh issue
+create` → `gh api repos/o/r/issues -f title=...` evasion without touching the many other
+legitimate uses of `gh api` (PRs, releases, workflow runs, …).
 
 `gh -R owner/repo issue create …` / `gh --repo owner/repo issue create …` (the `-R`/`--repo`/
-`--hostname` global flags) are walked past, same as `git -C` in the commit-gate. A wrapped
-invocation (`env FOO=bar gh issue create …`, `sudo gh issue create …`, `timeout 60 gh issue
-create …`) is still gated — the same wrapper-peeling `require-ticket-before-commit` uses.
+`--hostname` global flags) are walked past, same as `git -C` in the commit-gate — in either
+position, BEFORE `issue` or AFTER it (`gh issue -R owner/repo create …`, Cobra persistent flags
+are valid in both spots). A wrapped invocation (`env FOO=bar gh issue create …`, `sudo gh issue
+create …`, `timeout 60 gh issue create …`) is still gated — the same wrapper-peeling
+`require-ticket-before-commit` uses.
 
 ## When does the gate actually fire — `task_cli_active(cwd)`
 
@@ -62,9 +70,16 @@ The gate only fires when task-cli is a **real, usable alternative right now**:
    `~/.config/rig/config.yaml` is in any case a **global**, machine-wide provisioning marker, not
    a per-repo signal — rig-cli's own `rig.yaml` carries no `tools:` block at all, confirming
    `tools.items` is resolved at the global config layer.)
+3. That resolved `task` binary actually **identifies as task-cli**. `task` is a famously
+   ambiguous name — Taskwarrior and go-task both install a `task` on PATH too — so `shutil.which`
+   resolving *something* is not proof it resolved task-cli. `_task_binary_is_task_cli` runs
+   `task --help` (read-only, no side effects) and checks for task-cli's own description string.
+   Mirrors the exact collision guard ship.sh's own acceptance gate already has
+   (`ci/ship/ship.sh`'s `_acceptance_gate_looks_like_task_cli_json`, agent-tools#521): trust
+   neither PATH resolution nor a zero exit code as identity, only the tool's own output.
 
-Both checks fail OPEN on error (a `git` invocation error, a broken `PATH`) — this hook nags, it
-doesn't wedge a machine that can't answer the question.
+All three checks fail OPEN on error (a `git`/`task` invocation error, a broken `PATH`) — this
+hook nags, it doesn't wedge a machine that can't answer the question.
 
 ## What's deliberately NOT covered
 

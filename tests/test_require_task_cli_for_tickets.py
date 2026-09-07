@@ -73,8 +73,19 @@ def _run(
     bin_dir = scratch / "bin"
     bin_dir.mkdir(exist_ok=True)
     if task_on_path:
+        # `--help` must print task-cli's OWN description string — `_task_binary_is_task_cli`
+        # positively identifies the resolved `task` binary this way (rather than trusting PATH
+        # resolution alone) to guard against a same-named Taskwarrior/go-task collision.
         fake = bin_dir / "task"
-        fake.write_text("#!/bin/sh\necho fake-task\n", encoding="utf-8")
+        fake.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "--help" ]; then\n'
+            '  echo "task \\xe2\\x80\\x94 the enforced ticket interface."\n'
+            "  exit 0\n"
+            "fi\n"
+            "echo fake-task\n",
+            encoding="utf-8",
+        )
         fake.chmod(0o755)
         env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     else:
@@ -118,6 +129,41 @@ class TestBlocksDirectMutation:
         assert out["code"] == rtc.BLOCK_EXIT_CODE
         assert out["decision"] == "block"
 
+    def test_gh_issue_new_alias_blocks(self, tmp_path):
+        """`gh issue new` is gh's own documented alias for `gh issue create` — review finding,
+        agent-tools#597."""
+        repo = _git_repo(tmp_path)
+        out = _run("gh issue new --title x --body y", cwd=repo, scratch=tmp_path)
+        assert out["code"] == rtc.BLOCK_EXIT_CODE
+        assert out["decision"] == "block"
+
+    def test_global_repo_flag_after_issue_still_blocks(self, tmp_path):
+        """`gh issue -R o/r create` / `gh issue --repo o/r create` — the global flag placed
+        AFTER `issue` but before the real subcommand — review finding, agent-tools#597."""
+        repo = _git_repo(tmp_path)
+        out = _run("gh issue -R o/r create --title x", cwd=repo, scratch=tmp_path)
+        assert out["code"] == rtc.BLOCK_EXIT_CODE
+        assert out["decision"] == "block"
+
+    def test_gh_api_attached_field_flag_blocks(self, tmp_path):
+        """`-ftitle=x` (short flag, value concatenated, no separate token) — review finding,
+        agent-tools#597."""
+        repo = _git_repo(tmp_path)
+        out = _run("gh api repos/o/r/issues -ftitle=x", cwd=repo, scratch=tmp_path)
+        assert out["code"] == rtc.BLOCK_EXIT_CODE
+        assert out["decision"] == "block"
+
+    def test_gh_api_concrete_comment_route_blocks(self, tmp_path):
+        """`repos/<owner>/<repo>/issues/comments/<comment_id>` — GitHub's route for mutating ONE
+        issue comment directly, not nested under an issue number. Review finding,
+        agent-tools#597."""
+        repo = _git_repo(tmp_path)
+        out = _run(
+            "gh api repos/o/r/issues/comments/123 -X PATCH -f body=x", cwd=repo, scratch=tmp_path
+        )
+        assert out["code"] == rtc.BLOCK_EXIT_CODE
+        assert out["decision"] == "block"
+
 
 class TestReadOnlyNeverBlocks:
     @pytest.mark.parametrize("sub", ["view 1", "list", "status"])
@@ -130,6 +176,17 @@ class TestReadOnlyNeverBlocks:
     def test_gh_api_get_issues_allows(self, tmp_path):
         repo = _git_repo(tmp_path)
         out = _run("gh api repos/o/r/issues", cwd=repo, scratch=tmp_path)
+        assert out["code"] == 0
+        assert out["decision"] == "allow"
+
+    def test_gh_api_explicit_get_overrides_field_inference(self, tmp_path):
+        """`-X GET -f state=open` sends the field as a query parameter, not a body — an
+        explicit read-only method must override the field-presence heuristic. Review finding,
+        agent-tools#597."""
+        repo = _git_repo(tmp_path)
+        out = _run(
+            "gh api repos/o/r/issues -X GET -f state=open", cwd=repo, scratch=tmp_path
+        )
         assert out["code"] == 0
         assert out["decision"] == "allow"
 
@@ -167,6 +224,46 @@ class TestTaskCliMustBeActive:
         out = _run("gh issue create --title x", cwd=not_repo, scratch=tmp_path)
         assert out["code"] == 0
         assert out["decision"] == "allow"
+
+
+class TestTaskCliIdentity:
+    """`task` is a famously ambiguous binary name (Taskwarrior, go-task also install as `task`)
+    — the gate must not treat a same-named collision as an active alternative. Review finding,
+    agent-tools#597 (mirrors the exact collision guard ship.sh's own acceptance gate already has
+    at `ci/ship/ship.sh`'s `_acceptance_gate_looks_like_task_cli_json`)."""
+
+    def test_same_named_non_task_cli_binary_allows(self, tmp_path):
+        repo = _git_repo(tmp_path)
+        env = dict(os.environ)
+        env.pop("REQUIRE_TASK_CLI_STRICT", None)
+        env.pop(_HATCH_ENV, None)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        fake = bin_dir / "task"
+        fake.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "--help" ]; then\n'
+            '  echo "task 2.6.2 (Taskwarrior)"\n'
+            "  exit 0\n"
+            "fi\n"
+            "echo not-task-cli\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        event = json.dumps({"args": {"command": "gh issue create --title x"}, "cwd": str(repo)})
+        proc = subprocess.run(
+            [sys.executable, str(_HOOK)],
+            input=event,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(tmp_path),
+            timeout=10,
+        )
+        payload = json.loads((proc.stdout or "").strip())
+        assert proc.returncode == 0
+        assert payload["decision"] == "allow"
 
 
 class TestStrictToggle:

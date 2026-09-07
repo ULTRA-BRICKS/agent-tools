@@ -31,9 +31,36 @@ _HATCH_ENV = "RIG_HATCH_REQUEST_REQUIRE_TASK_CLI_FOR_TICKETS"
 
 
 def _fake_task_bin(bin_dir: Path) -> None:
-    """Drop a fake `task` executable into `bin_dir` so `shutil.which("task")` resolves."""
+    """Drop a fake `task` executable into `bin_dir` that behaves like the REAL task-cli enough
+    to pass `_task_binary_is_task_cli`'s identity check: it must print task-cli's own
+    description string on `--help`."""
     fake = bin_dir / "task"
-    fake.write_text("#!/bin/sh\necho fake-task\n", encoding="utf-8")
+    fake.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--help" ]; then\n'
+        '  echo "task \\xe2\\x80\\x94 the enforced ticket interface."\n'
+        "  exit 0\n"
+        "fi\n"
+        "echo fake-task\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+
+def _fake_collision_task_bin(bin_dir: Path) -> None:
+    """Drop a fake `task` executable that resolves on PATH but does NOT identify as task-cli —
+    stands in for a Taskwarrior/go-task binary shadowing the real one (the collision
+    `_task_binary_is_task_cli` guards against, agent-tools#597)."""
+    fake = bin_dir / "task"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--help" ]; then\n'
+        '  echo "task 2.6.2 (Taskwarrior)"\n'
+        "  exit 0\n"
+        "fi\n"
+        "echo not-task-cli\n",
+        encoding="utf-8",
+    )
     fake.chmod(0o755)
 
 
@@ -158,6 +185,11 @@ def _run_hook_inproc(command: str, *, cwd: str, env_extra: dict | None = None, t
                 mock.patch.object(mod.hatch_escalation, "resolve_home", lambda: str(home)),
                 mock.patch.object(mod.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,)),
                 mock.patch("shutil.which", return_value="/fake/bin/task"),
+                # The real identity check (`_task_binary_is_task_cli`) execs "task --help" on
+                # PATH — irrelevant to what this test class exercises (hatch escalation
+                # plumbing, already covered by TaskCliActive/GhIssueClassification below), so
+                # it's stubbed True here rather than standing up a fake binary on PATH too.
+                mock.patch.object(mod, "_task_binary_is_task_cli", return_value=True),
                 mock.patch.object(sys, "stdin", io.StringIO(event)),
                 mock.patch.object(sys, "stdout", out),
             ):
@@ -218,6 +250,25 @@ class GhIssueClassification(unittest.TestCase):
             mod.gh_issue_mutation(["gh", "-R", "o/r", "issue", "edit", "1"]), "edit"
         )
 
+    def test_global_repo_flag_after_issue_is_consumed(self):
+        """`gh issue -R o/r create` / `gh issue --repo o/r create` — the global flag placed
+        AFTER `issue` but before the real subcommand — review finding, agent-tools#597."""
+        self.assertEqual(
+            mod.gh_issue_mutation(["gh", "issue", "-R", "o/r", "create"]), "create"
+        )
+        self.assertEqual(
+            mod.gh_issue_mutation(["gh", "issue", "--repo", "o/r", "create", "--title", "x"]),
+            "create",
+        )
+
+    def test_new_is_a_mutating_alias_of_create(self):
+        """`gh issue new` is gh's own documented alias for `gh issue create` (verified live
+        against `gh issue create --help`'s ALIASES section) — review finding, agent-tools#597."""
+        self.assertEqual(mod.gh_issue_mutation(["gh", "issue", "new"]), "new")
+        self.assertEqual(
+            mod.gh_issue_mutation(["gh", "issue", "new", "--title", "x"]), "new"
+        )
+
 
 class GhApiClassification(unittest.TestCase):
     def test_post_to_issues_path_is_mutation(self):
@@ -258,6 +309,55 @@ class GhApiClassification(unittest.TestCase):
             mod.gh_api_issue_mutation(["gh", "api", "repos/o/r/issues", "--method=POST"])
         )
 
+    def test_attached_field_flags_are_recognized(self):
+        """`--field=`/`--raw-field=`/`--input=` (long, `=`-attached) and `-ftitle=x`/`-Ftitle=x`
+        (short, concatenated) — gh's own pflag grammar accepts both alongside the separate-token
+        form. Review finding, agent-tools#597."""
+        self.assertTrue(
+            mod.gh_api_issue_mutation(["gh", "api", "repos/o/r/issues", "--field=title=x"])
+        )
+        self.assertTrue(
+            mod.gh_api_issue_mutation(["gh", "api", "repos/o/r/issues", "--raw-field=title=x"])
+        )
+        self.assertTrue(
+            mod.gh_api_issue_mutation(["gh", "api", "repos/o/r/issues", "-ftitle=x"])
+        )
+        self.assertTrue(
+            mod.gh_api_issue_mutation(["gh", "api", "repos/o/r/issues", "-Ftitle=x"])
+        )
+
+    def test_explicit_get_overrides_field_inference(self):
+        """`-X GET -f state=open` sends the field as a query parameter, not a body — gh's own
+        docs say so explicitly. An explicit read-only method must override the field-presence
+        heuristic. Review finding, agent-tools#597."""
+        self.assertFalse(
+            mod.gh_api_issue_mutation(
+                ["gh", "api", "repos/o/r/issues", "-X", "GET", "-f", "state=open"]
+            )
+        )
+
+    def test_explicit_post_is_mutation_even_with_no_fields(self):
+        self.assertTrue(
+            mod.gh_api_issue_mutation(["gh", "api", "repos/o/r/issues", "-X", "POST"])
+        )
+
+    def test_concrete_comment_route_is_mutation(self):
+        """`repos/<owner>/<repo>/issues/comments/<comment_id>` — GitHub's route for mutating ONE
+        issue comment directly (it does not nest under an issue number). Review finding,
+        agent-tools#597."""
+        self.assertTrue(
+            mod.gh_api_issue_mutation(
+                ["gh", "api", "repos/o/r/issues/comments/123", "-X", "PATCH", "-f", "body=x"]
+            )
+        )
+
+    def test_concrete_label_route_is_mutation(self):
+        self.assertTrue(
+            mod.gh_api_issue_mutation(
+                ["gh", "api", "repos/o/r/issues/42/labels/bug", "-X", "DELETE"]
+            )
+        )
+
 
 class TaskCliActive(unittest.TestCase):
     def test_active_when_binary_present_and_inside_git_repo(self):
@@ -294,6 +394,34 @@ class TaskCliActive(unittest.TestCase):
             os.environ["PATH"] = f"{bin_dir}:{old_path}"
             try:
                 self.assertFalse(mod.task_cli_active(str(not_repo)))
+            finally:
+                os.environ["PATH"] = old_path
+
+    def test_inactive_when_task_binary_is_a_same_named_collision(self):
+        """A `task` on PATH that resolves but is NOT task-cli (Taskwarrior/go-task shadowing
+        it) must not be treated as an active alternative — review finding, agent-tools#597."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _git_repo(Path(tmp))
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            _fake_collision_task_bin(bin_dir)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{bin_dir}:{old_path}"
+            try:
+                self.assertFalse(mod.task_cli_active(str(repo)))
+            finally:
+                os.environ["PATH"] = old_path
+
+    def test_active_when_real_task_cli_signature_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _git_repo(Path(tmp))
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            _fake_task_bin(bin_dir)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{bin_dir}:{old_path}"
+            try:
+                self.assertTrue(mod._task_binary_is_task_cli(str(repo)))
             finally:
                 os.environ["PATH"] = old_path
 
@@ -403,6 +531,43 @@ class EndToEnd(unittest.TestCase):
             code, decision = run_hook('gh api repos/o/r/issues', cwd=str(repo))
         self.assertEqual(code, 0)
         self.assertEqual(decision, "allow")
+
+    def test_gh_issue_new_blocks_by_default_when_task_cli_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _git_repo(Path(tmp))
+            code, decision = run_hook('gh issue new --title x --body y', cwd=str(repo))
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_task_binary_collision_allows(self):
+        """A same-named `task` that is NOT task-cli must not be treated as an active
+        alternative — the gate should allow (fail open), not block toward an unusable
+        `task new`/`task classify`. Review finding, agent-tools#597."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _git_repo(Path(tmp))
+            env = dict(os.environ)
+            env.pop("REQUIRE_TASK_CLI_STRICT", None)
+            env.pop(_HATCH_ENV, None)
+            with tempfile.TemporaryDirectory() as scratch:
+                bin_dir = Path(scratch) / "bin"
+                bin_dir.mkdir()
+                _fake_collision_task_bin(bin_dir)
+                env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+                event = json.dumps(
+                    {"args": {"command": "gh issue create --title x"}, "cwd": str(repo)}
+                )
+                proc = subprocess.run(
+                    [sys.executable, str(_SCRIPT)],
+                    input=event,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    cwd=scratch,
+                    timeout=10,
+                )
+            payload = json.loads((proc.stdout or "").strip())
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(payload["decision"], "allow")
 
 
 class OverMatchRegression(unittest.TestCase):

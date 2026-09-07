@@ -23,7 +23,9 @@ ticket itself must be created/mutated through the enforced CLI, not by hand).
 Only fires when task-cli is actually usable here: the `task` binary must resolve on PATH (so a
 machine that never provisioned task-cli, via rig's `tools.items.task`, is never blocked with no
 alternative) AND the command's cwd must be inside a git repository (task-cli resolves its
-backend/target from git context; outside a repo there is nothing for it to file against).
+backend/target from git context; outside a repo there is nothing for it to file against) AND the
+resolved `task` binary must actually identify as task-cli (`task --help`'s own description
+string) rather than a same-named Taskwarrior/go-task collision.
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command
@@ -343,20 +345,39 @@ _GH_GLOBAL_VALUE_FLAGS = frozenset({"-R", "--repo", "--hostname"})
 # The `gh issue` subcommands that CREATE or MUTATE a ticket directly — exactly the bypass this
 # hook exists to close. `view`/`list`/`status` (read-only) are deliberately excluded.
 MUTATING_ISSUE_SUBCOMMANDS = frozenset({
-    "create", "edit", "close", "reopen", "comment", "delete",
+    "create", "new", "edit", "close", "reopen", "comment", "delete",
     "transfer", "lock", "unlock", "pin", "unpin",
 })
+# `new` is gh's own documented alias for `create` (`gh issue create --help` lists it under
+# ALIASES; verified live against gh 2.92.0/2.96.0) — without it, `gh issue new` bypasses the
+# gate outright (review finding, agent-tools#597).
 
 # HTTP methods on `gh api` that mutate. `gh api` defaults to GET; passing any of these (or a
 # `-f`/`--field`/`--raw-field`/`--input` value, which makes gh api default to POST) is a write.
 _MUTATING_HTTP_METHODS = frozenset({"POST", "PATCH", "PUT", "DELETE"})
 _GH_API_METHOD_FLAGS = frozenset({"-X", "--method"})
 _GH_API_FIELD_FLAGS = frozenset({"-f", "--field", "-F", "--raw-field", "--input"})
+# `gh api`'s Go/pflag flag parser also accepts a field flag with its value ATTACHED, not just as
+# a separate token: `--field=title=x` / `--raw-field=title=x` / `--input=file.json` (long-flag
+# `=` form) and `-ftitle=x` / `-Ftitle=x` (short-flag concatenated form, no space or `=` needed).
+# A separate-token-only check misses all of these (review finding, agent-tools#597; verified
+# against the installed gh's own `gh api --help` flag grammar).
+_GH_API_FIELD_FLAG_EQ_PREFIXES = tuple(f"{flag}=" for flag in _GH_API_FIELD_FLAGS if flag.startswith("--"))
+_GH_API_SHORT_FIELD_FLAGS = tuple(flag for flag in _GH_API_FIELD_FLAGS if len(flag) == 2)
 
-# A GitHub REST path that addresses an issue/its sub-resources: `repos/<owner>/<repo>/issues`,
-# optionally `/<number>` and a mutable sub-resource (`comments`, `labels`, `assignees`, `lock`).
+# A GitHub REST path that addresses an issue/its sub-resources:
+#   - `repos/<owner>/<repo>/issues`, optionally `/<number>`, optionally a mutable sub-resource
+#     (`comments`, `labels`, `assignees`, `lock`) with an optional trailing identifier
+#     (`/issues/42/labels/bug` removes one specific label);
+#   - OR `repos/<owner>/<repo>/issues/comments/<comment_id>` — GitHub's route for mutating ONE
+#     issue comment directly, which does not nest under an issue number at all (review finding,
+#     agent-tools#597: the previous pattern only matched `issues/<n>/comments`, never the
+#     concrete per-comment route `issues/comments/<id>`).
 _ISSUES_PATH_RE = re.compile(
-    r"^/?repos/[^/\s]+/[^/\s]+/issues(?:/\d+)?(?:/(?:comments|labels|assignees|lock))?/?$",
+    r"^/?repos/[^/\s]+/[^/\s]+/issues"
+    r"(?:/comments/[^/\s]+"
+    r"|/\d+(?:/(?:comments|labels|assignees|lock)(?:/[^/\s]+)?)?"
+    r")?/?$",
     re.IGNORECASE,
 )
 
@@ -380,13 +401,17 @@ def _skip_gh_global_flags(argv: list[str], start: int) -> int:
 def gh_issue_mutation(argv: list[str]) -> str | None:
     """If `argv` (a `gh …` segment, wrapper-peeled, argv[0] == gh) is a `gh issue
     <mutating-subcommand>` invocation, return that subcommand; else None. `gh issue view/list/
-    status` and any unrecognized subcommand return None (fail open — not our job to catch)."""
+    status` and any unrecognized subcommand return None (fail open — not our job to catch).
+
+    Global flags (`-R`/`--repo`/`--hostname`) are walked past both BEFORE `issue` (`gh -R o/r
+    issue create`) and AFTER it (`gh issue -R o/r create`, `gh issue --repo o/r create`) — Cobra
+    persistent flags are valid in either position, so both spots need the SAME value-consuming
+    skip, not a bare `.startswith("-")` scan that treats `-R`'s separate value token as the
+    subcommand itself (review finding, agent-tools#597)."""
     i = _skip_gh_global_flags(argv, 1)
     if i >= len(argv) or argv[i] != "issue":
         return None
-    i += 1
-    while i < len(argv) and argv[i].startswith("-"):
-        i += 1
+    i = _skip_gh_global_flags(argv, i + 1)
     if i >= len(argv):
         return None
     sub = argv[i]
@@ -395,31 +420,44 @@ def gh_issue_mutation(argv: list[str]) -> str | None:
 
 def gh_api_issue_mutation(argv: list[str]) -> bool:
     """True when `argv` is a `gh api` call to a `repos/<owner>/<repo>/issues…` REST path with a
-    mutating signal (an explicit mutating `-X`/`--method`, or any `-f`/`-F`/`--field`/
-    `--raw-field`/`--input`, which makes `gh api` default to POST). A plain `gh api
-    repos/o/r/issues` (no method, no fields) is a READ (gh api's own GET default) and is not
-    gated — same read/write split as `gh issue view` vs `gh issue create`."""
+    mutating signal: an explicit mutating `-X`/`--method` (POST/PATCH/PUT/DELETE), or — with NO
+    explicit method — any `-f`/`-F`/`--field`/`--raw-field`/`--input` (which makes `gh api`
+    default to POST). A plain `gh api repos/o/r/issues` (no method, no fields) is a READ (gh
+    api's own GET default) and is not gated — same read/write split as `gh issue view` vs `gh
+    issue create`.
+
+    An explicit `--method`/`-X` ALWAYS wins over field-flag inference, in both directions: `-X
+    GET -f state=open` is a read (gh's own docs: `--method GET` sends fields as a query string,
+    not a body) even though fields are present, and `-X POST` is a write even with no fields at
+    all. Inferring the mutation from field presence alone when a method was explicitly given
+    blocked legitimate filtered reads (review finding, agent-tools#597)."""
     i = _skip_gh_global_flags(argv, 1)
     if i >= len(argv) or argv[i] != "api":
         return False
     i += 1
     path: str | None = None
-    has_mutating_method = False
+    explicit_method: str | None = None
     has_field = False
     while i < len(argv):
         tok = argv[i]
         if tok in _GH_API_METHOD_FLAGS and i + 1 < len(argv):
-            if argv[i + 1].strip().upper() in _MUTATING_HTTP_METHODS:
-                has_mutating_method = True
+            explicit_method = argv[i + 1].strip().upper()
             i += 2
+            continue
+        if tok.startswith("--method="):
+            explicit_method = tok.split("=", 1)[1].strip().upper()
+            i += 1
             continue
         if tok in _GH_API_FIELD_FLAGS and i + 1 < len(argv):
             has_field = True
             i += 2
             continue
-        if tok.startswith("--method="):
-            if tok.split("=", 1)[1].strip().upper() in _MUTATING_HTTP_METHODS:
-                has_mutating_method = True
+        if tok.startswith(_GH_API_FIELD_FLAG_EQ_PREFIXES):
+            has_field = True
+            i += 1
+            continue
+        if tok.startswith(_GH_API_SHORT_FIELD_FLAGS) and len(tok) > 2:
+            has_field = True
             i += 1
             continue
         if tok.startswith("-") and tok != "-":
@@ -430,7 +468,9 @@ def gh_api_issue_mutation(argv: list[str]) -> bool:
         i += 1
     if path is None or not _ISSUES_PATH_RE.match(path):
         return False
-    return has_mutating_method or has_field
+    if explicit_method is not None:
+        return explicit_method in _MUTATING_HTTP_METHODS
+    return has_field
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -460,6 +500,41 @@ def _inside_git_repo(cwd: str | None) -> bool:
         return False
 
 
+# A stable positive-identification marker: task-cli's own argparse description text (see
+# task-cli's `tasklib/cli.py`, `description=`). `task` is a famously ambiguous binary name —
+# Taskwarrior and go-task both install a `task` on PATH too — so `shutil.which("task") is not
+# None` alone can resolve one of THOSE instead of task-cli on a machine that has one installed.
+# This is the exact collision ship.sh's own acceptance gate already guards against
+# (`ci/ship/ship.sh`'s `_acceptance_gate_looks_like_task_cli_json`, agent-tools#521): trust
+# neither PATH resolution nor a zero exit code as proof of identity, only the tool's own
+# distinctive output (review finding, agent-tools#597).
+_TASK_CLI_SIGNATURE = "enforced ticket interface"
+
+
+def _looks_like_task_cli_help(output: str) -> bool:
+    return _TASK_CLI_SIGNATURE in output
+
+
+def _task_binary_is_task_cli(cwd: str | None) -> bool:
+    """Positively identify the `task` binary resolved on PATH as task-cli, not a same-named
+    collision. Runs `task --help` — read-only, no side effects, no ticket touched — and checks
+    for task-cli's own description string. Fails OPEN (returns False, so the gate does not fire)
+    on any subprocess error: this hook nags, it doesn't wedge a machine that can't answer the
+    question."""
+    try:
+        out = subprocess.run(
+            ["task", "--help"],
+            cwd=cwd or None,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        warn(f"could not verify task binary identity: {exc}")
+        return False
+    return _looks_like_task_cli_help(out.stdout) or _looks_like_task_cli_help(out.stderr)
+
+
 def task_cli_active(cwd: str | None) -> bool:
     """task-cli is a usable alternative right now: the `task` binary resolves on PATH (a machine
     that never provisioned it via rig's `tools.items.task` is never blocked with nothing to point
@@ -467,10 +542,13 @@ def task_cli_active(cwd: str | None) -> bool:
     github-issues — resolves the target repo from git context; task-cli falls through cleanly to
     github-issues with no `rig.yaml` `task:` block at all, so "task binary present + inside a git
     repo" already means task-cli is usable here, without duplicating task-cli's own config
-    cascade resolution in this hook)."""
+    cascade resolution in this hook) AND that resolved binary is actually task-cli, not a
+    same-named Taskwarrior/go-task collision (`_task_binary_is_task_cli`)."""
     if shutil.which("task") is None:
         return False
-    return _inside_git_repo(cwd)
+    if not _inside_git_repo(cwd):
+        return False
+    return _task_binary_is_task_cli(cwd)
 
 
 _GUIDANCE = (
