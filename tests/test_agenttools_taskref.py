@@ -83,6 +83,27 @@ def _gh_missing(argv, **kwargs):
     return _origin("alex-mextner", "agent-tools")(argv, **kwargs)
 
 
+def _gh_not_executable(argv, **kwargs):
+    if argv[0] == "git":
+        return _origin("alex-mextner", "agent-tools")(argv, **kwargs)
+    raise PermissionError("gh is not executable")
+
+
+def _gh_leaky_auth_error(argv, **kwargs):
+    if argv[0] == "git":
+        return _origin("alex-mextner", "agent-tools")(argv, **kwargs)
+    return _FakeProc(
+        returncode=1,
+        stderr="gh: HTTP 403\nAuthorization: token ghp_SUPERSECRETVALUE123\nrate limited",
+    )
+
+
+def _gh_null_html_url(argv, **kwargs):
+    if argv[0] == "git":
+        return _origin("alex-mextner", "agent-tools")(argv, **kwargs)
+    return _FakeProc(returncode=0, stdout="null\n")
+
+
 def _fail_if_called(argv, **kwargs):
     raise AssertionError(f"subprocess.run should not have been called with {argv!r}")
 
@@ -176,6 +197,55 @@ def test_github_gh_missing_rejected_cleanly(repo, monkeypatch):
     result = validate("607", repo)
     assert not result.ok
     assert "gh CLI not found" in result.reason
+
+
+def test_github_gh_not_executable_does_not_crash(repo, monkeypatch):
+    """review finding: _check_github_issue only caught FileNotFoundError/SubprocessError --
+    a PermissionError (gh on PATH but not +x) would have propagated out of validate()
+    despite the module's "never raises" contract."""
+    monkeypatch.setattr(subprocess, "run", _gh_not_executable)
+    result = validate("607", repo)
+    assert not result.ok
+    assert "PermissionError" in result.reason
+
+
+def test_github_gh_stderr_secrets_are_redacted(repo, monkeypatch):
+    """review finding (Grok/security): GH_DEBUG=api makes `gh` dump the Authorization
+    header (with the bearer token) to stderr on a non-404 failure; that must never be
+    echoed verbatim into a ValidationResult.reason that callers print/persist."""
+    monkeypatch.setattr(subprocess, "run", _gh_leaky_auth_error)
+    result = validate("607", repo)
+    assert not result.ok
+    assert "ghp_SUPERSECRETVALUE123" not in result.reason
+    assert "Authorization" not in result.reason or "[redacted]" in result.reason
+
+
+def test_github_null_html_url_becomes_none(repo, monkeypatch):
+    """review finding: jq's literal `null` token, if the field were ever absent, must not
+    become the truthy string "null" as result.url."""
+    monkeypatch.setattr(subprocess, "run", _gh_null_html_url)
+    result = validate("607", repo)
+    assert result.ok
+    assert result.url is None
+
+
+def test_validate_rejects_non_string_code_cleanly(repo, monkeypatch):
+    monkeypatch.setattr(subprocess, "run", _fail_if_called)
+    result = validate(None, repo)  # type: ignore[arg-type]
+    assert not result.ok
+    assert "must be a string" in result.reason
+
+
+def test_ssh_remote_to_a_non_github_host_is_not_mistaken_for_github(repo, monkeypatch):
+    def _gitlab_origin(argv, **kwargs):
+        if argv[0] == "git":
+            return _FakeProc(returncode=0, stdout="git@gitlab.example.com:backend/service.git\n")
+        raise AssertionError("gh should never be reached with an unresolved repo")
+
+    monkeypatch.setattr(subprocess, "run", _gitlab_origin)
+    result = validate("607", repo)
+    assert not result.ok
+    assert "cannot resolve github repo" in result.reason
 
 
 def test_parse_github_remote_forms():

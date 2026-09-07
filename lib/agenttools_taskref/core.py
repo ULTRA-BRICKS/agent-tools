@@ -54,6 +54,13 @@ _GITHUB_CODE_RE = re.compile(
 _LINEAR_CODE_RE = re.compile(r"^(?P<prefix>[A-Za-z]{2,10})-(?P<num>[0-9]+)$")
 # The SCP-like git remote syntax (`[user@]host:path`, no `://`), e.g. `git@github.com:o/r.git`.
 _SCP_LIKE_REMOTE_RE = re.compile(r"^(?:[^@/]+@)?(?P<host>[^:/]+):(?P<path>.+)$")
+# Redact anything that looks like a credential before a `gh` stderr snippet ever reaches a
+# ValidationResult.reason (review finding: GH_DEBUG=api makes `gh` dump the Authorization
+# header, including the bearer token, to stderr on a non-404 failure -- that snippet must
+# never be echoed back verbatim, since callers print/persist `reason`).
+_SECRET_RE = re.compile(
+    r"(?i)(authorization\s*:\s*\S+|bearer\s+\S+|gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)"
+)
 
 _GIT_TIMEOUT_S = 5
 _GH_TIMEOUT_S = 15
@@ -64,7 +71,8 @@ _GUIDANCE = (
 
 
 class TaskRefError(RuntimeError):
-    """A malformed ``task.yaml`` (fail-closed) — ``validate()`` catches this internally."""
+    """A malformed ``task.yaml`` or ``rig.yaml`` ``task:`` block (fail-closed) —
+    ``validate()`` catches this internally and returns ``ok=False`` instead."""
 
 
 @dataclass(frozen=True)
@@ -300,13 +308,19 @@ def _check_github_issue(owner: str, repo: str, number: int) -> tuple[bool | None
         out = subprocess.run(argv, capture_output=True, text=True, timeout=_GH_TIMEOUT_S, check=False)
     except FileNotFoundError:
         return None, "gh CLI not found on PATH; cannot verify GitHub issue/PR numbers", None
-    except subprocess.SubprocessError as exc:
-        return None, f"gh api call failed: {exc}", None
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
+        # OSError (e.g. PermissionError on a non-executable gh) is broader than
+        # FileNotFoundError alone; UnicodeDecodeError can surface from `text=True`
+        # decoding non-UTF8 stderr. Neither leaks the exception's own text -- that text is
+        # ours (argv/errno), never `gh`'s own stderr -- so no redaction needed here.
+        return None, f"gh api call failed: {type(exc).__name__}: {exc}", None
 
     if out.returncode == 0:
-        return True, "resolved via gh api", (out.stdout.strip().strip('"') or None)
+        stripped = out.stdout.strip().strip('"')
+        html_url = stripped if stripped and stripped != "null" else None
+        return True, "resolved via gh api", html_url
 
-    stderr = (out.stderr or "").strip()
+    stderr = _SECRET_RE.sub("[redacted]", (out.stderr or "").strip())
     if "HTTP 404" in stderr or "Not Found" in stderr:
         return False, f"{owner}/{repo}#{number} does not exist", None
     return None, f"could not verify via gh api ({stderr[:200] or 'unknown error'})", None
@@ -379,12 +393,19 @@ def validate(code: str, repo_root: Path | str) -> ValidationResult:
     """Validate ``code`` against ``repo_root``'s configured tracker backend.
 
     Never raises: a malformed ``task.yaml``/``rig.yaml`` becomes an ``ok=False`` result with
-    the parse error as the reason, exactly like every other rejection.
+    the parse error as the reason, exactly like every other rejection. A non-``str`` ``code``
+    (e.g. ``None``) is also rejected explicitly rather than silently coerced -- coercing
+    ``None`` would otherwise produce the confusing candidate ``"None"``.
     """
     repo_root = Path(repo_root)
-    candidate = str(code).strip()
+    if not isinstance(code, str):
+        return ValidationResult(
+            False, repr(code), None, None, None,
+            f"task code must be a string, got {type(code).__name__}",
+        )
+    candidate = code.strip()
     if not candidate:
-        return ValidationResult(False, str(code), None, None, None, "task code is empty")
+        return ValidationResult(False, code, None, None, None, "task code is empty")
 
     try:
         cfg = load_repo_task_config(repo_root)
