@@ -271,11 +271,15 @@ def test_claude_code_recipe_names_only_the_agent_tool(tmp_path, monkeypatch):
 def test_unknown_or_missing_harness_is_governed_and_lists_every_recipe(tmp_path, monkeypatch):
     """A missing/unrecognized `harness` (a fixture that predates the tag, a future bridge) stays
     GOVERNED — fail closed — and, since the gate cannot know which harness it is talking to,
-    the refusal carries every harness's recipe so it is still actionable."""
+    the refusal carries every harness's recipe so it is still actionable.
+
+    Uses `_FALLBACK_CHAIN`, not `_REPRO_CHAIN`: agent-tools#541 (`_is_read_only_sed`) made the
+    literal `sed -n` repro chain read-only for every harness, so it no longer trips WARN-then-
+    BLOCK — see `test_literal_repro_chain_with_sed_n_is_read_only_on_first_offense` below."""
     for harness_field in ({}, {"harness": "some-future-harness"}):
         marker_dir = tmp_path / str(len(harness_field))
         event = {"point": "pre-bash", "cwd": "/repo", **harness_field,
-                  "args": {"command": _REPRO_CHAIN}}
+                  "args": {"command": _FALLBACK_CHAIN}}
         _run(event, monkeypatch, marker_dir)
         out, _e, c = _run(event, monkeypatch, marker_dir)
         assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
