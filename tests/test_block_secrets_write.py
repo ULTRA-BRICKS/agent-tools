@@ -102,6 +102,18 @@ def test_specific_secret_shapes_are_unaffected(content, monkeypatch):
     assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+@pytest.mark.parametrize("content", [
+    # a slug query URL FIRST, a live key after it (review finding: the first benign match
+    # must not shadow the rest of the file)
+    "// see /redeem?token=ultra-invalid-proof-value\napi_key = \"sk_live_9f8e7d6c5b4a3f2e1d0c\"",  # gitleaks:allow
+    # a placeholder first, a real assignment after it (pre-existing single-search gap)
+    'token = "YOUR_TOKEN_HERE_xxxxxxxx"\nsecret = "zX9yW8vU7tS6rQ5pO4nM3lK2"',  # gitleaks:allow
+])
+def test_benign_first_match_does_not_shadow_a_later_real_secret(content, monkeypatch):
+    out, code = _run(content, "src/config.ts", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
 def test_placeholder_and_example_files_still_pass(monkeypatch):
     out, code = _run('API_KEY = "YOUR_KEY_HERE_xxxxxxxxxx"', "src/x.ts", monkeypatch)
     assert code == 0 and _decision(out) == "allow"

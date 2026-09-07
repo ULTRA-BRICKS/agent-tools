@@ -102,25 +102,35 @@ def main() -> int:
         emit("allow")  # example/fixture file — placeholders expected
         return 0
 
-    for label, pattern in PATTERNS:
-        m = pattern.search(content)
-        if not m:
-            continue
-        captured = m.group(m.lastindex) if m.lastindex else m.group(0)
-        if label.startswith("generic") and is_url_query_slug(content, m):
-            continue
-        if looks_real(captured):
-            emit(
-                "block",
-                f"Refusing to write what looks like a {label} into {path or 'a file'}. "
-                "Secrets belong in env / a secret manager referenced via config, never "
-                "in source. If this is a placeholder, make it obviously fake (e.g. "
-                "'YOUR_KEY_HERE') or use a .example file.",
-            )
-            return BLOCK_EXIT_CODE
+    label = first_real_secret(content)
+    if label is not None:
+        emit(
+            "block",
+            f"Refusing to write what looks like a {label} into {path or 'a file'}. "
+            "Secrets belong in env / a secret manager referenced via config, never "
+            "in source. If this is a placeholder, make it obviously fake (e.g. "
+            "'YOUR_KEY_HERE') or use a .example file.",
+        )
+        return BLOCK_EXIT_CODE
 
     emit("allow")
     return 0
+
+
+def first_real_secret(content: str) -> str | None:
+    """The label of the first likely-real secret in `content`, or None.
+
+    EVERY match of every pattern is judged (`finditer`), so a placeholder or a slug query
+    parameter earlier in the file never shadows a live credential later in it — a single
+    `search` + `continue` skipped the whole pattern on its first benign hit (review finding)."""
+    for label, pattern in PATTERNS:
+        for m in pattern.finditer(content):
+            if label.startswith("generic") and is_url_query_slug(content, m):
+                continue
+            captured = m.group(m.lastindex) if m.lastindex else m.group(0)
+            if looks_real(captured):
+                return label
+    return None
 
 
 if __name__ == "__main__":
