@@ -163,6 +163,28 @@ def test_real_process_table_parses_this_process():
     assert "python" in args or "pytest" in args
 
 
+def test_real_process_table_keeps_a_long_argv_intact():
+    """procps clips `args` to 80 columns when stdout is not a terminal unless `-ww` is passed —
+    CI's uv-installed python (`/home/runner/work/_temp/setup-uv-cache/builds-v0/.tmp…/bin/`)
+    fell off the end and the sibling test above failed there. A harness under a long install
+    path would be invisible to the ancestry walk the same way."""
+    import subprocess
+    import sys
+
+    marker = "subagent-identity-long-argv-" + "x" * 160
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys, time; time.sleep(30)", marker],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        table = ident._process_table()
+    finally:
+        child.kill()
+        child.wait()
+    assert child.pid in table
+    assert marker in table[child.pid][1]
+
+
 # ── combined precedence ──────────────────────────────────────────────────────────────────
 
 def test_detect_prefers_env_marker_over_ancestry(monkeypatch):

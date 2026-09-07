@@ -1,7 +1,9 @@
 """Subagent identity for harnesses whose hook payload does not carry one (agent-tools#573).
 
 Claude Code and codex put a TOP-LEVEL ``agent_id``/``agent_type`` on every hook event fired
-inside a spawned subagent, so their bridges just forward that field. opencode's plugin payload
+inside a spawned subagent, so their bridges just forward that field (the codex bridge also reads
+the spawned thread's rollout ``session_meta`` behind the event's ``transcript_path`` — see
+``codex_hook_bridge.dispatch._rollout_subagent_identity``). opencode's plugin payload
 and omp's (root-level) extension payload carry nothing of the kind, and a child started as a
 separate PROCESS (``codex exec`` / ``omp -p`` / ``opencode run`` launched from a parent session's
 shell tool) is invisible to the parent harness altogether. This module gives every bridge the same
@@ -123,7 +125,9 @@ def _process_table() -> dict[int, tuple[int, str]]:
     """``{pid: (ppid, args)}`` from one ``ps`` snapshot; ``{}`` on any failure."""
     try:
         out = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,args="],
+            # `-ww`: unlimited width. Without it procps (Linux) clips `args` to 80 columns when
+            # stdout is not a terminal, so a harness under a long install path is never matched.
+            ["ps", "-axwwo", "pid=,ppid=,args="],
             capture_output=True, text=True, timeout=_PS_TIMEOUT_S, check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):

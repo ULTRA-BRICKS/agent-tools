@@ -69,6 +69,7 @@ def to_v1_event(codex_event: dict, *, point: str) -> dict:
     for key in (
         "agent_id",
         "agent_type",
+        "transcript_path",
         "file_path",
         "file_paths",
         "path",
@@ -116,19 +117,23 @@ def _apply_subagent_identity(codex_event: dict, args: dict) -> None:
     """Populate ``args.agent_id``/``args.agent_type`` from the trusted sources ONLY (#573).
 
     ``to_v1_event`` has already dropped any ``agent_id``/``agent_type`` that rode in via
-    ``tool_input`` (model-authored, never trusted). Three sources may restore them, in order:
+    ``tool_input`` (model-authored, never trusted). Four sources may restore them, in order:
 
     1. Codex's OWN top-level ``agent_id``/``agent_type`` — present on every hook event fired
        inside a ``collaboration.spawn_agent`` child thread (captured on codex 0.153.4: the
        child's Bash PreToolUse carries them, the parent's does not), the same shape Claude Code
        emits. Codex writes these from its thread bookkeeping; they are not part of the tool
        call the model composed, so nothing in ``tool_input`` can set or change them.
-    2. The launcher env markers ``RIG_AGENT_ID``/``RIG_DETACHED_AGENT`` — a ``codex exec``
+    2. The child thread's ROLLOUT ``session_meta`` behind the event's top-level
+       ``transcript_path`` — ``thread_source: "subagent"`` with ``parent_thread_id`` equal to the
+       event's ``session_id`` (see ``_rollout_subagent_identity``). This is the record every
+       spawned codex thread carries, independent of whether that codex build also emits (1).
+    3. The launcher env markers ``RIG_AGENT_ID``/``RIG_DETACHED_AGENT`` — a ``codex exec``
        child started by the ``rig-detached-codex`` launcher skill.
-    3. Process ancestry — a ``codex`` process of the same harness above the one that dispatched
+    4. Process ancestry — a ``codex`` process of the same harness above the one that dispatched
        this hook (a child ``codex exec`` run from a parent session's shell tool).
 
-    See ``agent_hooks_v1.subagent_identity`` for why 2 and 3 are outside ``tool_input``'s reach.
+    See ``agent_hooks_v1.subagent_identity`` for why 3 and 4 are outside ``tool_input``'s reach.
     No source → no key at all (never an empty string), so every ``_is_subagent`` reader treats
     the call as the orchestrator's — fail closed in the relax direction."""
     native_id = codex_event.get("agent_id")
@@ -137,12 +142,84 @@ def _apply_subagent_identity(codex_event: dict, args: dict) -> None:
         if codex_event.get("agent_type") is not None:
             args["agent_type"] = codex_event["agent_type"]
         return
+    rollout_id, rollout_type = _rollout_subagent_identity(codex_event)
+    if rollout_id:
+        args["agent_id"] = rollout_id
+        args["agent_type"] = rollout_type
+        return
     if subagent_identity is None:
         return
     agent_id, agent_type = subagent_identity.detect_subagent(HARNESS)
     if agent_id:
         args["agent_id"] = agent_id
         args["agent_type"] = agent_type
+
+
+# A rollout's first line is its `session_meta` record; with the full `base_instructions` text it
+# runs to ~20 KB on codex 0.153.4, so the cap leaves headroom without ever reading a transcript.
+_ROLLOUT_META_MAX_BYTES = 256 * 1024
+_ROLLOUT_SUBAGENT_TYPE = "subagent"
+
+
+def _rollout_subagent_identity(codex_event: dict) -> tuple[str, str]:
+    """``(child_thread_id, "subagent")`` when the event's ``transcript_path`` is the rollout of a
+    codex-spawned child thread, else ``("", "")``.
+
+    Codex writes a rollout per thread under ``$CODEX_HOME/sessions/``; the first line is a
+    ``session_meta`` record and a spawned child's carries ``thread_source: "subagent"``,
+    ``parent_thread_id`` (the spawner) and its own ``id`` — the child thread id (audit of the
+    2026-09-05 ``~/work/private`` sessions, codex 0.153.4: every ``orchestrator-stays-thin`` /
+    ``no-long-inline-process`` refusal there landed on exactly such a thread). ``transcript_path``
+    is a top-level field of the hook event, written by codex — the model's tool call cannot set
+    it (``to_v1_event`` reads it from the event root only, never from ``tool_input``).
+
+    What a cooperative-but-mistaken orchestrator CANNOT do with its own shell tool is make its
+    own rollout pass this check: the rollout content alone is not trusted, the record must also
+    be CONSISTENT with two facts codex owns — (a) the filename's trailing uuid equals the
+    record's ``id`` (an orchestrator's rollout is named after its own session id, which is
+    also the event's ``session_id``), and (b) ``parent_thread_id`` equals the event's
+    ``session_id`` while ``id`` differs from it (a child's ``session_id`` is the PARENT's —
+    codex's documented "subagent hooks use the parent session id", confirmed by the captured
+    child-thread fixture and the audited session_meta records). Editing the first line of one's
+    own rollout cannot satisfy (a) and (b) at once; renaming the file codex holds open leaves
+    ``transcript_path`` pointing nowhere → no identity → governed. Every failure path (no path,
+    unreadable, not JSON, an over-long first line, any field mismatch) yields ``("", "")``."""
+    path = codex_event.get("transcript_path")
+    session_id = str(codex_event.get("session_id") or "").strip()
+    if not isinstance(path, str) or not path or not session_id:
+        return "", ""
+    payload = _rollout_session_meta_payload(path)
+    if payload is None or payload.get("thread_source") != _ROLLOUT_SUBAGENT_TYPE:
+        return "", ""
+    thread_id = str(payload.get("id") or "").strip()
+    parent_id = str(payload.get("parent_thread_id") or "").strip()
+    if not thread_id or not parent_id:
+        return "", ""
+    if parent_id != session_id or thread_id == session_id:
+        return "", ""
+    if not Path(path).name.endswith(f"{thread_id}.jsonl"):
+        return "", ""
+    return thread_id, _ROLLOUT_SUBAGENT_TYPE
+
+
+def _rollout_session_meta_payload(path: str) -> dict | None:
+    """The ``payload`` dict of a rollout's first line when it is a ``session_meta`` record within
+    the size cap, else ``None`` (any IO/JSON failure included)."""
+    try:
+        with open(path, "rb") as fh:
+            first = fh.readline(_ROLLOUT_META_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(first) > _ROLLOUT_META_MAX_BYTES:
+        return None
+    try:
+        record = json.loads(first.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return None
+    payload = record.get("payload")
+    return payload if isinstance(payload, dict) else None
 
 
 def codex_block_output(reason: str) -> dict:

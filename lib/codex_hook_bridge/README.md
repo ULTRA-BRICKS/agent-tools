@@ -38,9 +38,9 @@ v1 event contract.
 
 ## Identity contract (subagent exemption, agent-tools#573)
 
-The bridge strips `agent_id` / `agent_type` from Codex `tool_input` (model-authored, never
-trusted) and repopulates `args.agent_id` / `args.agent_type` from three trusted sources, in
-order (`_apply_subagent_identity`):
+The bridge strips `agent_id` / `agent_type` / `transcript_path` from Codex `tool_input`
+(model-authored, never trusted) and repopulates `args.agent_id` / `args.agent_type` from four
+trusted sources, in order (`_apply_subagent_identity`):
 
 1. **Codex's own top-level `agent_id` / `agent_type`.** Every hook event fired inside a
    `collaboration.spawn_agent` child thread carries them at the TOP level of the hook JSON
@@ -49,15 +49,36 @@ order (`_apply_subagent_identity`):
    rollout). The parent thread's events carry neither. Codex writes these from its thread
    bookkeeping; they are not part of the tool call the model composed, so nothing in
    `tool_input` can set or change them — the same T2 precedence `cc_hook_bridge` applies.
-2. **Launcher env markers** `RIG_AGENT_ID` / `RIG_DETACHED_AGENT` — a `codex exec` child
+2. **The child thread's rollout `session_meta`** behind the event's top-level
+   `transcript_path` (`_rollout_subagent_identity`). Codex writes one rollout per thread under
+   `$CODEX_HOME/sessions/`; a spawned thread's first line carries `thread_source: "subagent"`,
+   `parent_thread_id` (the spawner) and `id` (the child thread — also the filename's trailing
+   uuid), while the event's `session_id` is the PARENT's. This is the record the 2026-09-05
+   `~/work/private` audit found on every thread the old bridge had refused as "the
+   orchestrator" (sessions `16-13`/`16-13b`/`16-14`, codex 0.153.4), so it identifies a
+   delegate whether or not the codex build also emits source 1. `transcript_path` is a field of
+   the hook event root, written by codex — the bridge never reads it from `tool_input`. The
+   record is trusted only when it is CONSISTENT with facts codex owns: filename uuid ==
+   `payload.id`, `payload.parent_thread_id` == event `session_id`, `payload.id` != event
+   `session_id`. An orchestrator's own rollout is named after its own session id (== the
+   event's `session_id`), so editing its first line cannot satisfy all three at once, and
+   renaming the open file leaves `transcript_path` dangling → no identity → governed. The read
+   is the first line only, capped at 256 KB (a real `session_meta` line is ~20 KB with the full
+   `base_instructions` text); any IO/JSON/shape failure → no identity.
+   `tests/test_codex_subagent_replay.py` replays the audit's real refused tool calls against
+   the real `session_meta` records through this bridge and the real hooks.
+   *Ruled out:* an env-var source. The hook process's environment carries only `CODEX_HOME` /
+   `CODEX_MANAGED_*` (captured on 0.153.4); `CODEX_THREAD_ID` / `CODEX_SESSION_ID` exist in the
+   binary but are exported to the shell tool's child, not to hook commands.
+3. **Launcher env markers** `RIG_AGENT_ID` / `RIG_DETACHED_AGENT` — a `codex exec` child
    started by the `rig-detached-codex` launcher skill (Codex runs hook commands with its own
    environment, so the marker set at launch is visible on every tool call).
-3. **Process ancestry** — a `codex` process above the one that dispatched this hook, past the
+4. **Process ancestry** — a `codex` process above the one that dispatched this hook, past the
    dispatching invocation's own contiguous run (a codex invocation is two processes, the
    `node` wrapper and the vendor binary): a child `codex exec` started from a parent session's
    shell tool without the launcher.
 
-Sources 2 and 3 live in the shared `lib/agent_hooks_v1/subagent_identity.py` (read by the
+Sources 3 and 4 live in the shared `lib/agent_hooks_v1/subagent_identity.py` (read by the
 opencode and omp bridges too); its docstring carries the trust reasoning. No source → no key
 at all, so every `_is_subagent` reader treats the call as the orchestrator's (fail closed in
 the relax direction).
