@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from _delegation_fixtures import RECIPE_NEEDLE
+
 _HOOK = (
     Path(__file__).resolve().parents[1]
     / "agent-hooks"
@@ -487,12 +489,7 @@ def _run_event(event, monkeypatch) -> tuple[str, str, int]:
     return out.getvalue(), err.getvalue(), code
 
 
-_RECIPE_NEEDLE = {
-    "claude-code": 'subagent_type: "fork"',
-    "codex": "~/.agents/skills/rig-detached-codex/rig-detached-codex",
-    "opencode": "~/.agents/skills/rig-detached-opencode/rig-detached-opencode",
-    "omp": "~/.agents/skills/rig-detached-omp/rig-detached-omp",
-}
+_RECIPE_NEEDLE = RECIPE_NEEDLE
 
 
 @pytest.mark.parametrize("harness", sorted(_RECIPE_NEEDLE))

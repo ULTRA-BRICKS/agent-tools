@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from _delegation_fixtures import RECIPE_NEEDLE
+
 _HOOK = (
     Path(__file__).resolve().parents[1]
     / "agent-hooks"
@@ -183,7 +185,7 @@ def test_reminder_states_the_opencode_truth(monkeypatch):
     message = json.loads(out)["message"]
     assert "NO background field" in message
     assert "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS" in message
-    assert "~/.agents/skills/rig-detached-opencode/rig-detached-opencode" in message
+    assert RECIPE_NEEDLE["opencode"] in message
     assert "set its native background: true flag" not in message
 
 

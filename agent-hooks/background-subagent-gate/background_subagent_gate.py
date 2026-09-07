@@ -137,19 +137,16 @@ _REMINDER_TAIL = (
 # the ONE shared table in `agenttools_hatch_escalation.delegation_recipe` — Claude Code's line
 # there already states that `run_in_background` is not a field of the Agent tool, and the
 # launcher paths stay pinned to the provisioned carrier (`~/.agents/skills/<skill>/<launcher>`,
-# PR #497) in one place instead of two.
-_EVERY_HARNESS = ("claude-code", "codex", "opencode", "omp")
+# PR #497) in one place instead of two. The harness list and the "unknown → every recipe"
+# fallback live there too (review finding, #573 round 2: a second list here would miss a
+# harness added to the table).
 
 
 def reminder_for(harness: object) -> str:
     """The refusal for an event tagged with ``harness``: THAT harness's background-dispatch
     recipe between the shared head/tail. Only the TOP-LEVEL tag is ever passed in; a
-    missing/unknown one lists every recipe."""
-    if harness in _EVERY_HARNESS:
-        recipe = hatch_escalation.delegation_recipe(harness)
-    else:
-        recipe = "\n".join(hatch_escalation.delegation_recipe(h) for h in _EVERY_HARNESS)
-    return _REMINDER_HEAD + recipe + _REMINDER_TAIL
+    missing/unknown one lists every recipe (``delegation_recipe``'s own fallback)."""
+    return _REMINDER_HEAD + hatch_escalation.delegation_recipe(harness) + _REMINDER_TAIL
 
 
 # The harness-agnostic text (every recipe) — what an untagged event gets.

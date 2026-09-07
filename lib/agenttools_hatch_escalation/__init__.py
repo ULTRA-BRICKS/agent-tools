@@ -146,6 +146,9 @@ _DELEGATION_RECIPES: dict[str, str] = {
     ),
 }
 
+# Fallback deliberately differs from `_DELEGATION_RECIPES`: an unknown harness gets the Claude
+# Code text ALONE (it already names every shell form), not every entry joined — joining four
+# near-identical "remove the `&`" sentences would only pad the refusal (see `foreground_recipe`).
 _FOREGROUND_RECIPES: dict[str, str] = {
     "claude-code": (
         "Remove `run_in_background: true` from the Bash tool call (and any trailing `&` / "

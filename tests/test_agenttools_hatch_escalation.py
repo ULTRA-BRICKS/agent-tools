@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from _delegation_fixtures import RECIPE_NEEDLE
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 import agenttools_hatch_escalation
@@ -1416,12 +1418,12 @@ def test_delegation_harnesses_are_the_four_bridged_ones():
 @pytest.mark.parametrize(
     ("harness", "needle", "foreign"),
     [
-        ("claude-code", 'subagent_type: "fork"', "rig-detached-codex"),
-        ("codex", "collaboration.spawn_agent", 'subagent_type: "fork"'),
-        ("codex", "~/.agents/skills/rig-detached-codex/rig-detached-codex", "rig-detached-omp"),
-        ("opencode", "~/.agents/skills/rig-detached-opencode/rig-detached-opencode", "spawn_agent"),
+        ("claude-code", RECIPE_NEEDLE["claude-code"], "rig-detached-codex"),
+        ("codex", "collaboration.spawn_agent", RECIPE_NEEDLE["claude-code"]),
+        ("codex", RECIPE_NEEDLE["codex"], "rig-detached-omp"),
+        ("opencode", RECIPE_NEEDLE["opencode"], "spawn_agent"),
         ("omp", "`task` tool", "rig-detached-codex"),
-        ("omp", "~/.agents/skills/rig-detached-omp/rig-detached-omp", 'subagent_type: "fork"'),
+        ("omp", RECIPE_NEEDLE["omp"], RECIPE_NEEDLE["claude-code"]),
     ],
 )
 def test_delegation_recipe_names_only_that_harness_mechanism(harness, needle, foreign):

@@ -185,6 +185,39 @@ def test_real_process_table_keeps_a_long_argv_intact():
     assert marker in table[child.pid][1]
 
 
+def test_real_ancestry_walk_end_to_end(tmp_path):
+    """The walk against a REAL process tree (review finding, #573 round 2): a stub harness
+    binary — `/bin/sh` reachable under a unique harness name, so argv[0]'s basename IS the
+    harness and nothing else on the machine can match — runs the probe once directly (top
+    level → no identity) and once under a second copy of itself with a plain `sh` in between
+    (the parent session's shell tool → the outer one is the ancestor)."""
+    import os
+    import subprocess
+    import sys
+
+    harness = f"fakeharness{os.getpid()}"
+    stub = tmp_path / "bin" / harness
+    stub.parent.mkdir()
+    stub.symlink_to("/bin/sh")
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        f"import sys; sys.path.insert(0, {str(_LIB)!r})\n"
+        "from agent_hooks_v1 import subagent_identity\n"
+        f"print(subagent_identity.ancestor_agent_id({harness!r}))\n",
+        encoding="utf-8",
+    )
+    # `; true` keeps every shell level from exec-replacing itself with its only command.
+    leaf = f"{sys.executable} {probe}; true"
+    top = subprocess.run([str(stub), "-c", leaf], capture_output=True, text=True, timeout=30)
+    assert top.returncode == 0, top.stderr
+    assert top.stdout.strip() == ""
+
+    nested_cmd = f"/bin/sh -c '{stub} -c \"{leaf}\"; true'; true"
+    nested = subprocess.run([str(stub), "-c", nested_cmd], capture_output=True, text=True, timeout=30)
+    assert nested.returncode == 0, nested.stderr
+    assert nested.stdout.strip().startswith(f"ancestor:{harness}:")
+
+
 # ── combined precedence ──────────────────────────────────────────────────────────────────
 
 def test_detect_prefers_env_marker_over_ancestry(monkeypatch):

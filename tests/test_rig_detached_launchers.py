@@ -170,6 +170,34 @@ def test_missing_workdir_exits_2(harness, tmp_path):
     assert "not a directory" in proc.stderr
 
 
+def test_oversized_brief_exits_2_before_detaching(harness, tmp_path):
+    """The brief is one argv element; past the per-argument limit the backgrounded exec would
+    fail with E2BIG after "launched" was already printed (codex P1, #573 round 2). The launcher
+    refuses up front: exit 2, no launch line, no child."""
+    stub_dir = tmp_path / "bin"
+    marker = tmp_path / "stub-env.txt"
+    _stub_harness(harness, stub_dir, marker)
+    brief = tmp_path / "brief.md"
+    brief.write_text("x" * 100_001, encoding="utf-8")
+    proc = _run_launcher(harness, "agent-x", str(brief), str(tmp_path), path_override=stub_dir)
+    assert proc.returncode == 2
+    assert "100001 bytes" in proc.stderr and "limit" in proc.stderr
+    assert "launched" not in proc.stdout
+    time.sleep(0.3)
+    assert not marker.exists() and not (tmp_path / "stub-env.txt.tmp").exists()
+
+
+def test_brief_at_the_limit_still_launches(harness, tmp_path):
+    stub_dir = tmp_path / "bin"
+    marker = tmp_path / "stub-env.txt"
+    _stub_harness(harness, stub_dir, marker)
+    brief = tmp_path / "brief.md"
+    brief.write_text("x" * 100_000, encoding="utf-8")
+    proc = _run_launcher(harness, "agent-x", str(brief), str(tmp_path), path_override=stub_dir)
+    assert proc.returncode == 0, proc.stderr
+    _poll_for(marker)
+
+
 def test_harness_not_on_path_exits_127(harness, tmp_path, monkeypatch):
     """No harness binary resolvable at all → 127 (mirrors the shell's not-found code).
     PATH keeps the OS utility dirs (bash/date/mkdir/nohup for the launcher's shebang and

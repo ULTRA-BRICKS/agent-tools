@@ -125,7 +125,10 @@ orchestrator on every harness:
 
 - **codex** — codex's OWN top-level `agent_id`/`agent_type` on every hook event fired inside a
   `collaboration.spawn_agent` child thread (captured on 0.153.4; the parent thread's events carry
-  none), the same shape Claude Code emits; plus the `rig-detached-codex` launcher env markers and
+  none), the same shape Claude Code emits, and the child thread's rollout `session_meta`
+  (`thread_source: "subagent"`, `parent_thread_id` == the event's `session_id`) behind the event's
+  top-level `transcript_path` — the record the 2026-09-05 audit found on every thread this gate
+  had refused as "the orchestrator"; plus the `rig-detached-codex` launcher env markers and
   process ancestry (a `codex exec` started from a codex session's shell tool).
 - **opencode** — the plugin tags a `task` child SESSION's tool calls (opencode's own `parentID`
   bookkeeping, from the `session.created` event or `client.session.get`); plus the
@@ -133,6 +136,11 @@ orchestrator on every harness:
 - **omp** — the hook-bridge extension tags a `task`-spawned in-process child session's tool calls
   with its session id (later-than-first registration AND a child-shaped session file, both omp's
   own bookkeeping); plus the `rig-detached-omp` launcher env markers and process ancestry.
+
+The #533 caller the exemption used to shield — review-cli's reviewer sessions — needs no identity:
+its opencode reviewer runs the deny-all `read-only-reviewer` agent (no bash/edit/write, so the
+pre-bash/pre-write points never fire), and its codex reviewer is a `codex exec` without
+`--dangerously-bypass-hook-trust`, which runs no hooks at all (review finding, #573 round 2).
 
 See `lib/agent_hooks_v1/subagent_identity.py` and each bridge's README for why none of these can
 be forged from `tool_input`. The top-level `event["harness"]` tag is still read — for ONE purpose:

@@ -119,6 +119,18 @@ touch "$log" && chmod 600 "$log"
 # below would then fail silently (set -e does not reach into `$(...)` on a
 # `nohup ... &` line) and launch the child with an EMPTY prompt while still
 # exiting 0 (codex P1, PR #497).
+# The brief travels as ONE argv element (the last one, after `--`). Linux caps a single
+# argument at 128 KiB (MAX_ARG_STRLEN) and macOS caps argv+env together at 1 MiB (ARG_MAX);
+# past either, the backgrounded exec below fails with E2BIG AFTER this script has already
+# printed "launched" and exited 0 — a child that never runs and never writes its handoff
+# (codex P1, #573 round 2). Refuse up front, while the caller can still see it.
+max_brief_bytes=100000
+brief_bytes="$(wc -c <"$brief" | tr -d ' ')"
+if [ "$brief_bytes" -gt "$max_brief_bytes" ]; then
+    echo "$label: brief '$brief' is $brief_bytes bytes — larger than the $max_brief_bytes-byte" \
+        "limit for one argv element; shorten it, or keep the detail in a file the brief points at" >&2
+    exit 2
+fi
 brief_text="$(cat -- "$brief")"
 
 cd "$workdir"
