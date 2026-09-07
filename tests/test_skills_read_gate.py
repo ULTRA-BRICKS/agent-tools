@@ -693,6 +693,12 @@ _QUOTED_PIPE_FALSE_POSITIVES = [
     "rg --files /tmp | rg 'conloca.*(vitest|auth.*config)'",
     "sed -n '250,335p' package.json; rg -n 'typecheck-tests|vitest' targets/app",
     "rg -n -A16 -B4 'test|vitest' package.json ../../vitest.config.ts",
+    "echo 'run npm test later'",                                   # quoted prose, no runner head
+    "echo 'ci: pytest;npm test flake'",                            # fused sep INSIDE quotes stays text
+    "f() { npm test; }; true",                                     # a DEFINED function runs nothing (review r2)
+    "cat <<EOF\nmetadata;npm test\nEOF",                             # heredoc BODY is data (review r2)
+    "cat > notes.md <<'MD'\n- run pytest tomorrow\nMD",              # quoted delimiter form
+    "command -v npm",                                              # a probe, not a run
 ]
 
 
@@ -721,6 +727,23 @@ def test_quoted_pipe_alternation_is_allowed_end_to_end(command, tmp_path, monkey
     "timeout 600 npm test",               # no-op wrapper peeled off the head
     "CI=1 vitest run",                    # inline env peeled off the head
     "./node_modules/.bin/vitest run",     # a path-qualified runner is still the runner
+    "git status;npm test",                # a FUSED `;` is still a separator (review on #578)
+    "git fetch&&pytest",                  # fused `&&`
+    "true|npm test",                      # fused `|`
+    "(npm test)",                         # subshell group
+    "git pull && (npm test)",             # grouped after a real separator
+    "{ npm test; }",                      # brace group
+    "if npm test; then echo ok; fi",      # control keyword peeled off the head
+    "stdbuf -o L npm test",               # a wrapper flag's separate VALUE is skipped too
+    "/usr/bin/stdbuf -o L npm test",      # path-qualified wrapper: keyed by basename (review r2)
+    "timeout 5 stdbuf -o L npm test",     # nested wrappers: the table is re-keyed per level
+    "nice -n 10 pytest -q",               # `nice -n 10` (nice's own value flag)
+    "env -u FOO npm run build",           # `env -u NAME` (env's own value flag)
+    "env -S 'vitest run'",                # `-S`'s value IS the command — never skipped (review r2)
+    "env --split-string 'npm test'",
+    "exec npm test",                      # `exec`/`command` peeled like a control keyword
+    "command pytest -q",
+    "cat <<EOF\nnotes\nEOF\nnpm test",     # a real runner AFTER a heredoc is still found
 ])
 def test_real_runner_at_a_command_head_is_still_work(command):
     """Argv-aware matching must not lose any genuine inline build/test run."""

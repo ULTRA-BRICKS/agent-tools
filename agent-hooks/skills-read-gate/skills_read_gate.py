@@ -189,8 +189,38 @@ _BUILD_OR_TEST_HEAD = re.compile(
 # model are listed — peeling one only partway would leave a non-command at the head. Mirrors
 # the sibling hook's `_strip_wrappers` set.
 _WRAPPERS = frozenset({"timeout", "env", "nice", "time", "stdbuf", "nohup", "setsid", "unbuffer"})
-_WRAPPER_VALUE_FLAGS = frozenset({"-s", "-k", "--signal", "--kill-after", "-n", "-u"})
+# Per-WRAPPER option flags that consume a SEPARATE value token — keyed by wrapper because the
+# same short flag means different things (and takes a value or not) in different programs:
+# `stdbuf -o L cmd` must skip `L`, while an unkeyed set would leave `L` at the head and lose
+# the real runner behind it (a silent bypass, review finding on #578).
+_WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    # NOT `-S`/`--split-string`: its value IS the command (`env -S 'vitest run'`), so skipping it
+    # would hide the runner — left as a plain flag, its value lands at the head and is matched.
+    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+    "time": frozenset({"-f", "--format", "-o", "--output"}),
+}
 _MAX_WRAPPER_NESTING = 16
+# Shell separators between segments, and grouping/control tokens that precede a segment's real
+# command (`(npm test)`, `{ npm test; }`, `if npm test; then`). `punctuation_chars` tokenizing
+# emits `(`/`)` and fused `;`/`&&`/`|` as their own tokens, so a runner glued to a separator
+# (`git status;npm test`) is still found at a segment head — the raw-string matcher caught those
+# by substring, and dropping them would have been a regression (review finding on #578).
+_SEGMENT_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "|&", ";;", "(", ")"})
+_LEADING_SHELL_NOISE = frozenset({
+    "!", "{", "}", "if", "then", "do", "else", "elif", "while", "until", "exec", "command", "builtin",
+})
+# A heredoc BODY is data, not commands (`cat <<EOF` … `EOF`): its lines are cut out before
+# tokenizing, so a `;npm test` inside a note being written never starts a segment. Matches
+# `<<`, `<<-`, and a quoted/unquoted delimiter; the body runs from the line after the operator
+# to the line that is exactly the delimiter (a missing terminator swallows the rest — data anyway).
+_HEREDOC_RE = re.compile(
+    r"<<-?[ \t]*(?P<q>['\"]?)(?P<delim>[A-Za-z_][\w-]*)(?P=q)[^\n]*\n"
+    r"(?:.*?\n)*?[ \t]*(?P=delim)[ \t]*(?:\n|$)",
+    re.DOTALL,
+)
 # A `VAR=value` token at a segment head is an inline env assignment, transparent to WHICH
 # command runs (`CI=1 vitest run` invokes `vitest`).
 _INLINE_ENV_TOKEN = re.compile(r"^[A-Za-z_]\w*=")
@@ -401,8 +431,8 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         while i < len(rest):
             tok = rest[i]
             if tok.startswith("-"):
-                if "=" not in tok and tok in _WRAPPER_VALUE_FLAGS:
-                    i += 1  # `--signal SIGTERM` / `-k 5` take a separate value token
+                if "=" not in tok and tok in _WRAPPER_VALUE_FLAGS.get(wrapper, frozenset()):
+                    i += 1  # `--signal SIGTERM` / `-k 5` / `stdbuf -o L` take a separate value
                 i += 1
                 continue
             if wrapper == "env" and "=" in tok:
@@ -421,13 +451,56 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
 
 
 def _segment_head(segment: list[str]) -> list[str]:
-    """The argv a shell would actually EXEC for one segment: inline `VAR=value` assignments and
-    no-op wrappers peeled, argv[0] reduced to its basename."""
+    """The argv a shell would actually EXEC for one segment: leading control keywords, inline
+    `VAR=value` assignments and no-op wrappers peeled, argv[0] reduced to its basename."""
     i = 0
-    while i < len(segment) and _INLINE_ENV_TOKEN.match(segment[i]):
+    while i < len(segment) and (
+        segment[i] in _LEADING_SHELL_NOISE or _INLINE_ENV_TOKEN.match(segment[i])
+    ):
         i += 1
     argv = _strip_wrappers(segment[i:])
     return [_basename(argv[0]), *argv[1:]] if argv else []
+
+
+def _strip_function_bodies(tokens: list[str]) -> list[str]:
+    """Drop the body of a POSIX function DEFINITION (`f() { npm test; }`): defining `f` runs
+    nothing. The runner inside it is gated only when `f` is later called — which this hook
+    cannot see (pre-existing limit; the raw matcher never saw it either)."""
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        is_def = (
+            i + 3 < len(tokens) and tokens[i + 1] == "(" and tokens[i + 2] == ")" and tokens[i + 3] == "{"
+        )
+        if not is_def:
+            out.append(tokens[i])
+            i += 1
+            continue
+        depth, i = 0, i + 3
+        while i < len(tokens):  # skip to the matching `}`
+            depth += (tokens[i] == "{") - (tokens[i] == "}")
+            i += 1
+            if depth == 0:
+                break
+    return out
+
+
+def _shell_segments(command: str) -> list[list[str]]:
+    """Tokenize `command` with shell punctuation split out (`a;b`, `x&&y`, `(z)` become separate
+    tokens, quotes honoured, an unquoted `#` starts a comment), heredoc bodies and function
+    definitions removed, and split it into per-segment token lists. Raises ValueError on an
+    unbalanced quote."""
+    # The body is replaced by a `;` so the command AFTER the terminator starts its own segment
+    # (shlex reads a bare newline as whitespace, which would glue it onto `cat`).
+    lex = shlex.shlex(_HEREDOC_RE.sub(" ; ", command), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    segments: list[list[str]] = [[]]
+    for tok in _strip_function_bodies(list(lex)):
+        if tok in _SEGMENT_SEPARATORS:
+            segments.append([])
+        else:
+            segments[-1].append(tok)
+    return segments
 
 
 def _is_build_or_test(command: str) -> bool:
@@ -438,10 +511,10 @@ def _is_build_or_test(command: str) -> bool:
     tokenization failure (unbalanced quote) returns False — this gate is process discipline
     (on_error=open), so a parse failure must never invent a work action."""
     try:
-        tokens = shlex.split(command, comments=True)
+        segments = _shell_segments(command)
     except ValueError:
         return False
-    for segment in _segments(tokens):
+    for segment in segments:
         head = _segment_head(segment)
         if head and _BUILD_OR_TEST_HEAD.match(" ".join(head)):
             return True
