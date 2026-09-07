@@ -142,8 +142,12 @@
 #                          issue URL of THIS repo (https://github.com/<owner>/<repo>/issues/<n>
 #                          — the shape task-cli's links gate demands; both yield the literal
 #                          `#<n>`). EVERY such token of a source is tried in order (an incidental
-#                          `UTF-8` or a `GH-<this PR>` ahead of the real code no longer hides it,
-#                          agent-tools#571), and a GitHub-issue code is looked up under BOTH
+#                          `UTF-8` or a `GH-<this PR>` ahead of the real code no longer hides it
+#                          from THIS gate — a spelling with no review record moves the scan on,
+#                          agent-tools#571; the ACCEPTANCE gate below is deliberately stricter: a
+#                          grammar-valid token task-cli does not know, `UTF-8` included, REFUSES
+#                          with the remedy instead of being scanned past, agent-tools#569), and a
+#                          GitHub-issue code is looked up under BOTH
 #                          spellings, `#<n>` and `GH-<n>` (review-cli keys records by the literal
 #                          --task string; agents type GH-<n>, PR bodies say `Refs #<n>` —
 #                          agent-tools#572); the spelling that meets the bar is the one the
@@ -2212,7 +2216,16 @@ _review_quorum_extract_own_repo_issue_url() {  # $1 = text -> at most one candid
   issues=$(_ship_own_repo_issue_numbers "$m" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
   foreign=$(_ship_foreign_repo_issue_urls "$m" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
   if [ -n "$foreign" ]; then
-    echo "[ship] task-code: ignoring $(printf '%s\n' "$foreign" | LC_ALL=C grep -c .) issue link(s) of another repo, never this PR's ticket: $(printf '%s' "$foreign" | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed 's/ $//')" >&2
+    # "Foreign" is only a verdict when the PR's OWN repo is known; with no slug at all (no GitHub
+    # origin, no --repo, `gh pr view` failed) every link fails the match, and calling THOSE
+    # "another repo's" would send the shipper to fix a link that may well be this repo's (Opus
+    # review on PR #577) — say what is actually known instead.
+    local nlinks; nlinks=$(printf '%s\n' "$foreign" | LC_ALL=C grep -c .)
+    if [ -n "$(_ship_own_repo_slugs)" ]; then
+      echo "[ship] task-code: ignoring ${nlinks} issue link(s) of another repo, never this PR's ticket: $(printf '%s' "$foreign" | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed 's/ $//')" >&2
+    else
+      echo "[ship] task-code: not using ${nlinks} issue link(s) — this PR's own repo could not be established (no GitHub origin / --repo, and gh pr view gave no URL), so they cannot be told from another repo's: $(printf '%s' "$foreign" | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed 's/ $//')" >&2
+    fi
   fi
   n=$(printf '%s\n' "$issues" | LC_ALL=C grep -c .) || true
   if [ "$n" -eq 1 ]; then printf '#%s\n' "$issues"
@@ -2748,6 +2761,9 @@ _review_quorum_lookup_candidate() {  # $1 = candidate code
   # non-empty — so it needs no default of its own.
   local spelling anchor_code="" anchor_json="" anchor_roles twin
   twin=$(_review_quorum_twin_code "$1")
+  # $twin is deliberately UNQUOTED: word-splitting makes an empty twin vanish from the list.
+  # Quoting it would query an empty-string spelling for every non-GitHub code. A code never
+  # contains whitespace or glob characters (the extractor's shapes), so the split is safe.
   for spelling in "$1" $twin; do
     _review_quorum_query "$spelling"
     if [ -z "$QUORUM_JSON" ]; then
@@ -2801,9 +2817,14 @@ _review_quorum_scan_source() {  # $1 = candidates
 # names the code gets exactly that lookup, twin included), else the branch name, else the PR
 # body (fetched only when the branch yields no record). Same exit protocol as the per-source
 # scan; exit 4 when no source carries a candidate at all ("could not derive").
+# TASK_CODE_SOURCE names the source whose scan set $TASK_CODE — the acceptance gate reuses the
+# code and must report WHERE it came from (codex review on PR #577: a body-derived code that
+# task-cli then cannot resolve used to be blamed on "$TASK_CODE", a label nothing in the PR
+# text matches).
 _review_quorum_find_task() {
   local rc candidates
   if [ -n "${REVIEW_TASK_CODE:-}" ]; then
+    TASK_CODE_SOURCE='$REVIEW_TASK_CODE'
     rc=0; _review_quorum_scan_source "$REVIEW_TASK_CODE" || rc=$?
     return "$rc"
   fi
@@ -2811,6 +2832,7 @@ _review_quorum_find_task() {
   candidates=$(_review_quorum_extract_ticket_candidates "$BRANCH")
   if [ -n "$candidates" ]; then
     any=1
+    TASK_CODE_SOURCE="the branch name"
     rc=0; _review_quorum_scan_source "$candidates" || rc=$?
     [ "$rc" = "2" ] || return "$rc"
   fi
@@ -2818,6 +2840,7 @@ _review_quorum_find_task() {
   candidates=$(_review_quorum_extract_ticket_candidates "$PR_BODY_QC")
   if [ -n "$candidates" ]; then
     any=1
+    TASK_CODE_SOURCE="the PR body"
     rc=0; _review_quorum_scan_source "$candidates" || rc=$?
     [ "$rc" = "2" ] || return "$rc"
   fi
@@ -2874,7 +2897,7 @@ else
   # line and the hatch context.
   QITER=0; QMODELS_N=0; QMODELS=""; QROLES_N=0; QROLES=""; QERR=""; QPASSED=false
 
-  TASK_CODE=""; QTOTAL=0; QUORUM_JSON=""; QUORUM_ROLES_REQUESTED=1; QUORUM_HAS_ROLE_KEY=false
+  TASK_CODE=""; TASK_CODE_SOURCE=""; QTOTAL=0; QUORUM_JSON=""; QUORUM_ROLES_REQUESTED=1; QUORUM_HAS_ROLE_KEY=false
   QUORUM_HAS_TOTAL_KEY=false
   QUORUM_BAR_MET=0; QUORUM_NOTES=""; QUORUM_TRIED=""
   QUORUM_NORECORD_CODE=""; QUORUM_NORECORD_JSON=""; QUORUM_NORECORD_ROLES_REQUESTED=1
@@ -2907,8 +2930,15 @@ else
         case "$QUORUM_TRIED" in
           *", "*) QUORUM_NOTES="; also tried: ${QUORUM_TRIED#*, } (no recorded review iterations for any of them)" ;;
         esac
-        _review_quorum_refuse_or_hatch "$(_review_quorum_refusal_summary)" ;;
-      3) _review_quorum_refuse_or_hatch "could not query review-cli (store unreadable / task ${TASK_CODE} unknown)" ;;
+        _review_quorum_refuse_or_hatch "$(_review_quorum_refusal_summary)"
+        # Only reached on a live hatch APPROVAL. $TASK_CODE here is a spelling review-cli has
+        # never heard of (a record-less candidate — an incidental `UTF-8`, say), NOT a found
+        # ticket: leave it for the acceptance gate to reuse and that gate would ask task-cli
+        # about the same non-ticket and refuse right after Alex approved the ship (Opus review
+        # on PR #577). Clear it so the acceptance gate derives afresh from branch → title → body.
+        TASK_CODE=""; TASK_CODE_SOURCE="" ;;
+      3) _review_quorum_refuse_or_hatch "could not query review-cli (store unreadable / task ${TASK_CODE} unknown)"
+         TASK_CODE=""; TASK_CODE_SOURCE="" ;;  # same: an unqueryable spelling is not a found ticket
       *) _review_quorum_refuse_or_hatch "could not derive a task code (set \$REVIEW_TASK_CODE, or put the ticket code e.g. HYP-931 — or a link to THIS repo's issue, https://github.com/<owner>/<repo>/issues/<n> — in the branch name or PR body)" ;;
     esac
   fi
@@ -3070,8 +3100,10 @@ fi
 # notify step (post-merge) — one matcher, defined once, here, before its first caller.
 # Task-code derivation reuses _review_quorum_extract_ticket_candidates (the same matcher the
 # review-quorum gate above uses) but tries MORE sources, each candidate validated independently:
-# the gate's own $TASK_CODE (if it already ran and found one — avoids a redundant `gh pr view` on
-# the common path) → branch → PR TITLE → PR body. The title is a deliberate gap-fix over the
+# the gate's own $TASK_CODE (only if it already ran and FOUND one — a record-less or unqueryable
+# spelling a hatch approval waved through is cleared by the gate, never reused; the reuse is
+# labelled with the source the gate took it from, so a refusal still says "the PR body", not
+# "$TASK_CODE" — avoids a redundant `gh pr view` on the common path) → branch → PR TITLE → PR body. The title is a deliberate gap-fix over the
 # quorum gate (which only ever tries branch → body): a PR whose ticket code lives only in its
 # title (a common shape — "HYP-931: fix the thing") would otherwise never be found here even
 # though a human reads it immediately.
@@ -3195,7 +3227,7 @@ _ship_first_admissible_task_code() {
 }
 _ship_derive_task_code_for_notify() {
   _SHIP_TASK_CODE_SOURCE=""; _SHIP_TASK_CODE=""
-  _ship_first_admissible_task_code "${TASK_CODE:-}" '$TASK_CODE' && return 0
+  _ship_first_admissible_task_code "${TASK_CODE:-}" "${TASK_CODE_SOURCE:-\$TASK_CODE}" && return 0
   _ship_first_admissible_task_code "$(_review_quorum_extract_ticket_candidates "$BRANCH")" "the branch name" && return 0
 
   local pr_title pr_body_local

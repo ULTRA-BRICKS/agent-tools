@@ -74,6 +74,7 @@ case "$sub" in
         elif printf '%s' "$args" | grep -q -- '--json url,mergeCommit'; then
           printf '%s\\t%s\\n' "https://github.com/acme/widgets/pull/1" ""
         elif printf '%s' "$args" | grep -q -- '--json url'; then
+          if [ "${SHIP_TEST_GH_PR_VIEW_URL_FAIL:-0}" = "1" ]; then exit 1; fi
           printf '%s\\n' "https://github.com/acme/widgets/pull/1"
         elif printf '%s' "$args" | grep -q -- '--json commits'; then
           printf '%s\\n' "${SHIP_TEST_PR_COMMITS:-}"
@@ -119,6 +120,39 @@ if [ "$1" = "mark-shipped" ]; then
 fi
 exit 0
 """
+
+# A minimal fake `review` for the tests that run the review-quorum gate AND the acceptance gate
+# together: `review task <code> …` answers a PASSING 3/3/3 record for the codes listed in
+# $SHIP_TEST_REVIEW_KNOWN_CODES (space-separated) and review-cli's real no-record answer (zero
+# counts, `error`, exit 1) for every other code. Every other subcommand exits 0 silently.
+_FAKE_REVIEW = """\
+#!/usr/bin/env bash
+[ "${1:-}" = "task" ] || exit 0
+code="${2:-}"
+for k in ${SHIP_TEST_REVIEW_KNOWN_CODES:-}; do
+  if [ "$k" = "$code" ]; then
+    printf '{"task_code":"%s","passed_iterations":3,"total_iterations":3,"distinct_models_passed":3,"models":["a","b","c"],"min_iter":3,"passed":true,"distinct_roles_passed":3,"roles":["correctness","consistency","quality"],"min_roles":3}\\n' "$code"
+    exit 0
+  fi
+done
+printf '{"task_code":"%s","passed_iterations":0,"total_iterations":0,"distinct_models_passed":0,"models":[],"min_iter":3,"passed":false,"distinct_roles_passed":0,"roles":[],"min_roles":3,"error":"no recorded review iterations for %s"}\\n' "$code" "$code"
+exit 1
+"""
+
+
+def _ship_copy_with_approving_hatch(tmp_path: Path) -> Path:
+    """A ship.sh copy with a fake review_quorum_hatch.py beside it that APPROVES (the stdout
+    sentinel ship.sh gates on), so a quorum refusal proceeds as on a live Telegram approval — no
+    tg-ctl involved. Same shape as tests/test_ship.py's copy helper."""
+    dst = tmp_path / "toolcopy" / "ci" / "ship"
+    dst.mkdir(parents=True)
+    ship_copy = dst / "ship.sh"
+    ship_copy.write_text(_SHIP.read_text(encoding="utf-8"), encoding="utf-8")
+    ship_copy.chmod(0o755)
+    (dst / "review_quorum_hatch.py").write_text(
+        "import sys\nsys.stdout.write('APPROVED test approval\\n')\nsys.exit(0)\n", encoding="utf-8")
+    return ship_copy
+
 
 _NOT_ACCEPTED = json.dumps({
     "id": "HYP-931", "ok": False, "state": "in_progress", "gate_enabled": True,
@@ -183,7 +217,7 @@ def repo(tmp_path):
     return main
 
 
-def _bindir(tmp_path: Path, *, with_task: bool = True) -> Path:
+def _bindir(tmp_path: Path, *, with_task: bool = True, with_review: bool = False) -> Path:
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     (bindir / "gh").write_text(_FAKE_GH, encoding="utf-8")
@@ -191,6 +225,9 @@ def _bindir(tmp_path: Path, *, with_task: bool = True) -> Path:
     if with_task:
         (bindir / "task").write_text(_FAKE_TASK, encoding="utf-8")
         (bindir / "task").chmod(0o755)
+    if with_review:
+        (bindir / "review").write_text(_FAKE_REVIEW, encoding="utf-8")
+        (bindir / "review").chmod(0o755)
     return bindir
 
 
@@ -199,8 +236,9 @@ def _path_without_real_task() -> str:
     return os.pathsep.join(d for d in dirs if not (d and Path(d, "task").exists()))
 
 
-def _run(main: Path, tmp_path: Path, *, branch="hyp-931-fix-thing", with_task=True, env=None, args=(), pr="1"):
-    bindir = _bindir(tmp_path, with_task=with_task)
+def _run(main: Path, tmp_path: Path, *, branch="hyp-931-fix-thing", with_task=True, env=None, args=(), pr="1",
+         with_review=False, ship: Path = _SHIP):
+    bindir = _bindir(tmp_path, with_task=with_task, with_review=with_review)
     e = dict(os.environ)
     e["PATH"] = f"{bindir}{os.pathsep}{_path_without_real_task() if not with_task else e['PATH']}"
     e.update({
@@ -222,7 +260,7 @@ def _run(main: Path, tmp_path: Path, *, branch="hyp-931-fix-thing", with_task=Tr
     })
     if env:
         e.update(env)
-    r = _sh("bash", str(_SHIP), pr, "--no-screenshot-ok", "test", *args, cwd=main, env=e)
+    r = _sh("bash", str(ship), pr, "--no-screenshot-ok", "test", *args, cwd=main, env=e)
     return r
 
 
@@ -1020,6 +1058,64 @@ def test_acceptance_gate_reports_a_foreign_repo_issue_link_it_ignores(repo, tmp_
     assert "other-org/other-repo/issues/548" in r.stderr
     assert _task_calls(tmp_path) == []
     assert "could not derive a task code for #1 — skipping" in r.stderr
+
+
+def test_acceptance_gate_says_own_repo_unknown_instead_of_calling_a_link_foreign(repo, tmp_path):
+    """With NO own-repo slug at all (a non-GitHub origin, no --repo, and `gh pr view` giving no
+    URL) an issue link cannot be told from another repo's — the note must say THAT, not send
+    the shipper to fix a link that may well be this repo's (Opus review on PR #577)."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "SHIP_TEST_PR_BODY": "Companion of https://github.com/acme/widgets/issues/548.",
+        "SHIP_TEST_GH_PR_VIEW_URL_FAIL": "1",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "not using 1 issue link(s) — this PR's own repo could not be established" in r.stderr, r.stderr
+    assert "of another repo" not in r.stderr, r.stderr
+    assert "acme/widgets/issues/548" in r.stderr
+    assert _task_calls(tmp_path) == []
+
+
+def test_acceptance_gate_reuses_the_quorum_code_with_its_real_source(repo, tmp_path):
+    """The review-quorum gate found the ticket in the PR BODY (a passing record for #999); the
+    acceptance gate reuses that code, and when task-cli cannot resolve it the refusal must
+    blame the PR body — not "$TASK_CODE", a label nothing in the PR text matches (codex review
+    on PR #577)."""
+    r = _run(repo, tmp_path, branch="feat", with_review=True, env={
+        "SHIP_REVIEW_QUORUM": "1", "SHIP_TEST_REVIEW_KNOWN_CODES": "#999",
+        "SHIP_TEST_PR_BODY": "Refs #999",
+        "SHIP_TEST_TASK_GATE_JSON": "", "SHIP_TEST_TASK_GATE_ERR": "error: github: HTTP 404 for issue 999",
+        "SHIP_TEST_TASK_GATE_EXIT": "2",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "for #999" in r.stdout, r.stdout
+    assert "task-code: using '#999' from the PR body." in r.stderr, r.stderr
+    assert "Refusing: acceptance gate — task-cli could not resolve ticket #999" in r.stderr, r.stderr
+    assert "The code came from the PR body." in r.stderr, r.stderr
+    assert "$TASK_CODE" not in r.stderr, r.stderr
+    assert _task_calls(tmp_path) == ["gate #999 --json"]
+    assert not _merged(tmp_path)
+
+
+def test_acceptance_gate_does_not_reuse_a_record_less_quorum_spelling_after_a_hatch_approval(repo, tmp_path):
+    """The quorum gate found NO record for any candidate (the body's incidental `UTF-8`), Alex
+    approved the ship live through the hatch — the acceptance gate must then derive afresh
+    (here: HYP-777 from the PR TITLE, which the quorum gate never reads), not ask task-cli
+    about the stale record-less `UTF-8` and refuse right after the approval (Opus review on
+    PR #577)."""
+    ship_copy = _ship_copy_with_approving_hatch(tmp_path)
+    r = _run(repo, tmp_path, branch="feat", with_review=True, ship=ship_copy, env={
+        "SHIP_REVIEW_QUORUM": "1", "SHIP_TEST_REVIEW_KNOWN_CODES": "NONE",
+        "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM": "test: hotfix, review dispatched",
+        "SHIP_TEST_PR_TITLE": "HYP-777: fix the thing", "SHIP_TEST_PR_BODY": "Decodes UTF-8 properly now.",
+        "SHIP_TEST_TASK_GATE_JSON": _ACCEPTED.replace("HYP-931", "HYP-777"), "SHIP_TEST_TASK_GATE_EXIT": "0",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "hatch escalation was APPROVED" in r.stdout, r.stdout
+    assert "no recorded review iterations for UTF-8" in r.stderr, r.stderr
+    assert _task_calls(tmp_path) == ["gate HYP-777 --json"], _task_calls(tmp_path)
+    assert "task-code: using 'HYP-777' from the PR title." in r.stderr, r.stderr
+    assert "could not resolve ticket UTF-8" not in r.stderr, r.stderr
+    assert _merged(tmp_path)
 
 
 def test_acceptance_gate_scans_past_a_grammar_rejected_candidate_in_the_same_body(repo, tmp_path):
