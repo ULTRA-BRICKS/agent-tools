@@ -397,7 +397,11 @@ A shipping agent **may** autonomously resolve a review thread on a PR it created
 four conditions hold:
 
 1. **Quorum review passed**: `review diff` (or `review quorum`) produced an `[ok]` marker for
-   the current diff — multi-model consensus cleared.
+   the current diff — role-based coverage cleared (≥3 distinct BOARD ROLES among passed
+   iterations is the default/primary gate since review-cli#246; there is no default distinct-model
+   floor any more — an explicit `SHIP_REVIEW_QUORUM_MIN_MODELS`/`--min-models` opts into the old
+   model-count check separately). Don't describe this as "N models" to an agent or in a report —
+   say "N roles."
 2. **Finding is P2 / advisory / suggestion / nit** — explicitly NOT P0, P1, critical, or
    security-tagged.
 3. **Commenter is an automated bot and no human replied** — the original commenter's
