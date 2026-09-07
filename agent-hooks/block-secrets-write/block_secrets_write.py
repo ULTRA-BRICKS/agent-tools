@@ -41,13 +41,8 @@ PLACEHOLDER = re.compile(
 PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("private key block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
     ("AWS access key id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    # An ASSIGNMENT (`token = "…"`, `API_KEY: …`) — not a URL QUERY PARAMETER (`?token=…`,
-    # `&access_key=…`): the `(?<![?&])` lookbehind keeps a documented request URL in prose
-    # (an audit report's `…/redeem?token=ultra-invalid-proof`) from reading as a key being
-    # written into source. A real credential in a URL is still caught by the specific
-    # patterns below (slack / openai / AWS shapes) — this narrows only the generic one.
     ("generic api/secret token assignment",
-     re.compile(r"(?i)(?<![?&])\b(?:api[_-]?key|secret|token|access[_-]?key|client[_-]?secret|"
+     re.compile(r"(?i)\b(?:api[_-]?key|secret|token|access[_-]?key|client[_-]?secret|"
                 r"password|passwd)\b\s*[:=]\s*['\"]?([A-Za-z0-9_\-+/=]{16,})['\"]?")),
     ("bearer credential", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=]{20,}")),
     ("slack token", re.compile(r"\bxox[abpsr]-[A-Za-z0-9-]{10,}\b")),
@@ -67,9 +62,26 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"block-secrets-write: {msg}\n")
 
 
+# The ONE documented carve-out from the generic assignment pattern: a URL QUERY PARAMETER
+# (`…?token=ultra-invalid-proof`, the key preceded by `?`/`&`) whose value is a SLUG — lowercase
+# words joined by hyphens, nothing else. That is a human-readable marker quoted in prose (an
+# audit report describing a request), never a credential: a real token carries digits, mixed
+# case or symbols. Anything else in query position — `?token=AbCdEfGhIjKlMnOpQrStUvWx` written
+# into source — is still an assignment and still blocked.
+URL_QUERY_SLUG = re.compile(r"^[a-z]+(?:-[a-z]+)+$")
+
+
 def looks_real(matched_value: str) -> bool:
     """A captured value is a likely-real secret if it isn't an obvious placeholder."""
     return not PLACEHOLDER.search(matched_value)
+
+
+def is_url_query_slug(content: str, m: re.Match[str]) -> bool:
+    """True when the generic-assignment match is a `?key=slug` / `&key=slug` query parameter
+    whose value is a hyphenated lowercase slug (see URL_QUERY_SLUG)."""
+    if m.start() == 0 or content[m.start() - 1] not in "?&" or not m.lastindex:
+        return False
+    return bool(URL_QUERY_SLUG.match(m.group(m.lastindex)))
 
 
 def main() -> int:
@@ -95,6 +107,8 @@ def main() -> int:
         if not m:
             continue
         captured = m.group(m.lastindex) if m.lastindex else m.group(0)
+        if label.startswith("generic") and is_url_query_slug(content, m):
+            continue
         if looks_real(captured):
             emit(
                 "block",

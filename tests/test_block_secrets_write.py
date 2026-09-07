@@ -54,12 +54,25 @@ def test_audit_report_quoting_a_url_token_parameter_is_allowed(monkeypatch):
 
 @pytest.mark.parametrize("content", [
     "see https://example.test/redeem?token=ultra-invalid-proof-value for the flow",
-    "GET /api?access_key=AbCdEfGhIjKlMnOpQrSt&x=1",
-    "curl 'https://h/x?a=1&client_secret=abcdefghijklmnopqrstuvwxyz'",
+    "GET /api?access_key=not-a-real-key-marker&x=1",
+    "curl 'https://h/x?a=1&client_secret=redeem-flow-proof-marker'",
 ])
-def test_url_query_parameter_is_not_an_assignment(content, monkeypatch):
+def test_url_query_slug_parameter_is_not_an_assignment(content, monkeypatch):
     out, code = _run(content, "notes/audit.md", monkeypatch)
     assert code == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("content", [
+    'const endpoint = "https://api.example.test/redeem?token=AbCdEfGhIjKlMnOpQrStUvWx"',  # gitleaks:allow
+    "GET /api?access_key=a1b2c3d4e5f6g7h8i9j0&x=1",  # gitleaks:allow
+    "https://h/x?a=1&client_secret=abcdefghijklmnopqrstuvwxyz",  # a bare word, not a slug
+    "https://h/x?token=Ultra-Invalid-Proof",                     # mixed case is not a slug
+])
+def test_credential_shaped_query_value_is_still_blocked(content, monkeypatch):
+    """The carve-out is the SLUG shape only (review on the bundle): a real-looking value in a
+    URL written into source is still a generic assignment."""
+    out, code = _run(content, "src/client.ts", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
 @pytest.mark.parametrize("content", [
