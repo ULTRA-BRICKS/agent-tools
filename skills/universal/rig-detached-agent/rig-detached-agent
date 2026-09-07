@@ -131,6 +131,18 @@ if [ "$brief_bytes" -gt "$max_brief_bytes" ]; then
         "limit for one argv element; shorten it, or keep the detail in a file the brief points at" >&2
     exit 2
 fi
+# ARG_MAX counts the INHERITED ENVIRONMENT together with argv (codex P1, #573 round 3): a
+# caller carrying a huge environment can start this script (tiny argv) and still lose the child
+# to E2BIG once the brief is added. 16 KiB of headroom covers the child's flags, the exported
+# markers and the kernel's per-string overhead.
+arg_max="$(getconf ARG_MAX 2>/dev/null || echo 262144)"
+env_bytes="$(env | wc -c | tr -d ' ')"
+if [ $((brief_bytes + env_bytes + 16384)) -gt "$arg_max" ]; then
+    echo "$label: brief ($brief_bytes bytes) plus the inherited environment ($env_bytes bytes)" \
+        "exceeds this system's ARG_MAX ($arg_max) — the detached child could not be exec'd;" \
+        "shorten the brief or start the launcher from a leaner environment" >&2
+    exit 2
+fi
 brief_text="$(cat -- "$brief")"
 
 cd "$workdir"

@@ -459,6 +459,16 @@ def test_reminder_is_harness_aware(harness, needle, foreign, monkeypatch):
     assert "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE" in message
 
 
+@pytest.mark.parametrize("harness", ["not-a-harness", ["codex"], {"harness": "codex"}, 7])
+def test_reminder_with_an_unknown_or_malformed_harness_covers_every_harness(harness, monkeypatch):
+    """The fallback now belongs to `delegation_recipe` (it guards on `isinstance(str)`, so an
+    unhashable tag from malformed event JSON cannot raise and fail the gate OPEN) — pinned here
+    at the gate, not only in the hatch-escalation tests (review finding, #573 round 3)."""
+    assert gate.reminder_for(harness) == gate.REMINDER
+    for needle in RECIPE_NEEDLE.values():
+        assert needle in gate.reminder_for(harness)
+
+
 def test_reminder_without_harness_covers_every_harness(monkeypatch):
     event = {"point": "pre-agent", "cwd": "/repo",
              "args": {"prompt": _NON_TRIVIAL_PROMPT, "description": "big refactor", "harness": "omp"}}

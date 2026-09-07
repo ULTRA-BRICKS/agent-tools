@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from _delegation_fixtures import RECIPE_NEEDLE
+from _delegation_fixtures import RECIPE_NEEDLE as _RECIPE_NEEDLE
 
 _HOOK = (
     Path(__file__).resolve().parents[1]
@@ -489,7 +489,6 @@ def _run_event(event, monkeypatch) -> tuple[str, str, int]:
     return out.getvalue(), err.getvalue(), code
 
 
-_RECIPE_NEEDLE = RECIPE_NEEDLE
 
 
 @pytest.mark.parametrize("harness", sorted(_RECIPE_NEEDLE))

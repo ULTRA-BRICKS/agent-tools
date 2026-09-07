@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from _delegation_fixtures import RECIPE_NEEDLE
+from _delegation_fixtures import RECIPE_NEEDLE as _RECIPE_NEEDLE
 
 _HOOK = (
     Path(__file__).resolve().parents[1]
@@ -209,7 +209,6 @@ def test_repro_chain_still_warns_then_blocks_with_harness_claude_code(tmp_path, 
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # repeat: BLOCK
 
 
-_RECIPE_NEEDLE = RECIPE_NEEDLE
 
 
 @pytest.mark.parametrize("harness", ["codex", "opencode", "omp"])

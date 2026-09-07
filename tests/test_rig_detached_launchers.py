@@ -187,6 +187,35 @@ def test_oversized_brief_exits_2_before_detaching(harness, tmp_path):
     assert not marker.exists() and not (tmp_path / "stub-env.txt.tmp").exists()
 
 
+def test_brief_plus_huge_inherited_env_exits_2_before_detaching(harness, tmp_path):
+    """ARG_MAX bounds argv AND environment together (codex P1, #573 round 3): a caller whose
+    environment nearly fills it can start the launcher yet lose the detached child to E2BIG.
+    Pad the environment (in 64 KiB slices — Linux caps one string at 128 KiB) to within 30 KB
+    of ARG_MAX, then a 60 KB brief must be refused up front."""
+    stub_dir = tmp_path / "bin"
+    marker = tmp_path / "stub-env.txt"
+    _stub_harness(harness, stub_dir, marker)
+    brief = tmp_path / "brief.md"
+    brief.write_text("x" * 60_000, encoding="utf-8")
+    arg_max = os.sysconf("SC_ARG_MAX")
+    env_now = sum(len(k) + len(v) + 2 for k, v in os.environ.items())
+    pad_total = arg_max - env_now - 30_000
+    assert pad_total > 0
+    slice_len = 64 * 1024
+    pad = {}
+    remaining = pad_total
+    while remaining > 0:
+        pad[f"RIG_TEST_ENV_PAD_{len(pad)}"] = "p" * min(slice_len, remaining)
+        remaining -= slice_len + 20
+    proc = _run_launcher(harness, "agent-x", str(brief), str(tmp_path),
+                         path_override=stub_dir, extra_env=pad)
+    assert proc.returncode == 2, proc.stderr
+    assert "ARG_MAX" in proc.stderr
+    assert "launched" not in proc.stdout
+    time.sleep(0.3)
+    assert not marker.exists()
+
+
 def test_brief_at_the_limit_still_launches(harness, tmp_path):
     stub_dir = tmp_path / "bin"
     marker = tmp_path / "stub-env.txt"
