@@ -710,3 +710,24 @@ def test_hatch_exit_nonzero_denies(monkeypatch, tmp_path):
     )
     assert code == hook.BLOCK_EXIT_CODE
     assert "hatch escalation denied" in json.loads(out)["message"].lower()
+
+
+# ── #580: benign heredoc file writes must classify as safe ─────────────────────────────────
+#
+# Verbatim from the codex sessions in ~/work/private (2026-09-05T18:23Z, 2026-09-06T08:22Z): a
+# `cat > … <<'EOF'` writing a TypeScript module and a `python3 - <<'PY'` writing a Markdown
+# note were both refused as "could not verify this command is not a pattern-based kill …
+# (fail-closed)". Neither contains the token `kill` anywhere. The refusal does NOT reproduce
+# against the current hook (main at adc0173/07419a0, no commits to this file since 2026-08-20;
+# the main checkout's tree was dirty under `pull --autostash` at both timestamps, so the
+# fired copy is unrecoverable) — these tests pin the class so it cannot regress silently.
+
+from codex_private_refusals import PKILL_GUARD_PY_HEREDOC, PKILL_GUARD_TS_HEREDOC  # noqa: E402
+
+
+@pytest.mark.parametrize("command", [PKILL_GUARD_TS_HEREDOC, PKILL_GUARD_PY_HEREDOC])
+def test_benign_heredoc_write_without_a_kill_verb_is_safe(command, monkeypatch):
+    assert "kill" not in command  # the premise: nothing to verify
+    assert hook._classify(command) == ("safe", None)
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
