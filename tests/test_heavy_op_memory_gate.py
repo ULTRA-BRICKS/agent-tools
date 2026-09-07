@@ -447,6 +447,12 @@ def test_help_probes_and_read_only_segments_are_none(command):
     "npm --prefix x test",
     "ls -l && npm test",                   # a read-only segment next to a heavy one
     "cat notes.txt | pytest -q",           # heavy segment at the tail of a pipe
+    "cat pytest.ini; pytest",              # FUSED `;` after a read-only head (review on #579)
+    "ls -l; vitest run --root x",
+    "cat README.md|pytest -q",             # fused `|`
+    "rg x&&pnpm test",                     # fused `&&`
+    "(pytest)",                            # grouped
+    "sed -n 1p x >log; npm test 2>&1",     # redirects around a fused separator
     "vitest run --reporter -h",            # a short `-h` may be a VALUE: not a carve-out
     "pytest -V",
 ])

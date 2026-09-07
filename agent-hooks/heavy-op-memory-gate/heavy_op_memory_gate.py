@@ -136,9 +136,11 @@ _HELP_FLAGS = frozenset({"--help", "-help", "--version", "-version"})
 # wrapper (`sudo pytest`, `env CI=1 npm test`, `cd x && pnpm test` all still match — the
 # false-negative class the docstring below records as the dangerous direction).
 _READ_ONLY_HEADS = frozenset({"ls", "cat", "head", "tail", "sed", "rg", "grep", "wc", "stat"})
-# Segment boundaries, matched as whole whitespace-separated tokens (a fused `a;b` stays one
-# token — no looser than the single-bag check this refines).
-_SEGMENT_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "|&"})
+# Segment boundaries. `_shell_tokens` splits shell punctuation into its own tokens, so a FUSED
+# `cat x; pytest` / `ls -l|npm test` / `rg x&&pnpm test` still yields a separate heavy segment
+# — the read-only-head carve-out must never hide a runner glued to the same token run
+# (review finding on #579).
+_SEGMENT_SEPARATORS = frozenset({"&&", "||", ";", ";;", "|", "&", "|&"})
 
 
 def _tokenize(command: str) -> list[str]:
@@ -201,7 +203,7 @@ def _segments(command: str) -> list[list[str]]:
     out: list[list[str]] = []
     for line in command.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         current: list[str] = []
-        for tok in _tokenize(line):
+        for tok in _shell_tokens(line):
             if tok in _SEGMENT_SEPARATORS:
                 out.append(current)
                 current = []
@@ -209,6 +211,19 @@ def _segments(command: str) -> list[list[str]]:
                 current.append(tok)
         out.append(current)
     return [seg for seg in out if seg]
+
+
+def _shell_tokens(line: str) -> list[str]:
+    """Tokens with shell punctuation (`;`, `|`, `&&`, `(`, `>`) split out as their own tokens,
+    quotes honoured. Falls back to `_tokenize` (whitespace split) on an unbalanced quote —
+    still token-shaped, never a raw substring search."""
+    lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    try:
+        return list(lex)
+    except ValueError:
+        return _tokenize(line)
 
 
 def _is_help_probe(tokens: list[str]) -> bool:
