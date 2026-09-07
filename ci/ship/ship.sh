@@ -1941,6 +1941,41 @@ version_line_bumped() {  # $1 = version file path; uses $PR_DIFF (full patch tex
   return 0
 }
 
+# The PR's NEW version value (the `+` line of $1's diff section), for the base-tip check
+# below. Same extraction as version_line_bumped; empty when the PR declares none.
+pr_new_version_value() {  # $1 = version file path; uses $PR_DIFF
+  printf '%s\n' "$PR_DIFF" \
+    | awk -v f="$1" '
+        /^diff --git / { insec = ($0 == "diff --git a/" f " b/" f) ? 1 : 0; next }
+        insec { print }
+      ' \
+    | grep -E '^\+[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
+    | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1
+}
+
+# The version value at the TIP of the PR's base branch (`origin/<baseRefName>`), or empty
+# when it cannot be read (no such ref, no such file, no version line). Why the base TIP and
+# not the PR diff: `gh pr diff` is relative to the PR's MERGE-BASE, so a PR branched before
+# a sibling release shows `-0.34.1 / +0.35.0` even after main already moved to 0.35.0 — the
+# diff says "bumped" while the squash-merge onto main changes no version at all
+# (agent-tools#592: rig-cli #369 and #370 both bumped 0.34.1->0.35.0; #370 merged 44
+# minutes later, the gate said OK, and a feature shipped under a number main already had).
+# The fetch uses the explicit refspec so a SUCCESSFUL fetch definitely advances
+# `origin/<base>`; offline it falls back to the last-known ref (best-effort, like
+# `_empty_rollup_is_ci_outage`); a missing ref/file yields empty -> the check passes (the
+# PR-diff test above stays the floor).
+base_tip_version_value() {  # $1 = version file path -> prints the value or nothing
+  local base ref
+  base=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null) || base=""
+  case "$base" in ''|-*|*[!A-Za-z0-9._/-]*) base="$DEFAULT_BRANCH" ;; esac
+  ref="origin/$base"
+  git -C "$ROOT" fetch -q origin "$base:refs/remotes/origin/$base" 2>/dev/null || true
+  git -C "$ROOT" rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || return 0
+  git -C "$ROOT" show "$ref:$1" 2>/dev/null \
+    | grep -E '^[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
+    | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1
+}
+
 if [ "${SHIP_SKIP_VERSION_BUMP:-0}" = "1" ] && [ -z "$NO_VBUMP_OK" ]; then
   NO_VBUMP_OK="SHIP_SKIP_VERSION_BUMP=1 (env)"
 fi
@@ -1956,6 +1991,16 @@ else
             { echo "Refusing: PR #$PR changes shippable source but the version in $VFILE is UNCHANGED — this ship is a release, so bump the version (skill: bump-version-on-release)."
               echo "  Semver: patch for a fix, minor for a feature, major for a breaking change. Edit $VFILE's version field, push, re-run ship."
               echo "  If this is genuinely NOT a release (docs-only / pure test or CI / a revert), override: --no-version-bump-ok <reason> (or SHIP_SKIP_VERSION_BUMP=1)."; } >&2
+            exit 1
+          fi
+          # Bumped relative to the merge-base is not enough: the base branch may ALREADY
+          # carry that value (a sibling PR released it first) — then merging changes no
+          # version and this release ships under a number that is already taken.
+          VB_NEW=$(pr_new_version_value "$VFILE"); VB_BASE=$(base_tip_version_value "$VFILE")
+          if [ -n "$VB_NEW" ] && [ -n "$VB_BASE" ] && [ "$VB_NEW" = "$VB_BASE" ]; then
+            { echo "Refusing: PR #$PR bumps $VFILE to $VB_NEW, but the base branch tip ALREADY has version $VB_BASE — another release took that number, so merging would change no version (the PR diff is relative to the merge-base, not to the current base)."
+              echo "  Bump above $VB_BASE (rebase or edit $VFILE's version field), push, re-run ship."
+              echo "  If this is genuinely NOT a release, override: --no-version-bump-ok <reason> (or SHIP_SKIP_VERSION_BUMP=1)."; } >&2
             exit 1
           fi
           echo "[ship] version-bump gate OK — $VFILE version is bumped in PR #$PR."
