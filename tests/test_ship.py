@@ -7916,6 +7916,77 @@ def test_external_review_short_alias_env_var_also_disables_gate(repo_with_two_wo
     assert "[fake gh] merged" in r.stdout, r.stdout
 
 
+def test_external_review_disabled_via_committed_ship_config(repo_with_two_worktrees, tmp_path):
+    """agent-tools#600: a committed `.ship-config` line is a durable, per-repo alternative to the
+    env var -- one a repo owner can review and land like any other code change, and one a
+    different agent session or test process never inherits (unlike agent-tools#528's machine-wide
+    `~/.zshenv` export, which broke this script's own gate tests by leaking into them). Must
+    disable the gate with NO env var set at all."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    (main / ".ship-config").write_text("SHIP_EXTERNAL_REVIEW=0\n", encoding="utf-8")
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "disable the external-review gate for this repo", cwd=main)
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env.pop("SHIP_EXTERNAL_REVIEW_ENABLED", None)
+    env.pop("SHIP_EXTERNAL_REVIEW", None)
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode == 0, f"a committed .ship-config off-switch must let a zero-review PR merge\n{r.stdout}\n{r.stderr}"
+    assert "external-review gate disabled by the committed .ship-config (SHIP_EXTERNAL_REVIEW=0)" in r.stdout, r.stdout
+    assert "[fake gh] merged" in r.stdout, r.stdout
+
+
+def test_external_review_ship_config_off_switch_wins_even_with_env_explicitly_enabled(
+    repo_with_two_worktrees, tmp_path
+):
+    """Same OR-not-AND precedence _acceptance_gate already has between its env var and its
+    .ship-config key: an explicit SHIP_EXTERNAL_REVIEW=1 does not resurrect the gate once the
+    committed .ship-config says 0 -- either source disabling it is enough, and neither can force
+    the gate back ON when the other says off."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    (main / ".ship-config").write_text("SHIP_EXTERNAL_REVIEW=0\n", encoding="utf-8")
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "disable the external-review gate for this repo", cwd=main)
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env["SHIP_EXTERNAL_REVIEW"] = "1"
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode == 0, f"a committed .ship-config off-switch must win over an explicit env=1\n{r.stdout}\n{r.stderr}"
+    assert "external-review gate disabled by the committed .ship-config (SHIP_EXTERNAL_REVIEW=0)" in r.stdout, r.stdout
+    assert "[fake gh] merged" in r.stdout, r.stdout
+
+
+def test_external_review_ship_config_ignored_when_uncommitted(repo_with_two_worktrees, tmp_path):
+    """The audited-config contract applies here too (same property _ship_config_load already
+    enforces for SHIP_ACCEPTANCE_GATE/SHIP_LOCAL_TEST_CMD): only content committed at HEAD counts,
+    so a working-tree-only .ship-config cannot silently disable a merge-safety gate."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    (main / ".ship-config").write_text("SHIP_EXTERNAL_REVIEW=0\n", encoding="utf-8")
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env.pop("SHIP_EXTERNAL_REVIEW_ENABLED", None)
+    env.pop("SHIP_EXTERNAL_REVIEW", None)
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"an uncommitted .ship-config must NOT disable the gate\n{r.stdout}\n{r.stderr}"
+    assert "ZERO GitHub-side reviews" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
 def test_external_review_fails_closed_when_python3_exits_zero_without_sentinel(repo_with_two_worktrees, tmp_path):
     """Security fail-closed: a fake/broken `python3` that exits 0 but prints NO `APPROVED` sentinel
     must NOT be mistaken for approval — ship refuses and audits bypass:denied. Mirrors the
