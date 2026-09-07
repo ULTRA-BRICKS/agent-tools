@@ -23,8 +23,12 @@ commit -m/…) no longer trips it, while a genuine inline `review`/`npm test`/`-
 Flagged, decided per real command SEGMENT (executable parsed, not substring-matched):
   - the `review` CLI as the invoked command (`argv[0]` is `review`) — multi-model, minutes-long
   - a `--watch` flag token in the real args (gh pr checks --watch, vitest --watch, tsc --watch)
-  - a build/test SUITE: npm/pnpm/yarn/bun/deno test|build, pytest/vitest/jest/cypress/playwright,
-    cargo/go test|build, make/rake/msbuild test|build|all, mvn/gradle test|build|verify|package
+  - a build/test SUITE: npm/pnpm/yarn/bun/deno test|build, pytest/vitest/jest/cypress/playwright/
+    unittest/tox/nose2, cargo/go test|build, make/rake/msbuild test|build|all, mvn/gradle
+    test|build|verify|package — ALSO when it hides behind a LAUNCHER that executes it
+    (agent-tools#584): `python[3[.X]] -m pytest|unittest`, `uv run [--with …] pytest`, `uvx`,
+    `poetry|pipenv|pdm run`, `coverage run -m`, `npx|bunx`, `npm exec`, `pnpm exec|dlx`,
+    `yarn exec|dlx|run`, `bun run|x`. Launchers peel recursively (`uv run python -m pytest`).
   - `sleep N[unit]` as the invoked command with a duration >= 10s (`sleep 5m`/`sleep 1h` count)
 
 LIMITATION (documented under-block, the same precision trade as the sibling hooks' nested
@@ -167,7 +171,8 @@ _COMMENT_BOUNDARY_METACHARS = frozenset(";&|()")
 
 # ── what counts as a long-running runner (argv-keyed, not substring) ─────────────────────────
 # Test/CI runners that are a long process by the NAME ALONE — `pytest`, `vitest`, … as argv[0].
-_DIRECT_RUNNERS = frozenset({"pytest", "vitest", "jest", "cypress", "playwright"})
+# `unittest` is only ever reached as `python -m unittest`; `tox` and `nose2` are real executables.
+_DIRECT_RUNNERS = frozenset({"pytest", "vitest", "jest", "cypress", "playwright", "unittest", "tox", "nose2"})
 # Runners that are a suite only WITH a build/test subcommand. The word-boundary patterns mirror
 # the original SUITE regex (`\btest\b` matches `test`, `test:unit`, `test-helper`; not `tests`),
 # now applied per real arg TOKEN so a quoted multi-word arg of a DIFFERENT command can't match.
@@ -228,6 +233,60 @@ _WRAPPERS = frozenset({"timeout", "env", "nice", "time", "stdbuf", "nohup", "set
 # form (`-n10`, `--kill-after=5`) consumes no extra token.
 _WRAPPER_VALUE_FLAGS = frozenset({"-s", "-k", "--signal", "--kill-after", "-n", "-u"})
 _MAX_WRAPPER_NESTING = 16
+
+# ── launchers that EXECUTE an operand as the real command (agent-tools#584) ──────────────────
+# Unlike a no-op WRAPPER (`timeout 600 npm test`), a launcher is a real tool whose OPERAND is the
+# command that actually runs: `python -m pytest`, `uv run pytest`, `npx vitest`, `poetry run pytest`.
+# The suite hides behind the launcher's own options, so argv[0] alone never names it — which is how
+# `python3 -m pytest -q` (the replay command this repo documents) and `uv run --with pytest pytest
+# tests/` (every rig.yaml test script) passed this gate ungated. Each entry: the executing
+# SUBCOMMANDS (None = the launcher itself executes its first operand) and the launcher's own
+# VALUE-TAKING flags, which must be skipped WITH their value or the value would be read as the
+# command (`uv run --with pytest ruff check .` runs ruff, not pytest). Deliberately incomplete: an
+# unmodelled value flag leaves its VALUE at argv[0], which is not a runner → allow, the fail-open
+# direction of this discipline gate — never a false block.
+_UV_VALUE_FLAGS = frozenset({
+    "--with", "-w", "--with-requirements", "--with-editable", "--python", "-p", "--project",
+    "--directory", "--group", "--only-group", "--extra", "--env-file", "--index", "--default-index",
+    "--find-links", "-f", "--package", "--exclude-newer", "--config-file", "--cache-dir",
+    "--index-url", "-i", "--extra-index-url", "--constraints", "-c", "--build-constraints", "-b",
+    "--overrides", "--link-mode", "--resolution", "--prerelease", "--python-preference", "--color",
+    "--config-setting", "-C", "--refresh-package", "--reinstall-package", "--upgrade-package", "-P",
+    "--fork-strategy", "--index-strategy", "--keyring-provider", "--python-platform",
+})
+_LAUNCHERS: dict[str, tuple[frozenset[str] | None, frozenset[str]]] = {
+    "uv": (frozenset({"run"}), _UV_VALUE_FLAGS),
+    "uvx": (None, _UV_VALUE_FLAGS | {"--from"}),
+    "poetry": (frozenset({"run"}), frozenset({"-C", "--directory", "-P", "--project"})),
+    "pipenv": (frozenset({"run"}), frozenset({"--python"})),
+    "pdm": (frozenset({"run"}), frozenset({"-p", "--project", "-k", "--skip"})),
+    # `coverage run -m pytest`: `-m` is skipped like any other option, which lands the module at
+    # argv[0] — exactly what coverage's `-m` means.
+    "coverage": (frozenset({"run"}), frozenset({
+        "--source", "--include", "--omit", "--data-file", "--context", "--rcfile", "--concurrency",
+    })),
+    "npx": (None, frozenset({
+        "-p", "--package", "-c", "--call", "--shell", "--cache", "--userconfig", "--registry",
+        "--loglevel", "-w", "--workspace", "--prefix",
+    })),
+    "bunx": (None, frozenset({"-p", "--package", "--shell"})),
+    "npm": (frozenset({"exec", "x"}), frozenset({
+        "-p", "--package", "-c", "--call", "-w", "--workspace", "--prefix", "-C", "--loglevel",
+        "--registry",
+    })),
+    "pnpm": (frozenset({"exec", "dlx"}), frozenset({
+        "-C", "--dir", "--filter", "-F", "-p", "--package", "--reporter", "--loglevel",
+    })),
+    "yarn": (frozenset({"exec", "dlx", "run"}), frozenset({"--cwd", "-p", "--package"})),
+    "bun": (frozenset({"run", "x"}), frozenset({"-p", "--package", "--cwd", "--shell"})),
+}
+# Python interpreters run a suite as a MODULE: `python -m pytest`, `python3.12 -m unittest`.
+_PYTHON_EXE = re.compile(r"^(?:python|pypy)(?:\d+(?:\.\d+)?)?$")
+# Interpreter short options that take a value (`-W ignore`, `-X dev`, glued `-Wignore`); every other
+# short option is a boolean and may be clustered (`-um pytest`). `-m`/`-c` end the option list.
+_PYTHON_VALUE_OPTS = frozenset({"W", "X"})
+_PYTHON_LONG_VALUE_OPTS = frozenset({"--check-hash-based-pycs"})
+_MAX_LAUNCHER_NESTING = 8
 # Cap on leading shell-noise tokens peeled from one segment (its own concept, not the wrapper cap) —
 # named so the literal can't silently desync from the bound it represents.
 _MAX_LEADING_NOISE = 16
@@ -523,6 +582,71 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
     return argv
 
 
+def _skip_launcher_flags(rest: list[str], value_flags: frozenset[str]) -> int:
+    """Index of the first token of `rest` that is NOT one of the launcher's own options. A value-
+    taking flag skips its separate value (`--with pytest`); a glued `--flag=value` and any other
+    `-x` token skip one; a bare `--` ends the options (`npx -- vitest`)."""
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--":
+            return i + 1
+        if not tok.startswith("-"):
+            return i
+        if "=" not in tok and tok in value_flags:
+            i += 1
+        i += 1
+    return i
+
+
+def _strip_launcher(argv: list[str]) -> list[str] | None:
+    """The command a LAUNCHER executes, or None when argv[0] is not a launcher (or runs nothing we
+    can see: a missing executing subcommand, options only). `uv run --with pytest pytest -q` →
+    `pytest -q`; `npx -- vitest run` → `vitest run`; `pnpm exec vitest` → `vitest`."""
+    entry = _LAUNCHERS.get(_basename(argv[0]))
+    if entry is None:
+        return None
+    subcommands, value_flags = entry
+    rest = argv[1:]
+    if subcommands is not None:
+        # The launcher's global options may precede the subcommand (`uv --directory x run pytest`).
+        i = _skip_launcher_flags(rest, value_flags)
+        if i >= len(rest) or rest[i] not in subcommands:
+            return None
+        rest = rest[i + 1:]
+    return rest[_skip_launcher_flags(rest, value_flags):] or None
+
+
+def _strip_python_module(argv: list[str]) -> list[str] | None:
+    """`<module> <args…>` for an interpreter run of a MODULE (`python3 -m pytest -q`, `python -um
+    pytest`, `python -Wignore -m unittest`), else None: a script path, `-c code`, stdin, or a bare
+    interpreter is not a module run. Only `-m` is modelled — it is how every Python test runner is
+    invoked when it is not on PATH."""
+    if not _PYTHON_EXE.match(_basename(argv[0])):
+        return None
+    rest = argv[1:]
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if not tok.startswith("-") or tok in ("-", "--"):
+            return None  # a script path (or stdin) runs, not a module
+        if tok.startswith("--"):
+            i += 2 if tok in _PYTHON_LONG_VALUE_OPTS else 1
+            continue
+        for j, ch in enumerate(tok[1:]):
+            glued = tok[j + 2:]
+            if ch == "m":
+                return [glued, *rest[i + 1:]] if glued else (rest[i + 1:] or None)
+            if ch == "c":
+                return None  # inline code: not a module run
+            if ch in _PYTHON_VALUE_OPTS:
+                if not glued:
+                    i += 1  # the value is the next token
+                break
+        i += 1
+    return None
+
+
 def _is_suite(exe: str, rest: list[str]) -> bool:
     """True when the segment is a build/test suite: a direct runner by name, or a package/build tool
     with a build/test subcommand token in its real args."""
@@ -572,6 +696,13 @@ def _segment_long_process(segment: list[str]) -> str | None:
     shell noise, inline env assignments, and no-op wrappers are peeled so argv[0] is the REAL
     invoked command before any keyword check runs."""
     argv = _strip_wrappers(_split_inline_env(_strip_leading_shell_noise(segment)))
+    return _argv_long_process(argv, depth=0)
+
+
+def _argv_long_process(argv: list[str], depth: int) -> str | None:
+    """Classify a peeled argv by its REAL command. When that command is a launcher or an interpreter
+    module run, peel it too and classify what it EXECUTES (`uv run python -m pytest` → `python -m
+    pytest` → `pytest`), re-peeling wrappers at each step (`uv run env CI=1 pytest`)."""
     if not argv:
         return None
     exe = _basename(argv[0])
@@ -582,7 +713,13 @@ def _segment_long_process(segment: list[str]) -> str | None:
         return "--watch (a watch loop never exits)"
     if _is_suite(exe, rest):
         return "a build/test suite"
-    return _sleep_label(exe, rest)
+    label = _sleep_label(exe, rest)
+    if label or depth >= _MAX_LAUNCHER_NESTING:
+        return label
+    inner = _strip_launcher(argv) or _strip_python_module(argv)
+    if inner is None:
+        return None
+    return _argv_long_process(_strip_wrappers(inner), depth + 1)
 
 
 def _matched_long_process(command: str) -> str | None:
