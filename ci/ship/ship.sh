@@ -2212,6 +2212,11 @@ _review_quorum_extract_own_repo_issue_url() {  # $1 = text -> at most one candid
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE \
       'https?://(www\.)?github\.com/[^/[:space:]]+/[^/[:space:]]+/issues/[0-9]+[A-Za-z0-9_]?' || true)
   [ -n "$m" ] || return 0
+  # Resolve the own-repo slugs ONCE in this shell: the three `$(…)` uses below each run in a
+  # subshell, where a memo written inside would be lost and `gh pr view --json url` re-run per
+  # use (Sonnet review on PR #577). The callers' own `$(…)` boundary still re-derives per
+  # extraction — accepted, that is one fetch per text.
+  _ship_own_repo_slugs >/dev/null
   local issues foreign n
   issues=$(_ship_own_repo_issue_numbers "$m" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
   foreign=$(_ship_foreign_repo_issue_urls "$m" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
@@ -3227,6 +3232,9 @@ _ship_first_admissible_task_code() {
 }
 _ship_derive_task_code_for_notify() {
   _SHIP_TASK_CODE_SOURCE=""; _SHIP_TASK_CODE=""
+  # The label falls back to "$TASK_CODE" only for a TASK_CODE that did NOT come from the quorum
+  # gate (the gate is off, or the variable was set in the environment) — the gate always labels
+  # what it sets and clears both when it found nothing.
   _ship_first_admissible_task_code "${TASK_CODE:-}" "${TASK_CODE_SOURCE:-\$TASK_CODE}" && return 0
   _ship_first_admissible_task_code "$(_review_quorum_extract_ticket_candidates "$BRANCH")" "the branch name" && return 0
 

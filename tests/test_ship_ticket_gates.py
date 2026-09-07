@@ -1096,6 +1096,23 @@ def test_acceptance_gate_reuses_the_quorum_code_with_its_real_source(repo, tmp_p
     assert not _merged(tmp_path)
 
 
+def test_acceptance_gate_normalizes_a_twin_spelling_the_quorum_gate_authorized(repo, tmp_path):
+    """The body says `Refs #565`, every review was recorded as `GH-565`: the quorum gate
+    authorizes under the twin and the acceptance gate reuses THAT spelling — task-cli must
+    still be asked about `#565` (its own id form), never `GH-565`, or the #572 fix would refuse
+    the very ship it authorized (Opus review on PR #577)."""
+    r = _run(repo, tmp_path, branch="feat", with_review=True, env={
+        "SHIP_REVIEW_QUORUM": "1", "SHIP_TEST_REVIEW_KNOWN_CODES": "GH-565",
+        "SHIP_TEST_PR_BODY": "Refs #565",
+        "SHIP_TEST_TASK_GATE_JSON": _ACCEPTED.replace("HYP-931", "#565"), "SHIP_TEST_TASK_GATE_EXIT": "0",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "for GH-565" in r.stdout, r.stdout
+    assert "task-code: using 'GH-565' from the PR body." in r.stderr, r.stderr
+    assert _task_calls(tmp_path) == ["gate #565 --json"], _task_calls(tmp_path)
+    assert _merged(tmp_path)
+
+
 def test_acceptance_gate_does_not_reuse_a_record_less_quorum_spelling_after_a_hatch_approval(repo, tmp_path):
     """The quorum gate found NO record for any candidate (the body's incidental `UTF-8`), Alex
     approved the ship live through the hatch — the acceptance gate must then derive afresh

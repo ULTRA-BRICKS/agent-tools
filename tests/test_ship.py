@@ -5647,6 +5647,10 @@ def _run_ship_quorum(main, gh_bindir, review_bindir, *, branch="feat", extra_arg
     # SHIP_REVIEW_QUORUM_MIN_ROLES would otherwise leak in and silently change what
     # a "default 3-role floor" test actually asserts (codex review, PR #416).
     env.pop("SHIP_REVIEW_QUORUM_MIN_ROLES", None)
+    # And for an explicit code: a shell that exports REVIEW_TASK_CODE (an agent mid-ship) would
+    # send every derivation test down the explicit-code path instead of the branch/body scan
+    # (codex review on PR #577, reproduced). Tests that want it explicit set it via env_extra.
+    env.pop("REVIEW_TASK_CODE", None)
     if env_extra:
         env.update(env_extra)
     return _sh(
@@ -8430,6 +8434,29 @@ def test_review_quorum_short_primary_is_the_verdict_when_the_twin_cannot_be_quer
     assert "could not query" not in r.stderr
     log = code_log.read_text().split()   # the twin is retried on every query tier (3), as designed
     assert log[0] == "#565" and set(log[1:]) == {"GH-565"}, log
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_no_record_primary_with_an_unqueryable_twin_cannot_be_verified(tmp_path):
+    """`#565` has NO record and the GH-565 lookup returns nothing at all: with no record in hand
+    the twin's silence is "could not query" — refuse on THAT (fail-closed, exit protocol 3),
+    never scan on as if GH-565 had answered "no record" (Sonnet review on PR #577: the branch
+    distinct from the short-primary case)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "Refs #565",
+        # GH-565 is "known" only so the fake skips its no-record answer and reaches the
+        # unqueryable branch; #565 answers no-record.
+        "SHIP_TEST_REVIEW_KNOWN_CODES": "GH-565", "SHIP_TEST_REVIEW_UNQUERYABLE_CODES": "GH-565",
+        "SHIP_TEST_REVIEW_CODE_LOG": str(code_log),
+    })
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "could not query review-cli (store unreadable / task GH-565 unknown)" in r.stderr, r.stderr
+    log = code_log.read_text().split()
+    assert log[0] == "#565" and set(log[1:]) == {"GH-565"}, log   # the twin on every tier
     assert "[fake gh] merged" not in r.stdout
 
 
