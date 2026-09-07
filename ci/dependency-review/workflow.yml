@@ -5,8 +5,12 @@
 # repository … requires GitHub Advanced Security" even with the (free) Dependency Graph ON.
 # We dropped it. Instead this gate runs dep-audit.sh: the native auditor for each ecosystem
 # (bun / npm / pnpm / yarn audit, pip-audit, cargo-audit, govulncheck). It needs NO GitHub
-# feature, audits the WHOLE tree (not just the PR diff), and draws from the same advisory
-# databases — so vuln coverage is equal-or-better than the GHAS action.
+# feature and draws from the same advisory databases — so vuln coverage is equal-or-better
+# than the GHAS action. For a PR, dep-audit.sh is given BOTH the PR head's and the base
+# branch's lockfiles below and only FAILS on advisories NEW relative to the base branch
+# (task-cli#140) — a pre-existing one (already on the base branch, not introduced by this PR)
+# is still printed as a visible warning, it just doesn't block. A push with no PR to diff
+# against still audits the whole tree unscoped, exactly as before.
 #
 # ONE GAP vs the GHAS action: it does NOT enforce a LICENSE allow/deny policy. If you need
 # that, add an OSS license gate (license-checker / cargo-deny / pip-licenses) — see the
@@ -87,7 +91,9 @@ jobs:
         run: |
           set -eu
           if [ -z "${HEAD_SHA:-}" ]; then
-            # push / no PR: audit the already-checked-out base tree.
+            # push / no PR: audit the already-checked-out base tree. There is no PR to scope
+            # against here, so BASE_DIR is left unset — dep-audit.sh falls back to its
+            # original whole-tree behavior (fail on anything found), same as before task-cli#140.
             echo "AUDIT_DIR=." >> "$GITHUB_ENV"
             exit 0
           fi
@@ -96,13 +102,21 @@ jobs:
           git fetch --no-tags --depth=1 origin "$HEAD_SHA"
           git worktree add --detach ../pr-head "$HEAD_SHA"
           echo "AUDIT_DIR=../pr-head" >> "$GITHUB_ENV"
+          # $GITHUB_WORKSPACE is the BASE branch (the default ref under pull_request_target,
+          # already checked out by the first step) — pass it as the baseline tree so
+          # dep-audit.sh only fails on advisories NEW relative to it (task-cli#140), never on
+          # ones the PR didn't introduce. See dep-audit.sh's own header for the fallback
+          # behavior when this baseline turns out to be unusable for a given ecosystem.
+          echo "BASE_DIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
 
       # codeql[actions/cache-poisoning/poisonable-step]
       # Justified: this step runs the trusted BASE-branch dep-audit.sh against the PR's
       # lockfiles as data. The native auditors do not execute package install/lifecycle
       # scripts, so no PR-controlled code runs and no cache is poisoned. Suppressed greppably.
-      - name: Dependency audit (OSS — whole-tree vulns, fail on high+)
+      - name: Dependency audit (OSS — scoped to advisories new vs. the base branch, fail on high+)
         # dep-audit.sh fails CLOSED if it finds a manifest whose auditor isn't installed
         # (set DEP_AUDIT_ALLOW_MISSING=1 to intentionally skip a missing ecosystem). The
         # trusted base script runs; AUDIT_DIR holds the PR head's lockfiles (or '.' on push).
-        run: sh "$GITHUB_WORKSPACE/ci/dependency-review/dep-audit.sh" "$AUDIT_DIR"
+        # BASE_DIR (PR events only, see above) scopes the failure to advisories NEW relative
+        # to the base branch — a pre-existing one is still reported, just not blocking.
+        run: sh "$GITHUB_WORKSPACE/ci/dependency-review/dep-audit.sh" "$AUDIT_DIR" "${BASE_DIR:-}"

@@ -6,7 +6,30 @@ tooling, no GitHub Advanced Security and no paid action.
 - **`workflow.yml`** — GitHub Actions gate. Runs `dep-audit.sh` (below). Drop into
   `.github/workflows/`.
 - **`dep-audit.sh`** — generic multi-ecosystem audit (bun / npm / pnpm / yarn audit,
-  pip-audit, cargo-audit, govulncheck). Audits the **whole tree**. Works in any CI or locally.
+  pip-audit, cargo-audit, govulncheck). Works in any CI or locally. For a PR, only FAILS on
+  advisories NEW relative to the base branch (see "Scoping to the PR" below); with no base
+  branch to compare against, audits the whole tree as before.
+
+## Scoping to the PR (task-cli#140)
+
+Auditing the whole tree unconditionally meant every PR in a repo with ANY pre-existing
+high+ transitive advisory failed this gate forever, regardless of what the PR itself changed
+— a real incident (`hyperide/hyper-saas#780`, a docs-only PR) failed on 6 pre-existing
+`browserslist`/`fast-uri` advisories it never touched.
+
+`dep-audit.sh` now takes an optional second argument, `BASE_DIR` — the base branch's checked
+out tree. `workflow.yml` passes it as `$GITHUB_WORKSPACE` under `pull_request_target` (which
+is already the base branch's checkout, see "Tamper-resistance" below). When given, the
+bun/npm/pnpm/yarn branches also audit `BASE_DIR` and diff by the GitHub Advisory Database's
+numeric id: an advisory present in **both** the PR head and the base branch is printed as a
+visible informational warning but does **not** fail the check; an advisory present **only**
+in the PR head is genuinely new and **does** fail it. Python/Rust/Go audits are not scoped
+this way yet — they keep auditing the whole tree unconditionally.
+
+Every path that can't establish a trustworthy baseline (`jq` not installed, `BASE_DIR` unset
+or unresolvable, no matching lockfile there, or an unparseable audit run) fails OPEN toward
+the **original** whole-tree behavior for that ecosystem — it never crashes and never silently
+passes something it can't verify.
 
 ## Why not `actions/dependency-review-action`?
 
@@ -20,7 +43,7 @@ graph alone is not enough; the action gates on GHAS for private repos.) So we dr
 | | `dependency-review-action` (GHAS) | `dep-audit.sh` (OSS) |
 |---|---|---|
 | Cost | GHAS (paid) on private repos | free |
-| Scope | the PR **diff** (new deps only) | the **whole tree** (incl. pre-existing) |
+| Scope | the PR **diff** (new deps only) | the **whole tree**, scoped to advisories new-vs-base for bun/npm/pnpm/yarn (task-cli#140); still whole-tree for pip/cargo/go |
 | Vuln source | GitHub Advisory DB | each ecosystem's auditor (npm/bun → GitHub Advisory DB; pip-audit → OSV; cargo-audit → RustSec; govulncheck → Go DB) |
 | **License policy** | **allow/deny licenses ✅** | **not covered ⚠️** |
 
@@ -73,9 +96,11 @@ cp ci/dependency-review/workflow.yml .github/workflows/dependency-review.yml
 # the comments in workflow.yml); ubuntu-latest already ships node+npm so npm-only repos need
 # nothing extra — trim setup-bun if you have no bun.lock.
 
-# Run the same audit locally / in any other CI (optional dir arg, default '.'):
-sh ci/dependency-review/dep-audit.sh           # audit the current tree
-sh ci/dependency-review/dep-audit.sh path/to/checkout   # audit another checkout's lockfiles
+# Run the same audit locally / in any other CI (optional AUDIT_DIR, default '.'; optional
+# BASE_DIR to scope failures to advisories new relative to it — requires `jq` on PATH):
+sh ci/dependency-review/dep-audit.sh                                    # audit the current tree
+sh ci/dependency-review/dep-audit.sh path/to/checkout                   # audit another checkout's lockfiles
+sh ci/dependency-review/dep-audit.sh path/to/pr-head path/to/base-branch # only fail on advisories new vs. base
 ```
 
 > If your repo already has its own dependency-audit job, you don't need this one — don't
@@ -99,6 +124,10 @@ in the repo README.
   isn't installed. **Default `0` (fail-CLOSED):** a detected ecosystem with no usable scanner
   is a gate failure, not a silent skip — otherwise "no audit ran" masquerades as "no vulns".
   Install the named tool in your CI image, or set this to `1` to intentionally skip.
+- `BASE_DIR` (2nd positional arg, not an env var) — the base branch's checked-out tree, for
+  scoping bun/npm/pnpm/yarn failures to advisories new relative to it (task-cli#140). Requires
+  `jq` on PATH; without it, or without this argument, falls back to the original whole-tree
+  behavior. See "Scoping to the PR" above.
 
 ## Relationship to other slots
 
