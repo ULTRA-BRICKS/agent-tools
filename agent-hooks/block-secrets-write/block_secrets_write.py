@@ -41,8 +41,13 @@ PLACEHOLDER = re.compile(
 PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("private key block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
     ("AWS access key id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    # An ASSIGNMENT (`token = "…"`, `API_KEY: …`) — not a URL QUERY PARAMETER (`?token=…`,
+    # `&access_key=…`): the `(?<![?&])` lookbehind keeps a documented request URL in prose
+    # (an audit report's `…/redeem?token=ultra-invalid-proof`) from reading as a key being
+    # written into source. A real credential in a URL is still caught by the specific
+    # patterns below (slack / openai / AWS shapes) — this narrows only the generic one.
     ("generic api/secret token assignment",
-     re.compile(r"(?i)\b(?:api[_-]?key|secret|token|access[_-]?key|client[_-]?secret|"
+     re.compile(r"(?i)(?<![?&])\b(?:api[_-]?key|secret|token|access[_-]?key|client[_-]?secret|"
                 r"password|passwd)\b\s*[:=]\s*['\"]?([A-Za-z0-9_\-+/=]{16,})['\"]?")),
     ("bearer credential", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=]{20,}")),
     ("slack token", re.compile(r"\bxox[abpsr]-[A-Za-z0-9-]{10,}\b")),
