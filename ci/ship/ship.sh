@@ -2745,15 +2745,23 @@ fi
 #   2. a committed `SHIP_EXTERNAL_REVIEW=0` line in the repo's `.ship-config` (see "Knobs (file)"
 #      above) — an AUDITED, per-repo, reviewed-like-any-other-code alternative that a test
 #      process never inherits (it is read only from the repo under test's own HEAD, not from the
-#      environment), closing the GH-528 gap without going back to a leaky global env export.
+#      environment), closing the agent-tools#528 gap without going back to a leaky global env
+#      export.
 # Either source disabling it is enough (OR, not AND) — matching _acceptance_gate's existing
 # precedence: an explicit env=1 does not override a `.ship-config` SHIP_EXTERNAL_REVIEW=0, since
 # neither mechanism can force the gate back ON when the other says off.
+#
+# `.ship-config` is read from `$ROOT` — this checkout's own repo root — which is the WRONG repo's
+# policy for a `--repo`/foreign-target ship (same reasoning _acceptance_gate already applies to
+# its own foreign-repo skip: a local file here answers for a DIFFERENT repo's PR). Skip the file
+# lookup entirely on a foreign invoke so this checkout's `.ship-config` can never silently waive
+# the gate for someone else's repo; the env-var off-switch still applies (it is an explicit,
+# per-invocation operator choice, not an ambient local file read).
 EXTREV_ENABLED=1
 EXTREV_DISABLED_BY_SHIP_CONFIG=0
 case "${SHIP_EXTERNAL_REVIEW_ENABLED:-1}" in 0|false|no) EXTREV_ENABLED=0 ;; esac
 case "${SHIP_EXTERNAL_REVIEW:-1}" in 0|false|no) EXTREV_ENABLED=0 ;; esac
-if [ "$EXTREV_ENABLED" = "1" ]; then
+if [ "$EXTREV_ENABLED" = "1" ] && [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ]; then
   _ship_config_load "$ROOT"
   case "$SHIP_CFG_EXTERNAL_REVIEW" in
     0|false|no) EXTREV_ENABLED=0; EXTREV_DISABLED_BY_SHIP_CONFIG=1 ;;

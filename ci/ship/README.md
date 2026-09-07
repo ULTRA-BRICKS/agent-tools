@@ -39,14 +39,17 @@ test runner picks a command in this order (highest priority first):
 2. **`.ship-config` file, committed at the repo root** — an audited, per-repo override for
    repos where auto-detection can't guess correctly (e.g. a monorepo-of-fixtures whose real
    suite lives in a subdirectory, like a project with no root-level manifest). Simple
-   `KEY=value` lines, two whitelisted keys: `SHIP_LOCAL_TEST_DIR=<path>` (a repo-relative
-   subdirectory to run the command from, or to scope auto-detection to) and
-   `SHIP_LOCAL_TEST_CMD=<cmd>` (a command line, eval'd the same way as the env var of the
-   same name — this is just a committed, per-repo source for it). The file is read from the
-   last **committed** content at `HEAD` (`git show HEAD:.ship-config`), never the working
-   tree, so an uncommitted/staged-only edit is not honored — the "audited" claim is an
-   enforced property. `SHIP_LOCAL_TEST_DIR` is rejected (and invalidates the whole file) if
-   it's absolute, contains a `..` path component, or resolves to the repo root itself.
+   `KEY=value` lines. Two of its four whitelisted keys drive THIS local-test-command
+   selection: `SHIP_LOCAL_TEST_DIR=<path>` (a repo-relative subdirectory to run the command
+   from, or to scope auto-detection to) and `SHIP_LOCAL_TEST_CMD=<cmd>` (a command line,
+   eval'd the same way as the env var of the same name — this is just a committed, per-repo
+   source for it). The other two, `SHIP_ACCEPTANCE_GATE=0` and `SHIP_EXTERNAL_REVIEW=0`, are
+   unrelated ops off-switches for two different gates — see the knobs table and the refusal
+   table above. The file is read from the last **committed** content at `HEAD`
+   (`git show HEAD:.ship-config`), never the working tree, so an uncommitted/staged-only edit
+   is not honored — the "audited" claim is an enforced property. `SHIP_LOCAL_TEST_DIR` is
+   rejected (and invalidates the whole file) if it's absolute, contains a `..` path
+   component, or resolves to the repo root itself.
 3. **`dev run --repo-only test`** if the repo has a committed `rig.yaml`, that file declares
    top-level `scripts.test`, and `dev` is on PATH. Probe/runtime errors from
    `dev has-script --repo-only test` block instead of silently guessing a fallback runner.

@@ -7987,6 +7987,38 @@ def test_external_review_ship_config_ignored_when_uncommitted(repo_with_two_work
     assert "[fake gh] merged" not in r.stdout
 
 
+def test_external_review_ship_config_ignored_on_foreign_repo_invoke(repo_with_two_worktrees, tmp_path):
+    """A `.ship-config` disabling the gate lives in THIS checkout's repo root -- for a `--repo
+    other/repo` invocation that is a DIFFERENT repo's policy, so it must never waive the gate for
+    the foreign target (the same class of bug #600 exists to close: the wrong repo's setting
+    silently taking effect). Mirrors _acceptance_gate's own foreign-repo skip."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    (main / ".ship-config").write_text("SHIP_EXTERNAL_REVIEW=0\n", encoding="utf-8")
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "disable the external-review gate for THIS repo only", cwd=main)
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env.pop("SHIP_EXTERNAL_REVIEW_ENABLED", None)
+    env.pop("SHIP_EXTERNAL_REVIEW", None)
+    env.pop("GH_REPO", None)
+    env.pop("GH_SHIP_REPO", None)
+    r = _sh(
+        "bash", str(_SHIP), "1", "--repo", "owner/repo", "--no-screenshot-ok", "test",
+        cwd=main, env=env,
+    )
+    assert r.returncode != 0, (
+        f"a foreign --repo invocation must NOT be waived by this checkout's own .ship-config\n"
+        f"{r.stdout}\n{r.stderr}"
+    )
+    assert "ZERO GitHub-side reviews" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
 def test_external_review_fails_closed_when_python3_exits_zero_without_sentinel(repo_with_two_worktrees, tmp_path):
     """Security fail-closed: a fake/broken `python3` that exits 0 but prints NO `APPROVED` sentinel
     must NOT be mistaken for approval — ship refuses and audits bypass:denied. Mirrors the
