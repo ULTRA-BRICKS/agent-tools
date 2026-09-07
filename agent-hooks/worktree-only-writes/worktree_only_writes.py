@@ -32,6 +32,8 @@ Contract (agents-hooks/v1):
   stdin  : JSON event; target path in args.file_path/path/notebook_path; event.cwd is the shell dir.
            The verdict is keyed to the checkout the TARGET FILE lives in (its directory), not the
            shell cwd — they can differ (cwd in a worktree, an absolute write into the main checkout).
+           See `_target_dir`'s docstring for the no-path-key and relative-path resolution rules
+           (agent-tools#615).
   stdout : protocol JSON only       exit 0 : allow   exit 10 : BLOCK   other : error
 
 on_error is "open": workflow discipline, not a security boundary — a git/parse failure must
@@ -275,14 +277,40 @@ def _decide_block(cwd: str, branch: str) -> int:
     return BLOCK_EXIT_CODE
 
 
-def _target_dir(cwd: str, args: dict) -> str:
-    """The directory whose branch decides the verdict: the WRITE TARGET's dir, else ``cwd``.
+def _existing_ancestor(start: Path, base: str) -> str:
+    """The nearest existing directory at or above ``start`` — the target may not exist yet
+    (a create), so walk up to a real directory the git query can run against. Falls back to
+    ``base`` if nothing above ``start`` exists either; a downstream git query on a bogus
+    ``base`` fails open via this hook's own `on_error: open` contract, not a crash."""
+    for cand in (start, *start.parents):
+        if cand.exists():
+            return str(cand)
+    return base
 
-    The guard is about WHERE the file is authored, not the shell's cwd. A Write to an absolute path
-    inside a default-branch checkout must be judged against THAT checkout's branch even when cwd is
-    a feature worktree (and vice-versa) — so we resolve the branch from the target file's directory,
-    falling back to cwd only when there is no path (codex). The file may not exist yet (a create) →
-    walk up to the nearest existing ancestor so the git query has a real directory.
+
+def _target_dir(cwd: str, args: dict) -> str:
+    """The directory whose branch decides the verdict: the WRITE TARGET's dir, else `cwd`.
+
+    Resolves the branch from the target file's directory, not the shell's cwd — an absolute
+    write into the main checkout must be judged as main even when cwd is a feature worktree
+    (and vice-versa). A relative path is judged against `cwd`. The file may not exist yet (a
+    create) → walk up to the nearest existing ancestor for the git query.
+
+    DELIBERATE fallback to `cwd` when NO file_path/path/notebook_path key is usable at all —
+    whether a key is missing entirely or present but blank/wrong-typed, both are "no path
+    signal" and get the identical, tested outcome (agent-tools#615, replacing the prior
+    UNDOCUMENTED silent fallthrough with this explicit, deliberate, tested one). codex's
+    `apply_patch` bridge (its only write tool) genuinely produces a path-less pre-write event
+    when its patch-envelope parser finds no file path in the command text
+    (lib/codex_hook_bridge/dispatch.py's `to_v1_event`) — failing OPEN in that case would
+    turn a real parse hiccup into a silent bypass of the very guard this hook exists to
+    enforce. Judging `cwd` directly keeps this hook's normal posture (BLOCK on main, ALLOW on
+    a feature branch) even when the target path itself could not be determined.
+
+    Known limitation (agent-tools#613/#615, tracked in #616): a relative hashline path is
+    judged against `cwd` even when the file really lives in a different worktree — a
+    same-repo sibling-worktree existence guess was tried and reverted as exploitable. Use an
+    absolute path, or the `RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES` escape hatch, for that case.
     """
     base = cwd or os.getcwd()
     for key in ("file_path", "path", "notebook_path"):
@@ -291,10 +319,7 @@ def _target_dir(cwd: str, args: dict) -> str:
             target = Path(raw)
             if not target.is_absolute():
                 target = Path(base) / target
-            for cand in (target.parent, *target.parent.parents):
-                if cand.exists():
-                    return str(cand)
-            return base
+            return _existing_ancestor(target.parent, base)
     return base
 
 
