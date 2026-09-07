@@ -153,6 +153,15 @@ class TestBlocksDirectMutation:
         assert out["code"] == rtc.BLOCK_EXIT_CODE
         assert out["decision"] == "block"
 
+    def test_gh_api_compact_method_flag_blocks(self, tmp_path):
+        """`-XPOST` (concatenated) — verified live against the installed gh (a 404 JSON
+        response, not an "unknown flag" error). Found during the review-cli quorum pass on
+        agent-tools#597, not one of the original 6 threads."""
+        repo = _git_repo(tmp_path)
+        out = _run("gh api repos/o/r/issues -XPOST", cwd=repo, scratch=tmp_path)
+        assert out["code"] == rtc.BLOCK_EXIT_CODE
+        assert out["decision"] == "block"
+
     def test_gh_api_concrete_comment_route_blocks(self, tmp_path):
         """`repos/<owner>/<repo>/issues/comments/<comment_id>` — GitHub's route for mutating ONE
         issue comment directly, not nested under an issue number. Review finding,

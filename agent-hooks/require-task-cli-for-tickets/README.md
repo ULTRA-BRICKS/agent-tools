@@ -39,7 +39,9 @@ method — any `-f`/`-F`/`--field`/`--raw-field`/`--input` (which makes `gh api`
 `--field=title=x`). A plain `gh api repos/o/r/issues` with no method/fields is `gh api`'s own GET
 default — a read — and is not gated, matching the `gh issue view`/`list` exclusion. An explicit
 `--method`/`-X` always wins over field-flag inference: `-X GET -f state=open` is a read (gh's own
-docs: `--method GET` sends fields as a query string, not a body). This closes the `gh issue
+docs: `--method GET` sends fields as a query string, not a body). `-X` itself is recognized in
+its separate-token (`-X POST`), compact (`-XPOST`), `=`-attached (`-X=POST`), and long
+`--method=POST` forms — all verified live against the installed gh. This closes the `gh issue
 create` → `gh api repos/o/r/issues -f title=...` evasion without touching the many other
 legitimate uses of `gh api` (PRs, releases, workflow runs, …).
 
@@ -83,6 +85,15 @@ hook nags, it doesn't wedge a machine that can't answer the question.
 
 ## What's deliberately NOT covered
 
+- **A nested shell interpreter** (`bash -c 'gh issue create --title x'`, `sh -c …`) or a command
+  substitution (`echo "$(gh issue create --title x)"`) — same documented limitation as the rest
+  of this hook family (`block-no-verify`, `block-devserver-primary`, `block-reset-hard`,
+  `pkill-guard`). Detection here is argv-scoped: only the top-level command segment is tokenized
+  and checked for a `gh` executable; a `gh` invocation buried inside another interpreter's
+  string argument is not re-parsed. `no-shell-file-edit` is the one sibling that DOES unwrap
+  `bash -c`/`sh -c` (up to a depth cap) because its own domain — file edits — makes that
+  worthwhile; adding the same recursive unwrapping here is a real, separate feature, not a
+  quick fix, and is tracked as a follow-up rather than folded into this pass.
 - **A Linear MCP tool call** (e.g. a `mcp__…__save_issue`/`mcp__…__create_issue`-shaped tool
   invocation through a Linear MCP server) — the actual incident that prompted this hook. There is
   **no `pre-mcp-tool`-style hook point in this family yet**: `agent-hooks/README.md`'s point table

@@ -341,6 +341,19 @@ class GhApiClassification(unittest.TestCase):
             mod.gh_api_issue_mutation(["gh", "api", "repos/o/r/issues", "-X", "POST"])
         )
 
+    def test_compact_method_flag_forms_are_recognized(self):
+        """`-XPOST` (concatenated) and `-X=POST` (pflag `=` form) — both verified live against
+        the installed gh (a 404 JSON response, not an "unknown flag" error). Found during the
+        review-cli quorum pass on agent-tools#597, not one of the original 6 threads."""
+        self.assertTrue(mod.gh_api_issue_mutation(["gh", "api", "repos/o/r/issues", "-XPOST"]))
+        self.assertTrue(mod.gh_api_issue_mutation(["gh", "api", "repos/o/r/issues", "-X=POST"]))
+        self.assertFalse(mod.gh_api_issue_mutation(["gh", "api", "repos/o/r/issues", "-XGET"]))
+        self.assertFalse(
+            mod.gh_api_issue_mutation(
+                ["gh", "api", "repos/o/r/issues", "-XGET", "-f", "state=open"]
+            )
+        )
+
     def test_concrete_comment_route_is_mutation(self):
         """`repos/<owner>/<repo>/issues/comments/<comment_id>` — GitHub's route for mutating ONE
         issue comment directly (it does not nest under an issue number). Review finding,

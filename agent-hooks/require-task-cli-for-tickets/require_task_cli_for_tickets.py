@@ -430,7 +430,8 @@ def gh_api_issue_mutation(argv: list[str]) -> bool:
     GET -f state=open` is a read (gh's own docs: `--method GET` sends fields as a query string,
     not a body) even though fields are present, and `-X POST` is a write even with no fields at
     all. Inferring the mutation from field presence alone when a method was explicitly given
-    blocked legitimate filtered reads (review finding, agent-tools#597)."""
+    blocked legitimate filtered reads (review finding, agent-tools#597). `-X`'s compact forms
+    (`-XPOST`, `-X=POST`) are recognized too, not just the separate-token/`--method=` spellings."""
     i = _skip_gh_global_flags(argv, 1)
     if i >= len(argv) or argv[i] != "api":
         return False
@@ -446,6 +447,19 @@ def gh_api_issue_mutation(argv: list[str]) -> bool:
             continue
         if tok.startswith("--method="):
             explicit_method = tok.split("=", 1)[1].strip().upper()
+            i += 1
+            continue
+        # Compact short-flag forms of `-X`: `-XPOST` (concatenated, no separator) and `-X=POST`
+        # (pflag also accepts a `=` after a short flag) — both verified live against the
+        # installed gh (a 404 JSON body, not an "unknown flag" error, from `gh api -XGET
+        # <nonexistent-path>` and `-X=GET`, proving gh parsed the method rather than ignoring
+        # the token). Separate-token-or-`--method=`-only checking missed both (review-cli
+        # quorum-pass finding, agent-tools#597).
+        if tok.startswith("-X") and tok != "-X" and len(tok) > 2:
+            value = tok[2:]
+            if value.startswith("="):
+                value = value[1:]
+            explicit_method = value.strip().upper()
             i += 1
             continue
         if tok in _GH_API_FIELD_FLAGS and i + 1 < len(argv):
