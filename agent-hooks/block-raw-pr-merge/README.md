@@ -11,7 +11,11 @@ Denies a shell command that merges a PR directly and bypasses the ship gate:
   even with `$variables` — or a file/stdin/substitution-backed query, which is over-blocked because
   it can't be inspected at pre-exec time)
 - any of the above behind a **wrapper** command (`env gh pr merge`, `sudo … gh pr merge`,
-  `timeout 60 gh pr merge`, `nohup`, `command`, …) — the wrapped `gh` is still an invoked merge
+  `timeout 60 gh pr merge`, `nohup`, `command`, `find . -exec gh pr merge {} \;`, …) — the wrapped
+  `gh` is still an invoked merge, even behind a wrapper flag whose OWN value happens to look like a
+  head (`env -u gh gh pr merge 1` unsets an env var *named* `gh`; the resolver tries every
+  head-shaped token in the segment, not just the first, so that decoy can't hide the real merge one
+  token later — agent-tools#606)
 - any of the above wrapped in a **command substitution** — `` `gh pr merge 1` ``, `$(gh pr merge 1)`,
   `echo "$(gh pr merge 1)"` (executed even inside double quotes), or a process substitution
   `<(gh pr merge 1)` — the substitution body is extracted and re-scanned. A `$( … )` inside a `#`
@@ -73,6 +77,33 @@ merge 1` / `merge`). Rather than chase every mis-classification, any executable-
 skipped body line is re-injected and blocked. A legitimate heredoc almost never opens a line with a
 literal `gh pr merge`; a prose mention still passes. If a genuine heredoc trips this, re-phrase it or
 use the Telegram hatch below.
+
+## Known scope boundary (documented residual, agent-tools#606 adversarial re-audit)
+
+Detection is anchored on the `gh` CLI (plus `ghgql`, a shell interpreter's `-c` string, and
+`eval`) — a closed, known set. Two classes of merge remain genuinely undetected, both accepted
+residuals rather than gaps to chase, because closing them would mean the hook trying to bound an
+unbounded problem:
+
+- **Any general-purpose interpreter exec'ing `gh pr merge`** — `python3 -c "subprocess.run(['gh',
+  'pr','merge','1'])"`, `perl -e 'exec(...)'`, `node -e "..."`, or a **separate script file**
+  written to disk and then run (`bash merge.sh`, `./merge.sh`). The hook parses shell syntax and a
+  shell interpreter's `-c` string; it does not (and cannot, in general) interpret arbitrary
+  Python/Perl/JS/Ruby source or read and re-parse an externally referenced script file — doing so
+  would mean solving the halting problem for arbitrary code, or reading and rescanning every script
+  any agent workflow ever runs (wholesale blocking every `bash script.sh` invocation to be safe
+  would make the hook useless for ordinary development).
+- **A raw HTTP client hitting GitHub's API directly** — `curl -X PUT
+  https://api.github.com/repos/o/r/pulls/<n>/merge`, `wget --method=PUT …`, or a `curl`/`wget` POST
+  to `…/graphql` with a `mergePullRequest` body. The REST/GraphQL merge-route detection is
+  `gh api`-specific (and `ghgql`, which wraps it); a bare HTTP client is a different program with no
+  argv shape in common with `gh` at all.
+
+Both were tested and confirmed to pass (`allow`) during the #606 adversarial audit. Neither is
+believed to be the historical 2026-07-18→07-23 ROADMAP finding (that one — the clustered-flag `gh
+api` parsing gap tracked as #333 — is fixed; see ROADMAP.md). If either residual becomes a live
+concern, treat it as new scope (a filesystem-reading `pre-bash` hook, or blocking known GitHub API
+hosts across HTTP clients) rather than something this argv-parsing design can absorb as-is.
 
 ## Why an agent-hook (not a skill, not a git-hook)
 

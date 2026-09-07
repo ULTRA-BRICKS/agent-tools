@@ -1270,6 +1270,79 @@ def test_additional_exec_wrappers_are_covered(command, monkeypatch):
     assert _decision(out) == "block"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `-u gh` unsets an env var NAMED `gh`; the real command is the remaining argv. Confirmed
+        # live: `env -u gh gh --version` really does print the gh version.
+        "env -u gh gh pr merge 1",
+        # `-C gh` (GNU env, change directory to a dir literally named `gh`) — same decoy shape as
+        # `-u`, a different value-taking flag.
+        "env -C gh gh pr merge 1",
+        # `-E gh` sets xargs's logical EOF string to `gh`; the wrapped command is still `gh pr
+        # merge {}`.
+        "xargs -E gh -I{} gh pr merge {}",
+        # `sudo -u gh` (run as a user literally named `gh`) — same decoy shape, less realistic in
+        # practice (needs a real user named `gh`) but the same parser hazard.
+        "sudo -u gh gh pr merge 1",
+    ],
+)
+def test_decoy_head_shaped_wrapper_flag_value_is_blocked(command, monkeypatch):
+    """agent-tools#606 adversarial-audit finding: `_resolve_invoked_argv` used to return only the
+    FIRST token in a wrapped segment whose basename matched a head (`gh`/a shell interpreter/
+    `eval`). A wrapper flag whose OWN value happens to be head-shaped (`env -u gh …`, `xargs -E gh
+    …`) hijacked that first match, so the resolver read `['gh', '-u', 'gh', 'pr', 'merge', '1']`
+    for `env -u gh gh pr merge 1` — `sub[0]` came out `'gh'`, not `'pr'`, silently missing the real
+    merge one token later — and the whole command was wrongly ALLOWED even though it genuinely
+    invokes `gh pr merge` (confirmed live before the fix: `env -u gh gh --version` prints the real
+    gh version, proving `-u`'s value is consumed and the tail is the real command). The fix
+    (`_resolve_invoked_argv_candidates`) tries EVERY head-shaped token in the segment, not just the
+    first, and blocks if any candidate resolves to a merge route."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"find . -exec gh pr merge {} \;",
+        "find . -exec gh pr merge {} +",
+        r"find . -maxdepth 1 -exec gh pr merge 1 \;",
+        # A `-name gh` decoy positioned AHEAD of the real `-exec gh pr merge` must not hide it —
+        # the multi-candidate scan tries every head-shaped token, not just the first.
+        r"find . -name gh -exec gh pr merge 1 \;",
+    ],
+)
+def test_find_exec_merge_is_blocked(command, monkeypatch):
+    """agent-tools#606 adversarial-audit finding: `find`'s `-exec`/`-execdir`/`-ok`/`-okdir` actions
+    genuinely exec the given argv — the same threat class `xargs` already covers — but `find` was
+    not in `_WRAPPERS`, so `find . -exec gh pr merge {} \\;` was a working, undetected raw merge.
+    Added to `_WRAPPERS`; safe now that `_resolve_invoked_argv_candidates` tries every head-shaped
+    token instead of stopping at the first, so a `-name`/`-path` value that happens to read `gh`
+    cannot hide a later, real `-exec gh pr merge`."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"""find . -name "*.py" -exec black {} \;""",
+        "find . -name gh",  # a benign search for a file literally named `gh` — no `-exec` at all
+        "find . -name gh -print",
+    ],
+)
+def test_find_without_merge_is_still_allowed(command, monkeypatch):
+    """A benign `find` — even one whose `-name` value happens to literally read `gh` — must still
+    ALLOW: `_is_invoked_head` requires an EXACT basename match, and with no real `gh pr merge`/`gh
+    api` invocation anywhere in the segment no candidate resolves to a merge route."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
 def test_command_dash_v_gh_is_not_a_merge(monkeypatch):
     """`command -v gh` (a lookup, `command` is a wrapper + a bare `gh` tail with no subcommand) must
     ALLOW — the resolved `gh` has no `pr merge`/`api` subargs (codex review round 8, FP guard)."""

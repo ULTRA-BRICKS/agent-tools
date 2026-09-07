@@ -156,12 +156,16 @@ _GH_VALUE_FLAGS = frozenset({"-R", "--repo", "--hostname"})
 # obscure wrapper not listed here (and deliberate circumvention generally) is a documented residual
 # — the scan must stay keyed to KNOWN executors, because treating ANY leading token as a wrapper
 # would re-block a prose mention (`see the gh pr merge docs`) that anchoring on the invoked command
-# exists to allow.
+# exists to allow. `find` is included because its `-exec`/`-execdir`/`-ok`/`-okdir` actions genuinely
+# exec the given argv (`find . -exec gh pr merge {} \;`, agent-tools#606) — the SAME threat class as
+# `xargs`, and safe to scan generically now that `_resolve_invoked_argv_candidates` tries every
+# head-shaped token in the segment rather than stopping at the first: a `-name gh` decoy ahead of a
+# real `-exec gh pr merge` no longer hides it (agent-tools#606).
 _WRAPPERS = frozenset(
     {"env", "command", "builtin", "exec", "sudo", "doas", "nice", "ionice", "stdbuf", "nohup",
      "setsid", "time", "timeout", "xargs", "flock", "chronic", "firejail", "strace", "ltrace",
      "valgrind", "taskset", "setarch", "numactl", "chrt", "unbuffer", "proxychains", "proxychains4",
-     "catchsegv", "setpriv", "rlwrap", "watch", "script", "torify", "cpulimit"}
+     "catchsegv", "setpriv", "rlwrap", "watch", "script", "torify", "cpulimit", "find"}
 )
 # Interpreters that run a command from a STRING argument (not the token stream): a shell's `-c
 # <cmd>` and `eval <args…>`. A merge hidden in that quoted string can't be reached by the wrapper
@@ -1138,25 +1142,39 @@ def _is_invoked_head(base: str) -> bool:
     return base == "gh" or base == _GHGQL_WRAPPER or base == "eval" or base in _SHELL_INTERPRETERS
 
 
-def _resolve_invoked_argv(argv: list[str]) -> list[str] | None:
-    """Return the argv of the actually-invoked command, seeing through ONE wrapper prefix. Returns
-    the tail starting at the first token whose basename is `gh`, a shell interpreter, or `eval` —
-    so `env gh pr merge`, `env bash -c '…'` (wrapper + interpreter), and `/usr/bin/timeout 60 gh …`
-    (path-qualified) all resolve. Returns None when no such invocation is at the command position.
-    A quoted `gh pr merge` inside another program's arg (`echo "gh pr merge"`) is one token whose
-    basename is not a head, so it is not matched (Opus/codex reviews 4/6/7)."""
+def _resolve_invoked_argv_candidates(argv: list[str]) -> list[list[str]]:
+    """Return EVERY argv tail that could be the actually-invoked command, seeing through ONE
+    wrapper prefix: the direct head itself (`argv[0]` when its basename is `gh`, a shell
+    interpreter, or `eval`), or — behind a known `_WRAPPERS` prefix — the tail starting at EVERY
+    later token whose basename is a head, not only the first. So `env gh pr merge`, `env bash -c
+    '…'` (wrapper + interpreter), and `/usr/bin/timeout 60 gh …` (path-qualified) all resolve. A
+    quoted `gh pr merge` inside another program's arg (`echo "gh pr merge"`) is one token whose
+    basename is not a head, so it is not matched (Opus/codex reviews 4/6/7).
+
+    Multiple candidates, not just the first (agent-tools#606): `_WRAPPERS`' own flag grammar is
+    NOT modeled (see the `_WRAPPERS` comment below), so the scan cannot tell a wrapper's flag VALUE
+    from the start of the wrapped command. A coincidentally head-shaped VALUE earlier in argv —
+    `env -u gh gh pr merge 1` (`gh` is `-u`'s argument, unsetting a same-named env var; confirmed
+    live: `env -u gh gh --version` really does print the gh version — `-u`'s value is consumed and
+    the remaining argv is the real command) or `xargs -E gh -I{} gh pr merge {}` (`gh` is `-E`'s
+    eof-string) — used to HIJACK resolution: returning only the first match made the caller scan
+    the WRONG tail (`['gh', '-u', 'gh', 'pr', 'merge', '1']` for the `env` example — its `sub[0]`
+    is `'gh'`, not `'pr'`, so the merge one token later was silently missed) and ALLOW a command
+    that genuinely invokes `gh pr merge`. Returning every candidate and letting the caller block if
+    ANY of them is a merge route closes this without modeling each wrapper's flag arity — the same
+    escape-hatch the original single-match scan took, just applied exhaustively. This can only ADD
+    over-blocks (the safe direction: `nice echo gh pr merge` was already an accepted over-block),
+    never remove a real detection the single-match scan already made."""
     if not argv:
-        return None
+        return []
     if _is_invoked_head(os.path.basename(argv[0])):
-        return argv
+        return [argv]
     if os.path.basename(argv[0]) in _WRAPPERS:  # basename so `/usr/bin/env …` matches too
-        # Scan for the wrapped invoked head without modelling each wrapper's flag arity. This can
+        # Scan for every wrapped invoked head without modelling each wrapper's flag arity. This can
         # OVER-block a token that is merely DATA to a non-head command under a wrapper (`nice echo
         # gh pr merge`) — the safe direction for a security gate; a merge is never let through.
-        for k in range(1, len(argv)):
-            if _is_invoked_head(os.path.basename(argv[k])):
-                return argv[k:]
-    return None
+        return [argv[k:] for k in range(1, len(argv)) if _is_invoked_head(os.path.basename(argv[k]))]
+    return []
 
 
 def _unparseable_command_has_invoked_head(command: str) -> bool:
@@ -1186,7 +1204,7 @@ def _unparseable_command_has_invoked_head(command: str) -> bool:
     if current:
         segments.append(current)
     return any(
-        _resolve_invoked_argv(_segment_argv(segment)) is not None for segment in segments
+        _resolve_invoked_argv_candidates(_segment_argv(segment)) for segment in segments
     )
 
 
@@ -1214,16 +1232,12 @@ def _wrapped_command_strings(argv: list[str]) -> list[str]:
     return []
 
 
-def _is_merge_route(segment: list[str], strict: bool = False) -> bool:
-    """True iff this segment's argv is a direct PR-merge route that skips `gh ship`: `gh pr merge …`
-    (incl. behind a `gh -R o/r` global flag, a wrapper like `env`/`sudo`/`timeout`, or a wrapper +
-    interpreter like `env bash -c '…'`), or a `gh api` REST/GraphQL merge (see `_gh_api_is_merge`),
-    or a merge inside a shell interpreter's `-c` string / `eval` argument. Anchored on the
-    ACTUALLY-invoked command, so a prose mention in another program's args (`tg "…mergePullRequest…"`,
-    `echo mergePullRequest`) and `git merge main` all pass. `strict` — see `_graphql_query_is_unprovable`."""
-    argv = _resolve_invoked_argv(_segment_argv(segment))
-    if argv is None:
-        return False
+def _is_merge_route_for_argv(argv: list[str], strict: bool = False) -> bool:
+    """The merge-route check for ONE resolved invocation candidate — split out of `_is_merge_route`
+    so it can be applied to EVERY candidate `_resolve_invoked_argv_candidates` returns, not just
+    the first (agent-tools#606: a wrapper flag VALUE that happens to be head-shaped, e.g. `env -u
+    gh gh pr merge 1`, could otherwise hijack resolution onto the wrong tail and hide a real merge
+    one token later)."""
     if os.path.basename(argv[0]) == "gh":
         sub = _gh_subargs(argv)
         if len(sub) >= 2 and sub[0] == "pr" and sub[1] == "merge":
@@ -1242,6 +1256,23 @@ def _is_merge_route(segment: list[str], strict: bool = False) -> bool:
         if _command_contains_gh_pr_merge(cmd, strict=True) is True:
             return True
     return False
+
+
+def _is_merge_route(segment: list[str], strict: bool = False) -> bool:
+    """True iff this segment's argv is a direct PR-merge route that skips `gh ship`: `gh pr merge …`
+    (incl. behind a `gh -R o/r` global flag, a wrapper like `env`/`sudo`/`timeout`, or a wrapper +
+    interpreter like `env bash -c '…'`), or a `gh api` REST/GraphQL merge (see `_gh_api_is_merge`),
+    or a merge inside a shell interpreter's `-c` string / `eval` argument. Anchored on the
+    ACTUALLY-invoked command, so a prose mention in another program's args (`tg "…mergePullRequest…"`,
+    `echo mergePullRequest`) and `git merge main` all pass. `strict` — see `_graphql_query_is_unprovable`.
+
+    Checks EVERY candidate `_resolve_invoked_argv_candidates` returns, not just one: a wrapper's
+    own flag grammar is unmodeled, so more than one token in the segment can look like the wrapped
+    head, and only one of them is real (agent-tools#606)."""
+    return any(
+        _is_merge_route_for_argv(argv, strict=strict)
+        for argv in _resolve_invoked_argv_candidates(_segment_argv(segment))
+    )
 
 
 def _read_paren_substitution(command: str, start: int) -> tuple[str, int]:
@@ -1490,24 +1521,25 @@ def _graphql_query_field_is_expandable(blanked_command: str) -> bool:
         # fail-closed logic decide — independently blocking here over-blocks benign `grep won't file`.
         return False
     for seg in segments:
-        argv = _resolve_invoked_argv(_segment_argv(seg))
-        if not argv:
-            continue
-        base = os.path.basename(argv[0])
-        if base == "gh":
-            sub = _gh_subargs(argv)
-            if not sub or sub[0] != "api":
+        # Check every resolved candidate, not just one — same decoy-hijack fix as `_is_merge_route`
+        # (agent-tools#606): a wrapper flag value coincidentally shaped like `gh`/`ghgql` could
+        # otherwise hide the real, expandable `gh api graphql` invocation one token later.
+        for argv in _resolve_invoked_argv_candidates(_segment_argv(seg)):
+            base = os.path.basename(argv[0])
+            if base == "gh":
+                sub = _gh_subargs(argv)
+                if not sub or sub[0] != "api":
+                    continue
+                rest = sub[1:]
+            elif base == _GHGQL_WRAPPER:
+                rest = _ghgql_to_graphql_rest(argv)
+            else:
                 continue
-            rest = sub[1:]
-        elif base == _GHGQL_WRAPPER:
-            rest = _ghgql_to_graphql_rest(argv)
-        else:
-            continue
-        rest = _expand_clustered_gh_api_flags(rest)
-        endpoint = _gh_api_endpoint(rest)
-        if endpoint == "graphql" or (endpoint or "").endswith("/graphql"):
-            if any("$" in val or "`" in val for val in _graphql_query_field_values(rest)):
-                return True
+            rest = _expand_clustered_gh_api_flags(rest)
+            endpoint = _gh_api_endpoint(rest)
+            if endpoint == "graphql" or (endpoint or "").endswith("/graphql"):
+                if any("$" in val or "`" in val for val in _graphql_query_field_values(rest)):
+                    return True
     return False
 
 

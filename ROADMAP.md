@@ -90,11 +90,22 @@ never ✅.*
 
 ### Held / deferred — deliberately, with real reasons (do not "just do it" without re-reading these)
 
-- ⛔ **A real, unpatched security bypass exists on `block-raw-pr-merge`.** **Held privately, on purpose —
-  NOT filed as a public GitHub issue**, because this repo is public and an issue would be premature exploit
-  disclosure. The mechanics are intentionally NOT described here or in any public tracker. **Talk to the
-  CTO directly** for the dedicated private fix. This is the top security item outstanding — tracked in
-  "Remaining as of 2026-07-23" below.
+- 🔬 **[UPDATED 2026-09-07/08, agent-tools#606] The `block-raw-pr-merge` bypass held privately here is
+  FIXED.** The CTO has since confirmed this repo-level privacy caution was stale/overridden — this is a
+  normal bug, not a disclosure risk, and #606 tracked a real adversarial re-audit in the open. Finding: the
+  historical bypass was a crafted-argument gap in `gh api` flag parsing (a clustered short-flag spelling
+  like `-iFquery=...` could smuggle a merge mutation or write method past the scanner unseen); it was fixed
+  by agent-tools#333/#335 ("harden flag-parsing (defense-in-depth)", merged 2026-07-24, right after this
+  block's own dated window) and is covered by dedicated regression tests. The #606 re-audit ALSO ran a fresh
+  adversarial pass against the current hook and found and fixed one more, DIFFERENT real gap: a wrapper
+  command's own flag VALUE that happens to be head-shaped (`env -u gh gh pr merge 1` — `-u`'s argument is
+  literally the string `gh`) could hijack the wrapper-resolution scan onto the wrong token and hide a real
+  merge one position later, silently ALLOWING it; also added `find` (its `-exec`/`-execdir` genuinely execs
+  a merge, same threat class as the already-covered `xargs`) to the wrapper set now that the hijack is
+  fixed. See the hook's README `## Known scope boundary` section for what remains a deliberate, documented
+  residual (arbitrary-interpreter/script-file execution, a raw HTTP client hitting GitHub's API directly) —
+  neither is believed fixable without the hook reading file contents or blocking broad classes of ordinary
+  tool use, so both are accepted rather than chased.
 - 🔬 **agent-tools #294 is now MERGED** (was listed here as held, not merged). The salvaged WIP pi
   permission-guard extension's 5 unresolved P1/P2 security findings were fixed by a dedicated security
   review pass, which also surfaced and fixed additional, worse findings before merge — tracked for an
@@ -125,9 +136,11 @@ never ✅.*
 
 ### Remaining as of 2026-07-23 (a snapshot, not a permanent section — supersede on the next dated block)
 
-- ⛔ **`block-raw-pr-merge` security bypass** — see "A real, unpatched security bypass exists on
-  `block-raw-pr-merge`" above. Still the single biggest open item; talk to the CTO directly, no further
-  status detail belongs in this public file.
+- 🔬 **`block-raw-pr-merge` security bypass — FIXED, see the 2026-09-07/08 agent-tools#606 update above.**
+  No longer the biggest open item; the historical clustered-flag gap was closed by #333/#335 back on
+  2026-07-24, and a fresh #606 adversarial re-audit found and fixed one further real gap (a decoy
+  head-shaped wrapper-flag value) with regression tests. This bullet is retained for history; supersede on
+  the next dated block.
 - ⏳ **task-cli #72** — a real design disagreement, not a bug: the codex bot flagged
   `_daemon_bootstrapped`'s inconclusive-timeout-treated-as-healthy behavior as a P2 finding; Alex
   responded on the PR thread that it is a deliberate, already-reviewed trade-off (an inconclusive
