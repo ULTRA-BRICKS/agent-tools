@@ -405,10 +405,10 @@ def _request_present_hatch_approval(
 # `ask-forward expired: … messageId=N — posted to Telegram; no decision within …`,
 # `ask-forward not-posted: … daemon declined: reason=not-registered`, `ask-forward timed-out: …`,
 # `ask-forward unreachable: …`. It is what the asking agent must be told, verbatim.
-_ASK_FORWARD_VERDICT_RE = re.compile(
-    r"ask-forward (?:expired|timed-out|declined-after-post|not-posted|unreachable|dropped|"
-    r"multi-question not-completed)\b[^\n]*"
-)
+# Any client-side outcome kind (`expired`, `timed-out`, `not-posted`, `unreachable`, a future
+# one) is forwarded as-is — the daemon-side progress lines (`arrived`, `posted`, `replayed-
+# answer`, …) never reach the client's stderr, so no exclusion list is needed (review note).
+_ASK_FORWARD_VERDICT_RE = re.compile(r"ask-forward [a-z][a-z-]*(?: [a-z-]+)*:[^\n]*")
 
 
 def _ask_forward_verdict(stderr_text: str) -> str | None:

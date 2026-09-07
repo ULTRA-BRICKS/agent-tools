@@ -304,6 +304,15 @@ def test_daemon_decline_reason_is_forwarded(tmp_path):
     assert "no reply" not in result.reason
 
 
+@pytest.mark.parametrize("kind", [
+    "timed-out", "declined-after-post", "dropped", "unreachable", "multi-question not-completed",
+    "some-future-kind",
+])
+def test_every_ask_forward_outcome_kind_is_forwarded(tmp_path, kind):
+    result = _ask(tmp_path, f"echo '[t] ask-forward {kind}: req=hatch-k agent=claude pane=- — detail' >&2\nexit 0\n")
+    assert result.reason == f"tg-ctl ask: ask-forward {kind}: req=hatch-k agent=claude pane=- — detail"
+
+
 def test_last_ask_forward_line_wins_over_earlier_noise(tmp_path):
     body = ("echo '[t] ask reconnect: daemon socket dropped — resending' >&2\n"
             "echo '[t] ask-forward unreachable: req=hatch-z agent=claude pane=- — daemon socket closed or errored without a reply' >&2\n"
