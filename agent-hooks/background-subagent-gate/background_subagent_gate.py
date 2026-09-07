@@ -124,25 +124,55 @@ HOOK_API = "agents-hooks/v1"
 # false negative (a borderline one slipping through) is preferred to nagging on quick tasks.
 TRIVIAL_MAX_CHARS = 200
 
-REMINDER = (
-    "Dispatch this subagent in the BACKGROUND — foreground blocks the main thread until "
-    "it finishes.\n"
-    "Claude Code: subagent_type=\"fork\" or isolation=\"remote\" (both background per CC's "
-    "tool contract), or a dynamic Workflow. run_in_background is NOT a real field on CC's "
-    "Agent tool — it does nothing.\n"
-    "opencode: dispatch with subagent_type general or explore — allowed as-is. Its task tool\n"
-    "has NO background field in a default build (1.18.20: only description/prompt/\n"
-    "subagent_type/task_id/command) and runs in the foreground; tolerated because opencode\n"
-    "has no in-tool background path — do not invent a background flag (the schema rejects\n"
-    "it; the native background: true exists only behind\n"
-    "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true). For a truly detached child use the\n"
-    "canonical launcher ~/.agents/skills/rig-detached-opencode/rig-detached-opencode (the\n"
-    "rig-detached-opencode skill's provisioned copy — default skills target, `rig status`\n"
-    "shows yours; RIG_AGENT_ID markers make the child session subagent-exempt).\n"
-    "No self-service bypass — ask the human, or request one-time Telegram approval via "
-    "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE=\"<justification>\" (deny-by-default; bare "
-    "\"1\" rejected)."
-)
+# Per-harness delegation recipe named in the REMINDER (agent-tools#573): keyed by the
+# bridge-set, unforgeable `event["harness"]` (never `args`). A missing/unrecognized harness
+# falls back to Claude Code's recipe. SYNC: the same recipe family is duplicated in
+# `agent-hooks/orchestrator-stays-thin` and `agent-hooks/no-long-inline-process` (each
+# agent-hook is self-contained, no shared import across agent-hooks/ dirs).
+_HARNESS_RECIPES = {
+    "claude-code": (
+        "Claude Code: subagent_type=\"fork\" or isolation=\"remote\" (both background per CC's "
+        "tool contract), or a dynamic Workflow. run_in_background is NOT a real field on CC's "
+        "Agent tool — it does nothing."
+    ),
+    "opencode": (
+        "opencode: dispatch with subagent_type general or explore — allowed as-is. Its task tool\n"
+        "has NO background field in a default build (1.18.20: only description/prompt/\n"
+        "subagent_type/task_id/command) and runs in the foreground; tolerated because opencode\n"
+        "has no in-tool background path — do not invent a background flag (the schema rejects\n"
+        "it; the native background: true exists only behind\n"
+        "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true). For a truly detached child use the\n"
+        "canonical launcher ~/.agents/skills/rig-detached-opencode/rig-detached-opencode (the\n"
+        "rig-detached-opencode skill's provisioned copy — default skills target, `rig status`\n"
+        "shows yours; RIG_AGENT_ID markers make the child session subagent-exempt)."
+    ),
+    "codex": (
+        "codex: dispatch a `spawn_agent` call where your build has one (background per its own\n"
+        "contract). On a default build with no such tool, use the canonical launcher\n"
+        "~/.agents/skills/rig-detached-codex/rig-detached-codex (the rig-detached-codex skill's\n"
+        "provisioned copy; RIG_AGENT_ID markers make the detached child session subagent-exempt)."
+    ),
+    "omp": (
+        "omp: dispatch with the task tool — omp's own contract makes a non-blocking spawn a\n"
+        "background AsyncJobManager job by default (docs/tools/task.md), so this is already the\n"
+        "background shape. For a truly detached child outside a task-tool dispatch, use the\n"
+        "canonical launcher ~/.agents/skills/rig-detached-omp/rig-detached-omp (RIG_AGENT_ID\n"
+        "markers make the detached child session subagent-exempt)."
+    ),
+}
+
+
+def _reminder_for(harness) -> str:
+    """The BLOCK reminder text for `harness`, falling back to Claude Code's recipe."""
+    recipe = _HARNESS_RECIPES.get(str(harness or "").strip(), _HARNESS_RECIPES["claude-code"])
+    return (
+        "Dispatch this subagent in the BACKGROUND — foreground blocks the main thread until "
+        "it finishes.\n"
+        f"{recipe}\n"
+        "No self-service bypass — ask the human, or request one-time Telegram approval via "
+        "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE=\"<justification>\" (deny-by-default; bare "
+        "\"1\" rejected)."
+    )
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -261,6 +291,7 @@ def main() -> int:
         return 0
 
     cwd = str(event.get("cwd") or os.getcwd())
+    reminder = _reminder_for(event.get("harness"))
     ctx = {"hook": "background-subagent-gate"}
     hatch = hatch_escalation.request_hatch_approval("background-subagent-gate", ctx, cwd=cwd)
     if hatch.should_stop:
@@ -268,10 +299,10 @@ def main() -> int:
             warn(f"background-subagent-gate allowed via hatch escalation ({hatch.reason})")
             emit("allow", f"allowed via hatch escalation ({hatch.reason})")
             return 0
-        emit("block", f"hatch escalation denied: {hatch.reason}\n{REMINDER}")
+        emit("block", f"hatch escalation denied: {hatch.reason}\n{reminder}")
         return BLOCK_EXIT_CODE
 
-    emit("block", REMINDER)
+    emit("block", reminder)
     return BLOCK_EXIT_CODE
 
 

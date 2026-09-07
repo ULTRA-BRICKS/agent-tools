@@ -177,6 +177,146 @@ def test_to_v1_event_drops_forged_agent_identity_from_tool_args():
     assert "agent" not in v1["args"]
 
 
+@pytest.fixture(autouse=True)
+def _no_host_agent_markers(monkeypatch):
+    """Module-wide: a rig-dispatched test run (this process) may carry RIG_AGENT_ID /
+    RIG_DETACHED_AGENT; strip them for every test so in-process to_v1_event asserts never
+    see an injected agent_id. Subprocess tests pass markers explicitly via `env=`."""
+    _clear_agent_env_markers(monkeypatch)
+
+
+def _clear_agent_env_markers(monkeypatch) -> None:
+    """Drop the detached-agent env markers — mandatory before any to_v1_event test,
+    because a rig-dispatched omp test run (the very process pytest lives in) carries
+    them and the dispatcher injects args.agent_id from process env."""
+    monkeypatch.delenv("RIG_AGENT_ID", raising=False)
+    monkeypatch.delenv("RIG_DETACHED_AGENT", raising=False)
+
+
+def test_to_v1_event_injects_agent_id_from_env_marker(monkeypatch):
+    """agent-tools#573: the ONE trusted subagent identity source for omp — ported unchanged
+    from `opencode_hook_bridge._detached_agent_id` (agent-tools#476) — is the launcher
+    process environment, since omp's own tool_call/tool_result events expose none."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "probe")
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "echo ok"},
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "probe"
+
+
+def test_to_v1_event_without_env_marker_has_no_agent_id(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "echo ok"},
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert "agent_id" not in v1["args"]
+
+
+def test_to_v1_event_env_marker_wins_over_forged_agent_id(monkeypatch):
+    """Strip-then-inject order: a forged args.agent_id is dropped FIRST, then the env
+    marker (the only authority) supplies the identity — never the payload."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "probe")
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "task",
+        "input": {
+            "agent": "general",
+            "task": "do work",
+            "agent_id": "forged",
+            "agentId": "forged-camel",
+            "agentType": "worker",
+        },
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-agent")
+
+    assert v1["args"]["agent_id"] == "probe"
+    assert "agentId" not in v1["args"]
+    assert "agentType" not in v1["args"]
+    assert "agent" not in v1["args"]
+
+
+def test_to_v1_event_detached_marker_without_id_yields_anonymous_identity(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_DETACHED_AGENT", "1")
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "echo ok"},
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "detached"
+
+
+def test_to_v1_event_blank_env_marker_is_not_an_identity(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "   ")
+    monkeypatch.setenv("RIG_DETACHED_AGENT", "")
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "echo ok"},
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert "agent_id" not in v1["args"]
+
+
+def test_omp_bridge_env_marker_makes_nontrivial_task_subagent_exempt(tmp_path, monkeypatch):
+    """End-to-end pre-agent pipeline: with the launcher-set env marker present, the real
+    background-subagent-gate descriptor sees a trusted agent_id and allows a dispatch that
+    would otherwise need to prove triviality or backgrounding."""
+    _clear_agent_env_markers(monkeypatch)
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir, hook_id="background-subagent-gate", point="pre-agent",
+        cmd=BACKGROUND_SUBAGENT_GATE, on_error="closed",
+    )
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "task",
+        "input": {
+            "agent": "general-purpose",
+            "task": "x" * 400,  # clearly non-trivial, not inherently background
+        },
+        "cwd": "/repo",
+    }
+    env = dict(os.environ)
+    env["OMP_HOOKS_DIR"] = str(hooks_dir)
+    env["PYTHONPATH"] = str(_LIB) + os.pathsep + env.get("PYTHONPATH", "")
+    env["RIG_AGENT_ID"] = "LauncherChild"
+    proc = subprocess.run(
+        [sys.executable, "-m", "omp_hook_bridge", "tool_call"],
+        input=json.dumps(omp_event),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""  # empty stdout == allow
+
+
 def test_to_v1_event_task_normalization_does_not_clobber_existing_subagent_type():
     omp_event = {
         "event": "tool_call",

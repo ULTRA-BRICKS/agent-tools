@@ -57,11 +57,15 @@ TRUSTED per-tool-call subagent identity in the extension event either (confirmed
 from the documented `tool_call`/`tool_result` shape). Every translated v1 event also
 carries a top-level `harness: "omp"` — a hardcoded module constant (`dispatch.HARNESS`),
 never derived from the omp event, so it can't be forged the way the identity fields above
-must be actively stripped. `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES`
-reads this tag to exempt omp from that gate (agent-tools#533) for the same reason it
-already exempts codex and opencode: none of the three expose a trusted per-call subagent
-identity, so the gate's "main thread must delegate to a CC subagent" premise does not
-transplant cleanly onto any of them.
+must be actively stripped. The bridge restores a TRUSTED `args.agent_id` from the launcher
+process environment (`RIG_AGENT_ID`/`RIG_DETACHED_AGENT`, set by the `rig-detached-omp`
+launcher skill) via `_detached_agent_id`, the same mechanism `opencode_hook_bridge` uses
+(agent-tools#476, ported to omp/codex by agent-tools#573). `agent-hooks/orchestrator-stays-thin`
+and the other delegation gates read `event["harness"]` to name the right delegation recipe
+in their refusal text — omp exposes no trustworthy per-call subagent identity of its OWN
+beyond that launcher-env marker (confirmed absent from the documented `tool_call`/
+`tool_result` shape), so the launcher-env marker is the only non-forgeable identity source
+here, same as opencode.
 
 ## Hashline content extraction is an approximation
 

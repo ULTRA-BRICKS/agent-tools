@@ -24,11 +24,17 @@ from pathlib import Path
 
 HOOK_API = "agents-hooks/v1"
 # The v1 event's `harness` tag for every event this bridge produces — a MODULE LITERAL,
-# never derived from `omp_event`, so it cannot be forged via tool args. See
-# `codex_hook_bridge.HARNESS` / `opencode_hook_bridge.HARNESS` for the same reasoning: omp
-# exposes no TRUSTED per-tool-call subagent identity either (forged agent_id/agent_type
-# keys are stripped below). `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES`
-# reads this tag to exempt the whole harness (agent-tools#533).
+# never derived from `omp_event`, so it cannot be forged via tool args. A hook that wants to
+# tailor a message (or otherwise branch) on the source harness reads this tag — see
+# `agent-hooks/orchestrator-stays-thin`'s per-harness delegation-recipe text for a consumer
+# (agent-tools#573). omp exposes no TRUSTED per-tool-call subagent identity of its OWN in the
+# documented `tool_call`/`tool_result` extension event shape (confirmed absent from
+# `extension.ts`'s payload: `toolName`/`input`/`cwd`/`toolCallId` only — no session/task-spawn
+# marker distinguishing a dispatched child from the top-level session), so a forged
+# agent_id/agent_type is stripped below and restored ONLY from the launcher process
+# environment via `_detached_agent_id` — the same trust boundary
+# `opencode_hook_bridge._detached_agent_id` uses (agent-tools#476), ported here unchanged
+# (agent-tools#573).
 HARNESS = "omp"
 
 _KNOWN_EVENTS = frozenset({"tool_call", "tool_result"})
@@ -43,6 +49,35 @@ _FORGED_AGENT_KEYS = (
     "agentType",
     "agent",
 )
+
+
+def _detached_agent_id() -> str:
+    """The ONE authoritative subagent identity source for omp sessions (agent-tools#573).
+
+    The forge-strip above removes any model/tool-supplied agent_id; omp's own `tool_call`/
+    `tool_result` extension events carry no session/task-spawn marker to restore it from
+    (`extension.ts`'s payload is `toolName`/`input`/`cwd`/`toolCallId` only — confirmed
+    absent, same as `opencode_hook_bridge._detached_agent_id`'s finding for opencode's plugin
+    payload). The sanctioned source is the omp PROCESS ENVIRONMENT, read at launch:
+    `RIG_AGENT_ID=<name>` (identity) or `RIG_DETACHED_AGENT=1` (anonymous marker), set by the
+    `rig-detached-omp` launcher skill. `extension.ts` spawns this dispatcher with
+    `{...process.env}`, so a marker set when the child omp process was launched is visible
+    here on every tool call.
+
+    Trust reasoning (ported unchanged from `opencode_hook_bridge._detached_agent_id`,
+    agent-tools#476): a running orchestrator cannot retroactively mutate its own process
+    environment — it can only set these vars for a CHILD process it dispatches, which is
+    exactly the sanctioned act of dispatching a subagent. Cooperative-orchestrator threat
+    model, on_error=open: discipline, not a security boundary. A bare/whitespace value is not
+    a marker.
+    """
+    val = os.environ.get("RIG_AGENT_ID", "").strip()
+    if val:
+        return val
+    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
+        return "detached"
+    return ""
+
 
 # A hashline section header: `[RELATIVE/PATH#TAG]` where TAG is 4 uppercase hex chars.
 _HASHLINE_HEADER = re.compile(r"^\[(?P<path>.+)#(?P<tag>[0-9A-F]{4})\]$")
@@ -79,6 +114,9 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
         _normalize_task_args(args)
     for key in _FORGED_AGENT_KEYS:
         args.pop(key, None)
+    detached_id = _detached_agent_id()
+    if detached_id:
+        args["agent_id"] = detached_id
 
     command = _tool_command(tool, raw_args)
     if command:

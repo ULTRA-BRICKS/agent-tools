@@ -19,14 +19,16 @@ from pathlib import Path
 HOOK_API = "agents-hooks/v1"
 # The v1 event's `harness` tag for every event this bridge produces — a MODULE LITERAL, not
 # derived from `opencode_event`, so it cannot be forged via tool args the way `args.harness`
-# could be. See `codex_hook_bridge.HARNESS` for the same reasoning: opencode exposes no TRUSTED
-# per-tool-call subagent identity in the plugin payload either (forged agent_id/agent_type keys
-# are stripped below). The ONE trusted identity source is the process environment set by the rig
-# detached launcher (`_detached_agent_id`, agent-tools#476) — and that covers only a rig-launched
-# detached child; a plain opencode session still carries no identity. So a hook that wants to
-# scope a policy to (or exempt) this WHOLE harness reads `event["harness"]` instead — see
-# `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer
-# (agent-tools#533).
+# could be. See `codex_hook_bridge.HARNESS` for the same reasoning: opencode exposes no
+# TRUSTED per-tool-call subagent identity in the plugin payload either (forged
+# agent_id/agent_type keys are stripped below). The ONE trusted identity source is the
+# process environment set by the rig detached launcher (`_detached_agent_id`,
+# agent-tools#476) — and that covers only a rig-launched detached child; a plain opencode
+# session still carries no identity. A hook that wants to tailor a message (or otherwise
+# branch) on the source harness reads `event["harness"]` instead — see
+# `agent-hooks/orchestrator-stays-thin`'s per-harness delegation-recipe text for the first
+# consumer (agent-tools#533; unified into a single subagent-identity story across every
+# harness by agent-tools#573).
 HARNESS = "opencode"
 _KNOWN_EVENTS = frozenset({"tool.execute.before", "tool.execute.after"})
 _WRITE_TOOLS = frozenset({"edit", "write", "apply_patch"})

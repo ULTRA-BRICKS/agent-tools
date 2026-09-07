@@ -168,21 +168,23 @@ def test_only_args_agent_id_exempts_not_top_level_or_tool_input(tmp_path, monkey
     assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-# ── HARNESS-EXEMPT (agent-tools#533) ─────────────────────────────────────────────────────
+# ── HARNESS-UNIFIED (agent-tools#573; supersedes #533's harness-wide allowlist) ─────────────
 
 # The literal repro from the live incident (Alex, 2026-09-05): a review-cli-spawned `codex exec
 # -s read-only` reviewer process ran this exact chain as read-only inspection for ITS OWN review
 # role and got WARN→BLOCK'd by this gate treating it as "the orchestrator doing inline
 # implementation work." TWO separate bugs stacked up: (1) the event carried no usable subagent
 # identity, so a whole Codex/opencode harness looked like the CC orchestrator (agent-tools#533,
-# fixed by the `harness` allowlist), and (2) `sed -n` (a read-only print) was not in
-# READ_ONLY_BASH — only `sed -i` was, as a build/edit signal — so the chain fell through to the
-# >=3-segment fallback and was judged implementation-shaped on chain length alone
-# (agent-tools#541, fixed by `_is_read_only_sed`). With #541 fixed the literal repro is read-only
-# for EVERY harness, so it can no longer serve as the #533 control; `_FALLBACK_CHAIN` below keeps
-# the same shape (an un-allowlisted head + three read-only git segments → chain-length fallback)
-# with `awk`, a head this gate has no read-only entry for, so the #533 tests still prove the
-# harness tag bypasses the classifier regardless of what the command looks like.
+# originally "fixed" with a harness allowlist that then left codex/opencode/omp ungoverned
+# entirely — replaced by agent-tools#573's launcher-env identity restoration instead), and (2)
+# `sed -n` (a read-only print) was not in READ_ONLY_BASH — only `sed -i` was, as a build/edit
+# signal — so the chain fell through to the >=3-segment fallback and was judged
+# implementation-shaped on chain length alone (agent-tools#541, fixed by `_is_read_only_sed`).
+# With #541 fixed the literal repro is read-only for EVERY harness, so it can no longer serve as
+# a harness-governance control; `_FALLBACK_CHAIN` below keeps the same shape (an un-allowlisted
+# head + three read-only git segments → chain-length fallback) with `awk`, a head this gate has
+# no read-only entry for, so the tests below still prove `harness` alone never relaxes the
+# classifier — only a real `agent_id` (subagent-exempt) does, agnostic of harness.
 _REPRO_CHAIN = (
     "sed -n '1,240p' SKILL.md && git diff --check && git status --short && git diff -- a.py"
 )
@@ -195,7 +197,7 @@ def test_repro_chain_control_warns_then_blocks_with_no_harness(tmp_path, monkeyp
     """Control: with no `harness` tag at all (a hook fixture that predates agent-tools#533, or
     any future bridge that doesn't set one) the exact repro chain still trips WARN-then-BLOCK —
     proving the chain itself is what got misclassified, not some other cause, and setting up the
-    contrast with the harness-exempt cases below."""
+    contrast with the harness-governed cases below."""
     event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": _FALLBACK_CHAIN}}
     out1, _e, c1 = _run(event, monkeypatch, tmp_path / "m")
     assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
@@ -205,8 +207,7 @@ def test_repro_chain_control_warns_then_blocks_with_no_harness(tmp_path, monkeyp
 
 def test_repro_chain_still_warns_then_blocks_with_harness_claude_code(tmp_path, monkeypatch):
     """The actual CC shape (`cc_hook_bridge.HARNESS == "claude-code"`, not just an absent
-    field) must stay GOVERNED — this is the one positive case the allowlist exists to keep
-    blocking, so it needs its own test, not just the omitted-field control above."""
+    field) stays GOVERNED, same as every other harness now (agent-tools#573)."""
     event = {"point": "pre-bash", "cwd": "/repo", "harness": "claude-code",
               "args": {"command": _FALLBACK_CHAIN}}
     out1, _e, c1 = _run(event, monkeypatch, tmp_path / "m")
@@ -216,36 +217,35 @@ def test_repro_chain_still_warns_then_blocks_with_harness_claude_code(tmp_path, 
 
 
 @pytest.mark.parametrize("harness", ["codex", "opencode", "omp"])
-def test_repro_chain_allowed_silently_for_exempt_harness(tmp_path, monkeypatch, harness):
-    """The SAME repro chain, tagged with a top-level `harness` a codex/opencode/omp bridge would
-    set, is allowed silently on every call — no WARN, no BLOCK, no tier ever primed. Checks the
-    marker dir directly (not just the decision), since a first-offense WARN also decides
-    "allow" — only an empty marker dir proves no tier was primed at all (Fable review round 3)."""
-    marker_dir = tmp_path / "m"
+def test_repro_chain_still_warns_then_blocks_for_other_harnesses(tmp_path, monkeypatch, harness):
+    """agent-tools#573: codex/opencode/omp events are NO LONGER exempt from this gate — the
+    same repro chain, tagged with a top-level `harness` one of those bridges would set, still
+    trips WARN-then-BLOCK exactly like Claude Code. No `harness` value relaxes the gate by
+    itself; only `_is_subagent` (a real `agent_id`) does."""
     event = {"point": "pre-bash", "cwd": "/repo", "harness": harness,
               "args": {"command": _FALLBACK_CHAIN}}
-    for _ in range(3):  # would BLOCK by the second call if harness-exemption didn't short-circuit
-        out, _e, c = _run(event, monkeypatch, marker_dir)
-        assert c == 0 and _decision(out) == "allow"
-    assert not marker_dir.exists() or not list(marker_dir.iterdir())
+    out1, _e, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
+    out2, _e, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # repeat: BLOCK
 
 
 @pytest.mark.parametrize("harness", ["codex", "opencode", "omp"])
-def test_exempt_harness_also_exempts_code_write(tmp_path, monkeypatch, harness):
-    """Same exemption on the pre-write side: a non-docs code write tagged with an exempt
-    `harness` is allowed even on repeat, and never primes a tier marker either."""
+def test_code_write_also_governed_for_other_harnesses(tmp_path, monkeypatch, harness):
+    """Same governance on the pre-write side: a non-docs code write tagged with a
+    codex/opencode/omp `harness` still BLOCKs on repeat, exactly like Claude Code."""
     marker_dir = tmp_path / "m"
     event = {"point": "pre-write", "cwd": "/repo", "harness": harness,
               "args": {"file_path": "/repo/src/a.ts"}}
     _run(event, monkeypatch, marker_dir)
     out, _e, c = _run(event, monkeypatch, marker_dir)
-    assert c == 0 and _decision(out) == "allow"
-    assert not marker_dir.exists() or not list(marker_dir.iterdir())
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-def test_unknown_harness_does_not_exempt(tmp_path, monkeypatch):
-    """An unrecognized `harness` value (not in EXEMPT_HARNESSES) must NOT relax the gate —
-    the allowlist fails closed on anything it doesn't explicitly know."""
+def test_unknown_harness_still_governed(tmp_path, monkeypatch):
+    """An unrecognized `harness` value must NOT relax the gate — there is no allowlist to check
+    membership against any more (agent-tools#573 removed it entirely); every harness is
+    governed identically regardless of the tag's value."""
     event = {"point": "pre-bash", "cwd": "/repo", "harness": "some-future-harness",
               "args": {"command": _FALLBACK_CHAIN}}
     _run(event, monkeypatch, tmp_path / "m")
@@ -253,53 +253,65 @@ def test_unknown_harness_does_not_exempt(tmp_path, monkeypatch):
     assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-def test_forged_args_harness_does_not_exempt(tmp_path, monkeypatch):
-    """TRUST BOUNDARY regression guard: `_is_exempt_harness` reads ONLY the TOP-LEVEL
-    `event['harness']` — a bridge-set constant no model/tool_input can reach. A `harness` value
-    sitting under `args` (where a forged agent_id would also have to hide) must NOT exempt the
-    orchestrator: a repeat impl write still BLOCKs exactly as if no harness were set at all."""
+def test_forged_args_harness_has_no_effect(tmp_path, monkeypatch):
+    """TRUST BOUNDARY regression guard: only the sanitized top-level `event['harness']` ever
+    feeds `_delegation_recipe` (message text only, never a gating decision since
+    agent-tools#573 removed the harness-wide relax). A `harness` value sitting under `args`
+    (where a forged agent_id would also have to hide) must have NO effect either way: a repeat
+    impl write still BLOCKs exactly as if no harness were set at all."""
     event = {"point": "pre-write", "cwd": "/repo",
               "args": {"harness": "codex", "file_path": "/repo/src/a.ts"}}
-    _run(event, monkeypatch, tmp_path / "m")  # warn (NOT exempted by the decoy)
+    _run(event, monkeypatch, tmp_path / "m")
     out, _e, c = _run(event, monkeypatch, tmp_path / "m")
     assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-def test_exempt_harnesses_constant_is_exactly_codex_opencode_omp():
-    """Documents the allowlist's exact membership — `claude-code` (or anything else) must never
-    be added here, or the gate would exempt the very orchestrator it exists to govern."""
-    assert ost.EXEMPT_HARNESSES == frozenset({"codex", "opencode", "omp"})
-
-
-def test_exempt_bridge_harness_constants_are_pinned_to_the_allowlist():
-    """Cross-module regression guard: `EXEMPT_HARNESSES` and the bridges' `HARNESS` constants
-    are independently hardcoded strings in four different files. Nothing else ties them
-    together — a rename on either side (e.g. `codex_hook_bridge.HARNESS` to `"codex-cli"`)
-    would silently reintroduce the #533 block for that harness with an otherwise-green suite,
-    because every OTHER test here hand-builds `{"harness": "codex"}` rather than importing the
-    bridge's own constant. This test is the one place that would catch it."""
+def test_harness_recipe_keys_pinned_to_bridge_harness_constants():
+    """Cross-module regression guard: `_HARNESS_RECIPES`' keys and the bridges' `HARNESS`
+    constants are independently hardcoded strings in five different files. A rename on either
+    side (e.g. `codex_hook_bridge.HARNESS` to `"codex-cli"`) would silently fall back to the
+    Claude Code recipe text for that harness with an otherwise-green suite — this is the one
+    place that would catch it."""
     import cc_hook_bridge.dispatch as cc_dispatch
     import codex_hook_bridge.dispatch as codex_dispatch
     import omp_hook_bridge.dispatch as omp_dispatch
     import opencode_hook_bridge.dispatch as opencode_dispatch
 
-    assert codex_dispatch.HARNESS in ost.EXEMPT_HARNESSES
-    assert opencode_dispatch.HARNESS in ost.EXEMPT_HARNESSES
-    assert omp_dispatch.HARNESS in ost.EXEMPT_HARNESSES
-    # The property that actually protects the orchestrator: CC's OWN harness must NEVER be in
-    # the allowlist, or this gate would exempt the very orchestrator it exists to govern.
-    assert cc_dispatch.HARNESS not in ost.EXEMPT_HARNESSES
+    for dispatch in (cc_dispatch, codex_dispatch, omp_dispatch, opencode_dispatch):
+        assert dispatch.HARNESS in ost._HARNESS_RECIPES
+    # Every recipe must actually be distinct — a copy-paste that left two harnesses sharing
+    # the same text would defeat the whole point of per-harness advice.
+    assert len(set(ost._HARNESS_RECIPES.values())) == len(ost._HARNESS_RECIPES)
+
+
+@pytest.mark.parametrize("harness,fragment", [
+    ("claude-code", "Agent tool"),
+    ("codex", "rig-detached-codex"),
+    ("opencode", "rig-detached-opencode"),
+    ("omp", "rig-detached-omp"),
+    (None, "Agent tool"),  # missing harness falls back to the Claude Code recipe
+    ("some-future-harness", "Agent tool"),  # unrecognized harness: same fallback
+])
+def test_block_message_names_correct_recipe_for_harness(tmp_path, monkeypatch, harness, fragment):
+    """Each gate refusal must name a delegation recipe the ACTUAL firing harness can follow
+    (agent-tools#573's core ask) — not always Claude Code's `Agent` tool."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": _FALLBACK_CHAIN}}
+    if harness is not None:
+        event["harness"] = harness
+    _run(event, monkeypatch, tmp_path / "m")
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == ost.BLOCK_EXIT_CODE
+    assert fragment in json.loads(out)["message"]
 
 
 @pytest.mark.parametrize(
     "bridge_module",
     ["codex_hook_bridge.dispatch", "opencode_hook_bridge.dispatch", "omp_hook_bridge.dispatch"],
 )
-def test_real_bridge_to_v1_event_output_is_exempt_end_to_end(tmp_path, monkeypatch, bridge_module):
+def test_real_bridge_to_v1_event_output_stays_governed_end_to_end(tmp_path, monkeypatch, bridge_module):
     """Feeds an ACTUAL bridge-produced `to_v1_event(...)` output (not a hand-built fixture)
-    through the real hook — the integration point Codex review flagged as missing: every other
-    harness-exempt test in this file hand-builds the event, so a bridge that stopped setting
-    `harness` correctly could still pass every hand-built test here."""
+    through the real hook: codex/opencode/omp events stay GOVERNED (agent-tools#573), and the
+    resulting BLOCK message names that bridge's own delegation recipe."""
     import importlib
 
     dispatch = importlib.import_module(bridge_module)
@@ -310,14 +322,16 @@ def test_real_bridge_to_v1_event_output_is_exempt_end_to_end(tmp_path, monkeypat
             "tool_input": {"command": _FALLBACK_CHAIN},
             "cwd": "/repo",
         }
+        recipe_fragment = "rig-detached-codex"
     elif bridge_module == "omp_hook_bridge.dispatch":
         raw_event = {
             "event": "tool_call",
             "toolName": "bash",
-            "input": {"command": _REPRO_CHAIN},
+            "input": {"command": _FALLBACK_CHAIN},
             "cwd": "/repo",
             "toolCallId": "call_1",
         }
+        recipe_fragment = "rig-detached-omp"
     else:
         raw_event = {
             "hook": "tool.execute.before",
@@ -325,18 +339,21 @@ def test_real_bridge_to_v1_event_output_is_exempt_end_to_end(tmp_path, monkeypat
             "input": {"tool": "bash", "sessionID": "ses_1"},
             "output": {"args": {"command": _FALLBACK_CHAIN}},
         }
+        recipe_fragment = "rig-detached-opencode"
     v1_event = dispatch.to_v1_event(raw_event, point="pre-bash")
     assert v1_event["harness"] == dispatch.HARNESS
 
-    for _ in range(3):
-        out, _e, c = _run(v1_event, monkeypatch, tmp_path / "m")
-        assert c == 0 and _decision(out) == "allow"
+    out1, _e, c1 = _run(v1_event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
+    out2, _e, c2 = _run(v1_event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # repeat: BLOCK
+    assert recipe_fragment in json.loads(out2)["message"]
 
 
 def test_real_cc_bridge_to_v1_event_output_stays_governed_end_to_end(tmp_path, monkeypatch):
-    """Closes the loop the exempt-harness end-to-end tests above leave open (Fable review round
-    3): the actual CC bridge's own `to_v1_event(...)` output — `harness == "claude-code"` — must
-    stay GOVERNED, not just a hand-built `{"harness": "claude-code"}` fixture."""
+    """Closes the loop the governed-harness end-to-end tests above leave open (Fable review
+    round 3): the actual CC bridge's own `to_v1_event(...)` output — `harness == "claude-code"`
+    — must stay GOVERNED, not just a hand-built `{"harness": "claude-code"}` fixture."""
     import cc_hook_bridge.dispatch as cc_dispatch
 
     raw_event = {
@@ -350,6 +367,97 @@ def test_real_cc_bridge_to_v1_event_output_stays_governed_end_to_end(tmp_path, m
     assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
     out2, _e, c2 = _run(v1_event, monkeypatch, tmp_path / "m")
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # repeat: BLOCK
+
+
+@pytest.mark.parametrize(
+    "bridge_module",
+    ["codex_hook_bridge.dispatch", "opencode_hook_bridge.dispatch", "omp_hook_bridge.dispatch"],
+)
+def test_real_bridge_launcher_env_child_is_subagent_exempt(tmp_path, monkeypatch, bridge_module):
+    """agent-tools#573: a session launched by the `rig-detached-<harness>` launcher skill
+    carries `RIG_AGENT_ID` in its process environment. Each bridge's `_detached_agent_id`
+    restores that into `args.agent_id` AFTER the forge-strip, so the resulting v1 event is
+    subagent-exempt here — allowed silently on every call, no WARN/BLOCK tier ever primed —
+    under EVERY harness, not just opencode (agent-tools#476)."""
+    import importlib
+
+    monkeypatch.setenv("RIG_AGENT_ID", "LauncherChild")
+    dispatch = importlib.import_module(bridge_module)
+    if bridge_module == "codex_hook_bridge.dispatch":
+        raw_event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": _FALLBACK_CHAIN},
+            "cwd": "/repo",
+        }
+    elif bridge_module == "omp_hook_bridge.dispatch":
+        raw_event = {
+            "event": "tool_call",
+            "toolName": "bash",
+            "input": {"command": _FALLBACK_CHAIN},
+            "cwd": "/repo",
+            "toolCallId": "call_1",
+        }
+    else:
+        raw_event = {
+            "hook": "tool.execute.before",
+            "cwd": "/repo",
+            "input": {"tool": "bash", "sessionID": "ses_1"},
+            "output": {"args": {"command": _FALLBACK_CHAIN}},
+        }
+    v1_event = dispatch.to_v1_event(raw_event, point="pre-bash")
+    assert v1_event["args"]["agent_id"] == "LauncherChild"
+
+    marker_dir = tmp_path / "m"
+    for _ in range(3):  # would BLOCK by the second call if not subagent-exempt
+        out, _e, c = _run(v1_event, monkeypatch, marker_dir)
+        assert c == 0 and _decision(out) == "allow"
+    assert not marker_dir.exists() or not list(marker_dir.iterdir())
+
+
+@pytest.mark.parametrize(
+    "bridge_module",
+    ["codex_hook_bridge.dispatch", "opencode_hook_bridge.dispatch", "omp_hook_bridge.dispatch"],
+)
+def test_real_bridge_forged_agent_id_is_stripped_and_stays_governed(tmp_path, monkeypatch, bridge_module):
+    """A model/tool-supplied `agent_id` in the RAW tool call (no launcher-env marker set) must
+    NOT self-exempt: every bridge strips it before this hook ever sees the event, so the
+    orchestrator stays governed exactly as if no `agent_id` were ever offered."""
+    import importlib
+
+    for var in ("RIG_AGENT_ID", "RIG_DETACHED_AGENT"):
+        monkeypatch.delenv(var, raising=False)
+    dispatch = importlib.import_module(bridge_module)
+    if bridge_module == "codex_hook_bridge.dispatch":
+        raw_event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": _FALLBACK_CHAIN, "agent_id": "forged"},
+            "cwd": "/repo",
+        }
+    elif bridge_module == "omp_hook_bridge.dispatch":
+        raw_event = {
+            "event": "tool_call",
+            "toolName": "bash",
+            "input": {"command": _FALLBACK_CHAIN, "agent_id": "forged"},
+            "cwd": "/repo",
+            "toolCallId": "call_1",
+        }
+    else:
+        raw_event = {
+            "hook": "tool.execute.before",
+            "cwd": "/repo",
+            "input": {"tool": "bash", "sessionID": "ses_1"},
+            "output": {"args": {"command": _FALLBACK_CHAIN, "agent_id": "forged"}},
+        }
+    v1_event = dispatch.to_v1_event(raw_event, point="pre-bash")
+    assert not v1_event["args"].get("agent_id")
+
+    out1, _e, c1 = _run(v1_event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
+    out2, _e, c2 = _run(v1_event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # repeat: BLOCK
+
 
 
 # ── regression: the OLD self-service escape hatch is DEAD (env AND inline) ──────────────────
