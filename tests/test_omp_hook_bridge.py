@@ -1162,3 +1162,58 @@ def test_extension_ts_runs_overlapping_dispatches_independently(tmp_path):
     assert out["a"] == {"block": True, "reason": "no"}
     assert out["b"] is None
     assert out["elapsedMs"] < 1900, f"the two dispatches ran serially: {out['elapsedMs']} ms"
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_ts_timeout_sends_sigterm_first_and_lets_the_dispatcher_clean_up(tmp_path):
+    """On a timeout the child gets SIGTERM first (what the old synchronous spawn sent), so a
+    dispatcher that cleans up after itself still can: the stub traps SIGTERM, reports it on
+    stderr and exits on its own — the bridge must then NOT wait out the SIGKILL grace."""
+    stub = _write_stub_dispatcher(
+        tmp_path,
+        "import signal\n"
+        "def bye(*_a):\n"
+        "    sys.stderr.write('stub: got SIGTERM, cleaning up\\n')\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, bye)\n"
+        "time.sleep(30)\n",
+    )
+    proc = _run_bun_driver(
+        tmp_path,
+        "const started = Date.now();\n"
+        "const result = (await handlers['tool_call'](event, ctx)) ?? null;\n"
+        "console.log(JSON.stringify({ elapsedMs: Date.now() - started, result }));\n",
+        {"OMP_HOOK_BRIDGE_PYTHON": str(stub), "OMP_HOOK_BRIDGE_TIMEOUT_MS": "500"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["result"] is None
+    assert "stub: got SIGTERM, cleaning up" in proc.stderr
+    assert "timed out" in proc.stderr
+    # 500 ms budget + the dispatcher's own exit; well under budget + the 2000 ms SIGKILL grace.
+    assert out["elapsedMs"] < 2200, f"the bridge waited out the SIGKILL grace: {out['elapsedMs']} ms"
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_ts_timeout_escalates_to_sigkill_when_sigterm_is_ignored(tmp_path):
+    """A dispatcher that ignores SIGTERM is still ended: SIGKILL follows after the grace, so the
+    handler settles (fail-open, "allow") instead of hanging on a child that never exits."""
+    stub = _write_stub_dispatcher(
+        tmp_path,
+        "import signal\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(30)\n",
+    )
+    proc = _run_bun_driver(
+        tmp_path,
+        "const started = Date.now();\n"
+        "const result = (await handlers['tool_call'](event, ctx)) ?? null;\n"
+        "console.log(JSON.stringify({ elapsedMs: Date.now() - started, result }));\n",
+        {"OMP_HOOK_BRIDGE_PYTHON": str(stub), "OMP_HOOK_BRIDGE_TIMEOUT_MS": "500"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["result"] is None
+    assert "timed out" in proc.stderr
+    # Must outlast the 2000 ms grace (SIGTERM alone did nothing) but never the stub's 30 s sleep.
+    assert 2000 <= out["elapsedMs"] < 10000, f"SIGKILL did not follow the grace: {out['elapsedMs']} ms"
