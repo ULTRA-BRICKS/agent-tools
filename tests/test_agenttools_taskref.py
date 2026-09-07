@@ -29,6 +29,7 @@ from agenttools_taskref import (  # noqa: E402
     load_repo_task_config,
     validate,
 )
+from agenttools_taskref.core import _parse_github_remote  # noqa: E402
 
 
 # ── fixtures / fakes ─────────────────────────────────────────────────────────────────────────
@@ -175,6 +176,41 @@ def test_github_gh_missing_rejected_cleanly(repo, monkeypatch):
     result = validate("607", repo)
     assert not result.ok
     assert "gh CLI not found" in result.reason
+
+
+def test_parse_github_remote_forms():
+    assert _parse_github_remote("https://github.com/alex-mextner/agent-tools.git") == (
+        "alex-mextner",
+        "agent-tools",
+    )
+    assert _parse_github_remote("git@github.com:alex-mextner/agent-tools.git") == (
+        "alex-mextner",
+        "agent-tools",
+    )
+    assert _parse_github_remote("ssh://git@github.com/alex-mextner/agent-tools.git") == (
+        "alex-mextner",
+        "agent-tools",
+    )
+
+
+def test_parse_github_remote_rejects_lookalike_hosts():
+    """CodeQL py/incomplete-url-substring-sanitization: a bare `"github.com/" in url` check
+    would wrongly accept both of these. Anchoring on the exact parsed hostname must not."""
+    assert _parse_github_remote("https://github.com.evil.example/owner/repo") is None
+    assert _parse_github_remote("https://evil.example/github.com/owner/repo") is None
+    assert _parse_github_remote("https://evil.example/redirect?u=github.com/o/r") is None
+
+
+def test_github_lookalike_origin_host_not_used(repo, monkeypatch):
+    def _evil_origin(argv, **kwargs):
+        if argv[0] == "git":
+            return _FakeProc(returncode=0, stdout="https://github.com.evil.example/x/y.git\n")
+        raise AssertionError("gh should never be reached with an unresolved repo")
+
+    monkeypatch.setattr(subprocess, "run", _evil_origin)
+    result = validate("607", repo)
+    assert not result.ok
+    assert "cannot resolve github repo" in result.reason
 
 
 def test_github_no_origin_and_no_config_rejected_not_crashed(repo, monkeypatch):

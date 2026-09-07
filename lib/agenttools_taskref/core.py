@@ -40,6 +40,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 VALID_BACKENDS = frozenset({"github-issues", "linear"})
 
@@ -51,6 +52,8 @@ _GITHUB_CODE_RE = re.compile(
 )
 # A Linear/Jira-style key: 2+ letters, a hyphen, digits. Team prefixes are short (HYP, GH, ...).
 _LINEAR_CODE_RE = re.compile(r"^(?P<prefix>[A-Za-z]{2,10})-(?P<num>[0-9]+)$")
+# The SCP-like git remote syntax (`[user@]host:path`, no `://`), e.g. `git@github.com:o/r.git`.
+_SCP_LIKE_REMOTE_RE = re.compile(r"^(?:[^@/]+@)?(?P<host>[^:/]+):(?P<path>.+)$")
 
 _GIT_TIMEOUT_S = 5
 _GH_TIMEOUT_S = 15
@@ -238,12 +241,20 @@ def _git_origin_owner_repo(repo_root: Path) -> tuple[str, str] | None:
 
 
 def _parse_github_remote(url: str) -> tuple[str, str] | None:
+    """Parse ``owner/repo`` from a ``github.com`` remote (``https://``, ``ssh://``, or the
+    SCP-like ``git@github.com:owner/repo`` form). Anchors on the exact hostname via
+    ``urlparse``/an explicit SCP-like pattern, never a bare ``"github.com/" in url``
+    substring check — a substring check also matches a lookalike host like
+    ``github.com.evil.example`` or ``evil.example/github.com/...`` (CodeQL:
+    ``py/incomplete-url-substring-sanitization``)."""
     cleaned = url[: -len(".git")] if url.endswith(".git") else url
-    if cleaned.startswith("git@") and ":" in cleaned:
-        path = cleaned.split(":", 1)[1]
-    elif "github.com/" in cleaned:
-        path = cleaned.split("github.com/", 1)[1]
+    scp_match = None if "://" in cleaned else _SCP_LIKE_REMOTE_RE.match(cleaned)
+    if scp_match:
+        host, path = scp_match.group("host"), scp_match.group("path")
     else:
+        parsed = urlparse(cleaned)
+        host, path = parsed.hostname or "", parsed.path
+    if host.lower() != "github.com":
         return None
     parts = path.strip("/").split("/")
     if len(parts) < 2 or not parts[0] or not parts[1]:
