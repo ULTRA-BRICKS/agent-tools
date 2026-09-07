@@ -395,3 +395,66 @@ def test_main_non_string_args_does_not_crash(monkeypatch):
     code = hook.main()
     assert code == 0
     assert json.loads(out.getvalue())["decision"] == "allow"
+
+
+# ── #579: `--help` probes and read-only segments are never heavy; real suites still are ──────
+#
+# Verbatim from the codex sessions in ~/work/private (2026-09-05/06): seven refusals under
+# jetsam warn, of which THREE were false positives (a `smoo playwright --help` probe twice, and
+# a `sed/cat/rg/ls -l …/vitest` read line) and FOUR were genuine vitest/bun-test runs.
+
+from codex_private_refusals import (  # noqa: E402
+    HEAVY_OP_HELP_PROBE,
+    HEAVY_OP_READ_ONLY_LINE,
+    HEAVY_OP_REAL_SUITE_RUNS,
+)
+
+
+@pytest.mark.parametrize("command", [HEAVY_OP_HELP_PROBE, HEAVY_OP_READ_ONLY_LINE])
+def test_refused_help_probe_and_read_line_are_not_heavy(command, monkeypatch):
+    assert hook.classify_heavy_operation(command) is None
+    out, _err, code = _run(command, monkeypatch, macos_level=2)
+    assert code == 0 and json.loads(out)["decision"] == "allow"
+
+
+@pytest.mark.parametrize("command", HEAVY_OP_REAL_SUITE_RUNS)
+def test_refused_real_suite_runs_are_still_gated_under_warn(command, monkeypatch):
+    """The other four refusals from the same sessions were correct and must stay so."""
+    assert hook.classify_heavy_operation(command) is not None
+    out, _err, code = _run(command, monkeypatch, macos_level=2)
+    assert code == hook.BLOCK_EXIT_CODE and json.loads(out)["decision"] == "block"
+
+
+@pytest.mark.parametrize("command", [
+    "pytest --help",
+    "npx playwright --version",
+    "./node_modules/.bin/vitest run --help",
+    "ls -l node_modules/.bin/vitest",
+    "cat vitest.config.ts | head -20",
+    "rg -n 'pytest|jest' package.json",
+    "sed -n '1,40p' pytest.ini; stat playwright.config.ts",
+    "npm test --help",                     # flag before any `--` → a probe of npm itself
+])
+def test_help_probes_and_read_only_segments_are_none(command):
+    assert hook.classify_heavy_operation(command) is None
+
+
+@pytest.mark.parametrize("command", [
+    "npm run build -- --help",             # the flag goes to the build SCRIPT, not the runner
+    "sudo pytest",                         # wrappers are never exempt (docstring's FN list)
+    "env CI=1 npm test",
+    "cd /repo && pnpm test",
+    "npm --prefix x test",
+    "ls -l && npm test",                   # a read-only segment next to a heavy one
+    "cat notes.txt | pytest -q",           # heavy segment at the tail of a pipe
+    "vitest run --reporter -h",            # a short `-h` may be a VALUE: not a carve-out
+    "pytest -V",
+])
+def test_real_suites_next_to_carve_outs_still_classify(command):
+    assert hook.classify_heavy_operation(command) is not None
+
+
+def test_cross_segment_coincidence_no_longer_matches():
+    """Per-segment membership: `make` on one segment and `all` on another was never a suite."""
+    assert hook.classify_heavy_operation("make && ./run all") is None
+    assert hook.classify_heavy_operation("make all") is not None

@@ -121,6 +121,25 @@ _SUITE_SUBCOMMANDS = frozenset({"test", "build", "verify", "package", "all"})
 _DIRECT_TEST_RUNNERS = frozenset({"playwright", "cypress", "jest", "vitest", "pytest"})
 _REVIEW_HEAVY_SUBCOMMANDS = frozenset({"diff", "quorum", "brainstorm", "just-ask"})
 
+# ── what can never be heavy (agent-tools#579) ──
+# A `--help`/`--version` probe of a runner prints usage and exits; it allocates nothing, so a
+# memory-pressure gate has no business refusing it (`smoo playwright --help` was blocked as a
+# "test-suite runner" under jetsam warn — twice). The probe is recognized per SEGMENT and only
+# when the flag comes BEFORE any `--`: `npm run build -- --help` hands the flag to the build
+# script, which may ignore it and build anyway.
+# Long forms only: a short `-h`/`-V` is also a plausible VALUE (`--reporter -h`) and must not
+# exempt a real run.
+_HELP_FLAGS = frozenset({"--help", "-help", "--version", "-version"})
+# A segment whose invoked command is a plain file reader/lister cannot start a suite, whatever
+# its ARGUMENTS name (`ls -l node_modules/.bin/vitest` was blocked because the path's basename
+# is `vitest`). Deliberately a tiny NEGATIVE list of tools that only read: it never exempts a
+# wrapper (`sudo pytest`, `env CI=1 npm test`, `cd x && pnpm test` all still match — the
+# false-negative class the docstring below records as the dangerous direction).
+_READ_ONLY_HEADS = frozenset({"ls", "cat", "head", "tail", "sed", "rg", "grep", "wc", "stat"})
+# Segment boundaries, matched as whole whitespace-separated tokens (a fused `a;b` stays one
+# token — no looser than the single-bag check this refines).
+_SEGMENT_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "|&"})
+
 
 def _tokenize(command: str) -> list[str]:
     """Best-effort shell tokenization. Falls back to a bare whitespace split on
@@ -158,8 +177,53 @@ def classify_heavy_operation(command: str) -> Optional[str]:
     operation is the more dangerous failure direction than an occasional
     unnecessary block, so the loose-membership version is the deliberate choice
     here, not an oversight.
+
+    What IS carved out (#579), per SEGMENT and never by command position: a `--help`/
+    `--version` probe, and a segment whose invoked command is a plain file reader (`ls`, `cat`,
+    `sed`, `rg`, …) — neither can allocate. See `_segments`/`_classify_segment`.
     """
-    tokens = _tokenize(command)
+    for segment in _segments(command):
+        label = _classify_segment(segment)
+        if label is not None:
+            return label
+    return None
+
+
+def _segments(command: str) -> list[list[str]]:
+    """Per-segment token lists: one per physical line, then per whole-token separator.
+
+    Splitting is what lets the `--help` and read-only exemptions apply to the one segment they
+    describe while a genuinely heavy sibling still matches (`python3 - <<'PY' … PY` followed by
+    `…/smoo playwright --help` on its own line; `sed …; cat … | head; ls -l …/vitest`). Within a
+    segment the check stays the loose membership described in `classify_heavy_operation` — the
+    only matches this loses are CROSS-segment coincidences (`make … && ./run all`), which were
+    never a real suite."""
+    out: list[list[str]] = []
+    for line in command.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        current: list[str] = []
+        for tok in _tokenize(line):
+            if tok in _SEGMENT_SEPARATORS:
+                out.append(current)
+                current = []
+            else:
+                current.append(tok)
+        out.append(current)
+    return [seg for seg in out if seg]
+
+
+def _is_help_probe(tokens: list[str]) -> bool:
+    """A `--help`/`--version` flag BEFORE any `--` token: the runner prints usage and exits."""
+    for tok in tokens:
+        if tok == "--":
+            return False
+        if tok in _HELP_FLAGS:
+            return True
+    return False
+
+
+def _classify_segment(tokens: list[str]) -> Optional[str]:
+    if not tokens or _is_help_probe(tokens) or _basename(tokens[0]) in _READ_ONLY_HEADS:
+        return None
     basenames = [_basename(t) for t in tokens]
 
     if any(b == "build-and-install.sh" for b in basenames):

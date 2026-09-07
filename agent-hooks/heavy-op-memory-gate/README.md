@@ -33,6 +33,18 @@ reaping a stale slot correctly is itself a hard, stateful problem that risks dea
 every agent on the machine. This hook is **stateless**: every invocation re-reads real
 pressure fresh, decides, and forgets. Nothing to leak, nothing to go stale.
 
+## What is never heavy: `--help` probes and read-only segments
+
+A `tool --help` / `--version` probe prints usage and exits, and a segment whose command is a
+plain file reader (`ls`, `cat`, `head`, `tail`, `sed`, `rg`, `grep`, `wc`, `stat`) cannot start
+a suite no matter what its arguments are named — `ls -l node_modules/.bin/vitest` lists a file.
+Both were refused under memory warn in the codex sessions of 2026-09-05/06 (agent-tools#579),
+so the classifier now judges each shell SEGMENT (one per line, then per `;`/`&&`/`|`) and skips
+those two shapes. The `--help` carve-out applies only when the flag precedes any `--`:
+`npm run build -- --help` hands the flag to the build script and is still gated. Wrappers are
+never exempt (`sudo pytest`, `env CI=1 npm test`, `cd x && pnpm test` all still block), and
+within a segment the check is the same loose token membership as before.
+
 ## Detection is token-based, not a raw substring search
 
 Unlike the advisory `enforce-timeout-on-bash`, this hook hard-blocks with **no bypass** —
