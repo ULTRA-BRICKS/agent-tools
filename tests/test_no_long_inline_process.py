@@ -696,6 +696,10 @@ def test_bare_or_too_short_justification_denies_without_telegram(
     "yarn run vitest",
     "bun run vitest",
     "npm exec vitest",
+    'npm exec --call "vitest run"',               # `-c/--call` runs a SHELL STRING: classified,
+    'npx -c "vitest run"',                        # not skipped as a value (round-1 bypass)
+    'npx --call="vitest run"',
+    "npx -c 'echo hi && pytest'",                 # any command in the nested string counts
     "pnpm test",
     "bun run build",
     "yarn run test",
@@ -724,7 +728,10 @@ def test_block_suite_behind_launcher(command, monkeypatch):
     "pdm run lint",
     "coverage run script.py",
     "npx cowsay hi",
-    "npm run dev",
+    "npm run dev",                                # `npm run <script>` is not modelled as a launcher
+    'npx -c "echo hi"',                           # a nested shell string that is not a suite
+    "uv run --unknown-boolean-flag ruff check .", # an option the table does not model: its
+                                                  # value (here: ruff) lands at argv[0] → allow
     "bun x cowsay hi",
 ])
 def test_allow_launcher_running_something_else(command, monkeypatch):

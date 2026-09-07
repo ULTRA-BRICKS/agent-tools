@@ -27,9 +27,14 @@ followed by a runner (`tg "(" review`) — see the module docstring's RESIDUAL L
   `coverage run -m pytest`, `npx|bunx vitest`, `npm exec vitest`, `pnpm exec|dlx vitest`,
   `yarn exec|dlx|run vitest`, `bun run|x vitest`. The launcher's own value-taking options are
   skipped with their value, so `uv run --with pytest ruff check .` runs `ruff` and stays allowed;
-  launchers peel recursively (`uv run python -m pytest`, `uv run env CI=1 pytest`). An option the
-  table does not model leaves its *value* at `argv[0]`, which is never a runner — the miss is an
-  allow (this gate's fail-open direction), never a false block.
+  launchers peel recursively (`uv run python -m pytest`, `uv run env CI=1 pytest`); an `npx`/`npm
+  exec` `-c`/`--call` value is a shell string the launcher runs, so it is classified as a nested
+  command line (`npx -c "vitest run"` blocks). The flag table is hand-maintained and incomplete
+  by design; the residual runs both ways but stays small: an option it does not model leaves that
+  option's *value* at `argv[0]` — an allow (this gate's fail-open direction) unless the value
+  happens to spell a runner name (`--future-flag pytest`), a false block on a spelling nobody
+  uses. The sibling `subagent-no-bg-longproc` hook carries the same peel (its drift guard pins
+  both the table and the behaviour).
 - **`sleep N`** with `N >= 10` (short sleeps like `sleep 2` are fine)
 
 Leading **no-op wrappers** are peeled off each segment before matching, so a wrapped long

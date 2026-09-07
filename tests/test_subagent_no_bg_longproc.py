@@ -171,6 +171,9 @@ def test_run_in_background_top_level_event_fallback(monkeypatch):
     "review -C /r && git commit -am x &",  # `&` backgrounds the WHOLE AND-OR list incl. review
     "lint && pytest tests/ &",           # `&` backgrounds the AND-list incl. the suite
     "review -C /r |& tee log &",         # `|&` pipe-both is within-job; the `&` backgrounds it
+    "uv run pytest tests/ &",            # a suite behind a LAUNCHER (agent-tools#584) — the
+    "python -m unittest discover &",     # inverse gate must see through it too
+    'npx -c "vitest run" &',             # …including a launcher's nested shell string
 ])
 def test_block_subagent_shell_backgrounding(command, monkeypatch):
     """A subagent backgrounding a long process via shell `&` / `setsid` → BLOCK.
@@ -480,6 +483,39 @@ def test_long_process_detection_constants_match_sibling():
     assert hook._SUITE_RUNNERS.keys() == sib._SUITE_RUNNERS.keys()
     for key, pat in hook._SUITE_RUNNERS.items():
         assert pat.pattern == sib._SUITE_RUNNERS[key].pattern, key
+    # The launcher/interpreter peel (agent-tools#584): the table and the interpreter grammar.
+    assert hook._LAUNCHERS == sib._LAUNCHERS
+    assert hook._UV_VALUE_FLAGS == sib._UV_VALUE_FLAGS
+    assert hook._PYTHON_EXE.pattern == sib._PYTHON_EXE.pattern
+    assert hook._PYTHON_VALUE_OPTS == sib._PYTHON_VALUE_OPTS
+    assert hook._PYTHON_LONG_VALUE_OPTS == sib._PYTHON_LONG_VALUE_OPTS
+    assert hook._MAX_LAUNCHER_NESTING == sib._MAX_LAUNCHER_NESTING
+
+
+@pytest.mark.parametrize("argv", [
+    "python3 -m pytest -q",
+    "python -um pytest",
+    "uv run --with pytest pytest tests/",
+    "uv run --with pytest python -m pytest",
+    "uv run env CI=1 pytest",
+    "npx vitest run",
+    'npx -c "vitest run"',
+    "npm exec --call='vitest run'",
+    "pnpm exec vitest",
+    "coverage run -m pytest",
+    "tox -e py312",
+    "uv run --with pytest ruff check .",   # allow in both
+    "python -m http.server",               # allow in both
+    "npx -c 'echo hi'",                    # allow in both
+])
+def test_long_process_label_matches_sibling_for_launcher_forms(argv):
+    """Behavioural drift guard for the launcher peel (round-1 review of agent-tools#584 asked for
+    behaviour, not just constants): both hooks must label the same peeled argv the same way."""
+    import shlex
+
+    sib = _load_sibling()
+    tokens = shlex.split(argv)
+    assert hook._long_process_label(tokens) == sib._long_process_label(tokens), argv
 
 
 if __name__ == "__main__":  # pragma: no cover
