@@ -200,6 +200,84 @@ def test_remove_force_flag_does_not_confuse_target(tmp_path, monkeypatch):
     assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+# ── `git worktree move` relocates a worktree — gated on its DESTINATION (review finding) ────
+
+def test_move_destination_outside_worktrees_blocks(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "git worktree move .worktrees/feat-x ../elsewhere", monkeypatch)
+    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_move_destination_inside_worktrees_allows(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "git worktree move ../elsewhere .worktrees/feat-x", monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_move_source_is_not_gated_only_destination(tmp_path, monkeypatch):
+    """A migration INTO `.worktrees/` from anywhere else stays allowed — only the destination is
+    checked, matching `add`'s single-target model."""
+    repo = _make_repo(tmp_path)
+    out, code = _run(
+        repo, "git worktree move /tmp/some-old-worktree .worktrees/migrated", monkeypatch
+    )
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_move_with_only_one_positional_is_not_gated(tmp_path, monkeypatch):
+    """An incomplete `move` (git itself would reject it) has no resolvable destination — nothing
+    to gate, fail open on this segment rather than guess."""
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "git worktree move .worktrees/feat-x", monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+# ── a bare `.worktrees` target (no `<name>`) is not a valid rig shape and stays blocked ──────
+
+def test_bare_worktrees_dir_itself_is_not_sanctioned(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "git worktree add .worktrees feat/x", monkeypatch)
+    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+# ── `--git-dir`/`GIT_DIR=` overrides are honored for repo-root resolution ───────────────────
+
+def test_dash_dash_git_dir_flag_resolves_real_repo(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    non_repo = tmp_path / "non-repo-dir"
+    non_repo.mkdir()
+    out, code = _run(
+        non_repo,
+        f"git -C {non_repo} --git-dir={repo}/.git worktree add /tmp/sprawl feat/x",
+        monkeypatch,
+    )
+    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_git_dir_env_assignment_resolves_real_repo(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    non_repo = tmp_path / "non-repo-dir2"
+    non_repo.mkdir()
+    out, code = _run(
+        non_repo,
+        f"GIT_DIR={repo}/.git git -C {non_repo} worktree add /tmp/sprawl2 feat/x",
+        monkeypatch,
+    )
+    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_dash_dash_git_dir_allows_target_inside_real_repos_worktrees(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    non_repo = tmp_path / "non-repo-dir3"
+    non_repo.mkdir()
+    out, code = _run(
+        non_repo,
+        f"git --git-dir={repo}/.git -C {non_repo} worktree add {repo}/.worktrees/feat-x feat/x",
+        monkeypatch,
+    )
+    assert code == 0 and _decision(out) == "allow"
+
+
 # ── out of scope: prune/list/lock/... are never gated ───────────────────────────────────────
 
 @pytest.mark.parametrize("sub", ["prune", "list", "lock .worktrees/x", "unlock .worktrees/x"])
@@ -276,6 +354,19 @@ def test_malformed_event_fails_open(monkeypatch):
     assert code == 0 and _decision(out_buf.getvalue()) == "allow"
 
 
+@pytest.mark.parametrize("payload", ["null", "5", "[]", '"oops"', "true"])
+def test_valid_json_non_dict_event_fails_open(monkeypatch, payload):
+    """Syntactically valid JSON that isn't an object must not crash `event.get(...)` — review
+    finding: only non-JSON text was previously tested, a valid-JSON non-dict payload was an
+    untested `AttributeError` path."""
+    out_buf = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
+    monkeypatch.setattr(sys, "stdout", out_buf)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    code = brwa.main()
+    assert code == 0 and _decision(out_buf.getvalue()) == "allow"
+
+
 # ── generic Telegram hatch escalation: mirrors pin-primary-worktree's own tests ─────────────
 
 def _fake_tg_ctl(path: Path, body: str) -> Path:
@@ -306,6 +397,28 @@ def test_hatch_escalation_allows(tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert "hatch escalation" in json.loads(out)["message"].lower()
+
+
+def test_hatch_capped_at_one_per_invocation(tmp_path, monkeypatch):
+    """A chain with TWO gate-worthy segments must not spend two hatch round-trips — the first
+    consumes the invocation's one hatch call (approved here), the second is blocked outright with
+    NO further `tg-ctl` invocation at all (review finding: unbounded per-segment hatch calls could
+    sum past the manifest timeout and silently fail the whole chain open via `on_error: open`)."""
+    call_marker = tmp_path / "tg-ctl-calls"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"echo x >> {call_marker}\n" + _ALLOW_REPLY_SH)
+    monkeypatch.setattr(brwa.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _make_repo(tmp_path)
+
+    out, code = _run(
+        repo,
+        "git worktree add ../elsewhere1 feat/x && git worktree add ../elsewhere2 -b feat/y",
+        monkeypatch,
+        {"RIG_HATCH_REQUEST_BLOCK_RAW_WORKTREE_ADD": "Migrating a pre-existing worktree."},
+    )
+
+    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "second worktree operation" in json.loads(out)["message"].lower()
+    assert call_marker.read_text().count("x") == 1
 
 
 def test_hatch_escalation_denied_blocks(tmp_path, monkeypatch):

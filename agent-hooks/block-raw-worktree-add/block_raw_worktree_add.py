@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""agents-hooks/v1 pre-bash hook — block a raw `git worktree add`/`remove` outside `.worktrees/`.
+"""agents-hooks/v1 pre-bash hook — block a raw git worktree add/remove/move outside .worktrees/.
 
 Incident this closes (agent-tools#608, Alex, 2026-09-07): rig-cli's own AGENTS.md documents
 `rig worktree create <name>` as "the ONLY way an agent (or a human) should create a worktree in
@@ -13,12 +13,15 @@ exact five-conventions problem was confirmed still happening, live, the same day
 written (`git worktree list` in `~/xp/rig-cli` showed worktrees in `/private/tmp`, a sibling
 `-worktrees/` dir, a `-wt-*` dir, and `.claude/worktrees/agent-*`).
 
-This hook closes that gap directly: it inspects `git worktree add` / `git worktree remove`
-invocations and BLOCKS one whose target path does not resolve under the repo's
-`<repo-root>/.worktrees/` — the one location rig's own reconciler (`rig worktree gc`) and
-sibling commands (`rig worktree create`/`remove`) know about. `git worktree list`, `git worktree
-lock`/`unlock`/`move`/`repair`, and `git worktree prune` are all unaffected (see "Deliberately
-out of scope" below).
+This hook closes that gap directly: it inspects `git worktree add` / `git worktree remove` /
+`git worktree move` invocations and BLOCKS one whose target path does not resolve under the
+repo's `<repo-root>/.worktrees/` — the one location rig's own reconciler (`rig worktree gc`) and
+sibling commands (`rig worktree create`/`remove`) know about. `move` relocates an EXISTING
+worktree (`git worktree move <worktree> <new-path>`) and is gated on its destination (the second
+positional) exactly like `add`/`remove` are gated on their single path argument — a legitimate
+migration INTO `.worktrees/` (`git worktree move /tmp/old .worktrees/old`) stays allowed; only a
+destination outside `.worktrees/` is blocked. `git worktree list`, `lock`/`unlock`/`repair`, and
+`git worktree prune` are all unaffected (see "Deliberately out of scope" below).
 
 Why `rig worktree create`'s OWN internal `git worktree add` call is never blocked — no
 process-ancestry trust needed: `rig worktree create` is a plain Python CLI (`riglib/worktree.py`,
@@ -43,20 +46,26 @@ all — it is git's own cleanup step, functionally the same direction as `rig wo
 REMOVES stale administrative state, it doesn't create sprawl). Gating it would add a second
 detection shape for zero benefit against GH-329's actual failure mode (worktrees landing in the
 wrong PLACE), and it would fight `rig worktree gc`'s own remediation path. `git worktree
-lock`/`unlock`/`move`/`repair`/`list` don't create or relocate a worktree relative to the repo
-root the way `add`/`remove` do and are likewise out of scope.
+lock`/`unlock`/`repair`/`list` don't create or relocate a worktree relative to the repo root the
+way `add`/`remove`/`move` do and are likewise out of scope. (`move` was originally grouped with
+these as "doesn't relocate a worktree" — that premise was WRONG, `move` is exactly a relocate
+primitive, and it is now gated; see the review note in git history/PR discussion if this class
+of mistake recurs — the fix here was to actually re-derive, not assume, what each subcommand
+does before excluding it.)
 
 Detection is ARGV-BASED (shlex, chain-aware — `_split_chain` is copied from
 `pin-primary-worktree/pin_primary_worktree.py`, itself SYNC'd with
 `orchestrator-stays-thin/orchestrator_stays_thin.py._split_chain`), not a substring match:
-`_classify_git_segment` (also copied from pin-primary-worktree) finds the real `git` invocation
-past any leading `VAR=value` assignments and global git options (`-C`, `-c`, ...), honoring a
-`-C <dir>` override so a cross-repo `git -C <other-repo> worktree add ...` is judged against
-THAT repo. `_worktree_target` then walks the `worktree add`/`worktree remove` argv, skipping
-recognized flags (`-b`/`-B`/`--reason` for `add`, which take a value; `-f`/`--force` and every
-other boolean flag for both), to find the first bare positional token — the target path — in
-EITHER flag order (`git worktree add -b feat path` and `git worktree add path -b feat` both
-resolve the same target).
+`_classify_git_segment` (also copied from pin-primary-worktree, EXTENDED to also capture a
+`--git-dir`/`GIT_DIR=` override — see its own docstring) finds the real `git` invocation past
+any leading `VAR=value` assignments and global git options (`-C`, `-c`, `--git-dir`, ...),
+honoring a `-C <dir>` override so a cross-repo `git -C <other-repo> worktree add ...` is judged
+against THAT repo. `_worktree_target` then walks the `worktree add`/`remove`/`move` argv via
+`_worktree_positionals`, skipping recognized flags (`-b`/`-B`/`--reason` for `add`, which take a
+value; `-f`/`--force` and every other boolean flag for all three), to find the checked path —
+the FIRST positional for `add`/`remove`, the SECOND for `move` — in EITHER flag order
+(`git worktree add -b feat path` and `git worktree add path -b feat` both resolve the same
+target).
 
 Repo-root resolution reuses the SAME git primitive pin-primary-worktree already established for
 this exact hook family: `git rev-parse --git-common-dir` resolves to the primary worktree's real
@@ -101,7 +110,21 @@ repo root unless the segment itself carries `git -C <dir>` (which IS honored); a
 FUTURE git-worktree flag that happens to take a value not in this hook's known value-flag set
 could be misread as the target path (or vice versa) — the same class of residual every
 argv-heuristic hook in this family accepts and documents rather than hand-parsing git's full
-option grammar.
+option grammar; a REPEATED `-C`/`--git-dir` (`git -C a -C b ...`, which real git composes — the
+second is resolved relative to the first, not to the original cwd) is not composed here either —
+`_classify_git_segment` just keeps the LAST occurrence's raw value, so a doubly-`-C`'d segment is
+judged against a directory git itself would not actually use (review finding; same class of
+imprecision as the rest of this list, named explicitly rather than left silent).
+
+A chained command with MORE THAN ONE gate-worthy `worktree add`/`remove`/`move` segment gets at
+most ONE Telegram hatch round-trip for the whole invocation — the second (and any later) such
+segment is blocked outright, without its own hatch call (review finding: `tg-ctl ask` legitimately
+runs up to ~900s; two sequential hatch calls could together exceed this hook's `timeout_ms`
+manifest budget — sized for ONE call — and the dispatcher's own timeout-kill would then resolve
+to `on_error: open`'s silent allow for the WHOLE chain. Capping at one hatch call per invocation
+closes this rather than merely documenting it; see `_evaluate_worktree_segment`'s `allow_hatch`
+parameter). Split a multi-worktree-op chain into separate Bash calls so each gets its own
+approval.
 
 Known, DELIBERATELY UNCLOSED bypasses (documented, not silently accepted — a reviewer or a future
 change should see these named, not discover them):
@@ -204,11 +227,18 @@ def warn(msg: str) -> None:
 # ── git plumbing (SYNC: copied from pin-primary-worktree/pin_primary_worktree.py — each
 # agent-hook is a standalone script by convention, no shared import between hook dirs) ──────────
 
-def _git(cwd: str, *args: str) -> str | None:
-    """Run a read-only ``git -C cwd <args>`` and return trimmed stdout, or None on any failure."""
+def _git(cwd: str, *args: str, git_dir: str | None = None) -> str | None:
+    """Run a read-only ``git [--git-dir=<git_dir>] -C cwd <args>`` and return trimmed stdout, or
+    None on any failure. ``git_dir`` (when given) is passed through to the REAL `git` binary
+    exactly as `--git-dir` — letting git itself resolve it (relative-to-cwd or absolute) rather
+    than hand-rolling that resolution here."""
+    argv = ["git"]
+    if git_dir:
+        argv.append(f"--git-dir={git_dir}")
+    argv += ["-C", cwd or ".", *args]
     try:
         proc = subprocess.run(  # noqa: S603 — fixed git argv, no shell
-            ["git", "-C", cwd or ".", *args],
+            argv,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -223,8 +253,8 @@ def _git(cwd: str, *args: str) -> str | None:
     return proc.stdout.strip()
 
 
-def _git_path(cwd: str, *rev_parse_args: str) -> Path | None:
-    out = _git(cwd, "rev-parse", *rev_parse_args)
+def _git_path(cwd: str, *rev_parse_args: str, git_dir: str | None = None) -> Path | None:
+    out = _git(cwd, "rev-parse", *rev_parse_args, git_dir=git_dir)
     if not out:
         return None
     p = Path(out)
@@ -236,14 +266,21 @@ def _git_path(cwd: str, *rev_parse_args: str) -> Path | None:
         return None
 
 
-def repo_root(cwd: str) -> Path | None:
+def repo_root(cwd: str, git_dir: str | None = None) -> Path | None:
     """The repo's single, unambiguous root directory, resolved the SAME way regardless of
     whether ``cwd`` sits in the primary worktree or a linked one (see module docstring): `git
     rev-parse --git-common-dir` always resolves to the primary worktree's real `.git`. Returns
     None (undetermined) on any git/resolve failure, or when the resolved `--git-common-dir`
     isn't a `.git`-named directory (a bare repo — out of scope, fails open rather than guessing
-    a wrong root)."""
-    common_dir = _git_path(cwd, "--git-common-dir")
+    a wrong root).
+
+    ``git_dir`` (a `--git-dir`/`GIT_DIR=` override captured off the gated command itself) is
+    forwarded to the underlying `git rev-parse` call so a segment like `git -C /tmp --git-dir
+    /real/repo/.git worktree add /tmp/x` — which git itself honors and executes against the REAL
+    repo despite `-C` pointing at a non-repo directory — resolves its true root instead of
+    reading as "repo root undetermined" and fail-opening (review finding: that combination let
+    an outside-`.worktrees/` target through unblocked)."""
+    common_dir = _git_path(cwd, "--git-common-dir", git_dir=git_dir)
     if common_dir is None or common_dir.name != ".git":
         return None
     return common_dir.parent
@@ -299,14 +336,35 @@ _GIT_GLOBAL_OPT_ARG = frozenset(
 _ASSIGN_RE = re.compile(r"^\w+=")
 
 
+def _leading_git_dir_assignment(toks: list[str], stop: int) -> str | None:
+    """The value of a leading ``GIT_DIR=<value>`` shell assignment among ``toks[:stop]`` (the
+    assignments `_classify_git_segment` skips over before finding the real `git` token), or None.
+    A bare `VAR=value` prefix is otherwise discarded entirely by `_classify_git_segment` (matching
+    pin-primary-worktree's own `_ASSIGN_RE` skip) — but `GIT_DIR` specifically changes which repo
+    `git` operates on, exactly like `--git-dir`, so it must feed the same repo-root resolution
+    (review finding: `GIT_DIR=/real/.git git -C /tmp worktree add /tmp/x` was otherwise
+    classified with an unresolvable `/tmp` root and fail-opened even though git itself honors
+    `GIT_DIR` and creates the worktree)."""
+    for tok in toks[:stop]:
+        key, sep, val = tok.partition("=")
+        if sep and key == "GIT_DIR":
+            return val
+    return None
+
+
 def _classify_git_segment(
     segment: str,
-) -> tuple[str, list[str], str | None] | None:
+) -> tuple[str, list[str], str | None, str | None] | None:
     """If ``segment``'s head is ``git`` (after any leading assignments / global options), return
-    ``(subcommand, rest_tokens, -C override)``, else None. SYNC: copied from
-    pin-primary-worktree/pin_primary_worktree.py._classify_git_segment (same rationale: leading
-    `VAR=val` assignments and global `-C`/`-c`/... options must be skipped to find the real `git`
-    subcommand and to honor a cross-repo `-C <dir>` override)."""
+    ``(subcommand, rest_tokens, -C override, --git-dir/GIT_DIR override)``, else None. SYNC:
+    based on pin-primary-worktree/pin_primary_worktree.py._classify_git_segment (same rationale:
+    leading `VAR=val` assignments and global `-C`/`-c`/... options must be skipped to find the
+    real `git` subcommand and to honor a cross-repo `-C <dir>` override) — EXTENDED here to also
+    capture `--git-dir`/`GIT_DIR=` (pin-primary-worktree only needs the `-C` form; this hook
+    additionally tracks `--git-dir` because a `worktree add` command that resolves an explicit,
+    real repo via `--git-dir`/`GIT_DIR` while `-C`/cwd point somewhere ELSE (a non-repo directory)
+    must not be treated as "repo root undetermined" — see `repo_root`'s `git_dir_override`
+    parameter)."""
     try:
         toks = shlex.split(segment)
     except ValueError:
@@ -314,6 +372,7 @@ def _classify_git_segment(
     i = 0
     while i < len(toks) and _ASSIGN_RE.match(toks[i]):
         i += 1
+    git_dir_override = _leading_git_dir_assignment(toks, i)
     if i >= len(toks) or toks[i].rsplit("/", 1)[-1] != "git":
         return None
     i += 1
@@ -322,12 +381,17 @@ def _classify_git_segment(
         opt = toks[i]
         if opt == "-C" and i + 1 < len(toks):
             cwd_override = toks[i + 1]
+        elif opt == "--git-dir" and i + 1 < len(toks):
+            git_dir_override = toks[i + 1]
+        elif opt.startswith("--git-dir="):
+            git_dir_override = opt.split("=", 1)[1]
         i += 1
         if opt in _GIT_GLOBAL_OPT_ARG and i < len(toks):
-            i += 1
+            i += 1  # skip this option's value token (glued `--git-dir=x` isn't in the set, so
+                     # this only fires for a genuinely DETACHED value like `--git-dir x`)
     if i >= len(toks):
         return None
-    return toks[i], toks[i + 1:], cwd_override
+    return toks[i], toks[i + 1:], cwd_override, git_dir_override
 
 
 # Flags that consume the NEXT token as a value, per `worktree add`'s own grammar (`-b <branch>`,
@@ -337,19 +401,24 @@ def _classify_git_segment(
 _ADD_VALUE_FLAGS = frozenset({"-b", "-B", "--reason"})
 # `worktree remove` has no value-taking flags of its own (`-f`/`--force` is boolean).
 _REMOVE_VALUE_FLAGS: frozenset[str] = frozenset()
+# `worktree move <worktree> <new-path>` — RELOCATES an existing worktree, exactly the sprawl
+# move `add`/`remove` already gate (review finding: this was originally left ungated on the
+# mistaken premise that only `add`/`remove` relocate a worktree relative to the repo root —
+# `move` is the third one, and the ONLY flag it takes is `-f`/`--force`, no value).
+_MOVE_VALUE_FLAGS: frozenset[str] = frozenset()
 
 
-def _worktree_target(toks: list[str], value_flags: frozenset[str]) -> str | None:
-    """The first bare positional token in `toks` (the args after `worktree add`/`worktree
-    remove`) — the target path/worktree, in EITHER flag order. Skips a recognized value flag and
-    its following token, a `--long=value` glued flag, and any other `-`-prefixed boolean flag; a
-    literal `--` ends flag scanning (everything after is positional). Returns None if there is no
-    positional token at all (an invalid/incomplete invocation git itself would reject)."""
+def _worktree_positionals(toks: list[str], value_flags: frozenset[str]) -> list[str]:
+    """Every bare positional token in `toks` (the args after `worktree add`/`remove`/`move`), in
+    order. Skips a recognized value flag and its following token, a `--long=value` glued flag,
+    and any other `-`-prefixed boolean flag; a literal `--` ends flag scanning (everything after
+    is positional)."""
+    positionals: list[str] = []
     i, n = 0, len(toks)
     while i < n:
         t = toks[i]
         if t == "--":
-            i += 1
+            positionals.extend(toks[i + 1:])
             break
         if t in value_flags and i + 1 < n:
             i += 2
@@ -360,8 +429,22 @@ def _worktree_target(toks: list[str], value_flags: frozenset[str]) -> str | None
         if t.startswith("-") and len(t) > 1:
             i += 1
             continue
-        return t
-    return toks[i] if i < n else None
+        positionals.append(t)
+        i += 1
+    return positionals
+
+
+def _worktree_target(kind: str, toks: list[str], value_flags: frozenset[str]) -> str | None:
+    """The target path this hook must check for `kind` (`add`/`remove`/`move`), in EITHER flag
+    order. For `add`/`remove` that's the FIRST positional (the worktree path itself). For `move`
+    it's the SECOND positional (`<worktree> <new-path>` — the source isn't gated, only where it
+    ends up; a legitimate migration `git worktree move /tmp/old .worktrees/old` stays allowed).
+    Returns None when there aren't enough positionals (an invalid/incomplete invocation git
+    itself would reject)."""
+    positionals = _worktree_positionals(toks, value_flags)
+    if kind == "move":
+        return positionals[1] if len(positionals) >= 2 else None
+    return positionals[0] if positionals else None
 
 
 def _resolve_effective_cwd(base_cwd: str, cwd_override: str | None) -> str:
@@ -403,11 +486,17 @@ def _worktrees_dir_escapes_repo(root: Path) -> bool:
 
 
 def _target_is_sanctioned(root: Path, resolved_target: Path) -> bool:
-    """True iff `resolved_target` resolves under `<root>/.worktrees/` AND `.worktrees` itself
-    isn't a symlink escaping `root` (see `_worktrees_dir_escapes_repo`)."""
+    """True iff `resolved_target` resolves to a PROPER child of `<root>/.worktrees/` (not
+    `.worktrees` itself — `Path.relative_to` on an identical path returns `.` without raising, so
+    a bare `git worktree add .worktrees feat/x` — no `<name>` subdirectory at all, not the
+    `rig worktree create` shape — must not be waved through as "already sanctioned"; review
+    finding) AND `.worktrees` itself isn't a symlink escaping `root` (see
+    `_worktrees_dir_escapes_repo`)."""
     if _worktrees_dir_escapes_repo(root):
         return False
     allowed_dir = (root / _WORKTREES_DIR_NAME).resolve()
+    if resolved_target == allowed_dir:
+        return False
     try:
         resolved_target.relative_to(allowed_dir)
         return True
@@ -415,13 +504,26 @@ def _target_is_sanctioned(root: Path, resolved_target: Path) -> bool:
         return False
 
 
+# The next-step guidance for each `kind`, appended to `MESSAGE`. `add`/`remove` map straight onto
+# their `rig worktree` counterpart; `move` has no direct rig equivalent (rig-cli doesn't offer a
+# relocate verb), so it gets a two-step recipe instead (review finding: `move` fully relocates a
+# worktree — the exact GH-329 failure mode — and was originally left ungated).
+_GUIDANCE = {
+    "add": "    rig worktree create <name>\n",
+    "remove": "    rig worktree remove <name>\n",
+    "move": (
+        "    rig worktree create <name>   # at the destination\n"
+        "    rig worktree remove <old-name>   # retire the old one\n"
+    ),
+}
+
 MESSAGE = (
     "BLOCKED — raw `git worktree {kind}` outside `{worktrees_dir}/` is not the sanctioned door "
     "(agent-tools#608 / rig-cli AGENTS.md: a real incident — GH-329 — left ~70 leftover "
     "worktrees scattered across five different ad-hoc locations, none tracked, tens of GB of "
     "duplicated node_modules/.venv). `{repo_worktrees}` is the ONLY sanctioned location.\n"
     "Use the rig door instead:\n"
-    "    rig worktree {rig_verb} <name>\n"
+    "{guidance}"
     "or, if `{target}` is a worktree that predates this convention, `rig worktree gc` to "
     "reconcile it.\n"
     "There is NO self-service bypass. If you have a genuine one-off reason (migrating an "
@@ -436,48 +538,60 @@ def _block_message(kind: str, root: Path, target: Path) -> str:
         kind=kind,
         worktrees_dir=_WORKTREES_DIR_NAME,
         repo_worktrees=str(root / _WORKTREES_DIR_NAME),
-        rig_verb="create" if kind == "add" else "remove",
+        guidance=_GUIDANCE[kind],
         target=target,
     )
+
+
+_WORKTREE_VALUE_FLAGS = {"add": _ADD_VALUE_FLAGS, "remove": _REMOVE_VALUE_FLAGS, "move": _MOVE_VALUE_FLAGS}
 
 
 def _classify_worktree_call(
     segment: str, base_cwd: str
 ) -> tuple[str, Path, Path, str] | None:
-    """If `segment` is a `git worktree add`/`remove` invocation with a resolvable target,
+    """If `segment` is a `git worktree add`/`remove`/`move` invocation with a resolvable target,
     return `(kind, root, resolved_target, eff_cwd)`; else None (nothing to gate — see
     `_evaluate_worktree_segment`'s docstring for every "nothing to gate" case)."""
     classified = _classify_git_segment(segment)
     if classified is None:
         return None
-    subcommand, rest, cwd_override = classified
+    subcommand, rest, cwd_override, git_dir_override = classified
     if subcommand != "worktree" or not rest:
         return None
     kind = rest[0]
-    if kind not in ("add", "remove"):
+    if kind not in _WORKTREE_VALUE_FLAGS:
         return None
-    value_flags = _ADD_VALUE_FLAGS if kind == "add" else _REMOVE_VALUE_FLAGS
-    target = _worktree_target(rest[1:], value_flags)
+    target = _worktree_target(kind, rest[1:], _WORKTREE_VALUE_FLAGS[kind])
     if target is None:
         return None
 
     eff_cwd = _resolve_effective_cwd(base_cwd, cwd_override)
-    root = repo_root(eff_cwd)
+    root = repo_root(eff_cwd, git_dir=git_dir_override)
     if root is None:
         return None  # undetermined repo root → fail open on this segment
     return kind, root, _resolve_target(eff_cwd, target), eff_cwd
 
 
 def _evaluate_worktree_segment(
-    segment: str, base_cwd: str, full_command: str
+    segment: str, base_cwd: str, full_command: str, *, allow_hatch: bool
 ) -> tuple[str, str] | None:
     """Evaluate ONE chained-command segment. Returns None if it needs no gating (not `git`, not
-    `worktree add`/`worktree remove`, no resolvable target, repo root undetermined, or the target
+    `worktree add`/`remove`/`move`, no resolvable target, repo root undetermined, or the target
     already resolves under `<repo-root>/.worktrees/`). Returns `("block", message)` when it must
     block, `("approved", note)` when a hatch escalation approved it.
 
-    The hatch escalation is asked with the FULL `full_command` (not just this segment) — the
-    human approver sees the whole chained command, and an inline
+    ``allow_hatch=False`` skips the hatch escalation entirely and blocks outright — used by
+    `main()` for every segment AFTER the first one that already consumed a hatch round-trip in
+    THIS invocation (review finding: `tg-ctl ask` legitimately runs up to ~900s per call; a chain
+    with two-plus gate-worthy segments could sum past this hook's `timeout_ms` manifest budget —
+    sized for ONE such call — and the dispatcher's own timeout-kill would then fail OPEN on
+    `on_error: open`, silently allowing the whole chain including a segment that was never
+    actually approved. Capping at one hatch call per invocation keeps the worst case bounded by a
+    single `tg-ctl ask` round-trip and turns "ran out of budget" into an explicit block instead
+    of a silent bypass).
+
+    The hatch escalation (when allowed) is asked with the FULL `full_command` (not just this
+    segment) — the human approver sees the whole chained command, and an inline
     `RIG_HATCH_REQUEST_BLOCK_RAW_WORKTREE_ADD="why" <cmd>` prefix on ANY segment of it is found
     (mirrors `pin-primary-worktree`)."""
     classified = _classify_worktree_call(segment, base_cwd)
@@ -486,6 +600,14 @@ def _evaluate_worktree_segment(
     kind, root, resolved_target, eff_cwd = classified
     if _target_is_sanctioned(root, resolved_target):
         return None
+
+    message = _block_message(kind, root, resolved_target)
+    if not allow_hatch:
+        return "block", (
+            "a second worktree operation in this chained command still needs its own "
+            "approval — split it into a separate command so each can be approved "
+            f"individually.\n{message}"
+        )
 
     context = {"hook": HOOK_ID, "kind": kind, "target": str(resolved_target), "command": full_command}
     hatch = hatch_escalation.request_hatch_approval(
@@ -496,7 +618,6 @@ def _evaluate_worktree_segment(
         note = f"worktree {kind} {resolved_target} approved via hatch escalation ({hatch.reason})"
         return "approved", note
 
-    message = _block_message(kind, root, resolved_target)
     if hatch.should_stop:
         warn(f"raw worktree {kind} hatch escalation denied: {hatch.reason}")
         return "block", f"hatch escalation denied: {hatch.reason}\n{message}"
@@ -510,6 +631,14 @@ def main() -> int:
         warn(f"could not parse event: {exc} — allowing (fail-open)")
         emit("allow")
         return 0
+    if not isinstance(event, dict):
+        # Syntactically valid JSON that isn't an object (`null`, `5`, `[]`, `"oops"`) — `.get()`
+        # below would raise AttributeError otherwise (review finding: uncaught, though the host's
+        # on_error=open still resolves the crash to allow — this makes the fail-open EXPLICIT and
+        # tested instead of an accidental byproduct of an unhandled exception).
+        warn(f"event is not a JSON object ({type(event).__name__}) — allowing (fail-open)")
+        emit("allow")
+        return 0
 
     cwd = str(event.get("cwd") or os.getcwd())
     args = event.get("args") if isinstance(event.get("args"), dict) else {}
@@ -519,10 +648,12 @@ def main() -> int:
         return 0
 
     approved_notes: list[str] = []
+    hatch_used = False
     for segment in _split_chain(command):
-        result = _evaluate_worktree_segment(segment, cwd, command)
+        result = _evaluate_worktree_segment(segment, cwd, command, allow_hatch=not hatch_used)
         if result is None:
             continue
+        hatch_used = True
         verdict, message = result
         if verdict == "block":
             emit("block", message)
