@@ -106,13 +106,23 @@ def test_help_only_invocation_of_a_heavy_command_is_not_heavy(command):
     assert hook.classify_heavy_operation(command) is None, command
 
 
-def test_help_flag_in_a_later_unrelated_pipe_segment_does_not_exempt_a_real_heavy_call():
+@pytest.mark.parametrize("command", [
+    "review diff -C . | grep -h pattern",
+    "review diff -C . & grep -h pattern",
+    "review diff -C . |& grep -h pattern",
+])
+def test_help_flag_in_a_later_unrelated_pipe_segment_does_not_exempt_a_real_heavy_call(command):
     """The false-NEGATIVE guard on the fix above: `-h` belongs to `grep`, not
-    `review`, in this pipeline — the `review diff` segment itself requests no
+    `review`, in these pipelines — the `review diff` segment itself requests no
     help, so it must still classify as heavy. Scoping the exemption to the
     matched invocation's OWN shell segment (not "anywhere in the command") is
-    what keeps this the safe direction — see `_segment_requests_help`."""
-    command = "review diff -C . | grep -h pattern"
+    what keeps this the safe direction — see `_segment_requests_help`.
+
+    `&` (backgrounds the preceding command) and `|&` (bash's stdout+stderr
+    pipe) are the two boundary operators a code-review pass (P2) caught
+    missing from the first version of this fix — `review diff -C . & grep -h
+    pattern` would have silently exempted the backgrounded `review diff`
+    without them."""
     assert hook.classify_heavy_operation(command) == "multi-model review-cli pass"
 
 

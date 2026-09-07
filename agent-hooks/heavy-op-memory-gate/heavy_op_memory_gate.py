@@ -121,10 +121,15 @@ _SUITE_SUBCOMMANDS = frozenset({"test", "build", "verify", "package", "all"})
 _DIRECT_TEST_RUNNERS = frozenset({"playwright", "cypress", "jest", "vitest", "pytest"})
 _REVIEW_HEAVY_SUBCOMMANDS = frozenset({"diff", "quorum", "brainstorm", "just-ask"})
 
-# Shell chain/pipe operators that shlex.split leaves as their own tokens (when
-# space-separated, the common style). Used to scope a `--help`/`-h` exemption
-# to the SAME segment as the matched invocation — see `_segment_requests_help`.
-_SHELL_BOUNDARY_TOKENS = frozenset({"|", "||", "&&", ";"})
+# Shell chain/pipe/background operators that shlex.split leaves as their own
+# tokens (when space-separated, the common style). Used to scope a
+# `--help`/`-h` exemption to the SAME segment as the matched invocation — see
+# `_segment_requests_help`. Includes `&` (backgrounds the preceding command —
+# `review diff -C . & grep -h pattern` must NOT let the trailing `-h` exempt
+# the backgrounded `review diff`) and `|&` (bash's stdout+stderr pipe) as well
+# as the plain chain/pipe operators — a real code-review catch (P2) on the
+# first version of this fix, which only covered `|`/`||`/`&&`/`;`.
+_SHELL_BOUNDARY_TOKENS = frozenset({"|", "||", "&", "|&", "&&", ";"})
 
 
 def _tokenize(command: str) -> list[str]:
