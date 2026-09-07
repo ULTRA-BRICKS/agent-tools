@@ -85,6 +85,16 @@ case "$sub" in
           echo "${SHIP_TEST_REVIEW_COUNT:-1}"
         elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q -- '--json baseRefName'; then
+          # SHIP_TEST_BASEREF_QUERY_FAIL exercises the gh-failure path for the external-review
+          # gate's own base-branch lookup specifically (independent of SHIP_TEST_REVIEW_QUERY_FAIL
+          # above, a DIFFERENT query) -- a dedicated test asserts this fails CLOSED (gate stays
+          # enabled), never falls back to guessing $SHIP_DEFAULT_BRANCH.
+          if [ -n "${SHIP_TEST_BASEREF_QUERY_FAIL:-}" ]; then
+            echo "fake gh: simulated baseRefName-query failure" >&2
+            exit 1
+          fi
+          printf '%s\\n' "${SHIP_TEST_BASE_BRANCH:-main}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           # One GREEN check so the CI gate passes on the normal (non-admin) merge path — this is
           # how tests that used to pass a bare --skip-ci (a shortcut to skip CI mocking) now run
@@ -7917,15 +7927,16 @@ def test_external_review_short_alias_env_var_also_disables_gate(repo_with_two_wo
 
 
 def test_external_review_disabled_via_committed_ship_config(repo_with_two_worktrees, tmp_path):
-    """agent-tools#600: a committed `.ship-config` line is a durable, per-repo alternative to the
-    env var -- one a repo owner can review and land like any other code change, and one a
-    different agent session or test process never inherits (unlike agent-tools#528's machine-wide
-    `~/.zshenv` export, which broke this script's own gate tests by leaking into them). Must
-    disable the gate with NO env var set at all."""
+    """agent-tools#600: a `.ship-config` line MERGED TO THE BASE BRANCH is a durable, per-repo
+    alternative to the env var -- one a repo owner can review and land like any other code
+    change, and one a different agent session or test process never inherits (unlike
+    agent-tools#528's machine-wide `~/.zshenv` export, which broke this script's own gate tests by
+    leaking into them). Must disable the gate with NO env var set at all."""
     main, _wt1, _wt2 = repo_with_two_worktrees
     (main / ".ship-config").write_text("SHIP_EXTERNAL_REVIEW=0\n", encoding="utf-8")
     _git("add", ".ship-config", cwd=main)
     _git("commit", "-qm", "disable the external-review gate for this repo", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
     bindir = _fake_gh_dir(tmp_path)
     env = dict(os.environ)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
@@ -7937,7 +7948,7 @@ def test_external_review_disabled_via_committed_ship_config(repo_with_two_worktr
     env.pop("SHIP_EXTERNAL_REVIEW", None)
     r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
     assert r.returncode == 0, f"a committed .ship-config off-switch must let a zero-review PR merge\n{r.stdout}\n{r.stderr}"
-    assert "external-review gate disabled by the committed .ship-config (SHIP_EXTERNAL_REVIEW=0)" in r.stdout, r.stdout
+    assert "external-review gate disabled by the committed .ship-config on origin/main (SHIP_EXTERNAL_REVIEW=0)" in r.stdout, r.stdout
     assert "[fake gh] merged" in r.stdout, r.stdout
 
 
@@ -7946,12 +7957,13 @@ def test_external_review_ship_config_off_switch_wins_even_with_env_explicitly_en
 ):
     """Same OR-not-AND precedence _acceptance_gate already has between its env var and its
     .ship-config key: an explicit SHIP_EXTERNAL_REVIEW=1 does not resurrect the gate once the
-    committed .ship-config says 0 -- either source disabling it is enough, and neither can force
+    base-branch .ship-config says 0 -- either source disabling it is enough, and neither can force
     the gate back ON when the other says off."""
     main, _wt1, _wt2 = repo_with_two_worktrees
     (main / ".ship-config").write_text("SHIP_EXTERNAL_REVIEW=0\n", encoding="utf-8")
     _git("add", ".ship-config", cwd=main)
     _git("commit", "-qm", "disable the external-review gate for this repo", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
     bindir = _fake_gh_dir(tmp_path)
     env = dict(os.environ)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
@@ -7962,14 +7974,15 @@ def test_external_review_ship_config_off_switch_wins_even_with_env_explicitly_en
     env["SHIP_EXTERNAL_REVIEW"] = "1"
     r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
     assert r.returncode == 0, f"a committed .ship-config off-switch must win over an explicit env=1\n{r.stdout}\n{r.stderr}"
-    assert "external-review gate disabled by the committed .ship-config (SHIP_EXTERNAL_REVIEW=0)" in r.stdout, r.stdout
+    assert "external-review gate disabled by the committed .ship-config on origin/main (SHIP_EXTERNAL_REVIEW=0)" in r.stdout, r.stdout
     assert "[fake gh] merged" in r.stdout, r.stdout
 
 
 def test_external_review_ship_config_ignored_when_uncommitted(repo_with_two_worktrees, tmp_path):
     """The audited-config contract applies here too (same property _ship_config_load already
-    enforces for SHIP_ACCEPTANCE_GATE/SHIP_LOCAL_TEST_CMD): only content committed at HEAD counts,
-    so a working-tree-only .ship-config cannot silently disable a merge-safety gate."""
+    enforces for SHIP_ACCEPTANCE_GATE/SHIP_LOCAL_TEST_CMD): only content actually merged to the
+    base branch counts, so a working-tree-only .ship-config cannot silently disable a
+    merge-safety gate."""
     main, _wt1, _wt2 = repo_with_two_worktrees
     (main / ".ship-config").write_text("SHIP_EXTERNAL_REVIEW=0\n", encoding="utf-8")
     bindir = _fake_gh_dir(tmp_path)
@@ -7987,15 +8000,55 @@ def test_external_review_ship_config_ignored_when_uncommitted(repo_with_two_work
     assert "[fake gh] merged" not in r.stdout
 
 
+def test_external_review_ship_config_on_feature_branch_only_does_not_disable_gate(
+    repo_with_two_worktrees, tmp_path
+):
+    """Security regression (review-cli finding, agent-tools#600 round 1): a `.ship-config`
+    committed ONLY on the shipping PR's own branch -- never merged to the base -- must NOT disable
+    the gate. Reading the off-switch from the PR's own HEAD would let that SAME PR grant itself an
+    exemption from "at least one GitHub review exists", recreating PR #764 (HYP-1380) inside the
+    fix for #764. Ships from the `feat` worktree (the realistic `gh ship` shape: run from the PR's
+    own checkout), with the line committed only on `feat`, never on `main`."""
+    main, wt1, wt2 = repo_with_two_worktrees
+    (wt1 / ".ship-config").write_text("SHIP_EXTERNAL_REVIEW=0\n", encoding="utf-8")
+    _git("add", ".ship-config", cwd=wt1)
+    _git("commit", "-qm", "attempt to disable the external-review gate from the PR itself", cwd=wt1)
+    _git("push", "-q", "origin", "feat", cwd=wt1)
+    # wt2 shares the `feat` branch ref (the fixture's exit-128 setup): the branch pointer moved
+    # when wt1 committed, but git does not auto-sync ANOTHER worktree's index/working tree when a
+    # shared branch advances elsewhere. Force wt2 back in sync with the new tip so ship.sh's OWN
+    # "every worktree on this branch must be clean" preflight (unrelated to this test) does not
+    # trip first and mask the assertion below.
+    _git("reset", "--hard", "HEAD", cwd=wt2)
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env.pop("SHIP_EXTERNAL_REVIEW_ENABLED", None)
+    env.pop("SHIP_EXTERNAL_REVIEW", None)
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=wt1, env=env)
+    assert r.returncode != 0, (
+        f"a .ship-config committed only on the PR's own branch must NOT disable the gate\n"
+        f"{r.stdout}\n{r.stderr}"
+    )
+    assert "ZERO GitHub-side reviews" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
 def test_external_review_ship_config_ignored_on_foreign_repo_invoke(repo_with_two_worktrees, tmp_path):
-    """A `.ship-config` disabling the gate lives in THIS checkout's repo root -- for a `--repo
+    """A `.ship-config` disabling the gate lives in THIS checkout's own repo -- for a `--repo
     other/repo` invocation that is a DIFFERENT repo's policy, so it must never waive the gate for
     the foreign target (the same class of bug #600 exists to close: the wrong repo's setting
-    silently taking effect). Mirrors _acceptance_gate's own foreign-repo skip."""
+    silently taking effect) even though the line IS genuinely merged to this repo's own base
+    branch. Mirrors _acceptance_gate's own foreign-repo skip."""
     main, _wt1, _wt2 = repo_with_two_worktrees
     (main / ".ship-config").write_text("SHIP_EXTERNAL_REVIEW=0\n", encoding="utf-8")
     _git("add", ".ship-config", cwd=main)
     _git("commit", "-qm", "disable the external-review gate for THIS repo only", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
     bindir = _fake_gh_dir(tmp_path)
     env = dict(os.environ)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
@@ -8013,6 +8066,77 @@ def test_external_review_ship_config_ignored_on_foreign_repo_invoke(repo_with_tw
     )
     assert r.returncode != 0, (
         f"a foreign --repo invocation must NOT be waived by this checkout's own .ship-config\n"
+        f"{r.stdout}\n{r.stderr}"
+    )
+    assert "ZERO GitHub-side reviews" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_external_review_ship_config_skipped_when_base_branch_unreadable(repo_with_two_worktrees, tmp_path):
+    """Security regression (review-cli finding, agent-tools#600 round 3): unlike
+    _empty_rollup_is_ci_outage (which safely falls back to $SHIP_DEFAULT_BRANCH on the same
+    gh-query failure -- guessing wrong there only costs an extra local test run), this gate must
+    NOT guess a fallback branch when `gh pr view --json baseRefName` fails. A PR that legitimately
+    targets some OTHER branch could otherwise inherit the DEFAULT branch's off-switch and merge
+    with zero reviews. On failure the .ship-config lookup must be skipped entirely and the gate
+    must stay enabled -- matching --known-flake's existing 'unreadable base -> refuse' contract."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    (main / ".ship-config").write_text("SHIP_EXTERNAL_REVIEW=0\n", encoding="utf-8")
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "disable the external-review gate for this repo", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env["SHIP_TEST_BASEREF_QUERY_FAIL"] = "1"
+    env.pop("SHIP_EXTERNAL_REVIEW_ENABLED", None)
+    env.pop("SHIP_EXTERNAL_REVIEW", None)
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, (
+        f"an unreadable base branch must NOT fall back to guessing $SHIP_DEFAULT_BRANCH's config\n"
+        f"{r.stdout}\n{r.stderr}"
+    )
+    assert "could not read PR #1's base branch" in r.stderr, r.stderr
+    assert "ZERO GitHub-side reviews" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_external_review_ship_config_skipped_when_fetch_fails_even_with_stale_local_ref(
+    repo_with_two_worktrees, tmp_path
+):
+    """Security regression (review-cli finding, agent-tools#600 round 3): a FAILED `git fetch`
+    (network/auth blip) must not fall through to reading whatever `origin/main` ref already
+    happens to exist locally from an earlier successful fetch. Pre-populates a stale local
+    `refs/remotes/origin/main` that DOES carry the off-switch (from a real prior fetch while the
+    remote was reachable), then breaks the `origin` remote so the fresh fetch this gate performs
+    fails -- the gate must stay enabled, not trust the stale cache."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    (main / ".ship-config").write_text("SHIP_EXTERNAL_REVIEW=0\n", encoding="utf-8")
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "disable the external-review gate for this repo", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    # Populate the stale local cache while origin is still reachable (mirrors a long-lived
+    # checkout that already ran ship successfully at least once before).
+    _git("fetch", "-q", "origin", "main:refs/remotes/origin/main", cwd=main)
+    # Now break `origin` so THIS run's fetch fails -- a nonexistent local path is a fast, offline
+    # way to force a real `git fetch` failure without touching network.
+    _git("remote", "set-url", "origin", str(tmp_path / "does-not-exist.git"), cwd=main)
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env.pop("SHIP_EXTERNAL_REVIEW_ENABLED", None)
+    env.pop("SHIP_EXTERNAL_REVIEW", None)
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, (
+        f"a failed fetch must NOT fall through to a stale local .ship-config cache\n"
         f"{r.stdout}\n{r.stderr}"
     )
     assert "ZERO GitHub-side reviews" in r.stderr, r.stderr
