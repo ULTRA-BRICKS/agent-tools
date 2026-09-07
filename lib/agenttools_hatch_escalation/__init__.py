@@ -119,7 +119,8 @@ _DELEGATION_RECIPES: dict[str, str] = {
     ),
     "codex": (
         "codex: spawn a child agent with `collaboration.spawn_agent` (in-process; codex tags the "
-        "child's tool calls with its own agent_id, so every gate sees them as a subagent's) and "
+        "child's tool calls with its own agent_id and records the child's rollout as a subagent "
+        "thread, so every gate sees them as a subagent's) and "
         "collect it with `collaboration.wait_agent`; for a truly detached child run the "
         "provisioned launcher `~/.agents/skills/rig-detached-codex/rig-detached-codex <name> "
         "<brief-file> [workdir]` (a `codex exec` child carrying RIG_AGENT_ID, launched with hook "
