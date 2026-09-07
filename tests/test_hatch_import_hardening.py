@@ -23,6 +23,7 @@ HATCH_HOOKS = (
     "agent-hooks/background-subagent-gate/background_subagent_gate.py",
     "agent-hooks/block-devserver-primary/block_devserver_primary.py",
     "agent-hooks/block-raw-pr-merge/block_raw_pr_merge.py",
+    "agent-hooks/block-raw-worktree-add/block_raw_worktree_add.py",
     "agent-hooks/block-reset-hard/block_reset_hard.py",
     "agent-hooks/decision-request-format/decision_request_format.py",
     "agent-hooks/no-long-inline-process/no_long_inline_process.py",
