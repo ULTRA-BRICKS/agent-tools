@@ -366,9 +366,18 @@ _GH_API_FIELD_FLAG_EQ_PREFIXES = tuple(f"{flag}=" for flag in _GH_API_FIELD_FLAG
 _GH_API_SHORT_FIELD_FLAGS = tuple(flag for flag in _GH_API_FIELD_FLAGS if len(flag) == 2)
 
 # A GitHub REST path that addresses an issue/its sub-resources:
-#   - `repos/<owner>/<repo>/issues`, optionally `/<number>`, optionally a mutable sub-resource
-#     (`comments`, `labels`, `assignees`, `lock`) with an optional trailing identifier
-#     (`/issues/42/labels/bug` removes one specific label);
+#   - `repos/<owner>/<repo>/issues`, optionally `/<number>`, optionally ONE sub-resource segment
+#     (`comments`, `labels`, `assignees`, `lock`, `reactions`, `sub_issues`, `timeline`, …) with
+#     an optional trailing identifier (`/issues/42/labels/bug` removes one specific label,
+#     `/issues/42/sub_issues/99` removes one). Deliberately NOT an enumerated allowlist of
+#     sub-resource names: GitHub ships more issue-mutating sub-resources than `comments`/
+#     `labels`/`assignees`/`lock` (e.g. `reactions`, `sub_issues` — review finding,
+#     agent-tools#597 quorum pass: `issues/42/sub_issues` with a POST/field bypassed the gate
+#     outright under the old enumerated pattern) and a closed list is a permanent game of
+#     whack-a-mole against GitHub's own API surface. Matching the SHAPE (issue number + one
+#     sub-resource segment) is safe because the path match alone never gates anything — the
+#     caller still requires an explicit mutating method or field flag on top of it, so a plain
+#     GET to an unlisted read-only sub-resource (e.g. `timeline`) is still never blocked;
 #   - OR `repos/<owner>/<repo>/issues/comments/<comment_id>` — GitHub's route for mutating ONE
 #     issue comment directly, which does not nest under an issue number at all (review finding,
 #     agent-tools#597: the previous pattern only matched `issues/<n>/comments`, never the
@@ -376,7 +385,7 @@ _GH_API_SHORT_FIELD_FLAGS = tuple(flag for flag in _GH_API_FIELD_FLAGS if len(fl
 _ISSUES_PATH_RE = re.compile(
     r"^/?repos/[^/\s]+/[^/\s]+/issues"
     r"(?:/comments/[^/\s]+"
-    r"|/\d+(?:/(?:comments|labels|assignees|lock)(?:/[^/\s]+)?)?"
+    r"|/\d+(?:/[^/\s]+(?:/[^/\s]+)?)?"
     r")?/?$",
     re.IGNORECASE,
 )
@@ -473,6 +482,14 @@ def gh_api_issue_mutation(argv: list[str]) -> bool:
         if tok.startswith(_GH_API_SHORT_FIELD_FLAGS) and len(tok) > 2:
             has_field = True
             i += 1
+            continue
+        # `gh`'s own global flags (`-R`/`--repo`/`--hostname`) are also valid AFTER `api` (e.g.
+        # `gh api --hostname ghe.example repos/o/r/issues -X POST`) and take a SEPARATE value —
+        # without this, the generic single-token flag skip below mistook the flag's own value
+        # for the endpoint path, so the real `repos/.../issues` path was never seen and the
+        # mutation went unclassified (review-cli quorum-pass finding, agent-tools#597).
+        if tok in _GH_GLOBAL_VALUE_FLAGS and i + 1 < len(argv):
+            i += 2
             continue
         if tok.startswith("-") and tok != "-":
             i += 1

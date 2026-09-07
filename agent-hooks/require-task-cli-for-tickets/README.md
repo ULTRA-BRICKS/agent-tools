@@ -28,20 +28,28 @@ command that merely *mentions* those words is not gated):
 | `create` (and its gh-documented alias `new`), `edit`, `close`, `reopen`, `comment`, `delete`, `transfer`, `lock`, `unlock`, `pin`, `unpin` | **yes** — creates or mutates a ticket |
 | `view`, `list`, `status` | no — read-only |
 
-`gh api`, scoped to a GitHub REST path that addresses an issue or one of its mutable
-sub-resources — `repos/<owner>/<repo>/issues`, optionally `/<number>` and a trailing `comments`/
-`labels`/`assignees`/`lock` (each optionally followed by its own identifier, e.g.
-`issues/42/labels/bug`), **or** the concrete per-comment route `repos/<owner>/<repo>/issues/
-comments/<comment_id>` (which does not nest under an issue number at all) — **and** a mutating
-signal: an explicit `-X`/`--method` of `POST`/`PATCH`/`PUT`/`DELETE`, or — with no explicit
-method — any `-f`/`-F`/`--field`/`--raw-field`/`--input` (which makes `gh api` default to
-`POST`), in either the separate-token form (`-f title=x`) or attached (`-ftitle=x`,
-`--field=title=x`). A plain `gh api repos/o/r/issues` with no method/fields is `gh api`'s own GET
-default — a read — and is not gated, matching the `gh issue view`/`list` exclusion. An explicit
+`gh api`, scoped to a GitHub REST path that addresses an issue or one of its sub-resources —
+`repos/<owner>/<repo>/issues`, optionally `/<number>` and ONE trailing sub-resource segment
+(`comments`, `labels`, `assignees`, `lock`, `reactions`, `sub_issues`, …) optionally followed by
+its own identifier (e.g. `issues/42/labels/bug`, `issues/42/sub_issues/99`) — **or** the concrete
+per-comment route `repos/<owner>/<repo>/issues/comments/<comment_id>` (which does not nest under
+an issue number at all). The sub-resource match is shape-based, not an enumerated allowlist —
+GitHub ships more issue-mutating sub-resources than the original four (`reactions`, `sub_issues`,
+…) and a closed list is a permanent game of whack-a-mole against GitHub's own API surface;
+matching the shape is safe because the path alone never gates anything by itself — **and** a
+mutating signal is still required on top of it: an explicit `-X`/`--method` of `POST`/`PATCH`/
+`PUT`/`DELETE`, or — with no explicit method — any `-f`/`-F`/`--field`/`--raw-field`/`--input`
+(which makes `gh api` default to `POST`), in either the separate-token form (`-f title=x`) or
+attached (`-ftitle=x`, `--field=title=x`). A plain `gh api repos/o/r/issues` with no method/fields
+is `gh api`'s own GET default — a read — and is not gated, matching the `gh issue view`/`list`
+exclusion (nor is a GET to an unlisted sub-resource like `issues/42/timeline`). An explicit
 `--method`/`-X` always wins over field-flag inference: `-X GET -f state=open` is a read (gh's own
 docs: `--method GET` sends fields as a query string, not a body). `-X` itself is recognized in
 its separate-token (`-X POST`), compact (`-XPOST`), `=`-attached (`-X=POST`), and long
-`--method=POST` forms — all verified live against the installed gh. This closes the `gh issue
+`--method=POST` forms — all verified live against the installed gh. `gh`'s own global flags
+(`-R`/`--repo`/`--hostname`) are recognized as taking a separate value in EVERY position they can
+appear — before `api`, and after it too (`gh api --hostname ghe.example repos/o/r/issues -X
+POST`) — so the flag's value is never mistaken for the endpoint path. This closes the `gh issue
 create` → `gh api repos/o/r/issues -f title=...` evasion without touching the many other
 legitimate uses of `gh api` (PRs, releases, workflow runs, …).
 

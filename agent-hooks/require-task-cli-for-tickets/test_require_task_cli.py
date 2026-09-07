@@ -354,6 +354,47 @@ class GhApiClassification(unittest.TestCase):
             )
         )
 
+    def test_hostname_flag_value_is_consumed_after_api(self):
+        """`gh api --hostname ghe.example repos/o/r/issues -X POST` — `--hostname` takes a
+        SEPARATE value (verified live: `gh api --hostname <host> <path>` fails on a connection
+        to `<host>`, proving the value was consumed as the hostname, not left as noise). Without
+        consuming it, the generic single-token flag skip mistook the hostname for the endpoint
+        path and never saw the real `repos/.../issues` path. Found during the review-cli quorum
+        pass, agent-tools#597."""
+        self.assertTrue(
+            mod.gh_api_issue_mutation(
+                ["gh", "api", "--hostname", "ghe.example.com", "repos/o/r/issues", "-X", "POST"]
+            )
+        )
+        self.assertTrue(
+            mod.gh_api_issue_mutation(
+                ["gh", "api", "-R", "o/r", "repos/o/r/issues", "-X", "POST"]
+            )
+        )
+
+    def test_sub_resource_beyond_the_old_enumeration_is_mutation(self):
+        """The path pattern is shape-based (issue number + one sub-resource segment), not an
+        enumerated allowlist — `sub_issues`/`reactions` are real GitHub issue-mutating
+        sub-resources the old `comments|labels|assignees|lock` enumeration missed entirely.
+        Found during the review-cli quorum pass, agent-tools#597."""
+        self.assertTrue(
+            mod.gh_api_issue_mutation(
+                ["gh", "api", "repos/o/r/issues/42/sub_issues", "-f", "sub_issue_id=99"]
+            )
+        )
+        self.assertTrue(
+            mod.gh_api_issue_mutation(
+                ["gh", "api", "repos/o/r/issues/42/reactions", "-f", "content=+1"]
+            )
+        )
+
+    def test_unlisted_sub_resource_get_still_not_gated(self):
+        """The broadened path shape must not, by itself, gate a plain read — only a mutating
+        signal (method/field) on top of a matching path fires the gate."""
+        self.assertFalse(
+            mod.gh_api_issue_mutation(["gh", "api", "repos/o/r/issues/42/timeline"])
+        )
+
     def test_concrete_comment_route_is_mutation(self):
         """`repos/<owner>/<repo>/issues/comments/<comment_id>` — GitHub's route for mutating ONE
         issue comment directly (it does not nest under an issue number). Review finding,

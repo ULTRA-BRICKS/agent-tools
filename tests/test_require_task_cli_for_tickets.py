@@ -162,6 +162,32 @@ class TestBlocksDirectMutation:
         assert out["code"] == rtc.BLOCK_EXIT_CODE
         assert out["decision"] == "block"
 
+    def test_gh_api_hostname_flag_value_consumed_still_blocks(self, tmp_path):
+        """`--hostname` takes a SEPARATE value; without consuming it the generic flag skip
+        mistook the hostname for the endpoint path and never saw the real issues path. Found
+        during the review-cli quorum pass, agent-tools#597."""
+        repo = _git_repo(tmp_path)
+        out = _run(
+            "gh api --hostname ghe.example.com repos/o/r/issues -X POST",
+            cwd=repo,
+            scratch=tmp_path,
+        )
+        assert out["code"] == rtc.BLOCK_EXIT_CODE
+        assert out["decision"] == "block"
+
+    def test_gh_api_sub_issues_route_blocks(self, tmp_path):
+        """The path pattern is shape-based, not an enumerated allowlist — `sub_issues` is a
+        real GitHub issue-mutating sub-resource the old `comments|labels|assignees|lock`
+        enumeration missed. Found during the review-cli quorum pass, agent-tools#597."""
+        repo = _git_repo(tmp_path)
+        out = _run(
+            "gh api repos/o/r/issues/42/sub_issues -f sub_issue_id=99",
+            cwd=repo,
+            scratch=tmp_path,
+        )
+        assert out["code"] == rtc.BLOCK_EXIT_CODE
+        assert out["decision"] == "block"
+
     def test_gh_api_concrete_comment_route_blocks(self, tmp_path):
         """`repos/<owner>/<repo>/issues/comments/<comment_id>` — GitHub's route for mutating ONE
         issue comment directly, not nested under an issue number. Review finding,
