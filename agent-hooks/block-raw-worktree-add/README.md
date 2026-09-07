@@ -150,6 +150,15 @@ agent's ability to run an unrelated Bash command.
   it (a second `-C` resolves relative to the first, not to the original cwd) — this hook just
   keeps the LAST occurrence's raw value, so a doubly-`-C`'d segment can be judged against a
   directory git itself would not actually use.
+- Inside a **submodule**, `--git-common-dir` resolves to `<parent>/.git/modules/<sub>` (named
+  `<sub>`, not `.git`), so `repo_root()` returns None and a `git worktree add` run from inside a
+  submodule of a rig-managed repo is NOT gated by this hook (tested:
+  `test_submodule_worktree_add_fails_open_documented_scope_limit`).
+- A `~/...`/`$HOME/...` target is never tilde/env-expanded — this hook works on the raw argv
+  token exactly as git receives it before shell expansion for a QUOTED path (an unquoted one is
+  already shell-expanded before this hook ever sees it). A SANCTIONED target spelled with `~`
+  resolves to a literal `<cwd>/~/...` and is over-blocked — safe direction, but costs a real
+  Telegram round-trip for a false positive.
 
 ## Known, deliberately unclosed bypasses
 
@@ -165,11 +174,25 @@ Named explicitly rather than left for a reviewer to rediscover:
   `.claude/worktrees/agent-*` convention) is not a Bash tool call at all, so no `pre-bash` hook —
   this one included — can see or gate it. This was one of the five ad-hoc conventions the live
   GH-329 incident actually observed.
-- **A `.worktrees` directory that is already a symlink pointing outside the repo root** would let
-  a target that resolves "under `.worktrees/`" actually land elsewhere. This one IS closed —
-  `_worktrees_dir_escapes_repo` (mirrors `riglib/worktree.py::_target_escapes_repo`) refuses to
-  treat ANY target as sanctioned once `.worktrees` itself is such a symlink — named here because
-  it's the kind of gap this class of hook is prone to and worth a reviewer's explicit attention.
+- **A `.worktrees` that is ALREADY a symlink** (pointing anywhere, including at itself or at the
+  repo root) is closed for a PRE-EXISTING symlink — `_worktrees_dir_is_untrusted` refuses to
+  treat ANY target as sanctioned once `.worktrees` is a symlink at all, checked at the moment
+  this hook evaluates the command.
+- **The same symlink, planted by an EARLIER segment of the SAME chained command, is a TOCTOU
+  residual — NOT closed.** This hook evaluates every segment of a chained command before any of
+  them actually run. `ln -s /tmp/sprawl .worktrees && git worktree add .worktrees/x feat/x` sees
+  `.worktrees` not yet a symlink at evaluation time, judges the target as sanctioned, and only
+  AFTER this hook allows the command does the shell create the symlink and let git follow it. A
+  SEPARATE, later Bash call hitting an already-planted symlink IS caught (the symlink exists by
+  then); only same-chain planting evades it. Same class as the `cd other-repo &&` scope limit
+  above (an earlier segment changes what a later one means) — a targeted "scan earlier segments
+  for anything touching `.worktrees`" check would still be evadable (`python -c`, `mv`, `cp -s`,
+  ...) and would over-block the benign `mkdir -p .worktrees && git worktree add .worktrees/x
+  feat/x`, so it's documented rather than half-closed.
+- **A raw target token carrying an unexpanded `$VAR`/`$( … )`/backtick** is closed — treated as
+  NOT sanctioned regardless of where it lexically resolves, because the literal argv token this
+  hook sees is pre-shell-expansion (`.worktrees/$(printf ../outside-wt)` has no `..` component
+  until the real shell expands it, at which point git lands the worktree outside `.worktrees/`).
 
 ## Test
 

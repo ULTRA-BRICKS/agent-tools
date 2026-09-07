@@ -179,6 +179,55 @@ def test_symlinked_worktrees_dir_never_sanctioned(tmp_path, monkeypatch):
     assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+def test_self_referential_worktrees_symlink_loop_blocks_not_crashes(tmp_path, monkeypatch):
+    """A `.worktrees -> .worktrees` symlink loop must BLOCK, not crash the hook. Real incident:
+    `Path.resolve()`'s loop detection raised `RuntimeError` (not `OSError`) on Python <=3.12, and
+    an earlier version of `_worktrees_dir_is_untrusted` caught only `OSError` around a `.resolve()`
+    call — an uncaught crash here, under `on_error: open`, silently allows the whole command. The
+    fix removed the `.resolve()` call entirely (any symlinked `.worktrees` is untrusted, no need
+    to resolve WHERE it points), so this must never even reach a resolve call."""
+    repo = _make_repo(tmp_path)
+    (repo / ".worktrees").symlink_to(repo / ".worktrees")
+    out, code = _run(repo, "git worktree add .worktrees/feat-x feat/x", monkeypatch)
+    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_worktrees_dir_self_symlink_to_repo_root_blocks(tmp_path, monkeypatch):
+    """A `.worktrees -> <repo-root>` symlink must not make EVERY in-repo path "sanctioned" (an
+    earlier version resolved the symlink, found it equal to `root`, and reported "does not
+    escape" — which then made `allowed_dir == root`, so any in-repo path passed `relative_to`)."""
+    repo = _make_repo(tmp_path)
+    (repo / ".worktrees").symlink_to(repo, target_is_directory=True)
+    out, code = _run(repo, "git worktree add src/evil feat/x", monkeypatch)
+    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+# ── a raw target token with unexpanded shell syntax is never lexically trusted ──────────────
+
+def test_target_with_dollar_paren_expansion_not_sanctioned(tmp_path, monkeypatch):
+    """`.worktrees/$(printf ../outside-wt)` has no literal `..` component and would otherwise
+    lexically resolve as a child of `.worktrees/` — but the REAL shell expands it to
+    `.worktrees/../outside-wt`, landing the worktree outside `.worktrees/` entirely. Must not be
+    treated as sanctioned."""
+    repo = _make_repo(tmp_path)
+    out, code = _run(
+        repo, 'git worktree add ".worktrees/$(printf ../outside-wt)" feat/x', monkeypatch
+    )
+    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_target_with_backtick_expansion_not_sanctioned(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "git worktree add .worktrees/`echo x` feat/x", monkeypatch)
+    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_target_with_dollar_var_not_sanctioned(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "git worktree add .worktrees/$FOO feat/x", monkeypatch)
+    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
 # ── `git worktree remove` mirrors `add` ──────────────────────────────────────────────────────
 
 def test_remove_outside_worktrees_blocks(tmp_path, monkeypatch):
@@ -306,7 +355,10 @@ def test_cross_repo_dash_c_blocks_against_target_repo(tmp_path, monkeypatch):
     repo_b = _make_repo(tmp_path, "repo-b")
     out, code = _run(repo_a, f"git -C {repo_b} worktree add ../outside-b feat/x", monkeypatch)
     assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
-    assert str(repo_b) in json.loads(out)["message"] or "repo-b" in json.loads(out)["message"]
+    # `_block_message`'s `{repo_worktrees}` interpolates `root / ".worktrees"` where `root` is
+    # the RESOLVED repo root (repo_root() resolves --git-common-dir) — assert the actual value,
+    # not a hedged "either raw or resolved" guess.
+    assert str(repo_b.resolve() / ".worktrees") in json.loads(out)["message"]
 
 
 def test_cross_repo_dash_c_allows_when_inside_target_repos_worktrees(tmp_path, monkeypatch):
@@ -342,6 +394,25 @@ def test_not_a_git_repo_fails_open(tmp_path, monkeypatch):
     plain_dir = tmp_path / "not-a-repo"
     plain_dir.mkdir()
     out, code = _run(plain_dir, "git worktree add ../elsewhere feat/x", monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_submodule_worktree_add_fails_open_documented_scope_limit(tmp_path, monkeypatch):
+    """Documented scope limit (repo_root's own docstring): inside a submodule,
+    `--git-common-dir` resolves to `<parent>/.git/modules/<sub>` (name `<sub>`, not `.git`), so
+    `repo_root()` returns None and a `git worktree add` run from a submodule of a rig-managed
+    repo is NOT gated by this hook. This test locks in that documented behavior rather than
+    leaving it as an untested claim."""
+    outer = _make_repo(tmp_path, "outer")
+    sub_src = _make_repo(tmp_path, "sub-src")
+    proc = subprocess.run(
+        ["git", "-C", str(outer), "-c", "protocol.file.allow=always",
+         "submodule", "add", str(sub_src), "sub"],
+        capture_output=True, text=True, env=_GIT_ENV,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    out, code = _run(outer / "sub", "git worktree add ../../elsewhere feat/x", monkeypatch)
     assert code == 0 and _decision(out) == "allow"
 
 
