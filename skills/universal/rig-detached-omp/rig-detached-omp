@@ -71,6 +71,18 @@ if [ ! -d "$workdir" ]; then
     echo "rig-detached-omp: workdir '$workdir' is not a directory" >&2
     exit 2
 fi
+# Canonicalize BEFORE the `cd "$workdir"` below: the child also receives this same string
+# via `--cwd "$workdir"`, and a RELATIVE workdir would otherwise be resolved a SECOND time
+# against the already-cd'd directory (`./packages/app` from `/repo` becomes
+# `/repo/packages/app/packages/app` for the child, or a silent wrong-tree run if that
+# nested path happens to exist) — the same GH-497 P1 class the brief-read-before-cd
+# comment above already guards against, applied to this second relative-path use.
+# `CDPATH=''` matches this repo's own canonicalize idiom (`canon_dir` in
+# git-hooks/global-dispatcher/install-local-hooks.sh): an inherited CDPATH makes bash's
+# `cd` print the resolved path to stdout on a match, which would corrupt this command
+# substitution with a second line. `--` stops a workdir literally named `-P`/`-L`/`-`
+# from being parsed as a `cd` option (e.g. `cd -P` silently landing in $OLDPWD/$HOME).
+workdir="$(CDPATH='' cd -- "$workdir" && pwd -P)"
 if ! command -v omp >/dev/null 2>&1; then
     echo "rig-detached-omp: 'omp' not found on PATH" >&2
     exit 127

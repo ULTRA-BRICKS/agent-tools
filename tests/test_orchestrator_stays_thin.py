@@ -394,7 +394,7 @@ def test_real_bridge_launcher_env_child_is_subagent_exempt(tmp_path, monkeypatch
         raw_event = {
             "event": "tool_call",
             "toolName": "bash",
-            "input": {"command": _REPRO_CHAIN},
+            "input": {"command": _FALLBACK_CHAIN},
             "cwd": "/repo",
             "toolCallId": "call_1",
         }
