@@ -133,62 +133,41 @@ never writes a top-level `agent_id`; a non-CC carrier wiring this hook must repl
 or a forged `agent_id` self-exempts the orchestrator (see `background-subagent-gate/README.md` for
 the full contract). This matches the sibling `skills-read-gate`'s narrowed read (agent-tools#115).
 
-**Harness-exempt (agent-tools#533):** a Codex, opencode, or omp event is exempt from this gate
-**entirely** — WARN, BLOCK, and the hatch escalation never fire — regardless of what the command
-or write looks like. `EXEMPT_HARNESSES = {"codex", "opencode", "omp"}`, checked against the
-top-level `event["harness"]` right after the subagent check, before any command/write is even
-classified.
+**Harness-unified (agent-tools#573):** an earlier revision exempted the WHOLE codex, opencode,
+and omp harnesses from this gate entirely (`EXEMPT_HARNESSES = {"codex", "opencode", "omp"}`,
+agent-tools#533) because none of their bridges exposed a trusted per-tool-call subagent
+identity and the block message's remediation ("Dispatch a subagent ... Agent tool with
+`subagent_type: 'fork'`") doesn't even apply outside Claude Code. That traded one bug for
+another: a bare interactive codex/opencode/omp session got NO delegation discipline at all, and
+a live codex session separately collected 184 `no-long-inline-process` refusals with unusable
+CC-only advice (that sibling hook never had a harness exemption in the first place).
 
-Why the whole harness, not a signal review-cli sets: this gate's premise is Claude-Code-specific
-— "the top-level Claude Code session must delegate implementation work to a CC `Agent`/`Task`
-subagent instead of doing it inline." Codex, opencode, and omp DO each model a subagent lifecycle
-of their own (Codex's `SubagentStart`/`SubagentStop` events, opencode's `task` tool, omp's own
-`task` tool), but none of the three bridges exposes a TRUSTED per-tool-call subagent identity from
-it today (a forged `args.agent_id`/`agent_type` is stripped by `lib/codex_hook_bridge`,
-`lib/opencode_hook_bridge`, and `lib/omp_hook_bridge` alike, and none repopulates it from anything
-authoritative — there is no CC-shaped top-level field to restore it from, and omp's `tool_call`/
-`tool_result` extension events document no such field either). So EVERY Codex/opencode/omp-sourced
-event used to look like "the orchestrator" here, whether it was:
-- a bare Codex/opencode/omp CLI session Alex runs directly (not a CC orchestrator refusing to
-  delegate at all — there is no CC session in the loop to be "thin"), or
-- a Codex/opencode/omp process spawned by another tool as delegated work (review-cli's read-only
-  reviewer backend running `git status`/`git diff`/`sed -n` as part of its own review role; a
-  CC-dispatched subagent that happens to shell out to `codex exec`).
+Both problems are fixed at the root instead of carving out a harness. `lib/codex_hook_bridge`
+and `lib/omp_hook_bridge` now restore `args.agent_id` from the launcher process environment
+(`RIG_AGENT_ID`/`RIG_DETACHED_AGENT`, set by the new `rig-detached-codex`/`rig-detached-omp`
+launcher skills) via `_detached_agent_id`, the same mechanism `lib/opencode_hook_bridge` already
+used (agent-tools#476) — so `_is_subagent` alone now correctly exempts a rig-launched detached
+child under EVERY harness, no harness-wide carve-out needed. And the block/warn text now reads
+the bridge-set, unforgeable `event["harness"]` to name the delegation recipe for the ACTUAL
+firing harness (`_delegation_recipe`/`_HARNESS_RECIPES`) instead of a hardcoded Claude-Code-only
+string: Claude Code gets the `Agent` tool, codex gets `rig-detached-codex` (or a native
+`spawn_agent` tool where one exists), opencode gets `rig-detached-opencode`, and omp gets its
+`task` tool or `rig-detached-omp`. A missing/unrecognized `harness` falls back to the Claude
+Code recipe rather than fabricating a fifth harness's advice.
 
-Both were wrongly blocked (agent-tools#533, a live Alex incident: a `codex exec` review process
-hit the WARN→BLOCK tier running harmless read-only inspection, and separately a standalone Codex
-session doing real delegated work was hard-blocked mid-task). Blocking the first case is simply
-wrong — there is no orchestrator to keep thin. Blocking the second is wrong for a sharper reason:
-the block message's remediation ("Dispatch a subagent ... Agent tool with `subagent_type:
-'fork'`") **does not exist in Codex, opencode, or omp** — CC's `Agent` tool is a Claude-Code-only
-concept, so the gate would be telling a blocked session to use tooling it doesn't have. omp hits
-the identical failure mode for the identical reason, added when `lib/omp_hook_bridge` shipped.
+`EXEMPT_HARNESSES` and `_is_exempt_harness` are gone entirely — codex/opencode/omp events are
+now judged by exactly the same `_is_code_write`/`_is_implementation_bash` classifiers as Claude
+Code's, and the only thing that ever relaxes the gate is a real subagent identity
+(`_is_subagent`), which now works correctly across all four harnesses instead of only Claude
+Code and (partially) opencode.
 
-**Non-forgeability.** `event["harness"]` is set from a hardcoded module constant
-(`codex_hook_bridge.HARNESS = "codex"`, `opencode_hook_bridge.HARNESS = "opencode"`,
-`omp_hook_bridge.HARNESS = "omp"`, `cc_hook_bridge.HARNESS = "claude-code"`) — a Python literal,
-not derived from any field of the underlying tool event, so nothing in `tool_input`/`args` can
-set or override it (unlike `args.agent_id`, which the bridges must actively strip a forged copy
-of). And which bridge fires at all is decided entirely by which product's own hook system invoked
-it: a Claude Code session's Bash call is dispatched by CC's PreToolUse machinery straight into
-`cc_hook_bridge` — it has no mechanism to reroute its own tool call through `codex_hook_bridge`
-instead, so a CC orchestrator cannot dodge this gate by claiming to be a different harness. If a
-CC orchestrator runs `codex exec …` inline as a Bash command, THAT Bash call is still judged as
-usual by `cc_hook_bridge` (harness `claude-code`); the exemption only reaches the codex CHILD
-process's own tool calls, which is by definition delegated work.
-
-The read is deliberately an **allowlist** (`harness in EXEMPT_HARNESSES`), not `harness !=
-"claude-code"`: an event with no `harness` field (every pre-#533 fixture, and any future bridge
-that doesn't set one) stays **governed** — the relax direction fails closed, same discipline as
-the `agent_id` read above. If a Codex/opencode/omp session is ever meant to function as a thin
-orchestrator dispatching its own subagents, that needs an explicit config knob, not a change to
-this hardcoded exemption.
-
-**review-cli note:** this exemption needed no cooperation from review-cli and no env marker for
-it to set — a review-cli-spawned `codex exec -s read-only`/opencode reviewer process is exempt
-purely because it runs through `codex_hook_bridge`/`opencode_hook_bridge`, the same as any other
-Codex/opencode invocation. `reviewlib/backends.py` (review-cli) needs no documentation change for
-this signal; there is nothing there to keep in sync.
+Neither Codex nor omp expose a genuinely trustworthy HARNESS-OWN child-spawn record beyond the
+launcher-env signal today: Codex's `SubagentStart`/`SubagentStop` events exist but carry no
+captured, confirmed parent/child linkage in `codex_hook_bridge`'s payload, and omp's
+`tool_call`/`tool_result` extension events document no session/task-spawn marker either (both
+bridges' own module docstrings record exactly what was checked and ruled out). Until one of
+those is confirmed and wired up, the launcher-env marker is the ONLY non-forgeable identity
+source for those two harnesses, same as opencode.
 
 ## `gh ship <PR#>` — restored narrow carve-out (agent-tools#159, Alex tg#9977; narrowed by agent-tools#363)
 

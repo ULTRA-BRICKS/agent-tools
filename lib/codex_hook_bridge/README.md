@@ -36,9 +36,14 @@ fan out descriptor execution so existing singular-path hooks receive one `args.f
 / `args.path` at a time. That keeps current path-scoped hooks useful without changing the
 v1 event contract.
 
-The bridge strips `agent_id` / `agent_type` from Codex `tool_input`. Those fields are not
-trusted until Codex has a captured, non-forgeable subagent identity fixture. Until that
-exists, subagent-exempt `pre-bash` hooks treat Codex calls as main-thread calls.
+The bridge strips `agent_id` / `agent_type` from Codex `tool_input` and restores a TRUSTED
+`args.agent_id` from the launcher process environment instead (`RIG_AGENT_ID`/
+`RIG_DETACHED_AGENT`, set by the `rig-detached-codex` launcher skill) via
+`_detached_agent_id` — the same mechanism `opencode_hook_bridge` uses (agent-tools#476,
+ported to codex/omp by agent-tools#573). Codex has no captured, non-forgeable subagent
+identity fixture of its OWN beyond that launcher-env marker (SubagentStart/SubagentStop exist
+but carry no confirmed parent/child linkage in this bridge's payload), so a plain Codex
+session with no launcher marker still looks like a main-thread call to subagent-exempt hooks.
 
 Every translated v1 event also carries a top-level `harness: "codex"` — a hardcoded module
 constant (`dispatch.HARNESS`), never derived from the Codex event, so it can't be forged via

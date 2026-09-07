@@ -46,12 +46,16 @@ its own equivalent process/module isolation.
   `"opencode"`) identifying which product's hook system dispatched the event — set from a
   hardcoded module literal in each bridge, never derived from `args`/`tool_input`, so it cannot
   be forged the way a same-named key sitting in `args` could be (agent-tools#533). A hook that
-  needs to scope itself to, or exempt, an entire harness reads `event["harness"]` directly; see
-  `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer. **A hook
-  that RELAXES on `harness` must use a fail-closed allowlist** (`harness in {known-safe values}`),
-  never a `!=` exclusion: the field may be absent on an event from a bridge that predates it, or
-  from any future bridge that doesn't set one, and an absent/unrecognized value must stay
-  GOVERNED by default, exactly like this repo's `agent_id` subagent-exemption convention.
+  needs to tailor its message (or otherwise branch) on the firing harness reads
+  `event["harness"]` directly — see `agent-hooks/orchestrator-stays-thin`'s per-harness
+  delegation-recipe text for a consumer (agent-tools#573). No hook exempts a whole harness by
+  this field any more (agent-tools#573 removed the last one, `orchestrator-stays-thin`'s old
+  `EXEMPT_HARNESSES`): every harness is governed identically, and the ONLY thing that varies
+  by harness is remediation wording. **A hook that ever wants to RELAX on `harness` again must
+  use a fail-closed allowlist** (`harness in {known-safe values}`), never a `!=` exclusion: the
+  field may be absent on an event from a bridge that predates it, or from any future bridge that
+  doesn't set one, and an absent/unrecognized value must stay GOVERNED by default, exactly like
+  this repo's `agent_id` subagent-exemption convention.
 - **stdout**: protocol JSON only — `{ "hook_api": "agents-hooks/v1", "decision": "allow"
   | "block", "message": "..." }`. Empty stdout = allow.
 - **stderr**: human logs (never parsed).
