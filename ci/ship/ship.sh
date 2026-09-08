@@ -128,6 +128,14 @@
 #   SHIP_SKIP_VERSION_BUMP=1  override the version-bump gate (same effect as
 #                          --no-version-bump-ok, with a generic env-set reason). Use only for a
 #                          genuine no-release ship.
+#   SHIP_AUTO_BUMP=0       opt OUT of the merge-time version bump (#518; default: on). By default,
+#                          when the version-bump gate would refuse, ship bumps the PATCH version
+#                          itself onto the PR HEAD via the GitHub Contents API. Env wins over a
+#                          committed .ship-config line. Case-insensitive 0/false/no/off.
+#   SHIP_AUTO_BUMP_HEAD_WAIT / SHIP_AUTO_BUMP_HEAD_POLL  seconds to wait (default 90) / poll
+#                          interval (default 3) for the PR head to reflect ship's own commit.
+#   SHIP_AUTO_BUMP_CI_GRACE  minimum check-registration grace (default 120s) when waiting on
+#                          ship's own push.
 #   SHIP_VERSION_FILES     space-separated list of version files to check (relative to the repo
 #                          root). Default: auto-detect pyproject.toml then package.json at the
 #                          root. Set it for a non-standard layout (e.g. a nested package).
@@ -245,8 +253,10 @@
 #                          it has itself gone through a normal, reviewed merge to the base. Simple
 #                          `KEY=value` lines, no quote-stripping (don't wrap values in quotes —
 #                          `KEY="val"` means the literal value `"val"`, not `val`);
-#                          `#`-only-prefixed lines and blank lines are ignored. Four whitelisted
+#                          `#`-only-prefixed lines and blank lines are ignored. Five whitelisted
 #                          keys, nothing else is read or evaluated from the file:
+#                            SHIP_AUTO_BUMP=0             opt this repo out of the merge-time version
+#                                                  bump (same as the env var; env wins when set).
 #                            SHIP_ACCEPTANCE_GATE=0       ops off-switch for the pre-merge acceptance
 #                                                  gate, per repo (same effect as the env var of
 #                                                  the same name; any other value keeps it on).
@@ -575,9 +585,20 @@ read -r BRANCH STATE MERGEABLE CROSS_REPO MERGE_STATE < <(gh pr view "$PR" \
 [ -n "$BRANCH" ] || { echo "Could not resolve PR #$PR" >&2; exit 1; }
 [ "$STATE" = "OPEN" ] || { echo "Refusing: PR #$PR is $STATE, not OPEN." >&2; exit 1; }
 [ "$MERGEABLE" = "CONFLICTING" ] && { echo "Refusing: PR #$PR is CONFLICTING — resolve the conflict first." >&2; exit 1; }
+# BEHIND: when auto-bump is not env-opted-out and this is a same-repo non-fork non-dry-run
+# ship, defer the refusal until helpers below can try update-branch first (#518). Env opt-out,
+# dry-run, foreign --repo, and fork PRs still refuse immediately.
 if [ "${MERGE_STATE:-}" = "BEHIND" ]; then
-  echo "Refusing: PR #$PR head is BEHIND its base. Update it (gh pr update-branch $PR --rebase), wait for CI, re-run." >&2
-  exit 1
+  _ab_early=$(printf '%s' "${SHIP_AUTO_BUMP:-}" | tr '[:upper:]' '[:lower:]')
+  case "$_ab_early" in 0|false|no|off)
+    echo "Refusing: PR #$PR head is BEHIND its base. Update it (gh pr update-branch $PR --rebase), wait for CI, re-run." >&2
+    exit 1
+    ;;
+  esac
+  if [ "$DRY_RUN" = "1" ] || [ "${_FOREIGN_REPO_INVOKE:-0}" = "1" ] || [ "${CROSS_REPO:-false}" = "true" ]; then
+    echo "Refusing: PR #$PR head is BEHIND its base. Update it (gh pr update-branch $PR --rebase), wait for CI, re-run." >&2
+    exit 1
+  fi
 fi
 
 # --- CI-down detection and local fallback gate -----------------------------------------
@@ -818,6 +839,7 @@ _ship_config_load() {
   SHIP_CFG_CMD=""
   SHIP_CFG_ACCEPTANCE_GATE=""
   SHIP_CFG_EXTERNAL_REVIEW=""
+  SHIP_CFG_AUTO_BUMP=""
   if ! (cd "$root" && git show "$ref:.ship-config") >/dev/null 2>&1; then
     [ "$ref" = "HEAD" ] && [ -f "$root/.ship-config" ] && \
       echo "[ship] local gate: .ship-config exists in the working tree but is not committed at HEAD — ignoring (uncommitted config is not audited)." >&2
@@ -874,7 +896,7 @@ _ship_config_load() {
     line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     case "$line" in
       ''|'#'*) continue ;;
-      SHIP_LOCAL_TEST_DIR=*|SHIP_LOCAL_TEST_CMD=*|SHIP_ACCEPTANCE_GATE=*|SHIP_EXTERNAL_REVIEW=*)
+      SHIP_LOCAL_TEST_DIR=*|SHIP_LOCAL_TEST_CMD=*|SHIP_ACCEPTANCE_GATE=*|SHIP_EXTERNAL_REVIEW=*|SHIP_AUTO_BUMP=*)
         key="${line%%=*}"
         val="${line#*=}"
         val="$(printf '%s' "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -883,6 +905,7 @@ _ship_config_load() {
           SHIP_LOCAL_TEST_CMD) SHIP_CFG_CMD="$val" ;;
           SHIP_ACCEPTANCE_GATE) SHIP_CFG_ACCEPTANCE_GATE="$val" ;;
           SHIP_EXTERNAL_REVIEW) SHIP_CFG_EXTERNAL_REVIEW="$val" ;;
+          SHIP_AUTO_BUMP) SHIP_CFG_AUTO_BUMP="$val" ;;
         esac
         ;;
       *)
@@ -890,11 +913,9 @@ _ship_config_load() {
     esac
   done <<< "$content"
   if [ -n "$SHIP_CFG_DIR" ] && ! _ship_config_dir_is_safe "$SHIP_CFG_DIR"; then
-    echo "[ship] local gate: .ship-config: SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' is not a safe repo-relative subdirectory (absolute, a '..' path component, or '.'/repo root itself — omit the key to mean root) — ignoring the whole file." >&2
+    echo "[ship] local gate: .ship-config: SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' is not a safe repo-relative subdirectory (absolute, a '..' path component, or '.'/repo root itself — omit the key to mean root) — ignoring SHIP_LOCAL_TEST_DIR/SHIP_LOCAL_TEST_CMD." >&2
     SHIP_CFG_DIR=""
     SHIP_CFG_CMD=""
-    SHIP_CFG_ACCEPTANCE_GATE=""
-    SHIP_CFG_EXTERNAL_REVIEW=""
   fi
 }
 
@@ -917,6 +938,450 @@ _ship_config_dir_is_safe() {
   [ "$all_dot" -eq 1 ] && return 1
   return 0
 }
+
+# --- merge-time version auto-bump helpers (#518) ---------------------------------------
+AUTO_BUMP_DONE=0; AUTO_BUMP_PLANNED=0; AUTO_BUMP_FILE=""; AUTO_BUMP_OLD=""; AUTO_BUMP_NEW=""
+AUTO_BUMP_SHA=""; AUTO_BUMP_LINE=""; AUTO_BUMP_SKIP_REASON=""
+VB_OLDV=""; VB_NEWV=""
+SHIP_AUTO_BUMP_COMMITTER_EMAIL='ship-auto-bump@noreply.agent-tools.local'
+SHIP_KNOWN_OIDS=""
+
+_record_ship_oid() {
+  case "${1:-}" in ''|*[!0-9a-f]*) return 0 ;; esac
+  SHIP_KNOWN_OIDS="${SHIP_KNOWN_OIDS} $1"
+}
+
+_verify_is_merge_of() {  # $1 = expected first-parent oid, $2 = candidate merge oid
+  local parents n p0
+  parents=$(gh api graphql -F owner='{owner}' -F name='{repo}' -F oid="$2" \
+      -f query='query($owner:String!,$name:String!,$oid:String!){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{parents(first:2){totalCount nodes{oid}}}}}}' \
+      --jq '.data.repository.object.parents | (.totalCount|tostring) + " " + (.nodes[0].oid // "") + " " + (.nodes[1].oid // "")' 2>/dev/null) || return 1
+  n=${parents%% *}; p0=${parents#* }; p0=${p0%% *}
+  [ "$n" = "2" ] && [ "$p0" = "$1" ]
+}
+
+_auto_bump_enabled() {
+  local _ab_v
+  _ab_v=$(printf '%s' "${SHIP_AUTO_BUMP:-}" | tr '[:upper:]' '[:lower:]')
+  case "$_ab_v" in 0|false|no|off) return 1 ;; esac
+  [ -n "$_ab_v" ] && return 0
+  _ship_config_load "$ROOT"
+  _ab_v=$(printf '%s' "${SHIP_CFG_AUTO_BUMP:-}" | tr '[:upper:]' '[:lower:]')
+  case "$_ab_v" in 0|false|no|off) return 1 ;; esac
+  return 0
+}
+
+_pr_head_oid() { gh pr view "$PR" --json headRefOid -q '.headRefOid' 2>/dev/null; }
+
+_wait_pr_head_oid() {  # $1 = eq|ne, $2 = sha
+  local deadline now oid; deadline=$(( $(date +%s) + ${SHIP_AUTO_BUMP_HEAD_WAIT:-90} ))
+  while :; do
+    oid=$(_pr_head_oid) || oid=""
+    case "$1" in
+      eq) [ -n "$oid" ] && [ "$oid" = "$2" ] && return 0 ;;
+      ne) [ -n "$oid" ] && [ "$oid" != "$2" ] && return 0 ;;
+    esac
+    now=$(date +%s); [ "$now" -ge "$deadline" ] && return 1
+    sleep "${SHIP_AUTO_BUMP_HEAD_POLL:-3}"
+  done
+}
+
+behind_clear_pr_branch_via_update_api() {
+  echo "[ship] PR #$PR is BEHIND its base — attempting to update it via the GitHub API before refusing (#518) ..." >&2
+  local base head out new_state new_head
+  base=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null) || base=""
+  case "$base" in ''|-*|*[!A-Za-z0-9._/-]*) base="" ;; esac
+  head=$(_pr_head_oid) || head=""
+  if [ -z "$base" ] || [ -z "$head" ]; then
+    echo "[ship] could not read PR #$PR's base/head to attempt the update — falling through to the BEHIND refusal." >&2
+    return 0
+  fi
+  if ! out=$(gh api -X PUT "repos/{owner}/{repo}/pulls/$PR/update-branch" -f expected_head_sha="$head" 2>&1); then
+    echo "[ship] could not update PR #$PR from ${base} (${out}) — falling through to the BEHIND refusal." >&2
+    return 0
+  fi
+  if ! _wait_pr_head_oid ne "$head"; then
+    echo "[ship] update-branch was accepted for PR #$PR but its head did not move within ${SHIP_AUTO_BUMP_HEAD_WAIT:-90}s — falling through to the BEHIND refusal." >&2
+    return 0
+  fi
+  new_head=$(_pr_head_oid) || new_head=""
+  if _verify_is_merge_of "$head" "$new_head"; then
+    _record_ship_oid "$new_head"
+  else
+    echo "[ship] could not verify the new head is ship's own update-branch merge — not attributing it to ship (the review-dwell/CI-grace gates will treat it as a normal push)." >&2
+  fi
+  new_state=$(gh pr view "$PR" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null) || new_state=""
+  if [ -z "$new_state" ]; then
+    echo "[ship] updated PR #$PR from ${base} (head moved) but could not re-read its merge state — falling through to the BEHIND refusal (re-run once GitHub settles)." >&2
+    return 0
+  fi
+  MERGE_STATE="$new_state"
+  if [ "$MERGE_STATE" = "BEHIND" ]; then
+    echo "[ship] updated PR #$PR from ${base} but it is still reported BEHIND — falling through to the refusal." >&2
+  else
+    echo "[ship] updated PR #$PR from ${base} — no longer BEHIND (mergeStateStatus=${MERGE_STATE:-unknown})." >&2
+  fi
+}
+
+local_branch_sanity_check() {
+  local wpath wt
+  WTS=()
+  while IFS= read -r wpath; do
+    [ -n "$wpath" ] && WTS+=("$wpath")
+  done < <(
+    git worktree list --porcelain 2>/dev/null \
+      | awk -v b="refs/heads/$BRANCH" '/^worktree /{w=substr($0,10)} $0=="branch "b{print w}'
+  )
+  for wt in ${WTS[@]+"${WTS[@]}"}; do
+    abort_if_core_bare "$wt" "PR worktree"
+    if [ -n "$(git -C "$wt" status --short 2>/dev/null)" ]; then
+      echo "Refusing: worktree $wt has uncommitted changes. Commit or discard first." >&2
+      git -C "$wt" status --short >&2; exit 1
+    fi
+  done
+  git fetch -q origin "$BRANCH" 2>/dev/null || true
+  if git show-ref --verify --quiet "refs/heads/$BRANCH" && git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+    AHEAD=$(git rev-list --count "origin/$BRANCH..$BRANCH" 2>/dev/null || echo 0)
+    [ "$AHEAD" = "0" ] || { echo "Refusing: local $BRANCH has $AHEAD unpushed commit(s). Push first." >&2; exit 1; }
+  fi
+}
+
+_pyproject_has_project_version() {  # $1 = path
+  awk '
+    /^\[project\]/ { inproj=1; next }
+    /^\[/ { inproj=0 }
+    inproj && /^[[:space:]]*version[[:space:]]*=/ { found=1; exit }
+    END { exit found ? 0 : 1 }
+  ' "$1"
+}
+
+_semver_parts() {  # $1 = version
+  local _sp_part
+  case "$1" in
+    *[!0-9.]*|.*|*.|*..*|'') return 1 ;;
+  esac
+  local IFS=.; set -- $1; [ "$#" -eq 3 ] || return 1
+  for _sp_part in "$1" "$2" "$3"; do
+    case "$_sp_part" in 0?*) return 1 ;; esac
+  done
+  printf '%s %s %s' "$1" "$2" "$3"
+}
+_semver_next_patch() {
+  local p; p=$(_semver_parts "$1") || return 1
+  set -- $p; printf '%s.%s.%s' "$1" "$2" "$(( $3 + 1 ))"
+}
+_semver_gt() {
+  local a b; a=$(_semver_parts "$1") || return 1; b=$(_semver_parts "$2") || return 1
+  set -- $a $b
+  [ "$1" -gt "$4" ] && return 0; [ "$1" -lt "$4" ] && return 1
+  [ "$2" -gt "$5" ] && return 0; [ "$2" -lt "$5" ] && return 1
+  [ "$3" -gt "$6" ]
+}
+
+_version_value_of_content() {  # stdin; $1 = filename
+  local kind="${1:-$AUTO_BUMP_FILE}" c
+  c=$(cat; printf x); c=${c%x}
+  case "$kind" in
+    pyproject.toml|*.toml)
+      printf '%s' "$c" | awk '
+        /^\[project\]/ { inproj=1; next }
+        /^\[/ { inproj=0 }
+        inproj && /^[[:space:]]*version[[:space:]]*=/ {
+          if (match($0, /[0-9][0-9A-Za-z.+_-]*/)) { print substr($0, RSTART, RLENGTH); exit }
+        }
+      '
+      ;;
+    package.json|*.json)
+      printf '%s' "$c" | jq -r '.version // empty' 2>/dev/null
+      ;;
+    *)
+      printf '%s' "$c" | grep -E '^[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
+        | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1
+      ;;
+  esac
+}
+
+_version_line_number_of_content() {  # stdin; $1 = filename
+  local kind="${1:-$AUTO_BUMP_FILE}" c
+  c=$(cat; printf x); c=${c%x}
+  case "$kind" in
+    pyproject.toml|*.toml)
+      printf '%s' "$c" | awk '
+        /^\[project\]/ { inproj=1 }
+        /^\[/ && $0 !~ /^\[project\]/ { inproj=0 }
+        { n++ }
+        inproj && /^[[:space:]]*version[[:space:]]*=/ { print n; exit }
+      '
+      ;;
+    *)
+      printf '%s' "$c" | grep -nE '^[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
+        | head -1 | cut -d: -f1
+      ;;
+  esac
+}
+
+_bumped_content() {  # $1=old $2=new; stdin content; uses $AUTO_BUMP_FILE
+  local content out
+  content=$(cat; printf x); content=${content%x}
+  case "$AUTO_BUMP_FILE" in
+    pyproject.toml|*.toml)
+      out=$(printf '%s' "$content" | awk -v old="$1" -v new="$2" '
+        /^\[project\]/ { inproj=1 }
+        /^\[/ && $0 !~ /^\[project\]/ { inproj=0 }
+        inproj && done == 0 && /^[[:space:]]*version[[:space:]]*=/ {
+          i = index($0, old)
+          if (i > 0) { $0 = substr($0, 1, i-1) new substr($0, i+length(old)); done=1 }
+        }
+        { print }'; printf x); out=${out%x}
+      ;;
+    package.json|*.json)
+      if command -v jq >/dev/null 2>&1; then
+        out=$(printf '%s' "$content" | jq --arg v "$2" '.version = $v'; printf x); out=${out%x}
+      else
+        out=$(printf '%s' "$content" | awk -v old="$1" -v new="$2" '
+          done == 0 && /^[[:space:]]{0,2}"version"[[:space:]]*:/ {
+            i = index($0, old)
+            if (i > 0) { $0 = substr($0, 1, i-1) new substr($0, i+length(old)); done=1 }
+          }
+          { print }'; printf x); out=${out%x}
+      fi
+      ;;
+    *)
+      out=$(printf '%s' "$content" | awk -v old="$1" -v new="$2" '
+        done == 0 && /^[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)/ {
+          i = index($0, old)
+          if (i > 0) { $0 = substr($0, 1, i-1) new substr($0, i+length(old)); done=1 }
+        }
+        { print }'; printf x); out=${out%x}
+      ;;
+  esac
+  case "$content" in *$'\n') : ;; *) out=${out%$'\n'} ;; esac
+  printf '%s' "$out"
+}
+
+_remote_file_fetch() {  # $1 = path, $2 = ref
+  local raw b64
+  raw=$(gh api "repos/{owner}/{repo}/contents/$1?ref=$2" --jq '.sha + " " + (.content | gsub("\n"; ""))' 2>/dev/null) || return 1
+  RF_SHA=${raw%% *}; b64=${raw#* }
+  [ -n "$RF_SHA" ] && [ "$RF_SHA" != "$raw" ] || return 1
+  RF_CONTENT=$( { printf '%s' "$b64" | base64 -d 2>/dev/null || printf '%s' "$b64" | base64 -D 2>/dev/null; } && printf x) || return 1
+  RF_CONTENT=${RF_CONTENT%x}
+}
+
+_auto_bump_update_branch() {  # $1 = current head oid, $2 = base ref
+  local out new_oid
+  echo "[ship] auto-bump: $2 already moved $AUTO_BUMP_FILE past this PR's merge-base — updating ${BRANCH} from $2 first (otherwise the squash would conflict on the version line) ..."
+  if ! out=$(gh api -X PUT "repos/{owner}/{repo}/pulls/$PR/update-branch" -f expected_head_sha="$1" 2>&1); then
+    { echo "Refusing: could not update ${BRANCH} from $2 (GitHub update-branch API failed): ${out}"
+      echo "  Merge $2 into ${BRANCH} yourself (resolve any conflict), push, re-run ship. Nothing was merged."; } >&2
+    exit 1
+  fi
+  if ! _wait_pr_head_oid ne "$1"; then
+    echo "Refusing: GitHub accepted the update-branch request for PR #$PR but the head did not move within ${SHIP_AUTO_BUMP_HEAD_WAIT:-90}s — re-run ship once it has. Nothing was merged." >&2
+    exit 1
+  fi
+  new_oid=$(_pr_head_oid) || new_oid=""
+  if _verify_is_merge_of "$1" "$new_oid"; then
+    _record_ship_oid "$new_oid"
+  else
+    echo "[ship] auto-bump: could not verify the new head is ship's own update-branch merge — not attributing it to ship." >&2
+  fi
+}
+
+_auto_bump_push() {  # $1 = blob sha
+  local msg b64 out
+  msg="chore(release): bump version ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} (ship auto-bump for #${PR})"
+  b64=$(printf '%s' "$AB_NEW_CONTENT" | base64 | tr -d '\n')
+  echo "[ship] auto-bump: committing ${AUTO_BUMP_FILE} ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} onto ${BRANCH} via the Contents API ..."
+  if ! out=$(gh api -X PUT "repos/{owner}/{repo}/contents/${AUTO_BUMP_FILE}" \
+        -f message="$msg" -f content="$b64" -f sha="$1" -f branch="$BRANCH" \
+        -f author[name]="ship (auto-bump)" -f author[email]="$SHIP_AUTO_BUMP_COMMITTER_EMAIL" \
+        -f committer[name]="ship (auto-bump)" -f committer[email]="$SHIP_AUTO_BUMP_COMMITTER_EMAIL" \
+        --jq '.commit.sha' 2>&1); then
+    { echo "Refusing: the version-bump commit was REJECTED by GitHub (Contents API PUT on ${BRANCH}): ${out}"
+      echo "  Nothing was merged. Fix the cause (branch moved? push permission? protected head branch?) and re-run ship, or bump ${AUTO_BUMP_FILE} by hand and push."; } >&2
+    exit 1
+  fi
+  AUTO_BUMP_SHA=$(printf '%s' "$out" | tr -d '[:space:]')
+  case "$AUTO_BUMP_SHA" in ''|*[!0-9a-f]*) echo "Refusing: the Contents API returned no commit sha for the version bump (${out}) — nothing was merged." >&2; exit 1 ;; esac
+  _record_ship_oid "$AUTO_BUMP_SHA"
+}
+
+_auto_bump_ff_local() {
+  local wt
+  git fetch -q origin "$BRANCH" 2>/dev/null || { echo "[ship] auto-bump: WARNING could not fetch origin/${BRANCH} after the bump — local ${BRANCH} is behind by ship's commit." >&2; return 0; }
+  for wt in ${WTS[@]+"${WTS[@]}"}; do
+    if git -C "$wt" merge --ff-only -q "origin/$BRANCH" >/dev/null 2>&1; then
+      echo "[ship] auto-bump: fast-forwarded worktree $wt to origin/${BRANCH}."
+    else
+      echo "[ship] auto-bump: WARNING could not fast-forward worktree $wt to origin/${BRANCH} — it is behind by ship's bump commit." >&2
+    fi
+  done
+  if [ "${#WTS[@]}" -eq 0 ] && git show-ref --verify --quiet "refs/heads/$BRANCH" \
+     && git merge-base --is-ancestor "$BRANCH" "origin/$BRANCH" 2>/dev/null; then
+    git branch -q -f "$BRANCH" "origin/$BRANCH" 2>/dev/null || true
+  fi
+}
+
+_auto_bump_audit_log() {  # $1 = decision
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[dry-run] would append version-bump audit: decision=$1 pr=${PR} file=${AUTO_BUMP_FILE} old=${AUTO_BUMP_OLD} new=${AUTO_BUMP_NEW} sha=${AUTO_BUMP_SHA:-<none>}" >&2
+    return 0
+  fi
+  local file="${SHIP_AUDIT_FILE:-$HOME/.config/agent-tools/ship-audit.jsonl}"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+  local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if command -v jq >/dev/null 2>&1; then
+    jq -nc --arg ts "$ts" --arg pr "$PR" --arg dec "$1" --arg file "$AUTO_BUMP_FILE" --arg old "$AUTO_BUMP_OLD" \
+      --arg new "$AUTO_BUMP_NEW" --arg sha "$AUTO_BUMP_SHA" --arg branch "$BRANCH" \
+      '{ts:$ts, pr:$pr, gate:"version-bump", decision:$dec, file:$file, old:$old, new:$new, sha:$sha, branch:$branch}' \
+      >> "$file" 2>/dev/null || true
+  else
+    local esc_pr esc_file esc_branch
+    esc_pr=$(printf '%s' "$PR" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_file=$(printf '%s' "$AUTO_BUMP_FILE" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_branch=$(printf '%s' "$BRANCH" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '{"ts":"%s","pr":"%s","gate":"version-bump","decision":"%s","file":"%s","old":"%s","new":"%s","sha":"%s","branch":"%s"}\n' \
+      "$ts" "$esc_pr" "$1" "$esc_file" "$AUTO_BUMP_OLD" "$AUTO_BUMP_NEW" "$AUTO_BUMP_SHA" "$esc_branch" >> "$file" 2>/dev/null || true
+  fi
+}
+
+_auto_bump_evaluate() {
+  local files
+  if [ -n "$NO_VBUMP_OK" ] || [ "${SHIP_SKIP_VERSION_BUMP:-0}" = "1" ]; then
+    AUTO_BUMP_SKIP_REASON="the version-bump gate is overridden"; return 1; fi
+  if [ "${_FOREIGN_REPO_INVOKE:-0}" = "1" ]; then
+    AUTO_BUMP_SKIP_REASON="--repo targets a foreign repo (the version file is located in THIS checkout, not the target)"; return 1; fi
+  if [ "${CROSS_REPO:-false}" = "true" ]; then
+    AUTO_BUMP_SKIP_REASON="PR head lives in a fork — ship cannot commit to it; bump by hand"; return 1; fi
+  files=$(gh pr diff "$PR" --name-only 2>/dev/null) || { AUTO_BUMP_SKIP_REASON="could not list the PR's changed files"; return 1; }
+  printf '%s\n' "$files" | any_shippable_source || { AUTO_BUMP_SKIP_REASON="no shippable source changed"; return 1; }
+  VFILE=$(locate_version_file) || { AUTO_BUMP_SKIP_REASON="no version file (pyproject.toml/package.json) at the repo root"; return 1; }
+  PR_DIFF=$(gh pr diff "$PR" 2>/dev/null) || { AUTO_BUMP_SKIP_REASON="could not read the PR diff"; return 1; }
+  version_line_bumped "$VFILE" && [ -z "$VB_OLDV" ] && { AUTO_BUMP_SKIP_REASON="PR declares $VFILE's version for the first time"; return 1; }
+  return 0
+}
+
+_auto_bump_decide() {
+  AB_BASE_REF=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null) || AB_BASE_REF=""
+  case "$AB_BASE_REF" in ''|-*|*[!A-Za-z0-9._/-]*) AB_BASE_REF="$DEFAULT_BRANCH" ;; esac
+  _remote_file_fetch "$VFILE" "$AB_BASE_REF" || { AUTO_BUMP_SKIP_REASON="could not read $VFILE on $AB_BASE_REF through the GitHub API"; return 1; }
+  AB_BASEV=$(printf '%s' "$RF_CONTENT" | _version_value_of_content "$VFILE") || true; AB_BASE_CONTENT="$RF_CONTENT"
+  _remote_file_fetch "$VFILE" "$BRANCH" || { AUTO_BUMP_SKIP_REASON="could not read $VFILE on $BRANCH through the GitHub API"; return 1; }
+  AB_HEAD_BLOB="$RF_SHA"; AB_HEAD_CONTENT="$RF_CONTENT"
+  AB_HEADV=$(printf '%s' "$RF_CONTENT" | _version_value_of_content "$VFILE") || true
+  [ -n "$AB_BASEV" ] && [ -n "$AB_HEADV" ] || { AUTO_BUMP_SKIP_REASON="could not parse the version value of $VFILE on $AB_BASE_REF/$BRANCH"; return 1; }
+  if [ -n "$VB_NEWV" ] && [ "$VB_NEWV" != "$VB_OLDV" ]; then
+    if _semver_gt "$VB_NEWV" "$AB_BASEV" || ! _semver_parts "$AB_BASEV" >/dev/null; then
+      AUTO_BUMP_SKIP_REASON="PR already bumps $VFILE ($VB_OLDV -> $VB_NEWV, $AB_BASE_REF at $AB_BASEV)"; return 1
+    fi
+    echo "[ship] auto-bump: PR #$PR bumps $VFILE $VB_OLDV -> $VB_NEWV but $AB_BASE_REF is already at $AB_BASEV — re-bumping on top of it."
+    AB_MERGE_BASE_V="$VB_OLDV"
+  else
+    AB_MERGE_BASE_V="$AB_HEADV"
+  fi
+  if [ "$AB_BASEV" != "$AB_MERGE_BASE_V" ] && ! _semver_parts "$AB_BASEV" >/dev/null; then
+    AUTO_BUMP_SKIP_REASON="$AB_BASE_REF's version '$AB_BASEV' is not a plain X.Y.Z — bump it by hand"; return 1
+  fi
+  return 0
+}
+
+run_merge_time_auto_bump() {
+  local head_oid newv
+  _auto_bump_enabled || { AUTO_BUMP_SKIP_REASON="SHIP_AUTO_BUMP=0 (env or .ship-config)"; return 0; }
+  _auto_bump_evaluate || return 0
+  _auto_bump_decide || { echo "[ship] auto-bump: not needed — ${AUTO_BUMP_SKIP_REASON}."; return 0; }
+  AUTO_BUMP_FILE="$VFILE"
+  local_branch_sanity_check
+  head_oid=$(_pr_head_oid) || head_oid=""
+  [ -n "$head_oid" ] || { echo "Refusing: could not read PR #$PR's head oid — cannot author the version bump safely. Nothing was merged." >&2; exit 1; }
+  if [ "$AB_BASEV" != "$AB_MERGE_BASE_V" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "[dry-run] would update ${BRANCH} from ${AB_BASE_REF} first (${AB_BASE_REF} is at ${AB_BASEV}, this PR's merge-base at ${AB_MERGE_BASE_V})."
+      AB_HEADV="$AB_BASEV"; AB_HEAD_CONTENT="$AB_BASE_CONTENT"
+    else
+      _auto_bump_update_branch "$head_oid" "$AB_BASE_REF"
+      _remote_file_fetch "$VFILE" "$BRANCH" || { echo "Refusing: could not re-read $VFILE on $BRANCH after updating it from $AB_BASE_REF. Nothing was merged." >&2; exit 1; }
+      AB_HEAD_BLOB="$RF_SHA"; AB_HEAD_CONTENT="$RF_CONTENT"
+      AB_HEADV=$(printf '%s' "$RF_CONTENT" | _version_value_of_content "$VFILE") || true
+      [ "$AB_HEADV" = "$AB_BASEV" ] || { echo "Refusing: after updating ${BRANCH} from ${AB_BASE_REF}, $VFILE reads ${AB_HEADV:-<none>} there but ${AB_BASEV} on ${AB_BASE_REF} — not a state ship can bump safely. Nothing was merged." >&2; exit 1; }
+    fi
+  fi
+  if ! newv=$(_semver_next_patch "$AB_HEADV"); then
+    AUTO_BUMP_SKIP_REASON="version '$AB_HEADV' in $VFILE is not a plain X.Y.Z — bump it by hand"; AUTO_BUMP_FILE=""
+    echo "[ship] auto-bump: skipped — ${AUTO_BUMP_SKIP_REASON}." >&2; return 0
+  fi
+  AUTO_BUMP_OLD="$AB_HEADV"; AUTO_BUMP_NEW="$newv"
+  AB_NEW_CONTENT=$(printf '%s' "$AB_HEAD_CONTENT" | _bumped_content "$AUTO_BUMP_OLD" "$AUTO_BUMP_NEW"; printf x); AB_NEW_CONTENT=${AB_NEW_CONTENT%x}
+  if [ -z "$AB_NEW_CONTENT" ] || [ "$AB_NEW_CONTENT" = "$AB_HEAD_CONTENT" ]; then
+    AUTO_BUMP_SKIP_REASON="could not rewrite the version line of $VFILE (value '$AUTO_BUMP_OLD' not found on it) — bump it by hand"; AUTO_BUMP_FILE=""
+    echo "[ship] auto-bump: skipped — ${AUTO_BUMP_SKIP_REASON}." >&2; return 0
+  fi
+  AUTO_BUMP_LINE=$(printf '%s' "$AB_NEW_CONTENT" | _version_line_number_of_content "$AUTO_BUMP_FILE") || true
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[dry-run] would bump ${AUTO_BUMP_FILE} ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} on ${BRANCH} via the GitHub Contents API (commit 'chore(release): bump version ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} (ship auto-bump for #${PR})'); nothing pushed."
+    AUTO_BUMP_PLANNED=1; _auto_bump_audit_log "version-bump:auto"; return 0
+  fi
+  _auto_bump_push "$AB_HEAD_BLOB"
+  _auto_bump_audit_log "version-bump:auto"
+  if ! _wait_pr_head_oid eq "$AUTO_BUMP_SHA"; then
+    echo "Refusing: the bump commit ${AUTO_BUMP_SHA} was pushed to ${BRANCH} but PR #$PR's head did not reflect it within ${SHIP_AUTO_BUMP_HEAD_WAIT:-90}s — re-run ship once it does (the PR is now bumped; no second bump will be made). Nothing was merged." >&2
+    exit 1
+  fi
+  AUTO_BUMP_DONE=1
+  echo "[ship] auto-bump: ${AUTO_BUMP_FILE} ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} committed as ${AUTO_BUMP_SHA} on ${BRANCH}; CI will be waited on for that head."
+  _auto_bump_ff_local
+}
+
+_pr_head_is_ship_bump() {
+  local email
+  email=$(gh api graphql -F owner='{owner}' -F name='{repo}' -F pr="$PR" \
+      -f query='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){commits(last:1){nodes{commit{committer{email}}}}}}}' \
+      --jq '.data.repository.pullRequest.commits.nodes[0].commit.committer.email // ""' 2>/dev/null) || return 1
+  [ "$email" = "$SHIP_AUTO_BUMP_COMMITTER_EMAIL" ]
+}
+
+_bump_line_eligible_jq() {
+  local f; f=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  printf '%s' 'def readable_body:
+    if type == "string" then (gsub("[^[:alnum:]]"; "") | length) > 0 else false end;
+  def has_high_severity_marker:
+    test("(^|[^[:alnum:]])(p0|p1|critical|blocker|security)($|[^[:alnum:]])"; "i");
+  [.data.repository.pullRequest.reviewThreads.nodes[]
+  | select(.isResolved == false and .isOutdated == true)
+  | select(.path == "'"$f"'")
+  | select(.line == '"$2"')
+  | select((.comments.nodes | length) > 0)
+  | select(.comments.totalCount != null and (.comments.nodes | length) >= .comments.totalCount)
+  | select([.comments.nodes[].author.login // ""] | all(. as $l | ($l | endswith("[bot]")) or ($l == "chatgpt-codex-connector") or ($l == "codex-review-bot")))
+  | select([.comments.nodes[].body | readable_body] | all)
+  | select([.comments.nodes[].body | has_high_severity_marker] | any | not)
+  | .id] | .[]'
+}
+
+BUMP_THREAD_Q='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated path line comments(first:100){totalCount nodes{author{login} body}}}}}}}'
+
+resolve_bump_line_bot_threads() {
+  local file="$AUTO_BUMP_FILE" line="$AUTO_BUMP_LINE" ids tid n=0
+  if [ -z "$file" ]; then
+    file=$(locate_version_file) || return 0
+    _remote_file_fetch "$file" "$BRANCH" || return 0
+    line=$(printf '%s' "$RF_CONTENT" | _version_line_number_of_content "$file") || true
+  fi
+  case "$line" in ''|*[!0-9]*) return 0 ;; esac
+  ids=$(gh api graphql --paginate -F owner='{owner}' -F name='{repo}' -F pr="$PR" \
+        -f query="$BUMP_THREAD_Q" --jq "$(_bump_line_eligible_jq "$file" "$line")" 2>/dev/null) || {
+    echo "[ship] auto-bump threads: could not query review threads — skipping; the gate below still applies." >&2; return 0; }
+  while IFS= read -r tid; do
+    [ -n "$tid" ] || continue
+    if [ "$DRY_RUN" = "1" ]; then echo "[ship] auto-bump threads (dry-run): would resolve bot thread $tid on ${file}:${line}"; n=$((n+1)); continue; fi
+    if _resolve_one_thread "$tid"; then echo "[ship] auto-bump threads: resolved bot thread $tid on ship's bump line ${file}:${line}"; n=$((n+1))
+    else echo "[ship] auto-bump threads: FAILED to resolve $tid — leaving it for the gate below." >&2; fi
+  done <<<"$ids"
+  [ "$n" -gt 0 ] && echo "[ship] auto-bump threads: ${n} bot thread(s) on the bump line $([ "$DRY_RUN" = "1" ] && echo 'would be resolved' || echo 'resolved')."
+  return 0
+}
+
 
 # True (exit 0) if $2 (a real, existing directory) is a STRICT physical descendant of $1
 # (root) — i.e. inside it, but not equal to it — resolving symlinks on BOTH sides via
@@ -1396,6 +1861,118 @@ if [ "${RESOLVE_THREADS:-0}" = "1" ]; then
   resolve_addressed_bot_threads
 fi
 
+# A path is NON-shippable (does NOT, on its own, make a ship a release) iff it is docs, a
+# test, or CI/meta. Everything else is treated as shippable source. Kept deliberately broad
+# on the exclusion side so a docs-only / test-only / CI-only PR is never forced to bump.
+is_nonshippable_path() {  # $1 = path -> rc 0 if non-shippable (docs/test/CI), 1 otherwise
+  local base; base=${1##*/}
+  # A dependency MANIFEST named with a docs-ish extension (`requirements.txt`,
+  # `constraints*.txt`) is a SHIPPABLE change (a dep bump is a release), so it must NOT be
+  # swept into the `.txt` docs bucket below — check it first and return "shippable".
+  case "$base" in
+    requirements.txt|requirements-*.txt|constraints.txt|constraints-*.txt) return 1 ;;
+  esac
+  case "$1" in
+    # docs & prose
+    *.md|*.mdx|*.markdown|*.rst|*.txt|*.adoc) return 0 ;;
+    docs/*|*/docs/*|LICENSE|LICENSE.*|*/LICENSE|NOTICE|NOTICE.*|.gitignore|.gitattributes) return 0 ;;
+    # CI / repo meta — provider config dirs AND the common single-file CI configs, so a
+    # pure-CI PR on any major provider is exempt (not just GitHub Actions under .github/).
+    .github/*|*/.github/*|.gitlab/*|.circleci/*|.buildkite/*) return 0 ;;
+  esac
+  case "$base" in
+    .gitlab-ci.yml|.gitlab-ci.yaml|.travis.yml|.travis.yaml|azure-pipelines.yml|azure-pipelines.yaml) return 0 ;;
+    appveyor.yml|appveyor.yaml|.appveyor.yml|Jenkinsfile|.drone.yml|bitbucket-pipelines.yml|cloudbuild.yaml|cloudbuild.yml) return 0 ;;
+  esac
+  case "$1" in
+    # ship's own CI/merge-gate metadata, not product code — a repo adding/editing the
+    # REPO-ROOT .ship-config to fix its local-fallback test detection is not a release.
+    # Exact path match (not basename): only the root file is ever read by
+    # _ship_config_load, so a nested same-named file (e.g. src/.ship-config, which ship
+    # never consumes) must NOT be swept into this exemption.
+    .ship-config) return 0 ;;
+  esac
+  case "$1" in
+    # tests (common conventions across languages)
+    test/*|*/test/*|tests/*|*/tests/*|__tests__/*|*/__tests__/*) return 0 ;;
+    test_*.py|*/test_*.py|*_test.py|*/*_test.py) return 0 ;;
+    *.test.ts|*.test.tsx|*.test.js|*.test.jsx|*.spec.ts|*.spec.tsx|*.spec.js|*.spec.jsx) return 0 ;;
+    *_test.go|*/*_test.go) return 0 ;;
+  esac
+  return 1
+}
+
+# True iff at least one changed path is shippable source. Reads newline-separated paths on stdin.
+any_shippable_source() {  # stdin: changed paths -> rc 0 if any shippable
+  local p found=1
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if ! is_nonshippable_path "$p"; then found=0; fi
+  done
+  return $found
+}
+
+# Locate the repo's version file: the explicit override, else pyproject.toml (with a
+# `[project] version =`), else package.json (with a `"version"`). Prints the path, or nothing.
+locate_version_file() {
+  local f
+  if [ -n "${SHIP_VERSION_FILES:-}" ]; then
+    for f in $SHIP_VERSION_FILES; do [ -f "$ROOT/$f" ] && { printf '%s' "$f"; return 0; }; done
+    return 1
+  fi
+  if [ -f "$ROOT/pyproject.toml" ] && _pyproject_has_project_version "$ROOT/pyproject.toml"; then
+    printf 'pyproject.toml'; return 0
+  fi
+  if [ -f "$ROOT/package.json" ] && grep -Eq '"version"[[:space:]]*:' "$ROOT/package.json"; then
+    printf 'package.json'; return 0
+  fi
+  return 1
+}
+
+# True iff the PR's diff CHANGES THE VALUE of the version line of $1 — not merely that an
+# added version line exists. The distinction matters: requiring only a `+version` line would
+# pass a cosmetic edit (whitespace/quote churn) or even a DOWNGRADE as "bumped", which defeats
+# the "the version must MOVE" intent. So we extract the removed (`-`) and added (`+`) version
+# VALUES inside that file's diff section and require a NEW value that differs from the OLD.
+# (A version DECLARED for the first time — an added `+` with no matching `-` — also counts: a
+# brand-new version field is a move from "no version".)
+version_line_bumped() {  # $1 = version file path; uses $PR_DIFF (full patch text)
+  local file="$1" oldv newv
+  # Restrict to that file's section of the unified diff so an unrelated `version` elsewhere
+  # can't falsely satisfy the gate. A file's section runs from its `diff --git a/.. b/<file>`
+  # header up to the next `diff --git`.
+  local section
+  section=$(printf '%s\n' "$PR_DIFF" \
+    | awk -v f="$file" '
+        /^diff --git / { insec = ($0 == "diff --git a/" f " b/" f) ? 1 : 0; next }
+        insec { print }
+      ')
+  # Extract the quoted value from a version-declaration line (both pyproject `version = "X"`
+  # and package.json `"version": "X"` quote the value). `head -1` guards against multiple
+  # matches (e.g. a workspace member) — take the first, which is the package's own.
+  newv=$(printf '%s\n' "$section" | grep -E '^\+[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
+           | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
+  oldv=$(printf '%s\n' "$section" | grep -E '^-[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
+           | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
+  VB_OLDV="$oldv"; VB_NEWV="$newv"
+  [ -n "$newv" ] || return 1            # no new version value declared -> not bumped
+  [ "$newv" != "$oldv" ] || return 1    # value unchanged (cosmetic-only edit) -> not bumped
+  return 0
+}
+
+# --- BEHIND-clear + merge-time auto-bump (#518), before the green-CI wait ---------------
+if [ "${MERGE_STATE:-}" = "BEHIND" ] && [ "$DRY_RUN" != "1" ] \
+   && [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ] && [ "${CROSS_REPO:-false}" != "true" ] \
+   && _auto_bump_enabled; then
+  local_branch_sanity_check
+  behind_clear_pr_branch_via_update_api
+fi
+if [ "${MERGE_STATE:-}" = "BEHIND" ]; then
+  echo "Refusing: PR #$PR head is BEHIND its base. Update it (gh pr update-branch $PR --rebase), wait for CI, re-run." >&2
+  exit 1
+fi
+run_merge_time_auto_bump
+
 # --- green-CI gate: CI must EXIST + be green; pending CI is WATCHED to completion -------
 # Design (CTO): "no CI" is itself a FAILED gate, not a free pass — refuse with guidance to
 # set CI up. Existing-but-pending checks are WATCHED (polled to completion, up to
@@ -1438,6 +2015,10 @@ if [ "$SKIP_CI" = "0" ]; then
     def _dts:  ((.completedAt // .startedAt // .createdAt) as $t | if $t != null then $t elif (_dsettled|not) then "~" else "" end);
     (. // []) | group_by(_dkey) | map(max_by(_dts))'
   CI_WAIT="${SHIP_CI_WAIT:-900}"; CI_POLL="${SHIP_CI_POLL:-20}"; CI_GRACE="${SHIP_CI_GRACE:-45}"
+  if [ -n "$SHIP_KNOWN_OIDS" ] && [ "$CI_GRACE" -lt "${SHIP_AUTO_BUMP_CI_GRACE:-120}" ]; then
+    CI_GRACE="${SHIP_AUTO_BUMP_CI_GRACE:-120}"
+    echo "[ship] green-CI gate: waiting on the checks of ship's own push (registration grace widened to ${CI_GRACE}s)."
+  fi
   START=$(date +%s); DEADLINE=$(( START + CI_WAIT )); GRACE_DEADLINE=$(( START + CI_GRACE ))
   while :; do
     # Read the rollup in TWO steps so a gh/API READ FAILURE is distinguishable from a
@@ -1653,6 +2234,12 @@ if [ "$SKIP_CI" = "0" ]; then
   fi
 fi
 
+# --- bot threads on ship's own version-bump line (#518) --------------------------------
+if [ "$AUTO_BUMP_DONE" = "1" ] || [ "$AUTO_BUMP_PLANNED" = "1" ] \
+   || { [ "$AUTO_BUMP_DONE" = "0" ] && locate_version_file >/dev/null && _pr_head_is_ship_bump; }; then
+  resolve_bump_line_bot_threads
+fi
+
 # --- unresolved review threads (see ci/review-threads/) --------------------------------
 # Fail-CLOSED: if the API call fails we must NOT merge (a silent 0 would let an unresolved
 # PR through). So check the gh exit status, not just the parsed count.
@@ -1717,9 +2304,27 @@ else
   #                      for "PR was force-pushed to an already-on-GitHub commit" that makes
   #                      pushedDate stale. Empty when there has been no force-push.
   # Window start = max(createdAt, pushedDate, committedDate, forcePushedAt).
-  DWELL_Q='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){createdAt commits(last:1){nodes{commit{committedDate pushedDate}}} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt}}}}}}'
+  SHIP_KNOWN_OIDS_JSON="["; _sk_first=1
+  for _sk_oid in $SHIP_KNOWN_OIDS; do
+    [ "$_sk_first" = "1" ] || SHIP_KNOWN_OIDS_JSON="${SHIP_KNOWN_OIDS_JSON},"
+    SHIP_KNOWN_OIDS_JSON="${SHIP_KNOWN_OIDS_JSON}\"${_sk_oid}\""; _sk_first=0
+  done
+  SHIP_KNOWN_OIDS_JSON="${SHIP_KNOWN_OIDS_JSON}]"
+  DWELL_Q='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){createdAt commits(last:15){nodes{commit{oid message committedDate pushedDate committer{email}}}} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt}}}}}}'
+  DWELL_JQ='def is_bump: ((.commit.committer.email // "") == "'"$SHIP_AUTO_BUMP_COMMITTER_EMAIL"'") or ((.commit.oid // "__none__") as $o | ('"$SHIP_KNOWN_OIDS_JSON"' | index($o))) != null;
+    def is_merge: ((.commit.message // "") | test("^Merge (remote-tracking )?branch .+ into "));
+    def peel:
+      if length == 0 then .
+      elif (.[length-1] | is_bump) then .[:-1] | peel
+      elif (.[length-1] | is_merge) and (length > 1) and (.[length-2] | is_bump or is_merge) then .[:-1] | peel
+      elif (.[length-1] | is_merge) and ((.[length-1].commit.oid // "__none__") as $o | ('"$SHIP_KNOWN_OIDS_JSON"' | index($o))) != null then .[:-1] | peel
+      else . end;
+    .data.repository.pullRequest as $pr
+    | ($pr.commits.nodes | peel) as $left
+    | ($left | if length == 0 then {} else .[length-1].commit end) as $c
+    | [$pr.createdAt, ($c.pushedDate // ""), ($c.committedDate // ""), ($pr.timelineItems.nodes[0].createdAt // "")] | @tsv'
   if DWELL_RAW=$(gh api graphql -F owner='{owner}' -F name='{repo}' -F pr="$PR" -f query="$DWELL_Q" \
-       --jq '.data.repository.pullRequest | [.createdAt, (.commits.nodes[0].commit.pushedDate // ""), (.commits.nodes[0].commit.committedDate // ""), (.timelineItems.nodes[0].createdAt // "")] | @tsv' 2>/dev/null); then
+       --jq "$DWELL_JQ" 2>/dev/null); then
     PR_CREATED=$(printf '%s' "$DWELL_RAW" | awk -F'\t' 'NR==1{print $1}')
     PR_PUSHED=$(printf '%s' "$DWELL_RAW" | awk -F'\t' 'NR==1{print $2}')
     PR_COMMITTED=$(printf '%s' "$DWELL_RAW" | awk -F'\t' 'NR==1{print $3}')
@@ -1750,41 +2355,7 @@ else
 fi
 
 # --- local branch sanity (no unpushed/diverged commits; clean worktree) ----------------
-# A branch can be checked out in MORE THAN ONE worktree (git permits it; a stray/leftover
-# tree often lingers). Collect ALL of them: feeding a single $WT that had concatenated two
-# paths to `git -C` / `git worktree remove` was the exit-128 bug this script had. Parse the
-# stable `--porcelain` line form (`worktree <path>` then `branch <ref>`); the `-z` variant
-# isn't available on older git (e.g. Apple git 2.39), so don't rely on it.
-# (bash 3.2 compatible — `#!/usr/bin/env bash` is 3.2 on stock macOS; guard every empty-array
-# expansion with the `${arr[@]+...}` idiom so `set -u` doesn't trip on an empty WTS.)
-WTS=()
-while IFS= read -r wpath; do
-  [ -n "$wpath" ] && WTS+=("$wpath")
-done < <(
-  git worktree list --porcelain 2>/dev/null \
-    | awk -v b="refs/heads/$BRANCH" '/^worktree /{w=substr($0,10)} $0=="branch "b{print w}'
-)
-for wt in ${WTS[@]+"${WTS[@]}"}; do
-  # Guard each linked PR worktree — this catches a REAL corruption the MAIN-checkout guard
-  # above misses: WORKTREE-SCOPED core.bare=true (extensions.worktreeConfig + `git -C "$wt"
-  # config --worktree core.bare true`). Plain core.bare on the MAIN config leaves linked
-  # worktrees healthy (each has its own gitdir + work tree, so they report not-bare), but the
-  # worktree-scoped form makes THIS worktree itself report rev-parse=bare with `status` failing.
-  # That matters because the dirty-check right below runs `git -C "$wt" status --short
-  # 2>/dev/null`: under the corruption it exits 128 and the fatal is swallowed, leaving empty
-  # output — so a worktree with unshipped changes would read as "clean" and could later be
-  # removed. Aborting here, before that fooled check, prevents losing unshipped work.
-  abort_if_core_bare "$wt" "PR worktree"
-  if [ -n "$(git -C "$wt" status --short 2>/dev/null)" ]; then
-    echo "Refusing: worktree $wt has uncommitted changes. Commit or discard first." >&2
-    git -C "$wt" status --short >&2; exit 1
-  fi
-done
-git fetch -q origin "$BRANCH" 2>/dev/null || true
-if git show-ref --verify --quiet "refs/heads/$BRANCH" && git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
-  AHEAD=$(git rev-list --count "origin/$BRANCH..$BRANCH" 2>/dev/null || echo 0)
-  [ "$AHEAD" = "0" ] || { echo "Refusing: local $BRANCH has $AHEAD unpushed commit(s). Push first." >&2; exit 1; }
-fi
+local_branch_sanity_check
 
 # --- version-bump gate: a release of shippable source MUST bump the declared version ----
 # Rationale (skill: bump-version-on-release): a tool's version is a freshness signal — it
@@ -1801,109 +2372,15 @@ fi
 # exclusion set below; the version file is auto-located (pyproject.toml `version =`, then
 # package.json `"version"`) or pinned via SHIP_VERSION_FILES.
 
-# A path is NON-shippable (does NOT, on its own, make a ship a release) iff it is docs, a
-# test, or CI/meta. Everything else is treated as shippable source. Kept deliberately broad
-# on the exclusion side so a docs-only / test-only / CI-only PR is never forced to bump.
-is_nonshippable_path() {  # $1 = path -> rc 0 if non-shippable (docs/test/CI), 1 otherwise
-  local base; base=${1##*/}
-  # A dependency MANIFEST named with a docs-ish extension (`requirements.txt`,
-  # `constraints*.txt`) is a SHIPPABLE change (a dep bump is a release), so it must NOT be
-  # swept into the `.txt` docs bucket below — check it first and return "shippable".
-  case "$base" in
-    requirements.txt|requirements-*.txt|constraints.txt|constraints-*.txt) return 1 ;;
-  esac
-  case "$1" in
-    # docs & prose
-    *.md|*.mdx|*.markdown|*.rst|*.txt|*.adoc) return 0 ;;
-    docs/*|*/docs/*|LICENSE|LICENSE.*|*/LICENSE|NOTICE|NOTICE.*|.gitignore|.gitattributes) return 0 ;;
-    # CI / repo meta — provider config dirs AND the common single-file CI configs, so a
-    # pure-CI PR on any major provider is exempt (not just GitHub Actions under .github/).
-    .github/*|*/.github/*|.gitlab/*|.circleci/*|.buildkite/*) return 0 ;;
-  esac
-  case "$base" in
-    .gitlab-ci.yml|.gitlab-ci.yaml|.travis.yml|.travis.yaml|azure-pipelines.yml|azure-pipelines.yaml) return 0 ;;
-    appveyor.yml|appveyor.yaml|.appveyor.yml|Jenkinsfile|.drone.yml|bitbucket-pipelines.yml|cloudbuild.yaml|cloudbuild.yml) return 0 ;;
-  esac
-  case "$1" in
-    # ship's own CI/merge-gate metadata, not product code — a repo adding/editing the
-    # REPO-ROOT .ship-config to fix its local-fallback test detection is not a release.
-    # Exact path match (not basename): only the root file is ever read by
-    # _ship_config_load, so a nested same-named file (e.g. src/.ship-config, which ship
-    # never consumes) must NOT be swept into this exemption.
-    .ship-config) return 0 ;;
-  esac
-  case "$1" in
-    # tests (common conventions across languages)
-    test/*|*/test/*|tests/*|*/tests/*|__tests__/*|*/__tests__/*) return 0 ;;
-    test_*.py|*/test_*.py|*_test.py|*/*_test.py) return 0 ;;
-    *.test.ts|*.test.tsx|*.test.js|*.test.jsx|*.spec.ts|*.spec.tsx|*.spec.js|*.spec.jsx) return 0 ;;
-    *_test.go|*/*_test.go) return 0 ;;
-  esac
-  return 1
-}
-
-# True iff at least one changed path is shippable source. Reads newline-separated paths on stdin.
-any_shippable_source() {  # stdin: changed paths -> rc 0 if any shippable
-  local p found=1
-  while IFS= read -r p; do
-    [ -n "$p" ] || continue
-    if ! is_nonshippable_path "$p"; then found=0; fi
-  done
-  return $found
-}
-
-# Locate the repo's version file: the explicit override, else pyproject.toml (with a
-# `[project] version =`), else package.json (with a `"version"`). Prints the path, or nothing.
-locate_version_file() {
-  local f
-  if [ -n "${SHIP_VERSION_FILES:-}" ]; then
-    for f in $SHIP_VERSION_FILES; do [ -f "$ROOT/$f" ] && { printf '%s' "$f"; return 0; }; done
-    return 1
-  fi
-  if [ -f "$ROOT/pyproject.toml" ] && grep -Eq '^[[:space:]]*version[[:space:]]*=' "$ROOT/pyproject.toml"; then
-    printf 'pyproject.toml'; return 0
-  fi
-  if [ -f "$ROOT/package.json" ] && grep -Eq '"version"[[:space:]]*:' "$ROOT/package.json"; then
-    printf 'package.json'; return 0
-  fi
-  return 1
-}
-
-# True iff the PR's diff CHANGES THE VALUE of the version line of $1 — not merely that an
-# added version line exists. The distinction matters: requiring only a `+version` line would
-# pass a cosmetic edit (whitespace/quote churn) or even a DOWNGRADE as "bumped", which defeats
-# the "the version must MOVE" intent. So we extract the removed (`-`) and added (`+`) version
-# VALUES inside that file's diff section and require a NEW value that differs from the OLD.
-# (A version DECLARED for the first time — an added `+` with no matching `-` — also counts: a
-# brand-new version field is a move from "no version".)
-version_line_bumped() {  # $1 = version file path; uses $PR_DIFF (full patch text)
-  local file="$1" oldv newv
-  # Restrict to that file's section of the unified diff so an unrelated `version` elsewhere
-  # can't falsely satisfy the gate. A file's section runs from its `diff --git a/.. b/<file>`
-  # header up to the next `diff --git`.
-  local section
-  section=$(printf '%s\n' "$PR_DIFF" \
-    | awk -v f="$file" '
-        /^diff --git / { insec = ($0 == "diff --git a/" f " b/" f) ? 1 : 0; next }
-        insec { print }
-      ')
-  # Extract the quoted value from a version-declaration line (both pyproject `version = "X"`
-  # and package.json `"version": "X"` quote the value). `head -1` guards against multiple
-  # matches (e.g. a workspace member) — take the first, which is the package's own.
-  newv=$(printf '%s\n' "$section" | grep -E '^\+[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
-           | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
-  oldv=$(printf '%s\n' "$section" | grep -E '^-[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
-           | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
-  [ -n "$newv" ] || return 1            # no new version value declared -> not bumped
-  [ "$newv" != "$oldv" ] || return 1    # value unchanged (cosmetic-only edit) -> not bumped
-  return 0
-}
-
 if [ "${SHIP_SKIP_VERSION_BUMP:-0}" = "1" ] && [ -z "$NO_VBUMP_OK" ]; then
   NO_VBUMP_OK="SHIP_SKIP_VERSION_BUMP=1 (env)"
 fi
 if [ -n "$NO_VBUMP_OK" ]; then
   echo "[ship] version-bump gate OVERRIDDEN — reason: $NO_VBUMP_OK"
+elif [ "$AUTO_BUMP_DONE" = "1" ]; then
+  echo "[ship] version-bump gate OK — $AUTO_BUMP_FILE version auto-bumped ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} on ${BRANCH} by ship (${AUTO_BUMP_SHA})."
+elif [ "$AUTO_BUMP_PLANNED" = "1" ]; then
+  echo "[ship] [dry-run] version-bump gate would be satisfied by the planned auto-bump of $AUTO_BUMP_FILE (${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW})."
 else
   if PR_FILES_VB=$(gh pr diff "$PR" --name-only 2>/dev/null); then
     if printf '%s\n' "$PR_FILES_VB" | any_shippable_source; then
@@ -1913,6 +2390,7 @@ else
           if ! version_line_bumped "$VFILE"; then
             { echo "Refusing: PR #$PR changes shippable source but the version in $VFILE is UNCHANGED — this ship is a release, so bump the version (skill: bump-version-on-release)."
               echo "  Semver: patch for a fix, minor for a feature, major for a breaking change. Edit $VFILE's version field, push, re-run ship."
+              echo "  ship normally bumps the patch version itself at merge time (#518); it did not here because: ${AUTO_BUMP_SKIP_REASON:-auto-bump disabled}."
               echo "  If this is genuinely NOT a release (docs-only / pure test or CI / a revert), override: --no-version-bump-ok <reason> (or SHIP_SKIP_VERSION_BUMP=1)."; } >&2
             exit 1
           fi

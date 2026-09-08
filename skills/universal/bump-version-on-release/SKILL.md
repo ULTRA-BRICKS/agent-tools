@@ -36,6 +36,11 @@ version, so the two disagree and neither is trustworthy.
   - Node: read `version` from `package.json` (e.g. `require('./package.json').version`).
 - **Docs-only / pure-test / pure-CI / a revert** is not a release — no bump required. The
   rule fires only when **shippable source** actually changed.
+- **Do not patch-bump in the PR.** `gh ship` auto-bumps the patch version at merge time
+  onto the PR HEAD (skill consumers: `ci/ship/ship.sh`, #518) so parallel PRs do not
+  conflict on the version line. An explicit **minor** or **major** bump in the PR is still
+  allowed and is not double-bumped. Opt out with `SHIP_AUTO_BUMP=0` (env or committed
+  `.ship-config`) to restore refuse-until-the-PR-bumps.
 
 ## Why
 

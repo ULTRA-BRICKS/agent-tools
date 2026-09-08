@@ -947,6 +947,7 @@ def _run_ship_vbump(main, bindir, *, name_only, patch, extra_args=(), env_extra=
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     env["SHIP_TEST_NAME_ONLY"] = name_only
     env["SHIP_TEST_PATCH"] = patch
+    env["SHIP_AUTO_BUMP"] = "0"  # this file pins the opt-out refuse path; auto-bump is tests/test_ship_auto_bump.py
     if env_extra:
         env.update(env_extra)
     return _sh(
@@ -981,12 +982,15 @@ _PATCH_DOCS_ONLY = (
 
 
 def test_source_change_without_version_bump_is_blocked(repo_with_pyproject, tmp_path):
-    """A PR that changes shippable source but leaves the declared version unchanged must be
-    REFUSED — this ship is a release, the version must move."""
+    """Default path now auto-bumps at merge (#518). Under SHIP_AUTO_BUMP=0 the gate still
+    REFUSES a source change that leaves the declared version unchanged."""
     main, _wt = repo_with_pyproject
     bindir = _fake_gh_vbump_dir(tmp_path)
 
-    r = _run_ship_vbump(main, bindir, name_only="src/a.py", patch=_PATCH_NO_BUMP)
+    r = _run_ship_vbump(
+        main, bindir, name_only="src/a.py", patch=_PATCH_NO_BUMP,
+        env_extra={"SHIP_AUTO_BUMP": "0"},
+    )
 
     assert r.returncode != 0, f"ship should refuse a source change with no version bump\n{r.stdout}\n{r.stderr}"
     assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr

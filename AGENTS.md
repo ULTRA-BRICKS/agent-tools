@@ -207,11 +207,13 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   `--skip-ci`/review-quorum; see `ci/ship/external_review_hatch.py`);
 - a UI-touching PR carries an embedded **screenshot** (override with `--no-screenshot-ok
   <reason>`);
-- a PR that changes **shippable source** (not docs/test/CI) has **bumped the declared
-  version** (`pyproject.toml` `version` / `package.json` `"version"`) vs the PR base — a ship
-  of source is a release, so `--version` stays a real freshness signal instead of a stale
-  literal (skill: `bump-version-on-release`); override a genuine no-release ship with
-  `--no-version-bump-ok <reason>` or `SHIP_SKIP_VERSION_BUMP=1`;
+- a PR that changes **shippable source** (not docs/test/CI) gets a **patch version bump at
+  merge** (`gh ship` commits it onto the PR HEAD via the GitHub Contents API) so parallel PRs
+  do not conflict on `pyproject.toml` / `package.json` (skill: `bump-version-on-release`,
+  #518). **Do not patch-bump in the PR**; an explicit minor/major bump in the PR is left
+  alone. Opt out with `SHIP_AUTO_BUMP=0` (env or `.ship-config`) to restore refuse-until-bumped.
+  Override a genuine no-release ship with `--no-version-bump-ok <reason>` or
+  `SHIP_SKIP_VERSION_BUMP=1`;
 - the **review-quorum bar is met** (Guard-B of the self-merge-authority program) — the PR's task
   code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token, else a purely descriptive
   ALL-CAPS/hyphenated code (`SME-ROADMAP-WORKTREE-NOTE`-shaped, 3+ segments, no digits) — all
