@@ -5653,7 +5653,7 @@ def test_review_quorum_blocks_when_bar_short(tmp_path):
     rv = _fake_review_dir(tmp_path)
     r = _run_ship_quorum(
         main, gh, rv,
-        env_extra={"REVIEW_TASK_CODE": "HYP-100", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_MODELS": "1", "SHIP_TEST_REVIEW_ROLES": "1"},
+        env_extra={"REVIEW_TASK_CODE": "HYP-100", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_MODELS": "2", "SHIP_TEST_REVIEW_ROLES": "1"},
     )
     assert r.returncode != 0, f"a short quorum must be refused\n{r.stdout}\n{r.stderr}"
     assert "bar NOT met" in r.stderr, r.stderr
@@ -6558,7 +6558,7 @@ def test_review_quorum_audit_log_records_refused(tmp_path):
     r = _run_ship_quorum(
         main, gh, rv,
         env_extra={
-            "REVIEW_TASK_CODE": "HYP-108", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_MODELS": "1",
+            "REVIEW_TASK_CODE": "HYP-108", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_MODELS": "2",
             "SHIP_TEST_REVIEW_ROLES": "1",
             "SHIP_AUDIT_FILE": str(audit),
         },
@@ -6568,8 +6568,8 @@ def test_review_quorum_audit_log_records_refused(tmp_path):
     assert rec["decision"] == "refused", rec
     assert rec["task_code"] == "HYP-108", rec
     assert rec["iterations"] == 1, rec
-    assert rec["models"] == 1, rec
-    # Refused on the role floor (1 < 3) — the predicate is distinct_roles_passed (#644).
+    assert rec["models"] == 2, rec
+    # Refused on the role floor (1 < 3); two models so the one-model fill does not apply.
     assert rec["roles"] == 1, rec
     assert rec["min_roles"] == 3, rec
     assert rec["min_models"] == 0, rec
@@ -7289,7 +7289,7 @@ def test_audit_line_written_without_jq(tmp_path):
     env.pop("SHIP_TEST_DISABLE_REVIEW_QUORUM", None)
     env["REVIEW_TASK_CODE"] = "HYP-200"
     env["SHIP_TEST_REVIEW_ITER"] = "1"
-    env["SHIP_TEST_REVIEW_MODELS"] = "1"
+    env["SHIP_TEST_REVIEW_MODELS"] = "2"
     env["SHIP_TEST_REVIEW_ROLES"] = "1"
     env["SHIP_AUDIT_FILE"] = str(audit)
     env.pop("RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM", None)
@@ -7410,7 +7410,7 @@ def _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy, *, request, audi
     env.pop("SHIP_TEST_DISABLE_REVIEW_QUORUM", None)
     env["REVIEW_TASK_CODE"] = "HYP-200"
     env["SHIP_TEST_REVIEW_ITER"] = "1"
-    env["SHIP_TEST_REVIEW_MODELS"] = "1"
+    env["SHIP_TEST_REVIEW_MODELS"] = "2"
     env["SHIP_TEST_REVIEW_ROLES"] = "1"
     env["RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM"] = request
     # --skip-ci is now hatch-gated too; request it so the fake approving skip_ci_hatch.py beside the
@@ -7565,7 +7565,7 @@ def test_ship_fails_closed_when_python3_exits_zero_without_sentinel(tmp_path):
     env.pop("SHIP_TEST_DISABLE_REVIEW_QUORUM", None)
     env["REVIEW_TASK_CODE"] = "HYP-200"
     env["SHIP_TEST_REVIEW_ITER"] = "1"
-    env["SHIP_TEST_REVIEW_MODELS"] = "1"
+    env["SHIP_TEST_REVIEW_MODELS"] = "2"
     env["SHIP_TEST_REVIEW_ROLES"] = "1"
     env["SHIP_AUDIT_FILE"] = str(audit)
     env["RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM"] = "genuine reason but python3 is faked"
