@@ -83,6 +83,86 @@ req_file_classify() {  # $1 = requirements file -> prints: pinned | empty | unsa
   ' "$1"
 }
 
+# Emit name==version for registry/PyPI packages from uv.lock / poetry.lock as TEXT.
+# Why: handing the lockfile or pyproject to pip-audit would BUILD it (RCE under
+# pull_request_target). uv/poetry export would invoke those tools on the PR tree.
+# Skip editable/path/git/url/virtual/directory — uv.lock `source = { editable = "." }`
+# is the local project, not a registry pin. Strip TOML single- and double-quoted
+# strings. A package record that cannot be emitted as name==version (unknown source,
+# leftover quoting, invalid name/version) is written as a non-pin line so classify
+# fails CLOSED — a sibling valid pin must not mask an omitted record.
+extract_python_lock_pins() {  # $1 = uv.lock | poetry.lock
+  awk '
+    function flush() {
+      if (name == "") {
+        ver = ""; skip = 0; saw_reg = 0
+        return
+      }
+      emit_ok = 0
+      if (ver != "" && skip == 0 && (mode != "uv" || saw_reg == 1)) {
+        if (name ~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ && ver ~ /^[A-Za-z0-9][A-Za-z0-9.+!_-]*$/) {
+          print name "==" ver
+          emit_ok = 1
+        }
+      }
+      if (skip == 0 && emit_ok == 0)
+        print "UNPARSED-LOCK-RECORD"
+      name = ""; ver = ""; skip = 0; saw_reg = 0
+    }
+    BEGIN {
+      n = ARGV[1]
+      mode = (n ~ /uv\.lock$/) ? "uv" : "poetry"
+    }
+    /^\[\[package\]\]/ { flush(); next }
+    /^\[package\.source\]/ { skip = 1; next }
+    /^\[/ { next }
+    /^name[ \t]*=/ {
+      line = $0
+      sub(/^[ \t]*name[ \t]*=[ \t]*/, "", line)
+      gsub(/"/, "", line)
+      gsub("\047", "", line)
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (name == "") name = line
+      next
+    }
+    /^version[ \t]*=/ {
+      line = $0
+      sub(/^[ \t]*version[ \t]*=[ \t]*/, "", line)
+      gsub(/"/, "", line)
+      gsub("\047", "", line)
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (ver == "") ver = line
+      next
+    }
+    /^source[ \t]*=/ {
+      if ($0 ~ /(editable|path|git|url|virtual|directory)[ \t]*=/) skip = 1
+      if ($0 ~ /registry[ \t]*=/) saw_reg = 1
+      next
+    }
+    END { flush() }
+  ' "$1"
+}
+
+# Write extracted pins to a temp file OUTSIDE the audited tree, classify, then
+# `pip-audit --no-deps -r` that temp. Never pass the lockfile/pyproject/-e.
+audit_python_lockfile_as_data() {  # $1 = lockfile
+  [ -f "$1" ] || return 0
+  _py_lock_tmp=$(mktemp /tmp/dep-audit-py.XXXXXX)
+  extract_python_lock_pins "$1" > "$_py_lock_tmp"
+  case "$(req_file_classify "$_py_lock_tmp")" in
+    pinned)
+      ran=1; audited_py=1
+      note "pip-audit --no-deps -r (extracted registry pins)"
+      pip-audit --no-deps -r "$_py_lock_tmp" || rc=1 ;;
+    empty)
+      note "skipping $1 — no registry/PyPI pins to audit as data" ;;
+    *)
+      refused_py=1
+      miss "extracted pins from $1 were not data-safe — auditing them would BUILD PR code under pull_request_target (RCE); pin name==version, or set DEP_AUDIT_ALLOW_MISSING=1" ;;
+  esac
+  rm -f "$_py_lock_tmp"
+}
+
 if [ -f bun.lock ] || [ -f bun.lockb ]; then
   if command -v bun >/dev/null 2>&1; then
     ran=1; note "bun audit --audit-level=$LEVEL"
@@ -121,20 +201,25 @@ fi
 #     actual declared deps, not the runner's environment.
 #   - a requirements file with a direct-reference / unpinned line: can't be audited as data
 #     without building -> fail CLOSED (pin every line to name==version, or DEP_AUDIT_ALLOW_MISSING=1).
-#   - pyproject.toml / poetry.lock WITHOUT a pinned requirements*.txt: pip-audit can audit these
-#     only by BUILDING the project (RCE under pull_request_target) or, for poetry.lock, not at
-#     all. So we do NOT fall back to the env-only `pip-audit` (which would check nothing of the
-#     PR's) — they fail CLOSED (pin a requirements*.txt, or set DEP_AUDIT_ALLOW_MISSING=1).
+#   - uv.lock / poetry.lock: parse as TEXT (never `uv export` / `poetry export` — those invoke
+#     the package manager on the PR tree). Emit name==version for registry/PyPI packages only;
+#     skip editable/path/git/url/virtual/directory. Write pins to a temp file OUTSIDE the
+#     audited tree, classify, then `pip-audit --no-deps -r <temp>`. Never pass the lockfile,
+#     pyproject.toml, `-e`, or a project path to pip-audit (that would BUILD = RCE).
+#   - pyproject.toml WITHOUT a pinned requirements*.txt AND without auditable lockfile pins:
+#     pip-audit can audit it only by BUILDING the project (RCE under pull_request_target).
+#     Fail CLOSED (commit uv.lock/poetry.lock, pin a requirements*.txt, or set
+#     DEP_AUDIT_ALLOW_MISSING=1). Do NOT fall back to env-only `pip-audit`.
 # HARD RULE: never give pip-audit a resolving `-r`/`-e`/project-path invocation here without
 # `--no-deps` AND the pinned-only data-safe scan (the `tests/test_ci_gate_bugs_129.py` guards pin this).
 py_manifest=0
 for f in requirements*.txt requirements/*.txt; do
   [ -f "$f" ] && { py_manifest=1; break; }
 done
-if [ "$py_manifest" = "1" ] || [ -f pyproject.toml ] || [ -f poetry.lock ]; then
+if [ "$py_manifest" = "1" ] || [ -f pyproject.toml ] || [ -f poetry.lock ] || [ -f uv.lock ]; then
   if command -v pip-audit >/dev/null 2>&1; then
-    audited_py=0   # a real (pinned) requirements file was audited
-    refused_py=0   # a requirements file was refused as unsafe (already fail-closed)
+    audited_py=0   # a pinned requirements file or extracted lockfile pins were audited
+    refused_py=0   # a requirements/lockfile extract was refused as unsafe (already fail-closed)
     for f in requirements*.txt requirements/*.txt; do
       [ -f "$f" ] || continue
       case "$(req_file_classify "$f")" in
@@ -149,11 +234,16 @@ if [ "$py_manifest" = "1" ] || [ -f pyproject.toml ] || [ -f poetry.lock ]; then
           miss "python requirements file $f has a non-pinned or direct-reference line (editable/URL/VCS/local-path/-r include/foreign index) — auditing it would BUILD PR code under pull_request_target (RCE); pin every line to name==version, or set DEP_AUDIT_ALLOW_MISSING=1" ;;
       esac
     done
-    # An un-auditable pyproject.toml/poetry.lock fails CLOSED — UNLESS we already audited a pinned
-    # requirements file (assumed to represent the deps) or already refused one (already
-    # fail-closed). An empty/stub requirements.txt must NOT mask this (agent-tools#131).
-    if [ "$audited_py" = "0" ] && [ "$refused_py" = "0" ] && { [ -f pyproject.toml ] || [ -f poetry.lock ]; }; then
-      miss "python project (pyproject.toml/poetry.lock) present but no pinned requirements*.txt to audit as data (a building project-audit would execute PR code under pull_request_target)"
+    # Lockfile pins cover pyproject when no pinned requirements file was audited (an empty
+    # stub requirements.txt must not mask pyproject — agent-tools#131 — unless a lockfile
+    # supplies registry pins). Skip if we already refused an unsafe requirements file.
+    if [ "$audited_py" = "0" ] && [ "$refused_py" = "0" ]; then
+      audit_python_lockfile_as_data uv.lock
+      audit_python_lockfile_as_data poetry.lock
+    fi
+    # Un-auditable pyproject/lockfile fails CLOSED unless we audited pins or already refused.
+    if [ "$audited_py" = "0" ] && [ "$refused_py" = "0" ] && { [ -f pyproject.toml ] || [ -f poetry.lock ] || [ -f uv.lock ]; }; then
+      miss "python project present but no pinned requirements*.txt and no auditable uv.lock/poetry.lock registry pins to audit as data (commit uv.lock/poetry.lock or pin a requirements*.txt; a building project-audit would execute PR code under pull_request_target)"
     fi
   else
     miss "python manifest present but pip-audit not installed (pipx install pip-audit)"

@@ -56,10 +56,18 @@ deps **as data, never building**:
   because pip-audit must **build** such an entry to read its metadata, which is the RCE. A file
   with any such line **fails closed** (pin every line, or set `DEP_AUDIT_ALLOW_MISSING=1`). The
   result audits the PR's *declared, pinned* deps against the advisory DB with no build.
-- A `pyproject.toml`/`poetry.lock` with **no** pinned `requirements*.txt` can only be audited
-  by building it, so it **fails closed** here (pin a `requirements*.txt`, or
-  `DEP_AUDIT_ALLOW_MISSING=1`). An **empty/stub `requirements.txt` does not mask this** — a
-  Python source tree must have a real pinned spec to be audited as data.
+- `uv.lock` / `poetry.lock` are parsed as **text** (never `uv export` / `poetry export`).
+  Registry/PyPI `name==version` pairs are written to a temp file *outside* the audited tree
+  and audited with `pip-audit --no-deps -r <temp>`. Editable/path/git/url/virtual/directory
+  packages are skipped (`source = { editable = "." }` is the local project). A package
+  record that cannot be emitted as a registry pin (unknown source, unparseable
+  name/version, leftover quoting) **fails closed** — a sibling valid pin must not mask
+  it. The lockfile itself is never passed to pip-audit — that would **build** it (RCE
+  under the privileged trigger).
+- A `pyproject.toml` with **no** pinned `requirements*.txt` **and** no auditable lockfile
+  pins can only be audited by building it, so it **fails closed** here (commit `uv.lock` /
+  `poetry.lock`, pin a `requirements*.txt`, or `DEP_AUDIT_ALLOW_MISSING=1`). An **empty/stub
+  `requirements.txt` does not mask this** unless a lockfile supplies registry pins.
 
 A bare no-arg `pip-audit` would instead audit the *runner's* installed packages and silently
 miss the PR's deps — never reintroduce it (agent-tools#131).
