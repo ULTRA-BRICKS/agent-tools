@@ -1020,6 +1020,45 @@ def test_worktree_only_writes_reads_omp_edit_file_path(tmp_path, monkeypatch):
     assert proc.returncode == 10
 
 
+def test_worktree_only_writes_relative_hashline_path_blocks_despite_sibling_worktree_match(tmp_path):
+    """agent-tools#615/#613: a relative hashline `[foo.py#TAG]` path is exactly the bare
+    string the bridge extracts (`_hashline_file_paths` never resolves it to an absolute path).
+    cwd is main; a different worktree happens to track a file at the same relative path.
+    Guessing that as the real target was reverted as exploitable (see the sibling
+    hook-level test); this proves the safe BLOCK verdict holds through the full bridge chain."""
+    import subprocess as sp
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sp.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    (repo / "rig.yaml").write_text("agent_hooks:\n  worktree_only: true\n", encoding="utf-8")
+    sp.run(["git", "add", "."], cwd=repo, check=True)
+    sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+    feat = tmp_path / "feat"
+    sp.run(["git", "worktree", "add", "-q", "-b", "feat/x", str(feat)], cwd=repo, check=True)
+    (feat / "new_helper.py").write_text("x\n", encoding="utf-8")
+    sp.run(["git", "add", "."], cwd=feat, check=True)
+    sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "add helper"], cwd=feat, check=True)
+
+    patch = "[new_helper.py#A1B2]\nPUT >$:\n+y\n"
+    omp_event = {"event": "tool_call", "toolName": "edit", "input": {"input": patch}, "cwd": str(repo)}
+    v1 = dispatch.to_v1_event(omp_event, point="pre-write")
+    assert v1["args"]["file_path"] == "new_helper.py"  # still bare/relative — the bridge does not resolve it
+
+    proc = sp.run(
+        [sys.executable, str(WORKTREE_ONLY_WRITES)],
+        input=json.dumps(v1),
+        capture_output=True,
+        text=True,
+        env={**{k: v for k, v in os.environ.items() if k != "RIG_WORKTREE_ONLY"}, "HOME": str(tmp_path)},
+        timeout=10,
+    )
+    out = json.loads(proc.stdout)
+    assert out["decision"] == "block"
+    assert proc.returncode == 10
+
+
 # --- extension.ts loads without a syntax error --------------------------------------------------
 
 

@@ -283,6 +283,67 @@ def test_bad_event_fails_open(monkeypatch):
     assert wow.main() == 0 and _decision(out.getvalue()) == "allow"
 
 
+# ── no path key at all is a DELIBERATE, documented cwd fallback, not a silent one (agent-tools#615) ─
+
+def test_target_dir_falls_back_to_cwd_when_no_path_key_at_all():
+    """No file_path/path/notebook_path key at all is now a deliberate, documented fallback
+    to `cwd` (agent-tools#615) — not the old UNDOCUMENTED silent fallthrough. Judging `cwd`
+    (rather than fail-opening) matters because codex's `apply_patch` bridge genuinely
+    produces path-less pre-write events on a patch-parse miss; failing open there would
+    silently bypass this guard on a real write."""
+    assert wow._target_dir("/tmp", {}) == "/tmp"
+
+
+@pytest.mark.parametrize("args", [
+    {},
+    {"file_path": ""},
+    {"file_path": "   "},
+    {"file_path": 123},
+])
+def test_target_dir_no_usable_path_always_uses_cwd(args):
+    """A missing key and a present-but-blank/wrong-typed key are both "no path signal" and
+    get the IDENTICAL deliberate outcome — the verdict must never depend on which of the two
+    shapes a bridge happens to send."""
+    assert wow._target_dir("/tmp", args) == "/tmp"
+
+
+def test_no_path_key_blocks_on_enrolled_main_cwd(tmp_path, monkeypatch):
+    """An event whose args carry NONE of file_path/path/notebook_path, on an enrolled
+    default-branch cwd, still BLOCKs — the deliberate `cwd` fallback (agent-tools#615), not
+    an accidental one. This is exactly the codex apply_patch-parse-miss shape: the guard
+    must not silently allow a main-branch write just because the path could not be parsed."""
+    repo = _make_repo(tmp_path, branch="main")
+    event = {"cwd": str(repo), "args": {}}
+    out_io = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out_io)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    for k in _ENV_KEYS:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("RIG_WORKTREE_ONLY", "1")
+    code = wow.main()
+    out = out_io.getvalue()
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+# ── a RELATIVE path is judged against cwd, never guessed via a sibling worktree (agent-tools#615) ─
+
+def test_relative_path_absent_from_cwd_still_blocks_despite_a_sibling_worktree_match(tmp_path, monkeypatch):
+    """agent-tools#615 tried resolving a relative path against whichever OTHER git worktree
+    of the same repo happened to have it (to fix the #613 false-block). Reverted: adversarial
+    review found it exploitable (a coincidental same-named file in a sibling worktree would
+    silently ALLOW a write really headed for main). Locks in the safe behavior: a relative
+    path absent from cwd still BLOCKs on cwd's own branch despite a sibling match."""
+    main_repo = _make_repo(tmp_path, branch="main")
+    feat = tmp_path / "feat"
+    _git(main_repo, "worktree", "add", "-b", "feat/x", str(feat))
+    (feat / "new_helper.py").write_text("x")
+    _git(feat, "add", "-A")
+    _git(feat, "commit", "-m", "add helper")
+    out, code = _run(main_repo, monkeypatch, {"RIG_WORKTREE_ONLY": "1"}, target="new_helper.py")
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
 # ── unit: the minimal rig.yaml boolean parse ──────────────────────────────────────────────
 
 @pytest.mark.parametrize("text,expected", [
