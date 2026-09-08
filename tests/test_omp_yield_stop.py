@@ -50,3 +50,23 @@ def test_stop_session_id_is_stable_across_yield_retries():
     assert a["event_id"] == b["event_id"]
     assert a["event_id"] != "call-1"
     assert a["args"]["session_id"]
+
+
+def test_to_v1_event_forwards_ctx_agent_id():
+    ev = dispatch.to_v1_event(
+        {"toolName": "bash", "toolCallId": "c1", "cwd": "/repo", "input": {"command": "ls"}, "agentId": "Helper"},
+        point="pre-bash",
+    )
+    assert ev["args"]["agent_id"] == "Helper"
+
+
+def test_stop_session_id_prefers_agent_id_over_cwd():
+    a = dispatch.to_v1_event(
+        {"toolName": "yield", "toolCallId": "c1", "cwd": "/repo", "input": {}, "agentId": "Helper"},
+        point="stop",
+    )
+    b = dispatch.to_v1_event(
+        {"toolName": "yield", "toolCallId": "c2", "cwd": "/repo", "input": {}, "agentId": "Helper"},
+        point="stop",
+    )
+    assert a["args"]["session_id"] == b["args"]["session_id"] == "Helper"

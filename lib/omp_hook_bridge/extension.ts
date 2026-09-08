@@ -176,6 +176,11 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
       input: event?.input ?? {},
       cwd: ctx?.cwd || process.cwd(),
       toolCallId: event?.toolCallId,
+      // Trusted subagent identity from omp's hook ctx (not tool args). Without this,
+      // orchestrator-stays-thin treats every native omp helper as the main thread
+      // (no RIG_AGENT_ID / PI_SESSION_FILE on the Node hook process).
+      agentId: ctx?.agentId ?? event?.agentId,
+      sessionId: ctx?.sessionId ?? event?.sessionId,
     });
     outcome = await spawnDispatcher(eventName, payload, event?.toolCallId);
   } catch (error: any) {

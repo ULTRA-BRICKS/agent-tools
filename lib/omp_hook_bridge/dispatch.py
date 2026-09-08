@@ -133,8 +133,10 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
     for key in _FORGED_AGENT_KEYS:
         args.pop(key, None)
     detached_id = _detached_agent_id()
-    if detached_id:
-        args["agent_id"] = detached_id
+    ctx_id = str(omp_event.get("agentId") or omp_event.get("agent_id") or "")
+    trusted_id = detached_id or ctx_id
+    if trusted_id:
+        args["agent_id"] = trusted_id
 
     command = _tool_command(tool, raw_args)
     if command:
