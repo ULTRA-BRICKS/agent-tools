@@ -131,10 +131,58 @@ def _tokenize_line(line: str) -> list[str] | None:
     return out
 
 
+_REDIRECT_OPS = frozenset({">", ">>", "<", "<<", ">&", "&>", "<&", "<>"})
+_FD_DIGITS_RE = re.compile(r"^\d+$")
+_HEREDOC_OPEN = re.compile(r"<<[-]?(['\"]?)(\w+)\1")
+
+
+def _drop_heredoc_bodies(lines: list[str]) -> list[str]:
+    """Keep heredoc openers, drop body lines so a mention inside a here-doc is not a command."""
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = _HEREDOC_OPEN.search(line)
+        out.append(line)
+        i += 1
+        if not m:
+            continue
+        delim = m.group(2)
+        while i < len(lines):
+            body = lines[i]
+            i += 1
+            if body == delim or body.strip() == delim:
+                break
+    return out
+
+
+def _strip_redirections(argv: list[str]) -> list[str]:
+    """Remove redirection operator tokens, their targets, and a leading fd-digit prefix.
+
+    SYNC: same shape as pkill-guard._strip_redirections. A leading `2>/dev/null cmd`
+    tokenizes to ['2', '>', '/dev/null', 'cmd']; without this, argv[0] is '2'.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        if (
+            i + 1 < len(argv)
+            and argv[i + 1] in _REDIRECT_OPS
+            and _FD_DIGITS_RE.match(argv[i])
+        ):
+            i += 1
+            continue
+        if argv[i] in _REDIRECT_OPS:
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
 def _tokenize(command: str) -> list[str] | None:
     joined = command.replace("\r\n", "\n").replace("\r", "\n")
     joined = joined.replace("\\\n", "")
-    lines = joined.split("\n")
+    lines = _drop_heredoc_bodies(joined.split("\n"))
     out: list[str] = []
     first = True
     i = 0
@@ -234,9 +282,15 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
 
 
 def _segment_argv(segment: list[str]) -> list[str]:
-    argv = _strip_leading_shell_noise(segment)
-    argv = _strip_inline_env(argv)
-    argv = _strip_wrappers(argv)
+    argv = list(segment)
+    for _ in range(_MAX_WRAPPER_NESTING + 1):
+        before = argv
+        argv = _strip_redirections(argv)
+        argv = _strip_leading_shell_noise(argv)
+        argv = _strip_inline_env(argv)
+        argv = _strip_wrappers(argv)
+        if argv == before:
+            return argv
     return argv
 
 

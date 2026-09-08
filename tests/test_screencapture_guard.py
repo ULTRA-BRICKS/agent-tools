@@ -150,3 +150,23 @@ def test_missing_command_field_allows(monkeypatch):
     code = hook.main()
     assert code == 0
     assert _decision(buf.getvalue()) == "allow"
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "2>/dev/null screencapture /tmp/x.png",
+        ">/tmp/log /usr/sbin/screencapture out.png",
+        "screencapture /tmp/x.png >/dev/null",
+    ],
+)
+def test_block_leading_redirection(command, monkeypatch):
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_allow_screencapture_inside_heredoc_body(monkeypatch):
+    command = "cat <<'EOF'\nscreencapture is forbidden\nEOF"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
