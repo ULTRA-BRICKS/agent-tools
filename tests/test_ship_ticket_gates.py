@@ -103,6 +103,15 @@ esac
 _FAKE_TASK = """\
 #!/usr/bin/env bash
 printf '%s\\n' "$*" >> "${TASK_LOG}"
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+  if [ "${SHIP_TEST_TASK_FOREIGN:-0}" = "1" ]; then
+    echo "go-task: A task runner / build tool"
+    exit 0
+  fi
+  echo "gate           exit 0 only when every criterion is checked WITH a proof (the pre-merge gate)"
+  echo "enforces acceptance criteria"
+  exit 0
+fi
 if [ "$1" = "gate" ]; then
   printf '%s\\n' "${SHIP_TEST_TASK_GATE_JSON:-}"
   exit "${SHIP_TEST_TASK_GATE_EXIT:-0}"
@@ -141,6 +150,11 @@ _OPTED_OUT = json.dumps({
 _BELOW_MINIMUM = json.dumps({
     "id": "HYP-931", "ok": False, "state": "in_progress", "gate_enabled": True,
     "post_merge_acceptance": None, "criteria": 1, "below_minimum": True,
+    "unchecked": [], "proofless": [],
+})
+_ZERO_CRITERIA = json.dumps({
+    "id": "HYP-931", "ok": False, "state": "in_progress", "gate_enabled": True,
+    "post_merge_acceptance": None, "criteria": 0, "below_minimum": True,
     "unchecked": [], "proofless": [],
 })
 
@@ -274,6 +288,18 @@ def test_acceptance_gate_refuses_below_minimum_with_empty_gap_arrays(repo, tmp_p
     assert line["detail"] == "criteria=1 below_minimum=true unchecked= proofless="
 
 
+
+def test_acceptance_gate_refuses_when_ticket_has_zero_criteria(repo, tmp_path):
+    """task-cli exit 1 with criteria:0 — nothing to accept. Must refuse and quote that."""
+    r = _run(repo, tmp_path, env={"SHIP_TEST_TASK_GATE_JSON": _ZERO_CRITERIA, "SHIP_TEST_TASK_GATE_EXIT": "1"})
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing: acceptance gate — ticket HYP-931 is NOT accepted" in r.stderr
+    assert "the ticket has no acceptance criteria at all" in r.stderr
+    assert not _merged(tmp_path)
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["decision"] == "refused"
+    assert "criteria=0" in line["detail"]
+
 def test_acceptance_gate_passes_and_merges_when_accepted(repo, tmp_path):
     r = _run(repo, tmp_path)
     assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
@@ -304,14 +330,35 @@ def test_acceptance_gate_skips_when_task_cli_is_absent(repo, tmp_path):
     assert line["decision"] == "skipped" and line["detail"] == "task-cli not on PATH" and "task_code" not in line
 
 
-def test_acceptance_gate_skips_when_no_ticket_code_is_derivable(repo, tmp_path):
+def test_acceptance_gate_refuses_when_no_ticket_code_is_derivable(repo, tmp_path):
+    """A PR with no ticket has no acceptance criteria. Skip-and-merge was fail-open
+    (agent-tools#639 / tg-cli#305): the gate must refuse, not ship."""
     r = _run(repo, tmp_path, branch="feat", env={"SHIP_TEST_PR_BODY": "no ticket here"})
-    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
-    assert "could not derive a task code for #1 — skipping" in r.stderr
-    assert _task_calls(tmp_path) == []
-    assert _merged(tmp_path)
-    assert _audit(tmp_path, "acceptance")[0]["detail"] == "no task code"
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing: acceptance gate" in r.stderr
+    assert "no acceptance criteria" in r.stderr
+    assert "could not derive a task code" in r.stderr
+    assert _task_calls(tmp_path) == ["--help"]
+    assert not _merged(tmp_path), "a PR with no ticket must never reach gh pr merge"
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["decision"] == "refused" and line["detail"] == "no task code"
 
+
+
+def test_acceptance_gate_skips_no_ticket_when_task_is_not_task_cli(repo, tmp_path):
+    """Codex P1 on agent-tools#641: go-task/Taskwarrior as `task` plus a ticketless PR
+    must SKIP, not refuse — command -v task is not identity."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "SHIP_TEST_PR_BODY": "no ticket here",
+        "SHIP_TEST_TASK_FOREIGN": "1",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "did not look like task-cli" in r.stderr
+    assert "Refusing: acceptance gate" not in r.stderr
+    assert _merged(tmp_path)
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["decision"] == "skipped"
+    assert "does not look like task-cli" in line["detail"]
 
 def test_acceptance_gate_derives_the_code_from_a_same_repo_issue_url(repo, tmp_path):
     """A body that links the ticket as a full same-repo issue URL (agent-tools#564) gates on
@@ -840,17 +887,20 @@ def test_acceptance_gate_rejects_the_pull_request_number_as_a_ticket_code(repo, 
     assert "names this pull request (#1)" in r.stderr, r.stderr
 
 
-def test_acceptance_gate_skips_when_only_the_pull_request_number_is_derivable(repo, tmp_path):
-    """With nothing but the PR's own number anywhere, the gate must report an honest "no task
-    code" skip — never gate the PR against itself."""
+def test_acceptance_gate_refuses_when_only_the_pull_request_number_is_derivable(repo, tmp_path):
+    """With nothing but the PR's own number anywhere, refuse — never gate the PR against
+    itself, and never skip-and-merge a PR that has no ticket (agent-tools#639)."""
     r = _run(repo, tmp_path, branch="feat", env={
         "TASK_CODE": "#1",
         "SHIP_TEST_PR_TITLE": "feat: the thing",
         "SHIP_TEST_PR_BODY": "no ticket here",
     })
-    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
-    assert "could not derive a task code for #1 — skipping" in r.stderr
-    assert _task_calls(tmp_path) == []
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing: acceptance gate" in r.stderr
+    assert "no acceptance criteria" in r.stderr
+    assert _task_calls(tmp_path) == ["--help"]
+    assert not _merged(tmp_path)
+    assert _audit(tmp_path, "acceptance")[0]["decision"] == "refused"
     assert _audit(tmp_path, "acceptance")[0]["detail"] == "no task code"
 
 
