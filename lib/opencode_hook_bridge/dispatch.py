@@ -33,6 +33,7 @@ HARNESS = "opencode"
 _KNOWN_EVENTS = frozenset({"tool.execute.before", "tool.execute.after"})
 _WRITE_TOOLS = frozenset({"edit", "write", "apply_patch"})
 _TASK_TOOL = "task"
+_SKILL_TOOL = "skill"
 _ID_KEYS = (
     "event_id",
     "sessionID",
@@ -65,6 +66,8 @@ def point_for_event(hook_name: str, tool_name: str | None) -> str | None:
             return "pre-write"
         if tool == _TASK_TOOL:
             return "pre-agent"
+        if tool == _SKILL_TOOL:
+            return "pre-skill"
     if hook_name == "tool.execute.after" and tool in _WRITE_TOOLS:
         return "post-write"
     return None
@@ -113,6 +116,8 @@ def to_v1_event(opencode_event: dict, *, point: str) -> dict:
     if detached_id:
         args["agent_id"] = detached_id
     _normalize_task_args(args)
+    if tool == _SKILL_TOOL:
+        _normalize_skill_args(args)
 
     command = _tool_command(tool, raw_args)
     if command:
@@ -306,6 +311,20 @@ def _background_subagents_enabled() -> bool:
         return os.environ.get(env, "").strip().lower() in _TRUTHY_ENV_FLAG
 
     return on("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS") or on("OPENCODE_EXPERIMENTAL")
+
+
+def _normalize_skill_args(args: dict) -> None:
+    """Map opencode skill-tool ``name`` onto ``args.skill``.
+
+    skills-marker-writer reads ``args.skill`` (the CC Skill ``tool_input`` key).
+    OpenCode's native parameter is ``name`` (``skill({ name: "git-release" })``,
+    packages/opencode/src/tool/skill.ts). The native field overwrites a
+    model-forged ``skill`` key so the marker records the skill that actually
+    loads, not a spoofed name.
+    """
+    name = args.get("name")
+    if isinstance(name, str) and name.strip():
+        args["skill"] = name
 
 
 def _normalize_task_args(args: dict) -> None:

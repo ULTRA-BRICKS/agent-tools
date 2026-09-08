@@ -184,8 +184,9 @@ def test_invalid_session_id_falls_back_to_global_marker(tmp_path, monkeypatch):
 
 
 def test_global_marker_still_satisfies_a_session_scoped_check(tmp_path, monkeypatch):
-    """A harness/workflow with no session-aware marker producer (Codex/opencode today have
-    no pre-skill mapping — see agent-hooks/README.md; or a human's manual `touch` recipe
+    """A harness/workflow with no session-aware marker producer (Codex has no pre-skill
+    mapping; opencode maps skill->pre-skill but still writes the global path unless
+    args.session_id is present — see agent-hooks/README.md; or a human's manual `touch` recipe
     from this hook's own README) can still only ever write the GLOBAL marker path. That
     must keep satisfying the gate even when the event carries a session id (Codex's own
     bridge forwards one on pre-bash too) — otherwise session-scoping silently breaks the

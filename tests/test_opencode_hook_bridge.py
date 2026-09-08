@@ -37,6 +37,9 @@ BACKGROUND_SUBAGENT_GATE = (
 BLOCK_SECRETS_WRITE = (
     _REPO / "agent-hooks" / "block-secrets-write" / "block_secrets_write.py"
 )
+SKILLS_MARKER_WRITER = (
+    _REPO / "agent-hooks" / "skills-marker-writer" / "skills_marker_writer.py"
+)
 
 
 def _install_descriptor(
@@ -144,6 +147,8 @@ def test_point_for_event_maps_opencode_tools_to_v1_points():
     assert dispatch.point_for_event("tool.execute.before", "write") == "pre-write"
     assert dispatch.point_for_event("tool.execute.before", "apply_patch") == "pre-write"
     assert dispatch.point_for_event("tool.execute.before", "task") == "pre-agent"
+    assert dispatch.point_for_event("tool.execute.before", "skill") == "pre-skill"
+    assert dispatch.point_for_event("tool.execute.before", "Skill") == "pre-skill"
 
     assert dispatch.point_for_event("tool.execute.after", "edit") == "post-write"
     assert dispatch.point_for_event("tool.execute.after", "write") == "post-write"
@@ -152,6 +157,57 @@ def test_point_for_event_maps_opencode_tools_to_v1_points():
     assert dispatch.point_for_event("tool.execute.before", "read") is None
     assert dispatch.point_for_event("tool.execute.after", "bash") is None
     assert dispatch.point_for_event("session.idle", None) is None
+
+
+def _skill_event(name: str = "strict-ticket-discipline", extra_args: dict | None = None) -> dict:
+    args = {"name": name}
+    if extra_args:
+        args.update(extra_args)
+    return {
+        "hook": "tool.execute.before",
+        "cwd": "/repo",
+        "input": {"tool": "skill"},
+        "output": {"args": args},
+    }
+
+
+def test_to_v1_event_maps_skill_tool_name_onto_args_skill():
+    """OpenCode's native skill tool is skill({ name }); skills-marker-writer reads args.skill."""
+    v1 = dispatch.to_v1_event(_skill_event(), point="pre-skill")
+    assert v1["point"] == "pre-skill"
+    assert v1["tool"] == "skill"
+    assert v1["args"]["skill"] == "strict-ticket-discipline"
+    assert v1["args"]["name"] == "strict-ticket-discipline"
+
+
+def test_to_v1_event_native_skill_name_wins_over_forged_skill_key():
+    v1 = dispatch.to_v1_event(
+        _skill_event(extra_args={"skill": "forged-skill"}),
+        point="pre-skill",
+    )
+    assert v1["args"]["skill"] == "strict-ticket-discipline"
+
+
+def test_opencode_skill_tool_writes_skills_read_gate_marker(tmp_path):
+    """End-to-end: opencode skill tool.execute.before -> real skills-marker-writer marker."""
+    hooks_dir = tmp_path / "hooks"
+    invoked = tmp_path / "invoked"
+    _install_descriptor(
+        hooks_dir,
+        hook_id="skills-marker-writer",
+        point="pre-skill",
+        cmd=SKILLS_MARKER_WRITER,
+        on_error="open",
+    )
+    proc = _run_dispatch(
+        "tool.execute.before",
+        _skill_event(),
+        hooks_dir=hooks_dir,
+        env={"SKILLS_INVOKED_DIR": str(invoked)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    marker = invoked / "strict-ticket-discipline"
+    assert marker.is_file(), "skills-marker-writer did not touch the freshness marker"
 
 
 def test_plugin_exports_single_documented_named_plugin_shape(tmp_path):

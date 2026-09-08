@@ -45,6 +45,7 @@ happened, so a block decision is logged as feedback and the plugin fails open.
 | `tool.execute.before` + `edit` / `write` | `pre-write` | `output.args.filePath` is normalized to `args.file_path` / `args.path`; proposed content is normalized to `args.content`. |
 | `tool.execute.before` + `apply_patch` | `pre-write` | `output.args.patchText` becomes raw `args.patch`; added patch lines become `args.content`; patch marker paths become `args.file_path` / `args.path`. |
 | `tool.execute.before` + `task` | `pre-agent` | Carries the task payload (`subagent_type`, `prompt`, `description`) for orchestration guards. opencode's task tool has no `background` field in a default build (foreground; the native field exists only behind `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS`, mapped to `run_in_background` only then); `general`/`explore` pass the background-subagent gate anyway because opencode has no in-tool background path — the truly-detached path is the `rig-detached-opencode` launcher. |
+| `tool.execute.before` + `skill` | `pre-skill` | Native opencode `skill` tool (`skill({ name })`). `output.args.name` is copied onto `args.skill` so `skills-marker-writer` records the invocation. A forged `args.skill` cannot override the native `name`. |
 | `tool.execute.after` + `edit` / `write` / `apply_patch` | `post-write` | Runs path-based hooks after the write; exit 10 is logged as feedback because opencode cannot un-run the completed write. |
 
 opencode has session events such as `session.idle`, but this bridge does not map
