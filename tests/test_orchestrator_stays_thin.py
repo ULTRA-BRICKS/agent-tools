@@ -215,21 +215,91 @@ def test_omp_bridge_nested_pi_session_git_commit_is_allowed(tmp_path, monkeypatc
     assert c == 0 and _decision(out) == "allow"
 
 
-def test_nested_pi_session_does_not_exempt_non_omp_harness(tmp_path, monkeypatch):
-    """A leftover nested PI_SESSION_FILE must not exempt Claude Code / Codex — the
-    nested-session grant is omp-only (review P1, agent-tools#634)."""
-    event = {"point": "pre-bash", "cwd": "/repo", "harness": "claude-code",
+@pytest.mark.parametrize("harness", ["claude-code", "codex", "opencode"])
+def test_nested_pi_session_exempts_regardless_of_harness(tmp_path, monkeypatch, harness):
+    """agent-tools#676: a nested omp Task/eval child's PI_SESSION_FILE is set on the CHILD
+    PROCESS by omp itself, regardless of which model harness backs that omp session — so the
+    grant must NOT be scoped to `event["harness"] == "omp"`. The live incident (CommitReconcile
+    / ThinNotSub) was exactly this: a Claude-Code-backed omp session (`rig.yaml` default
+    `harness.kind: claude-code`) dispatches a nested Task/eval subagent via omp's OWN task
+    tool; that child's own tool calls fire through `cc_hook_bridge`, which stamps
+    `event["harness"] == "claude-code"` (the HOOK TRANSPORT, not the orchestrator). The old
+    `harness == "omp"` restriction made the PI_SESSION_FILE tier unreachable for exactly that
+    default configuration and misclassified the subagent as the orchestrator. Repeat `git
+    commit` must ALLOW for every harness a nested child could plausibly report through — this
+    is the PR#637 review-P1 restriction (`test_nested_pi_session_does_not_exempt_non_omp_harness`)
+    intentionally superseded, not re-pinned, because that invariant is what caused #676. Would
+    FAIL on the pre-fix code (which only allowed `harness == "omp"`)."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": harness,
              "args": {"command": "git commit -m 'fix: x'"}}
     env = {"PI_SESSION_FILE": _OMP_NESTED_SESSION}
     _run(event, monkeypatch, tmp_path / "m", env=env)
     out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
-    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_nested_pi_session_exempts_with_no_harness_tag(tmp_path, monkeypatch):
+    """Same as above with NO `harness` key at all (a hook fixture that predates any bridge, or
+    a future bridge that doesn't set one): a genuine nested PI_SESSION_FILE must still exempt —
+    the path-shape check alone is the trust boundary, not a harness gate."""
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "git commit -m 'fix: x'"}}
+    env = {"PI_SESSION_FILE": _OMP_NESTED_SESSION}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == 0 and _decision(out) == "allow"
+
+
+# agent-tools#679: a live same-day report (post-#637-merge, pre-#676-fix) that a PLAIN
+# SINGLE-LEVEL omp Task-tool child (the common case, not just a deeper nested dispatch) still
+# got gated on a `gh` CLI call and a multi-step bash chain — the same root cause as #676
+# (`cc_hook_bridge` never emits `harness == "omp"`), just surfaced via different command
+# shapes than `git commit`. `_OMP_NESTED_SESSION` (`.../<session-id>/<agent-id>.jsonl`, ONE
+# directory level under the session dir) already models a single-level dispatch — the
+# path-shape check has no notion of "depth" at all, so the same fixture proves both #676 and
+# #679 are the identical bug, not two separate ones.
+@pytest.mark.parametrize("command", [
+    "gh issue list",
+    "gh pr checks 123",
+    "awk '{print}' SKILL.md && git diff --check && git status --short && git diff -- a.py",
+])
+def test_single_level_nested_session_exempts_gh_and_multistep_bash_claude_code(
+    tmp_path, monkeypatch, command,
+):
+    """agent-tools#679 repro, closed by the #676 fix: a single-level omp Task-tool child
+    (`_OMP_NESTED_SESSION`) running `gh issue list` / `gh pr checks` (delegated-by-default gh
+    subcommands) or a multi-step bash chain, tagged `harness == "claude-code"` (what
+    `cc_hook_bridge` actually emits for this dispatch shape), must ALLOW on every call — not
+    just `git commit`. Would FAIL on the pre-#676-fix code."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "claude-code",
+             "args": {"command": command}}
+    env = {"PI_SESSION_FILE": _OMP_NESTED_SESSION}
+    for attempt in (1, 2):
+        out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+        assert c == 0 and _decision(out) == "allow", (
+            f"call {attempt} for {command!r} was not allowed: {out}"
+        )
 
 
 def test_orchestrator_git_commit_still_blocks_with_main_pi_session_file(tmp_path, monkeypatch):
     """The MAIN omp session file (`.../<session-id>.jsonl`, not nested) is not a subagent.
     Repeat `git commit` still BLOCKs."""
     event = {"point": "pre-bash", "cwd": "/repo", "harness": "omp",
+             "args": {"command": "git commit -m 'fix: x'"}}
+    env = {"PI_SESSION_FILE": _OMP_MAIN_SESSION}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("harness", ["claude-code", "codex", "opencode"])
+def test_main_pi_session_file_still_blocks_regardless_of_harness(tmp_path, monkeypatch, harness):
+    """agent-tools#676 regression guard: now that the nested-child grant is no longer scoped
+    to `harness == "omp"`, the MAIN (non-nested) omp session file must still stay governed for
+    every harness — the path-shape check (parent dir is the project slug, not a
+    session-id-shaped nested dir) is the ONLY thing distinguishing a child from the
+    orchestrator, and it must keep doing that job unaided by a harness gate."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": harness,
              "args": {"command": "git commit -m 'fix: x'"}}
     env = {"PI_SESSION_FILE": _OMP_MAIN_SESSION}
     _run(event, monkeypatch, tmp_path / "m", env=env)

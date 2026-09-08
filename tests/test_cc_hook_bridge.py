@@ -61,6 +61,12 @@ SUBAGENT_NO_MONITOR = (
 WORKFLOW_DANGER_GATE = (
     _REPO / "agent-hooks" / "workflow-danger-gate" / "workflow_danger_gate.py"
 )
+# orchestrator-stays-thin (pre-bash half): the gate at the center of agent-tools#676 — a
+# nested omp Task/eval subagent's PI_SESSION_FILE must exempt it regardless of which harness
+# (`claude-code`, `codex`, `opencode`) actually fired the tool-call event.
+ORCHESTRATOR_STAYS_THIN = (
+    _REPO / "agent-hooks" / "orchestrator-stays-thin" / "orchestrator_stays_thin.py"
+)
 
 
 def _install_descriptor(hooks_dir: Path, *, hook_id: str, point: str, cmd: Path,
@@ -1185,6 +1191,127 @@ def test_post_write_hook_not_fired_on_posttooluse_bash(tmp_path):
     proc = _run_dispatch("PostToolUse", cc_event, home=home)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "", proc.stdout
+
+
+# ── agent-tools#676: nested omp subagent under a Claude-Code-backed harness ───────────────
+#
+# Live incident this reproduces: a top-level omp session backed by Claude Code
+# (`rig.yaml` default `harness.kind: claude-code`) dispatches a nested Task/eval subagent via
+# omp's OWN `task` tool (not CC's native `Agent`/`Task` tool — so CC never sets a top-level
+# `agent_id`, and no `RIG_AGENT_ID` launcher marker is set either). That subagent's own tool
+# calls still fire through CC's hook system, so `cc_hook_bridge` — which stamps
+# `event["harness"] == "claude-code"` UNCONDITIONALLY (its own module-literal `HARNESS`,
+# never derived from the event) — is what actually reaches `orchestrator-stays-thin`. Before
+# this fix, that hook's nested-`PI_SESSION_FILE` subagent-identity tier only fired when
+# `event["harness"] == "omp"`, which `cc_hook_bridge` can never produce — so the subagent was
+# misclassified as the orchestrator and its `git commit` was denied (agent-tools#676).
+#
+# Every case below drives the REAL `cc_hook_bridge` subprocess with the REAL
+# `orchestrator-stays-thin` script installed exactly as `rig apply` installs it (not a mock),
+# against a REAL temp git repo, and — on the allowed path — actually performs the `git commit`
+# to prove the underlying action succeeds, not just that the dispatcher's JSON says "allow".
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    return subprocess.run(["git", "-C", str(repo), *args],
+                           capture_output=True, text=True, env=env, timeout=30)
+
+
+def _make_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert _git(repo, "init", "-b", "main").returncode == 0
+    assert _git(repo, "config", "user.email", "t@t.t").returncode == 0
+    assert _git(repo, "config", "user.name", "t").returncode == 0
+    (repo / "README.md").write_text("hello\n")
+    assert _git(repo, "add", "README.md").returncode == 0
+    assert _git(repo, "commit", "-m", "init").returncode == 0
+    return repo
+
+
+def _run_dispatch_with_env(event: str, cc_event: dict, *, home: Path,
+                            extra_env: dict) -> subprocess.CompletedProcess:
+    """Same contract as `_run_dispatch`, plus caller-supplied env (PI_SESSION_FILE, etc.)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("RIG_HATCH_REQUEST_")}
+    env["HOME"] = str(home)
+    env["PYTHONPATH"] = str(_LIB) + os.pathsep + env.get("PYTHONPATH", "")
+    for k in ("PI_SESSION_FILE", "RIG_AGENT_ID", "RIG_DETACHED_AGENT"):
+        env.pop(k, None)
+    env.update(extra_env)
+    return subprocess.run(
+        [sys.executable, "-m", "cc_hook_bridge", event],
+        input=json.dumps(cc_event),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+
+def test_nested_omp_subagent_under_claude_code_harness_git_commit_allowed_clean_room(tmp_path):
+    """THE agent-tools#676 repro, end to end. A nested omp Task/eval child (real
+    `PI_SESSION_FILE` shaped `.../<session-id>/<agent>.jsonl`, no `args.agent_id`, no
+    `RIG_AGENT_ID`) fires a `git commit` PreToolUse event through the REAL `cc_hook_bridge`
+    subprocess — which always tags `event["harness"] == "claude-code"` — into the REAL
+    `orchestrator-stays-thin` script. Must be ALLOWED (empty stdout, exit 0, no deny), and the
+    real `git commit` that follows must actually succeed. Would FAIL on the pre-fix code,
+    which only exempted a nested `PI_SESSION_FILE` when `event["harness"] == "omp"` — a value
+    `cc_hook_bridge` never produces."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="orchestrator-stays-thin", point="pre-bash",
+                        cmd=ORCHESTRATOR_STAYS_THIN, on_error="closed")
+    repo = _make_repo(tmp_path)
+    nested_session_file = (
+        str(tmp_path / "omp-sessions" / "-repo" /
+            "2026-09-08T18-00-00-000Z_01a07dbc-040a-7089-9724-7f37bfdba15e" /
+            "CommitReconcile.jsonl")
+    )
+    (repo / "a.py").write_text("x = 1\n")
+    assert _git(repo, "add", "a.py").returncode == 0
+    cc_event = {
+        "hook_event_name": "PreToolUse", "tool_name": "Bash",
+        "tool_input": {"command": "git commit -m 'fix: x'"}, "cwd": str(repo),
+    }
+    # Call TWICE with the identical event/cwd: a genuinely subagent-exempt call allows on
+    # EVERY call (no tiering at all — `_is_subagent` short-circuits before the WARN/BLOCK
+    # marker logic even runs), whereas a merely-first-offense WARN (the bug's fingerprint: an
+    # ungated call that looks like "allow" only once) would BLOCK on this second call. A
+    # single call cannot tell those two apart; this can.
+    for attempt in (1, 2):
+        proc = _run_dispatch_with_env(
+            "PreToolUse", cc_event, home=home,
+            extra_env={"PI_SESSION_FILE": nested_session_file},
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "", (
+            f"nested omp subagent under claude-code harness was DENIED on call {attempt}: {proc.stdout}"
+        )
+    commit = _git(repo, "commit", "-m", "fix: x")
+    assert commit.returncode == 0, commit.stderr
+    assert "fix: x" in _git(repo, "log", "-1", "--format=%s").stdout
+
+
+def test_bare_orchestrator_git_commit_still_blocked_clean_room(tmp_path):
+    """Precision control for the same fix: a plain top-level Claude Code orchestrator (no
+    `agent_id`, no `RIG_AGENT_ID`, no nested `PI_SESSION_FILE` at all) driving the SAME REAL
+    subprocess pipeline must still be WARN-then-BLOCKED — broadening the nested-session tier
+    must not weaken real-orchestrator detection."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="orchestrator-stays-thin", point="pre-bash",
+                        cmd=ORCHESTRATOR_STAYS_THIN, on_error="closed")
+    repo = _make_repo(tmp_path)
+    cc_event = {
+        "hook_event_name": "PreToolUse", "tool_name": "Bash",
+        "tool_input": {"command": "git commit -m 'fix: x'"}, "cwd": str(repo),
+    }
+    first = _run_dispatch_with_env("PreToolUse", cc_event, home=home, extra_env={})
+    assert first.returncode == 0 and first.stdout.strip() == "", first.stdout  # first: WARN
+    second = _run_dispatch_with_env("PreToolUse", cc_event, home=home, extra_env={})
+    assert second.returncode == 0, second.stderr
+    out = json.loads(second.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", second.stdout
 
 
 if __name__ == "__main__":
