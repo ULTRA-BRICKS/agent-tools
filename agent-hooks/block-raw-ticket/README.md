@@ -2,8 +2,8 @@
 
 **Point:** `pre-bash` · **Fail policy:** `closed` · **Priority:** 10 (runs early)
 
-When **task-cli is configured** (`task` on PATH — activated, and zero-config github-issues
-counts as configured), this hook blocks a raw issue-tracker write that skips task-cli's
+When **task-cli is configured** (`task` on PATH *and* the binary is actually task-cli —
+the file contains `tasklib`, so Taskwarrior/go-task do not arm the gate), this hook blocks a raw issue-tracker write that skips task-cli's
 gates:
 
 - `gh issue create` / `gh issue new` (and `close` / `edit` / `comment` / `delete` / …)

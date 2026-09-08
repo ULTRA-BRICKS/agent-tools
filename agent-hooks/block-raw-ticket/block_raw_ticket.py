@@ -4,14 +4,14 @@
 Accessed via: harness PreToolUse bash -> this script (rig apply installs the
 descriptor from the agent-tools catalog when agent_hooks.all is true).
 
-Assumptions: task-cli is the enforced ticket interface. When `task` is on PATH
-it is activated and (zero-config) configured; a raw `gh issue create/new` or
-`linear issue` write then skips the gates. Read-only `gh issue list/view` and
-the sanctioned `task …` path stay allowed. Wrapper/`bash -c` hiding is a
-documented residual, same class as other small pre-bash gates.
+Assumptions: task-cli is the enforced ticket interface. The gate arms only when
+`task` on PATH is actually task-cli (the file contains `tasklib` — not
+Taskwarrior/go-task). Then a raw `gh issue` write or `linear issue` write
+skips the gates. Read-only `gh issue list/view` and `task …` stay allowed.
 
 Past bugs: require-ticket-before-commit explicitly allowed `gh issue create`
-because it is not a git commit — that is the hole this hook closes.
+because it is not a git commit. shutil.which("task") alone matched a foreign
+`task` binary (review on #636).
 """
 
 from __future__ import annotations
@@ -33,6 +33,12 @@ _INLINE_ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _WRAPPERS = frozenset({
     "timeout", "env", "nice", "time", "stdbuf", "nohup", "setsid", "unbuffer", "command",
 })
+_WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+}
 _GH_VALUE_FLAGS = frozenset({"-R", "--repo", "--hostname"})
 _GH_ISSUE_WRITES = frozenset({
     "create", "new", "close", "reopen", "edit", "comment", "delete",
@@ -42,6 +48,7 @@ _LINEAR_ISSUE_WRITES = frozenset({
     "create", "new", "update", "edit", "delete", "archive", "close", "comment",
 })
 _RAW_HINT = re.compile(r"\b(?:gh\s+issue|linear\s+issue)\b", re.IGNORECASE)
+_TASK_CLI_MARKERS = (b"tasklib", b"task-cli")
 
 _BLOCK_MSG = (
     "[block-raw-ticket] BLOCKED: raw tracker write while task-cli is configured. "
@@ -65,10 +72,21 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"{HOOK_ID}: {msg}\n")
 
 
+def _looks_like_task_cli(path: str) -> bool:
+    """True iff `path` is task-cli, not Taskwarrior/go-task (both also named `task`)."""
+    try:
+        with open(os.path.realpath(path), "rb") as fh:
+            head = fh.read(8192)
+    except OSError:
+        return False
+    return any(m in head for m in _TASK_CLI_MARKERS)
+
+
 def task_cli_configured(cwd: str | None = None) -> bool:
-    """Activated AND configured: `task` on PATH (zero-config is a configuration)."""
-    del cwd  # reserved for a future explicit-config-only mode
-    return shutil.which("task") is not None
+    """Activated AND configured: a real task-cli binary is on PATH."""
+    del cwd
+    path = shutil.which("task")
+    return bool(path) and _looks_like_task_cli(path)
 
 
 def _basename(tok: str) -> str:
@@ -82,23 +100,41 @@ def _strip_leading(argv: list[str]) -> list[str]:
     return argv[i:]
 
 
+def _skip_wrapper_args(wrapper: str, argv: list[str]) -> list[str]:
+    value_flags = _WRAPPER_VALUE_FLAGS.get(wrapper, frozenset())
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if _INLINE_ENV.match(tok):
+            i += 1
+            continue
+        if tok in value_flags:
+            i += 2
+            continue
+        if any(tok.startswith(f"{flag}=") for flag in value_flags):
+            i += 1
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        break
+    rest = argv[i:]
+    if wrapper == "timeout" and rest and re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", rest[0]):
+        rest = rest[1:]
+    return rest
+
+
 def _strip_wrappers(argv: list[str]) -> list[str]:
     guard = 0
     while argv and _basename(argv[0]) in _WRAPPERS and guard < 16:
         guard += 1
-        argv = argv[1:]
-        while argv and (argv[0].startswith("-") or _INLINE_ENV.match(argv[0])):
-            # timeout's duration operand is a bare token; drop one non-flag if needed
-            argv = argv[1:]
-        # timeout 60 <cmd> — after flags, a duration may remain
-        if argv and _basename(argv[0]) not in _WRAPPERS and _basename(argv[0]) not in {"gh", "linear", "task"}:
-            # could be timeout's duration
-            if re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", argv[0]):
-                argv = argv[1:]
+        wrapper = _basename(argv[0])
+        argv = _skip_wrapper_args(wrapper, argv[1:])
     return argv
 
 
-def _skip_gh_globals(argv: list[str]) -> list[str]:
+def _skip_gh_flags(argv: list[str]) -> list[str]:
+    """Skip gh inherited flags (`-R`/`--repo`/`--hostname`) and other dash options."""
     i = 0
     while i < len(argv):
         tok = argv[i]
@@ -122,20 +158,33 @@ def _segment_is_raw_write(segment: list[str]) -> bool:
     head = _basename(argv[0])
     rest = argv[1:]
     if head == "gh":
-        rest = _skip_gh_globals(rest)
-        if len(rest) >= 2 and rest[0] == "issue" and rest[1] in _GH_ISSUE_WRITES:
-            return True
-        return False
+        rest = _skip_gh_flags(rest)
+        if not rest or rest[0] != "issue":
+            return False
+        sub = _skip_gh_flags(rest[1:])
+        return bool(sub) and sub[0] in _GH_ISSUE_WRITES
     if head == "linear":
-        if len(rest) >= 2 and rest[0] == "issue" and rest[1] in _LINEAR_ISSUE_WRITES:
-            return True
-        return False
+        rest = _skip_gh_flags(rest)  # linear also takes dash flags before the verb
+        if not rest or rest[0] != "issue":
+            return False
+        sub = _skip_gh_flags(rest[1:])
+        return bool(sub) and sub[0] in _LINEAR_ISSUE_WRITES
     return False
 
 
 def _tokenize(command: str) -> list[str] | None:
+    """punctuation_chars so `true;gh` / `true&&gh` split; newlines are command separators."""
     try:
-        return shlex.split(command, posix=True)
+        out: list[str] = []
+        for i, line in enumerate(command.splitlines()):
+            if not line.strip():
+                continue
+            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+            toks = list(lex)
+            if i and out and toks:
+                out.append(";")
+            out.extend(toks)
+        return out
     except ValueError:
         return None
 

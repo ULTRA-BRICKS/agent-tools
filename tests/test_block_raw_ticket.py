@@ -47,7 +47,7 @@ def _task_on_path(tmp_path: Path) -> str:
     bindir = tmp_path / "bin"
     bindir.mkdir()
     task = bindir / "task"
-    task.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    task.write_text("#!/bin/sh\n# tasklib shim for tests\nexit 0\n", encoding="utf-8")
     task.chmod(task.stat().st_mode | stat.S_IXUSR)
     return f"{bindir}{os.pathsep}/usr/bin:/bin"
 
@@ -181,3 +181,90 @@ def test_configured_via_task_yaml_without_binary_does_not_block(tmp_path, monkey
     )
     assert code == 0, out
     assert _decision(out) == "allow"
+
+
+def _foreign_task_on_path(tmp_path: Path) -> str:
+    """A `task` binary that is NOT task-cli (Taskwarrior/go-task shape)."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    task = bindir / "task"
+    task.write_text("#!/bin/sh\necho go-task\nexit 0\n", encoding="utf-8")
+    task.chmod(task.stat().st_mode | stat.S_IXUSR)
+    return f"{bindir}{os.pathsep}/usr/bin:/bin"
+
+
+def test_gh_issue_new_allowed_when_foreign_task_binary(tmp_path, monkeypatch):
+    out, code = _run(
+        "gh issue new --title x",
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_foreign_task_on_path(tmp_path),
+    )
+    assert code == 0, out
+    assert _decision(out) == "allow"
+
+
+def test_newline_separated_gh_issue_create_blocked(tmp_path, monkeypatch):
+    out, code = _run(
+        "cd /repo\ngh issue create --title x",
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_task_on_path(tmp_path),
+    )
+    assert code == brt.BLOCK_EXIT_CODE, out
+    assert _decision(out) == "block"
+
+
+def test_unspaced_semicolon_gh_issue_create_blocked(tmp_path, monkeypatch):
+    out, code = _run(
+        "true;gh issue create --title x",
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_task_on_path(tmp_path),
+    )
+    assert code == brt.BLOCK_EXIT_CODE, out
+    assert _decision(out) == "block"
+
+
+def test_unspaced_andand_gh_issue_create_blocked(tmp_path, monkeypatch):
+    out, code = _run(
+        "true&&gh issue create --title x",
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_task_on_path(tmp_path),
+    )
+    assert code == brt.BLOCK_EXIT_CODE, out
+    assert _decision(out) == "block"
+
+
+def test_gh_issue_repo_flag_after_issue_blocked(tmp_path, monkeypatch):
+    out, code = _run(
+        "gh issue --repo owner/repo create --title x",
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_task_on_path(tmp_path),
+    )
+    assert code == brt.BLOCK_EXIT_CODE, out
+    assert _decision(out) == "block"
+
+
+def test_env_unset_wrapper_operand_still_blocked(tmp_path, monkeypatch):
+    out, code = _run(
+        "env -u GH_TOKEN gh issue create --title x",
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_task_on_path(tmp_path),
+    )
+    assert code == brt.BLOCK_EXIT_CODE, out
+    assert _decision(out) == "block"
+
+
+def test_timeout_signal_wrapper_operand_still_blocked(tmp_path, monkeypatch):
+    out, code = _run(
+        "timeout --signal KILL 10 gh issue create --title x",
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_task_on_path(tmp_path),
+    )
+    assert code == brt.BLOCK_EXIT_CODE, out
+    assert _decision(out) == "block"
