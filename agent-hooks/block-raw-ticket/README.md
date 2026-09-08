@@ -18,6 +18,13 @@ Lets the sanctioned path through:
 
 Inert when `task` is **not** on PATH (task-cli is not activated).
 
+Independent of that arming: a ticket **create** whose `--title` matches
+`Review uncommitted` is **always** blocked (`gh issue create`/`new`,
+`linear issue create`/`new`, `task new`/`create`). That title must never
+become a GitHub/Linear/task ticket (ask 041). `gh pr` is not a ticket and
+is left alone. `echo "Review uncommitted …"` is left alone.
+
+
 ## Why an agent-hook (not a skill, not AGENTS.md)
 
 "Use `task`, never raw `gh issue` / `linear`" was advice in the task skill. Advice cannot
@@ -44,4 +51,7 @@ model, not a sandbox.
 echo '{"args":{"command":"gh issue new --title x"}}' | ./block_raw_ticket.py; echo "exit=$?"
 # task on PATH → {"decision":"block",…} exit=10
 # task absent  → {"decision":"allow"} exit=0
+
+echo '{"args":{"command":"gh issue create --title \"Review uncommitted foo diff\""}}' | ./block_raw_ticket.py; echo "exit=$?"
+# always → {"decision":"block",…} exit=10  (even when task is absent)
 ```

@@ -9,9 +9,15 @@ Assumptions: task-cli is the enforced ticket interface. The gate arms only when
 Taskwarrior/go-task). Then a raw `gh issue` write or `linear issue` write
 skips the gates. Read-only `gh issue list/view` and `task …` stay allowed.
 
+A "Review uncommitted …" title is refused on ticket create even when task-cli
+is absent: that shape must never become a GitHub/Linear/task ticket (ask 041).
+`gh pr` is not a ticket and is left alone.
+
 Past bugs: require-ticket-before-commit explicitly allowed `gh issue create`
 because it is not a git commit. shutil.which("task") alone matched a foreign
-`task` binary (review on #636).
+`task` binary (review on #636). main() early-allowed every command when
+task-cli was absent, so `gh issue create --title "Review uncommitted …"` still
+minted GitHub tickets.
 """
 
 from __future__ import annotations
@@ -47,8 +53,13 @@ _GH_ISSUE_WRITES = frozenset({
 _LINEAR_ISSUE_WRITES = frozenset({
     "create", "new", "update", "edit", "delete", "archive", "close", "comment",
 })
+_CREATE_VERBS = frozenset({"create", "new"})
 _RAW_HINT = re.compile(r"\b(?:gh\s+issue|linear\s+issue)\b", re.IGNORECASE)
+_JUNK_UNCOMMITTED = re.compile(r"\breview\s+uncommitted\b", re.IGNORECASE)
 _TASK_CLI_MARKERS = (b"tasklib", b"task-cli")
+_INHERITED_VALUE_FLAGS = frozenset({
+    "-R", "--repo", "--hostname", "-C", "--cwd", "--backend", "--config",
+})
 
 _BLOCK_MSG = (
     "[block-raw-ticket] BLOCKED: raw tracker write while task-cli is configured. "
@@ -57,6 +68,13 @@ _BLOCK_MSG = (
     "motivation, user-impact, and screenshots; a raw tracker command skips them. "
     "Read-only `gh issue list`/`view` is allowed. There is no self-service bypass; "
     "ask the human for a genuine exception."
+)
+
+_JUNK_BLOCK_MSG = (
+    "[block-raw-ticket] BLOCKED: a 'Review uncommitted' title must not create a "
+    "ticket. That shape never leads to a merge — run `review diff` or post a PR "
+    "comment instead of filing a GitHub/Linear/`task` ticket. There is no "
+    "self-service bypass."
 )
 
 
@@ -207,6 +225,74 @@ def is_raw_tracker_write(command: str) -> bool | None:
     return any(_segment_is_raw_write(seg) for seg in _segments(tokens))
 
 
+def _extract_title_flag(argv: list[str]) -> str | None:
+    """`--title VALUE`, `-t VALUE`, or `--title=VALUE` from a tokenized argv."""
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("-t", "--title"):
+            if i + 1 < len(argv):
+                return argv[i + 1]
+            return None
+        if tok.startswith("--title="):
+            return tok.split("=", 1)[1]
+        i += 1
+    return None
+
+
+def _nonflag_words(argv: list[str]) -> list[str]:
+    """Non-flag tokens after argv[0], skipping inherited value-flag operands."""
+    words: list[str] = []
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok.startswith("--") and "=" in tok:
+            i += 1
+            continue
+        if tok in _INHERITED_VALUE_FLAGS:
+            i += 2
+            continue
+        if tok.startswith("-") and tok not in {"-", "--"}:
+            i += 1
+            continue
+        words.append(tok)
+        i += 1
+    return words
+
+
+def _segment_is_junk_ticket_create(segment: list[str]) -> bool:
+    argv = _strip_wrappers(_strip_leading(segment))
+    if not argv:
+        return False
+    title = _extract_title_flag(argv)
+    if not title or not _JUNK_UNCOMMITTED.search(title):
+        return False
+    head = _basename(argv[0])
+    words = _nonflag_words(argv)
+    if head == "gh":
+        return len(words) >= 2 and words[0] == "issue" and words[1] in _CREATE_VERBS
+    if head == "linear":
+        return len(words) >= 2 and words[0] == "issue" and words[1] in _CREATE_VERBS
+    if head == "task":
+        return bool(words) and words[0] in _CREATE_VERBS
+    return False
+
+
+def is_junk_review_ticket_create(command: str) -> bool | None:
+    """True if a ticket-create command carries a Review-uncommitted title.
+
+    None if the command is unparseable and still looks like that create.
+    """
+    tokens = _tokenize(command)
+    if tokens is None:
+        if _JUNK_UNCOMMITTED.search(command) and (
+            _RAW_HINT.search(command) or re.search(r"\btask\s+(?:new|create)\b", command)
+        ):
+            return None
+        return False
+    return any(_segment_is_junk_ticket_create(seg) for seg in _segments(tokens))
+
+
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -220,6 +306,24 @@ def main() -> int:
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):
         command = str(command)
+
+    try:
+        junk = is_junk_review_ticket_create(command)
+    except Exception as exc:  # noqa: BLE001
+        if _JUNK_UNCOMMITTED.search(command) and (
+            _RAW_HINT.search(command) or re.search(r"\btask\s+(?:new|create)\b", command)
+        ):
+            warn(f"junk-title inspection failed ({exc}) — blocking")
+            emit("block", _JUNK_BLOCK_MSG)
+            return BLOCK_EXIT_CODE
+        junk = False
+    if junk is None:
+        warn("unparseable command looks like a Review-uncommitted ticket create — blocking")
+        emit("block", _JUNK_BLOCK_MSG)
+        return BLOCK_EXIT_CODE
+    if junk:
+        emit("block", _JUNK_BLOCK_MSG)
+        return BLOCK_EXIT_CODE
 
     if not task_cli_configured(cwd):
         emit("allow")

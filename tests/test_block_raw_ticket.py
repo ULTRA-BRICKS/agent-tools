@@ -1,7 +1,10 @@
 """Tests for agent-hooks/block-raw-ticket — raw gh issue / Linear vs task-cli.
 
-The acceptance crux: ``gh issue new`` under a configured task-cli MUST block
+The 015 crux: ``gh issue new`` under a configured task-cli MUST block
 (exit 10). If that command were allowed, this file is red.
+
+The 041 crux: ``gh issue create --title "Review uncommitted …"`` MUST block
+even when task-cli is absent — that title must not become a GitHub ticket.
 """
 
 from __future__ import annotations
@@ -268,3 +271,62 @@ def test_timeout_signal_wrapper_operand_still_blocked(tmp_path, monkeypatch):
     )
     assert code == brt.BLOCK_EXIT_CODE, out
     assert _decision(out) == "block"
+
+
+def test_review_uncommitted_gh_issue_create_blocked_when_task_cli_absent(tmp_path, monkeypatch):
+    """CRUX 041: a Review-uncommitted title must not become a GitHub ticket, even via raw gh."""
+    out, code = _run(
+        'gh issue create --title "Review uncommitted foo diff"',
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_empty_path(),
+    )
+    assert code == brt.BLOCK_EXIT_CODE, out
+    assert _decision(out) == "block"
+    msg = json.loads(out).get("message", "").lower()
+    assert "review uncommitted" in msg or "junk" in msg
+
+
+def test_review_uncommitted_gh_issue_new_blocked_when_task_cli_absent(tmp_path, monkeypatch):
+    out, code = _run(
+        'gh issue new --title "Review uncommitted policy diff"',
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_empty_path(),
+    )
+    assert code == brt.BLOCK_EXIT_CODE, out
+    assert _decision(out) == "block"
+
+
+def test_review_uncommitted_task_new_blocked_when_task_cli_configured(tmp_path, monkeypatch):
+    out, code = _run(
+        'task new --title "Review uncommitted foo diff" --why y --impact z --if-not-done w --acceptance a',
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_task_on_path(tmp_path),
+    )
+    assert code == brt.BLOCK_EXIT_CODE, out
+    assert _decision(out) == "block"
+
+
+def test_echo_mentioning_review_uncommitted_allowed(tmp_path, monkeypatch):
+    out, code = _run(
+        'echo "do not Review uncommitted foo diff"',
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_empty_path(),
+    )
+    assert code == 0, out
+    assert _decision(out) == "allow"
+
+
+def test_gh_pr_create_review_uncommitted_title_allowed(tmp_path, monkeypatch):
+    """PRs are not tickets — junk-title refuse is for issue/ticket create only."""
+    out, code = _run(
+        'gh pr create --title "Review uncommitted foo diff" --body y',
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_empty_path(),
+    )
+    assert code == 0, out
+    assert _decision(out) == "allow"
