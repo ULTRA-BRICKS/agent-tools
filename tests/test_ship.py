@@ -5631,7 +5631,11 @@ def _run_ship_quorum(main, gh_bindir, review_bindir, *, branch="feat", extra_arg
     # a "default 3-role floor" test actually asserts (codex review, PR #416).
     env.pop("SHIP_REVIEW_QUORUM_MIN_ROLES", None)
     if env_extra:
-        env.update(env_extra)
+        for key, val in env_extra.items():
+            if val is None:
+                env.pop(key, None)
+            else:
+                env[key] = val
     return _sh(
         "bash", str(_SHIP), "1", "--no-screenshot-ok", "test", *extra_args,
         cwd=main, env=env,
@@ -5937,6 +5941,24 @@ def test_review_quorum_zero_env_is_rejected_at_parse(tmp_path):
     assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
 
 
+def test_review_quorum_test_disable_ignored_outside_pytest(tmp_path):
+    """SHIP_TEST_DISABLE_REVIEW_QUORUM=1 without PYTEST_CURRENT_TEST must NOT disable Guard-B
+    (Codex P1 on #645: a production caller must not recreate the SHIP_REVIEW_QUORUM=0 hole)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, review_bindir=None,
+        env_extra={
+            "SHIP_TEST_DISABLE_REVIEW_QUORUM": "1",
+            "REVIEW_TASK_CODE": "HYP-644E",
+            "PYTEST_CURRENT_TEST": None,
+        },
+    )
+    assert r.returncode != 0, (
+        f"test-only disable must not work outside pytest\n{r.stdout}\n{r.stderr}"
+    )
+    assert "review-quorum gate disabled" not in r.stdout, r.stdout
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
 
 
 def test_review_quorum_fails_closed_when_review_cli_missing(tmp_path):

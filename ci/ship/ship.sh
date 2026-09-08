@@ -149,9 +149,9 @@
 #                          (default: enabled). Best-effort and never blocks the merge either
 #                          way — this only controls whether `task mark-shipped` gets called at
 #                          all. See "task-cli notify" below the merge step for the full story.
-#   SHIP_REVIEW_QUORUM_MIN_ITER    quorum floor: PASSED review-cli iterations (default 3). CLAMPED
-#                          to a hard minimum of 3 — raise-only, an unset/0/negative/below-3 value
-#                          resolves to 3 (fail-closed #242).
+#   SHIP_REVIEW_QUORUM_MIN_ITER    passed through to `review task --check --min-iter` as
+#                          telemetry. Authorization is ROLE coverage (#644); ship requires
+#                          QITER > 0 as a hollow-payload guard, not QITER >= this floor.
 #   SHIP_REVIEW_QUORUM_MIN_ROLES   quorum floor: distinct BOARD ROLES among the passed iterations
 #                          (default 3). Same >=3 clamp. This is now the PRIMARY/default gate
 #                          mechanism and is ALWAYS enforced, matching review-cli's own default
@@ -2541,8 +2541,10 @@ _skip_ci_hatch_gate() {
 QUORUM_ENABLED=1
 # SHIP_REVIEW_QUORUM=0 / SHIP_REVIEW_QUORUM_ENABLED=0 is forbidden (agent-tools#644).
 # Reject at parse: never disable Guard-B. A 0 is not an ops off-switch.
-# Test-only isolation (mirrors SHIP_TEST_CI_DOWN): SHIP_TEST_DISABLE_REVIEW_QUORUM=1.
-# Never set in production.
+# Test-only isolation: SHIP_TEST_DISABLE_REVIEW_QUORUM=1 is honored ONLY when
+# PYTEST_CURRENT_TEST is set (pytest exports it into the test process and its
+# subprocesses). A production `gh ship` has no such var, so this cannot recreate
+# the SHIP_REVIEW_QUORUM=0 off-switch (agent-tools#644 Codex P1).
 case "${SHIP_REVIEW_QUORUM_ENABLED:-1}" in
   0|false|no)
     echo "[ship] SHIP_REVIEW_QUORUM_ENABLED=${SHIP_REVIEW_QUORUM_ENABLED} is forbidden — review-quorum gate stays enabled." >&2
@@ -2553,18 +2555,18 @@ case "${SHIP_REVIEW_QUORUM:-1}" in
     echo "[ship] SHIP_REVIEW_QUORUM=${SHIP_REVIEW_QUORUM} is forbidden — review-quorum gate stays enabled." >&2
     ;;
 esac
-case "${SHIP_TEST_DISABLE_REVIEW_QUORUM:-0}" in 1|true|yes) QUORUM_ENABLED=0 ;; esac
+if [ -n "${PYTEST_CURRENT_TEST:-}" ]; then
+  case "${SHIP_TEST_DISABLE_REVIEW_QUORUM:-0}" in 1|true|yes) QUORUM_ENABLED=0 ;; esac
+fi
 
 if [ "$QUORUM_ENABLED" = "0" ]; then
   echo "[ship] review-quorum gate disabled (SHIP_TEST_DISABLE_REVIEW_QUORUM=1, test-only)."
 else
-  # Hard fail-closed floor: the self-merge bar is >=3 passed iterations across >=3 distinct
-  # BOARD ROLES (the primary/default mechanism — review-cli#246) and, ONLY when the operator
-  # explicitly opts in via SHIP_REVIEW_QUORUM_MIN_MODELS, ADDITIONALLY across >=3 distinct
-  # models. Floors must NEVER silently resolve to 0 in this subprocess — a 0 floor makes an
-  # empty quorum trivially "pass" (0 >= 0) and defeats the whole gate (#242). So clamp every
-  # unset / non-numeric / <3 value UP to the hard minimum 3; only an explicit, well-formed value
-  # of 3-or-more is honored as-is (an operator may RAISE the bar, never lower it below 3).
+  # Hard fail-closed ROLE floor (#644): authorization is distinct_roles_passed >= MIN_ROLES
+  # (clamped to >=3). passed_iterations must be >0 (hollow-payload guard), not >= MIN_ITER.
+  # MIN_ITER is still parsed and passed to review-cli as telemetry. An explicit
+  # SHIP_REVIEW_QUORUM_MIN_MODELS additionally requires that many models. A 0 role floor
+  # would let empty evidence pass (#242), so clamp every unset/non-numeric/<3 value UP to 3.
   MIN_ITER=$(_review_quorum_clamp_floor "${SHIP_REVIEW_QUORUM_MIN_ITER:-}" "min-iter")
   MIN_MODELS=$(_review_quorum_clamp_floor "${SHIP_REVIEW_QUORUM_MIN_MODELS:-}" "min-models")
   MIN_ROLES=$(_review_quorum_clamp_floor "${SHIP_REVIEW_QUORUM_MIN_ROLES:-}" "min-roles")
