@@ -1,0 +1,14 @@
+// Managed by Rig. Class: source-backed. Canonical source: agent-tools/linters/oxc/.oxfmtrc.jsonc.
+// Do not edit this target directly: change the canonical source (or Rig selection) and run `rig apply`.
+
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "printWidth": 100,
+  "tabWidth": 2,
+  "useTabs": false,
+  "semi": true,
+  "singleQuote": false,
+  "trailingComma": "all",
+  "sortPackageJson": true,
+  "ignorePatterns": ["dist/**", "coverage/**", "tools/oxlint/anti-slop/**"]
+}

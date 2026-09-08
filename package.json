@@ -1,0 +1,16 @@
+{
+  "name": "agent-tools",
+  "private": true,
+  "description": "Repo-local Oxc toolchain so Rig can provision anti-slop + oxlint.config.ts.",
+  "type": "module",
+  "scripts": {
+    "lint": "oxlint --type-aware --disable-nested-config --ignore-pattern 'vendor/**' --ignore-pattern 'tools/oxlint/anti-slop/**'"
+  },
+  "devDependencies": {
+    "@oxlint/plugins": "^1.82.0",
+    "oxfmt": "^0.67.0",
+    "oxlint": "^1.82.0",
+    "oxlint-tsgolint": "^7.0.2001",
+    "typescript": "^5.9.2"
+  }
+}
