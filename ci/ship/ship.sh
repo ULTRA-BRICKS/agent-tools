@@ -2704,7 +2704,6 @@ else
       # when role coverage is met (PR 87 / #648). One live model occupies every seat.
       ROLES_OK=0
       [ "$QROLES_N" -gt 0 ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] && ROLES_OK=1
-      [ "$QMODELS_N" -eq 1 ] && [ "$QITER" -gt 0 ] && ROLES_OK=1
       if [ "$QUORUM_ROLES_REQUESTED" = "1" ] \
          && [ "$ROLES_OK" = "1" ] \
          && [ "$QITER" -gt 0 ] \

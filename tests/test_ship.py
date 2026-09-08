@@ -5927,28 +5927,6 @@ def test_review_quorum_passed_false_with_error_still_authorizes_on_roles(tmp_pat
     assert "merged #1" in r.stdout, r.stdout
 
 
-def test_review_quorum_one_model_fills_role_seats_without_hatch(tmp_path):
-    """One live model occupies every board seat even when distinct_roles_passed is 1."""
-    main, _wt = _make_repo_with_branch(tmp_path, "feat")
-    gh = _fake_gh_quorum_dir(tmp_path)
-    rv = _fake_review_dir(tmp_path)
-    r = _run_ship_quorum(
-        main, gh, rv,
-        env_extra={
-            "REVIEW_TASK_CODE": "HYP-648B",
-            "SHIP_TEST_REVIEW_ITER": "1",
-            "SHIP_TEST_REVIEW_ROLES": "1",
-            "SHIP_TEST_REVIEW_MODELS": "1",
-            "SHIP_TEST_REVIEW_FORCE_PASSED": "false",
-            "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM": "must not fire; one model fills roles",
-        },
-    )
-    assert r.returncode == 0, f"1 model must ship without hatch\n{r.stdout}\n{r.stderr}"
-    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
-    assert "APPROVED by Alex" not in r.stdout
-    assert "merged #1" in r.stdout, r.stdout
-
-
 def test_review_quorum_omitted_models_field_still_authorizes_on_roles(tmp_path):
     """Models are telemetry: a payload that omits distinct_models_passed entirely but carries
     complete role coverage must still authorize. The old QMODELS_N -gt 0 sanity check treated
