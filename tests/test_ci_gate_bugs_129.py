@@ -454,6 +454,52 @@ def test_dep_audit_python_poetry_lock_pypi_audits_as_data(tmp_path: Path):
     _assert_lockfile_data_audit_argv(out)
 
 
+def test_dep_audit_python_uv_lock_single_quoted_registry_audits(tmp_path: Path):
+    """TOML single-quoted name/version is a valid lockfile pin — audit it as data, do not drop it."""
+    tree = tmp_path / "pyuvsq"
+    tree.mkdir()
+    (tree / "pyproject.toml").write_text("[project]\nname='x'\nversion='0.1.0'\n")
+    (tree / "uv.lock").write_text(
+        "version = 1\n"
+        "\n"
+        "[[package]]\n"
+        'name = "colorama"\n'
+        'version = "0.4.6"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        "\n"
+        "[[package]]\n"
+        "name = 'requests'\n"
+        "version = '2.32.3'\n"
+        "source = { registry = 'https://pypi.org/simple' }\n"
+    )
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 0, out
+    _assert_lockfile_data_audit_argv(out)
+
+
+def test_dep_audit_python_uv_lock_unparsed_record_fails_closed(tmp_path: Path):
+    """A sibling registry pin must not mask a package record we cannot emit (unknown source)."""
+    tree = tmp_path / "pyuvunp"
+    tree.mkdir()
+    (tree / "pyproject.toml").write_text("[project]\nname='x'\nversion='0.1.0'\n")
+    (tree / "uv.lock").write_text(
+        _UV_LOCK_REGISTRY
+        + "\n"
+        + "[[package]]\n"
+        + 'name = "sneaky"\n'
+        + 'version = "1.0.0"\n'
+        + 'source = { weird = "https://evil.example" }\n'
+    )
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 1, out
+    assert "STUB_PIP_AUDIT_ARGV" not in out, f"pip-audit must NOT run when a record is unparsed:\n{out}"
+
 
 # A requirements line that forces pip-audit to BUILD the input (RCE under pull_request_target).
 # `--no-deps` does NOT prevent the build of a DIRECT reference, so dep-audit.sh must refuse the

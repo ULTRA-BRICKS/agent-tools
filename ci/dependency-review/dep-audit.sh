@@ -87,14 +87,26 @@ req_file_classify() {  # $1 = requirements file -> prints: pinned | empty | unsa
 # Why: handing the lockfile or pyproject to pip-audit would BUILD it (RCE under
 # pull_request_target). uv/poetry export would invoke those tools on the PR tree.
 # Skip editable/path/git/url/virtual/directory — uv.lock `source = { editable = "." }`
-# is the local project, not a registry pin.
+# is the local project, not a registry pin. Strip TOML single- and double-quoted
+# strings. A package record that cannot be emitted as name==version (unknown source,
+# leftover quoting, invalid name/version) is written as a non-pin line so classify
+# fails CLOSED — a sibling valid pin must not mask an omitted record.
 extract_python_lock_pins() {  # $1 = uv.lock | poetry.lock
   awk '
     function flush() {
-      if (name != "" && ver != "" && skip == 0 && (mode != "uv" || saw_reg == 1)) {
-        if (name ~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ && ver ~ /^[A-Za-z0-9][A-Za-z0-9.+!_-]*$/)
-          print name "==" ver
+      if (name == "") {
+        ver = ""; skip = 0; saw_reg = 0
+        return
       }
+      emit_ok = 0
+      if (ver != "" && skip == 0 && (mode != "uv" || saw_reg == 1)) {
+        if (name ~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ && ver ~ /^[A-Za-z0-9][A-Za-z0-9.+!_-]*$/) {
+          print name "==" ver
+          emit_ok = 1
+        }
+      }
+      if (skip == 0 && emit_ok == 0)
+        print "UNPARSED-LOCK-RECORD"
       name = ""; ver = ""; skip = 0; saw_reg = 0
     }
     BEGIN {
@@ -107,7 +119,8 @@ extract_python_lock_pins() {  # $1 = uv.lock | poetry.lock
     /^name[ \t]*=/ {
       line = $0
       sub(/^[ \t]*name[ \t]*=[ \t]*/, "", line)
-      gsub(/["]/, "", line)
+      gsub(/"/, "", line)
+      gsub("\047", "", line)
       gsub(/^[ \t]+|[ \t]+$/, "", line)
       if (name == "") name = line
       next
@@ -115,7 +128,8 @@ extract_python_lock_pins() {  # $1 = uv.lock | poetry.lock
     /^version[ \t]*=/ {
       line = $0
       sub(/^[ \t]*version[ \t]*=[ \t]*/, "", line)
-      gsub(/["]/, "", line)
+      gsub(/"/, "", line)
+      gsub("\047", "", line)
       gsub(/^[ \t]+|[ \t]+$/, "", line)
       if (ver == "") ver = line
       next

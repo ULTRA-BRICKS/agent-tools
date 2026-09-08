@@ -59,9 +59,11 @@ deps **as data, never building**:
 - `uv.lock` / `poetry.lock` are parsed as **text** (never `uv export` / `poetry export`).
   Registry/PyPI `name==version` pairs are written to a temp file *outside* the audited tree
   and audited with `pip-audit --no-deps -r <temp>`. Editable/path/git/url/virtual/directory
-  packages are skipped (`source = { editable = "." }` is the local project). The lockfile
-  itself is never passed to pip-audit — that would **build** it (RCE under the privileged
-  trigger).
+  packages are skipped (`source = { editable = "." }` is the local project). A package
+  record that cannot be emitted as a registry pin (unknown source, unparseable
+  name/version, leftover quoting) **fails closed** — a sibling valid pin must not mask
+  it. The lockfile itself is never passed to pip-audit — that would **build** it (RCE
+  under the privileged trigger).
 - A `pyproject.toml` with **no** pinned `requirements*.txt` **and** no auditable lockfile
   pins can only be audited by building it, so it **fails closed** here (commit `uv.lock` /
   `poetry.lock`, pin a `requirements*.txt`, or `DEP_AUDIT_ALLOW_MISSING=1`). An **empty/stub
