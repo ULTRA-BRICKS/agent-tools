@@ -45,7 +45,8 @@ def _run(event, monkeypatch, marker_dir: Path, env: dict | None = None) -> tuple
     monkeypatch.setenv("ORCH_THIN_MARKER_DIR", str(marker_dir))
     monkeypatch.setattr(ost, "MARKER_DIR", marker_dir)
     for k in ("ALLOW_ORCHESTRATOR_WORK", "ALLOW_ORCHESTRATOR_WORK_REASON", "RIG_ORCHESTRATOR_ONLY",
-              "RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN"):
+              "RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN",
+              "RIG_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE"):
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
@@ -138,6 +139,73 @@ def test_subagent_exempt_code_write(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
 
 
+def test_subagent_git_commit_allowed_with_args_agent_id(tmp_path, monkeypatch):
+    """Claude Code child: sanitized `args.agent_id`. Repeat `git commit` must allow — a
+    worker commit must never be gated as the orchestrator."""
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"agent_id": "cc-child", "command": "git commit -m 'fix: x'"}}
+    _run(event, monkeypatch, tmp_path / "m")
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_subagent_git_commit_allowed_with_rig_agent_id_env(tmp_path, monkeypatch):
+    """`RIG_AGENT_ID` in the hook process env (detached launcher child) must exempt even
+    when `args.agent_id` is absent. Repeat `git commit` must allow; would FAIL if that
+    worker were still gated as the orchestrator (agent-tools#634)."""
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "git commit -m 'fix: x'"}}
+    env = {"RIG_AGENT_ID": "ThinNotSub"}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == 0 and _decision(out) == "allow"
+
+
+_OMP_NESTED_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/ThinNotSub.jsonl"
+)
+_OMP_MAIN_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e.jsonl"
+)
+
+
+def test_subagent_git_commit_allowed_for_omp_nested_session(tmp_path, monkeypatch):
+    """omp Task/eval child: `PI_SESSION_FILE` is nested `.../<session-id>/<agent>.jsonl`.
+    No `args.agent_id`, no `RIG_AGENT_ID`. Repeat `git commit` must allow — the
+    conloca-landing / ThinNotSub incident (agent-tools#634). Would FAIL if that child
+    were still gated as the orchestrator."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "omp",
+             "args": {"command": "git commit -m 'fix: x'"}}
+    env = {"PI_SESSION_FILE": _OMP_NESTED_SESSION}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_nested_pi_session_does_not_exempt_non_omp_harness(tmp_path, monkeypatch):
+    """A leftover nested PI_SESSION_FILE must not exempt Claude Code / Codex — the
+    nested-session grant is omp-only (review P1, agent-tools#634)."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "claude-code",
+             "args": {"command": "git commit -m 'fix: x'"}}
+    env = {"PI_SESSION_FILE": _OMP_NESTED_SESSION}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_orchestrator_git_commit_still_blocks_with_main_pi_session_file(tmp_path, monkeypatch):
+    """The MAIN omp session file (`.../<session-id>.jsonl`, not nested) is not a subagent.
+    Repeat `git commit` still BLOCKs."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "omp",
+             "args": {"command": "git commit -m 'fix: x'"}}
+    env = {"PI_SESSION_FILE": _OMP_MAIN_SESSION}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
 def test_empty_agent_id_does_not_exempt(tmp_path, monkeypatch):
     """An EMPTY/whitespace `args.agent_id` is NOT a subagent — it must NOT exempt the
     orchestrator. A blank signal can't relax the gate, so a repeat impl write still BLOCKs."""
@@ -149,17 +217,16 @@ def test_empty_agent_id_does_not_exempt(tmp_path, monkeypatch):
 
 
 def test_only_args_agent_id_exempts_not_top_level_or_tool_input(tmp_path, monkeypatch):
-    """TRUST BOUNDARY regression guard (agent-tools#115). `_is_subagent` reads ONLY
-    `args.agent_id` — the single surface lib/cc_hook_bridge sanitizes (T2 precedence: it drops
-    any model/tool_input-supplied copy and NEVER writes a top-level `agent_id`). This gate uses
-    agent_id to RELAX (exempt a subagent), so a forged agent_id sitting ANYWHERE ELSE must NOT
-    exempt the orchestrator:
-      - at the event TOP LEVEL (the old `or event.get('agent_id')` fallback — an unsanitized
-        relax-surface, now dropped), and
+    """TRUST BOUNDARY regression guard (agent-tools#115). Event-payload identity is ONLY
+    sanitized `args.agent_id` (lib/cc_hook_bridge T2: drops any model/tool_input copy, never
+    writes a top-level `agent_id`). A forged agent_id sitting ANYWHERE ELSE on the event
+    must NOT exempt the orchestrator:
+      - at the event TOP LEVEL (the old `or event.get('agent_id')` fallback), and
       - nested under `args.tool_input` (a model-controllable surface).
-    With no real `args.agent_id` the orchestrator gate applies and a repeat impl write BLOCKs.
-    If a future edit widened the read to either surface, the orchestrator could self-exempt and
-    this test would catch it."""
+    Process env (`RIG_AGENT_ID` / nested `PI_SESSION_FILE`) is a separate trusted surface
+    (agent-tools#634) and is cleared by `_run` unless a test sets it. With no real
+    `args.agent_id` and no env identity the orchestrator gate applies and a repeat impl
+    write BLOCKs."""
     event = {"point": "pre-write", "cwd": "/repo", "agent_id": "top-level-decoy",
              "args": {"file_path": "/repo/src/a.ts",
                       "tool_input": {"agent_id": "nested-decoy"}}}

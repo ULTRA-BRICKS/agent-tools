@@ -49,8 +49,10 @@ TIERED (warn → block): the FIRST offense in the TTL window WARNs (allow + mess
 in the window BLOCKs. The tier is tracked by a marker file keyed by a hash of cwd. This gives
 the doctrine's "WARN then BLOCK" instead of a hard wall on the first inline edit.
 
-Subagent-exempt: a dispatched subagent (``agent_id`` present) does the actual work, so it is
-always allowed — this gate governs the orchestrator only.
+Subagent-exempt: a dispatched subagent does the actual work, so it is always allowed — this
+gate governs the orchestrator only. Identity is sanitized ``args.agent_id`` (Claude Code
+child), process env ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT=1`` (detached launcher), or a
+nested omp ``PI_SESSION_FILE`` (Task/eval child). Not a top-level / tool_input agent_id.
 
 Harness-unified (agent-tools#573): an earlier revision exempted the WHOLE codex/opencode/omp
 harnesses from this gate (``EXEMPT_HARNESSES``, agent-tools#533), because none of their bridges
@@ -78,8 +80,10 @@ launcher-env signal today: Codex's ``SubagentStart``/``SubagentStop`` events exi
 captured, confirmed parent/child linkage in this bridge's payload (see
 ``lib/codex_hook_bridge``'s own module comment), and omp's ``tool_call``/``tool_result``
 extension events document no session/task-spawn marker either (see
-``lib/omp_hook_bridge``'s). Until one of those is confirmed and wired up, the launcher-env
-marker is the ONLY non-forgeable identity source for those two harnesses, same as opencode.
+``lib/omp_hook_bridge``'s). Until a harness-own child-spawn record is confirmed and wired into the event, this hook
+also reads the launcher env itself (not only a bridge-injected ``args.agent_id``) and
+treats a nested omp ``PI_SESSION_FILE`` as a Task/eval child — otherwise those workers
+are gated as the orchestrator (agent-tools#634).
 
 Per-repo opt-out (Alex tg#5743): default ON; a repo that legitimately works inline on main
 (e.g. 3d-cli) sets `agent_hooks.orchestrator_only: false` in its rig.yaml, or exports
@@ -414,27 +418,57 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"orchestrator-stays-thin: {msg}\n")
 
 
+# omp Task/eval child transcript: .../<session-id>/<agent-id>.jsonl
+# Main session file is .../<session-id>.jsonl (parent dir is the project slug, not the id).
+_OMP_SESSION_DIR = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-fA-F-]+$"
+)
+
+
+def _is_omp_nested_session(event: dict) -> bool:
+    """True when this is an omp event AND PI_SESSION_FILE is a Task/eval child transcript.
+
+    Main:  .../<session-id>.jsonl
+    Child: .../<session-id>/<agent-id>.jsonl
+
+    Restricted to ``event["harness"] == "omp"`` (bridge-set, unforgeable) so a leftover
+    ``PI_SESSION_FILE`` in a Claude Code / Codex process cannot self-exempt. omp sets
+    the var on the process; a running orchestrator cannot retroactively mutate it.
+    Path shape only — no filesystem probe, so tests stay hermetic."""
+    if str(event.get("harness") or "").strip() != "omp":
+        return False
+    raw = os.environ.get("PI_SESSION_FILE", "").strip()
+    if not raw:
+        return False
+    path = Path(raw)
+    if path.suffix.lower() != ".jsonl" or not path.stem.strip():
+        return False
+    return bool(_OMP_SESSION_DIR.match(path.parent.name))
+
+
 def _is_subagent(event: dict) -> bool:
-    """True when this tool use fires INSIDE a dispatched subagent (agent_id present).
+    """True when this tool use fires INSIDE a dispatched subagent.
 
-    TRUST BOUNDARY — this gate uses agent_id to RELAX (a subagent is exempt from the
-    thin-orchestrator block), so the read surface must be exactly the one the bridge sanitizes,
-    and no wider. We read ONLY `args.agent_id`: lib/cc_hook_bridge enforces T2 precedence before
-    the event reaches us — it OVERWRITES args.agent_id from CC's authoritative top-level field
-    when CC supplies it and DROPS any model/tool_input-supplied copy when CC does not. So the only
-    way a truthy `args.agent_id` survives is if CC itself dispatched a subagent; a main-thread
-    agent cannot forge it.
+    Trusted identity sources — any one is enough (agent-tools#634):
+      1. sanitized ``args.agent_id`` — Claude Code child (bridge T2-sanitized)
+      2. process env ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT=1`` — detached launcher
+      3. nested ``PI_SESSION_FILE`` — omp Task/eval child
 
-    We deliberately DO NOT fall back to a top-level `event.get("agent_id")`: the bridge NEVER
-    writes a top-level `agent_id` (its v1 event has no such key), so that fallback was a DEAD path
-    that was nonetheless a TRUSTED, unsanitized relax-surface — if any non-bridge producer ever set
-    a top-level agent_id from a model-influenced field, the orchestrator would self-exempt. This
-    narrows the read to the sanitized `args.agent_id` only, matching the sibling skills-read-gate
-    (agent-tools#115, bringing the two gates into line per #112/#116). An empty/whitespace value is
-    not a subagent."""
+    TRUST BOUNDARY — these RELAX the gate, so they must not be model-controlled.
+    We still do NOT fall back to a top-level ``event.get("agent_id")`` or
+    ``args.tool_input`` (agent-tools#115): the bridge NEVER writes a top-level
+    ``agent_id``, and tool_input is model-controlled. Process env is the same
+    surface the bridges already trust: a running orchestrator cannot retroactively
+    mutate it. An empty/whitespace value is not a subagent."""
     args = event.get("args") or {}
     aid = args.get("agent_id")
-    return bool(aid and str(aid).strip())
+    if aid and str(aid).strip():
+        return True
+    if os.environ.get("RIG_AGENT_ID", "").strip():
+        return True
+    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
+        return True
+    return _is_omp_nested_session(event)
 
 
 def _marker(event: dict) -> Path:
