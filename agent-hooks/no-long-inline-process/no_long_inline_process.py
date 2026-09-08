@@ -56,7 +56,7 @@ sanitized ``args.agent_id`` (Claude Code child), process env ``RIG_AGENT_ID`` /
 (``.../<session-id>/<agent>.jsonl``, Task/eval child). omp Task children share the
 orchestrator's pre-bash hook with no ``args.agent_id`` — without the env/session
 signals they were gated as the orchestrator (agent-tools#635). Do not harness-allowlist
-omp/codex/opencode: the orchestrator must still be blocked; omp dispatch is ``hub start``
+omp/codex/opencode: the orchestrator must still be blocked; omp dispatch is ``hub start name=<id> application=<cmd> args=[...]``
 (argv[0] is hub, so this hook does not fire).
 
 Harness-aware remediation (agent-tools#573): this hook has ALWAYS governed every harness (it
@@ -622,7 +622,7 @@ _HARNESS_RECIPES = {
         "rig-detached-opencode launcher for a truly detached child"
     ),
     "omp": (
-        "Dispatch it with `hub start name=<id> application=review args=[...]` "
+        "Dispatch it with `hub start name=<id> application=<cmd> args=[...]` "
         "(argv[0] is hub, so this hook does not fire), or a Task/eval subagent"
     ),
 }

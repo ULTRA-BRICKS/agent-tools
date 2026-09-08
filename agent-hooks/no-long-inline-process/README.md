@@ -35,7 +35,7 @@ model/tool_input copies dropped), process env `RIG_AGENT_ID` / `RIG_DETACHED_AGE
 Task/eval child). Never model-controlled `tool_input`. omp Task children share the
 orchestrator's pre-bash hook with no `args.agent_id`; without the env/session signals they
 were gated as the orchestrator ([agent-tools#635](https://github.com/alex-mextner/agent-tools/issues/635)).
-Do not harness-allowlist omp: the orchestrator still blocks; dispatch with `hub start`
+Do not harness-allowlist omp: the orchestrator still blocks; dispatch with `hub start name=<id> application=<cmd> args=[...]`
 (argv[0] is hub, so this hook does not fire). Full contract in `background-subagent-gate/README.md`.
 
 ## Why a hard block (not warn-first)
