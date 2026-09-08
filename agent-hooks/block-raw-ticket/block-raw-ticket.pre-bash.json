@@ -1,0 +1,9 @@
+{
+  "id": "block-raw-ticket",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/block-raw-ticket/block_raw_ticket.py",
+  "priority": 10,
+  "timeout_ms": 5000,
+  "on_error": "closed",
+  "description": "When task-cli is on PATH (activated and zero-config configured), blocks a raw tracker write that skips its gates: `gh issue create`/`new`/`close`/`edit`/`comment`/… and `linear issue create`/`update`/…. Allows `task …`, read-only `gh issue list`/`view`, and `gh pr`. Inert when `task` is not on PATH. Fail-closed."
+}
