@@ -308,6 +308,16 @@ def _fake_tg_ctl(path: Path, body: str) -> Path:
     return path
 
 
+# "approved" answer must reply with the real hookSpecificOutput shape the helper parses
+# (`decision.behavior == "allow"`) — printing arbitrary text and exiting 0 no longer approves
+# (agent-tools#513). SYNC: identical to subagent-no-monitor's / subagent-no-bg-longproc's own
+# `_ALLOW_REPLY_SH`.
+_ALLOW_REPLY_SH = (
+    'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRequest",'
+    '"decision":{"behavior":"allow"}}}\'\nexit 0\n'
+)
+
+
 def test_hatch_unset_blocks_and_names_env_var(monkeypatch):
     out, _e, code = _run(monkeypatch, agent_id="sub-1")
     assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
@@ -328,7 +338,7 @@ def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
 
 def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     marker = tmp_path / "asked"
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nprintf approved\nexit 0\n")
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\n" + _ALLOW_REPLY_SH)
     monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     out, _e, code = _run(
         monkeypatch, agent_id="sub-1",
