@@ -19,6 +19,7 @@ In **autonomous** mode (harness mode autonomous, or the user says autonomous):
   are green. Ship.
 - Do **not** invent a "gate-behavior hold for Alex" class. That class does not
   exist.
+- Autonomous agents send key status via `tg --tag report`, not chat-only.
 - If extra-approval (or another GitHub/ship **knob**) is wrongly ON, **fix that
   knob** — [rig-cli#404](https://github.com/alex-mextner/rig-cli/pull/404)
   manages it. A red test is not a broken gate: fix the work. Do not stall
