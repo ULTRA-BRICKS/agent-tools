@@ -46,7 +46,8 @@ def _run(command, monkeypatch, *, agent_id=None, harness=None, env: dict | None 
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
     for k in ("ALLOW_INLINE_PROCESS", "ALLOW_INLINE_PROCESS_REASON",
-              "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS"):
+              "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS",
+              "RIG_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE"):
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
@@ -104,7 +105,7 @@ def test_block_long_running(command, monkeypatch):
     ("claude-code", "Agent with `subagent_type"),
     ("codex", "rig-detached-codex"),
     ("opencode", "rig-detached-opencode"),
-    ("omp", "rig-detached-omp"),
+    ("omp", "hub start"),
     ("some-future-harness", "Agent with `subagent_type"),  # unrecognized -> same fallback
 ])
 def test_block_message_names_correct_recipe_for_harness(monkeypatch, harness, fragment):
@@ -401,6 +402,80 @@ def test_subagent_exempt_allows_long_process(monkeypatch):
 def test_subagent_exempt_allows_review(monkeypatch):
     """The same real `review` that blocks for the orchestrator is allowed inside a subagent."""
     out, _e, code = _run("review diff -C /repo", monkeypatch, agent_id="sub-7")
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+_OMP_NESTED_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/LongInlineFix.jsonl"
+)
+_OMP_MAIN_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e.jsonl"
+)
+
+
+def test_subagent_review_allowed_via_rig_agent_id(monkeypatch):
+    """No args.agent_id; identity via RIG_AGENT_ID. review diff must allow
+    (agent-tools#635). Would FAIL if the classifier still required args.agent_id."""
+    out, _e, code = _run(
+        "review diff", monkeypatch, harness="omp",
+        env={"RIG_AGENT_ID": "LongInlineFix"},
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_subagent_review_allowed_via_omp_nested_session(monkeypatch):
+    """omp Task/eval child: PI_SESSION_FILE is nested .../<session-id>/<agent>.jsonl.
+    No args.agent_id, no RIG_AGENT_ID. review diff must allow (agent-tools#635)."""
+    out, _e, code = _run(
+        "review diff", monkeypatch, harness="omp",
+        env={"PI_SESSION_FILE": _OMP_NESTED_SESSION},
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_omp_orchestrator_inline_review_still_blocks(monkeypatch):
+    """Main thread, harness=omp, no subagent identity: inline review still
+    blocks. Do not harness-allowlist omp. Recipe names hub start."""
+    out, _e, code = _run("review diff", monkeypatch, harness="omp")
+    assert code == nlip.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+    assert "hub start" in json.loads(out)["message"]
+
+
+def test_omp_main_session_file_review_still_blocks(monkeypatch):
+    """PI_SESSION_FILE is the main session jsonl (not nested): still the
+    orchestrator, so inline review blocks."""
+    out, _e, code = _run(
+        "review diff", monkeypatch, harness="omp",
+        env={"PI_SESSION_FILE": _OMP_MAIN_SESSION},
+    )
+    assert code == nlip.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_inline_rig_agent_id_prefix_does_not_exempt(monkeypatch):
+    """A command-string RIG_AGENT_ID=… prefix is argv noise, not hook process
+    env — the orchestrator cannot self-exempt by forging identity on the
+    command line (agent-tools#635)."""
+    out, _e, code = _run(
+        "RIG_AGENT_ID=forged review diff", monkeypatch, harness="omp",
+    )
+    assert code == nlip.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_hub_start_application_review_allowed(monkeypatch):
+    """Orchestrator dispatch via hub: argv[0] is hub, so review as an
+    application= value is not a long inline process."""
+    out, _e, code = _run(
+        "hub start name=rev application=review args=[diff]",
+        monkeypatch, harness="omp",
+    )
     assert code == 0
     assert _decision(out) == "allow"
 

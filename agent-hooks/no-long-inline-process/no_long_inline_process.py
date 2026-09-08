@@ -49,8 +49,15 @@ inside a NORMAL multi-word quoted message, `tg --title x "...review..."`) is ful
 fix means a quote-aware separator scan replacing punctuation_chars across this and the sibling hooks'
 shared parser (follow-up, not this change). Pinned by `test_quoted_token_equal_to_separator_*`.
 
-Subagent-exempt: a dispatched subagent (``agent_id`` present) is EXPECTED to run these in
-the background, so it is always allowed — this gate governs the orchestrator only.
+Subagent-exempt: a dispatched subagent is EXPECTED to run these in the background,
+so it is always allowed — this gate governs the orchestrator only. Identity (any one):
+sanitized ``args.agent_id`` (Claude Code child), process env ``RIG_AGENT_ID`` /
+``RIG_DETACHED_AGENT=1`` (detached launcher), or a nested omp ``PI_SESSION_FILE``
+(``.../<session-id>/<agent>.jsonl``, Task/eval child). omp Task children share the
+orchestrator's pre-bash hook with no ``args.agent_id`` — without the env/session
+signals they were gated as the orchestrator (agent-tools#635). Do not harness-allowlist
+omp/codex/opencode: the orchestrator must still be blocked; omp dispatch is ``hub start name=<id> application=<cmd> args=[...]``
+(argv[0] is hub, so this hook does not fire).
 
 Harness-aware remediation (agent-tools#573): this hook has ALWAYS governed every harness (it
 never had a `codex`/`opencode`/`omp` carve-out), but its BLOCK message named only Claude
@@ -238,11 +245,53 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"no-long-inline-process: {msg}\n")
 
 
+# omp Task/eval child transcript: .../<session-id>/<agent-id>.jsonl
+# Main session file is .../<session-id>.jsonl (parent dir is the project slug, not the id).
+# Same path-shape detector as the #634 identity work on orchestrator-stays-thin
+# (duplicated: each hook is a standalone script; agent-tools#635).
+_OMP_SESSION_DIR = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-fA-F-]+$"
+)
+
+
+def _is_omp_nested_session() -> bool:
+    """True when PI_SESSION_FILE is an omp Task/eval child transcript.
+
+    Main:  .../<session-id>.jsonl
+    Child: .../<session-id>/<agent-id>.jsonl
+
+    omp sets PI_SESSION_FILE on the process; a running orchestrator cannot retroactively
+    mutate its own process environment (same trust model as RIG_AGENT_ID). Path shape
+    only — no filesystem probe, so tests stay hermetic."""
+    raw = os.environ.get("PI_SESSION_FILE", "").strip()
+    if not raw:
+        return False
+    path = Path(raw)
+    if path.suffix.lower() != ".jsonl" or not path.stem.strip():
+        return False
+    return bool(_OMP_SESSION_DIR.match(path.parent.name))
+
+
 def _is_subagent(event: dict) -> bool:
-    """True when this tool use fires INSIDE a dispatched subagent (agent_id present)."""
+    """True when this tool use fires INSIDE a dispatched subagent.
+
+    Trusted identity sources — any one is enough (agent-tools#635):
+      1. sanitized ``args.agent_id`` — Claude Code child (bridge T2-sanitized)
+      2. process env ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT=1`` — detached launcher
+      3. nested ``PI_SESSION_FILE`` — omp Task/eval child
+
+    TRUST BOUNDARY — these RELAX the gate, so they must not be model-controlled.
+    Top-level ``event.agent_id`` is also read (same as args). Empty/whitespace is
+    not a subagent."""
     args = event.get("args") or {}
     aid = args.get("agent_id") or event.get("agent_id")
-    return bool(aid and str(aid).strip())
+    if aid and str(aid).strip():
+        return True
+    if os.environ.get("RIG_AGENT_ID", "").strip():
+        return True
+    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
+        return True
+    return _is_omp_nested_session()
 
 
 def _strip_line_comment(line: str) -> str:
@@ -573,8 +622,8 @@ _HARNESS_RECIPES = {
         "rig-detached-opencode launcher for a truly detached child"
     ),
     "omp": (
-        "Dispatch it with the task tool, or the rig-detached-omp launcher for a truly "
-        "detached child"
+        "Dispatch it with `hub start name=<id> application=<cmd> args=[...]` "
+        "(argv[0] is hub, so this hook does not fire), or a Task/eval subagent"
     ),
 }
 
