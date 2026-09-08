@@ -44,6 +44,7 @@ def _no_host_agent_markers(monkeypatch):
     monkeypatch.delenv("RIG_AGENT_ID", raising=False)
     monkeypatch.delenv("RIG_DETACHED_AGENT", raising=False)
     monkeypatch.delenv("PI_SESSION_FILE", raising=False)
+    monkeypatch.delenv("REVIEW_CLI_ACTIVE", raising=False)
 
 
 def _run(event, monkeypatch, marker_dir: Path, env: dict | None = None) -> tuple[str, str, int]:
@@ -56,7 +57,8 @@ def _run(event, monkeypatch, marker_dir: Path, env: dict | None = None) -> tuple
     monkeypatch.setattr(ost, "MARKER_DIR", marker_dir)
     for k in ("ALLOW_ORCHESTRATOR_WORK", "ALLOW_ORCHESTRATOR_WORK_REASON", "RIG_ORCHESTRATOR_ONLY",
               "RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN",
-              "RIG_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE"):
+              "RIG_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE",
+              "REVIEW_CLI_ACTIVE"):
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
@@ -169,6 +171,43 @@ def test_subagent_git_commit_allowed_with_rig_agent_id_env(tmp_path, monkeypatch
     _run(event, monkeypatch, tmp_path / "m", env=env)
     out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
     assert c == 0 and _decision(out) == "allow"
+
+
+def test_review_cli_inner_session_git_commit_allowed(tmp_path, monkeypatch):
+    """Alex ask 122: orchestrator-stays-thin must NOT apply to sessions inside
+    review-cli. review-cli sets REVIEW_CLI_ACTIVE for the lifetime of a run
+    (reviewlib/cli.py); backend children (codex exec / opencode / omp) inherit
+    it and have no args.agent_id / RIG_AGENT_ID / nested PI_SESSION_FILE.
+    Repeat `git commit` must allow — would FAIL if that inner session were
+    still gated as the orchestrator."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "codex",
+             "args": {"command": "git commit -m 'fix: x'"}}
+    env = {"REVIEW_CLI_ACTIVE": "1"}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_review_cli_active_empty_string_still_exempts(tmp_path, monkeypatch):
+    """review-cli's reentrancy guard treats PRESENCE (`is not None`), not
+    truthiness — `REVIEW_CLI_ACTIVE=` (empty) is still nested inside a review
+    run. Match that: empty still exempts."""
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "git commit -m 'fix: x'"}}
+    env = {"REVIEW_CLI_ACTIVE": ""}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_unset_review_cli_active_does_not_exempt(tmp_path, monkeypatch):
+    """Control: without REVIEW_CLI_ACTIVE the orchestrator still warn-then-blocks
+    a repeat git commit — the new env must not become a blanket allow."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "codex",
+             "args": {"command": "git commit -m 'fix: x'"}}
+    _run(event, monkeypatch, tmp_path / "m")
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
 _OMP_NESTED_SESSION = (

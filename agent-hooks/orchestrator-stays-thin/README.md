@@ -129,12 +129,16 @@ gate governs the orchestrator only. `_is_subagent` trusts, in order: (1) sanitiz
 `args.agent_id` — Claude Code child (`cc_hook_bridge` T2: CC's top-level field overwrites,
 model/tool_input copies dropped); (2) process env `RIG_AGENT_ID` / `RIG_DETACHED_AGENT=1` —
 detached launcher child, read here as well as by the bridges, because a worker whose
-`args.agent_id` was not injected was still gated; (3) a nested omp `PI_SESSION_FILE`
+`args.agent_id` was not injected was still gated; (3) process env `REVIEW_CLI_ACTIVE`
+(presence, not truthiness — same as review-cli's own reentrancy guard) — a review-cli
+inner session. review-cli sets this for the lifetime of a run; Codex/omp/opencode/claude
+backend children inherit it and are workers, not the orchestrator (Alex ask 122 /
+agent-tools#649); (4) a nested omp `PI_SESSION_FILE`
 (`.../<session-id>/<agent>.jsonl`) — Task/eval child. Never a top-level `event.agent_id`
 fallback, never model-controlled `tool_input` (agent-tools#115). A running orchestrator
-cannot retroactively mutate its process env. Empty/whitespace is not a subagent. The MAIN
-omp session file (`.../<session-id>.jsonl`) is not nested and stays governed
-(agent-tools#634).
+cannot retroactively mutate its process env. Empty/whitespace `RIG_AGENT_ID` is not a
+subagent. The MAIN omp session file (`.../<session-id>.jsonl`) is not nested and stays
+governed (agent-tools#634).
 
 **Harness-unified (agent-tools#573):** an earlier revision exempted the WHOLE codex, opencode,
 and omp harnesses from this gate entirely (`EXEMPT_HARNESSES = {"codex", "opencode", "omp"}`,
@@ -170,7 +174,8 @@ captured, confirmed parent/child linkage in `codex_hook_bridge`'s payload, and o
 `tool_call`/`tool_result` extension events document no session/task-spawn marker either (both
 bridges' own module docstrings record exactly what was checked and ruled out). Until one of
 those is confirmed and wired into the event, this hook also reads the launcher env itself
-(not only a bridge-injected `args.agent_id`) and treats a nested omp `PI_SESSION_FILE` as a
+(not only a bridge-injected `args.agent_id`), treats `REVIEW_CLI_ACTIVE` as a review-cli
+inner-session worker (agent-tools#649), and treats a nested omp `PI_SESSION_FILE` as a
 Task/eval child — otherwise those workers are gated as the orchestrator (agent-tools#634).
 
 ## `gh ship <PR#>` — restored narrow carve-out (agent-tools#159, Alex tg#9977; narrowed by agent-tools#363)

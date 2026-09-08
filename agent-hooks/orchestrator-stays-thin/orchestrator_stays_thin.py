@@ -51,8 +51,10 @@ the doctrine's "WARN then BLOCK" instead of a hard wall on the first inline edit
 
 Subagent-exempt: a dispatched subagent does the actual work, so it is always allowed — this
 gate governs the orchestrator only. Identity is sanitized ``args.agent_id`` (Claude Code
-child), process env ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT=1`` (detached launcher), or a
-nested omp ``PI_SESSION_FILE`` (Task/eval child). Not a top-level / tool_input agent_id.
+child), process env ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT=1`` (detached launcher),
+``REVIEW_CLI_ACTIVE`` (a review-cli inner session — backend children inherit it from
+``review`` itself; Alex ask 122), or a nested omp ``PI_SESSION_FILE`` (Task/eval child).
+Not a top-level / tool_input agent_id.
 
 Harness-unified (agent-tools#573): an earlier revision exempted the WHOLE codex/opencode/omp
 harnesses from this gate (``EXEMPT_HARNESSES``, agent-tools#533), because none of their bridges
@@ -81,9 +83,10 @@ captured, confirmed parent/child linkage in this bridge's payload (see
 ``lib/codex_hook_bridge``'s own module comment), and omp's ``tool_call``/``tool_result``
 extension events document no session/task-spawn marker either (see
 ``lib/omp_hook_bridge``'s). Until a harness-own child-spawn record is confirmed and wired into the event, this hook
-also reads the launcher env itself (not only a bridge-injected ``args.agent_id``) and
-treats a nested omp ``PI_SESSION_FILE`` as a Task/eval child — otherwise those workers
-are gated as the orchestrator (agent-tools#634).
+also reads the launcher env itself (not only a bridge-injected ``args.agent_id``),
+treats ``REVIEW_CLI_ACTIVE`` as a review-cli inner-session worker (agent-tools#649),
+and treats a nested omp ``PI_SESSION_FILE`` as a Task/eval child — otherwise those
+workers are gated as the orchestrator (agent-tools#634).
 
 Per-repo opt-out (Alex tg#5743): default ON; a repo that legitimately works inline on main
 (e.g. 3d-cli) sets `agent_hooks.orchestrator_only: false` in its rig.yaml, or exports
@@ -449,17 +452,23 @@ def _is_omp_nested_session(event: dict) -> bool:
 def _is_subagent(event: dict) -> bool:
     """True when this tool use fires INSIDE a dispatched subagent.
 
-    Trusted identity sources — any one is enough (agent-tools#634):
+    Trusted identity sources — any one is enough (agent-tools#634 / #649):
       1. sanitized ``args.agent_id`` — Claude Code child (bridge T2-sanitized)
       2. process env ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT=1`` — detached launcher
-      3. nested ``PI_SESSION_FILE`` — omp Task/eval child
+      3. process env ``REVIEW_CLI_ACTIVE`` (presence, not truthiness) — a
+         review-cli inner session. review-cli sets this for the lifetime of a
+         run; Codex/omp/opencode/claude backend children inherit it and are
+         workers, not the orchestrator (Alex ask 122).
+      4. nested ``PI_SESSION_FILE`` — omp Task/eval child
 
     TRUST BOUNDARY — these RELAX the gate, so they must not be model-controlled.
     We still do NOT fall back to a top-level ``event.get("agent_id")`` or
     ``args.tool_input`` (agent-tools#115): the bridge NEVER writes a top-level
     ``agent_id``, and tool_input is model-controlled. Process env is the same
     surface the bridges already trust: a running orchestrator cannot retroactively
-    mutate it. An empty/whitespace value is not a subagent."""
+    mutate it. An empty/whitespace ``RIG_AGENT_ID`` is not a subagent.
+    ``REVIEW_CLI_ACTIVE`` matches review-cli's own reentrancy guard: presence
+    (``is not None``), so an empty value still counts as nested inside a review."""
     args = event.get("args") or {}
     aid = args.get("agent_id")
     if aid and str(aid).strip():
@@ -467,6 +476,8 @@ def _is_subagent(event: dict) -> bool:
     if os.environ.get("RIG_AGENT_ID", "").strip():
         return True
     if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
+        return True
+    if os.environ.get("REVIEW_CLI_ACTIVE") is not None:
         return True
     return _is_omp_nested_session(event)
 
