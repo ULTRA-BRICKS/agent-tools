@@ -118,9 +118,27 @@ def point_for_event(event_name: str, tool_name: str | None) -> str | None:
             return "pre-write"
         if tool == _TASK_TOOL:
             return "pre-agent"
+        if tool == "yield":
+            # Hidden completion tool (docs/tools/task.md). tool_call can return
+            # {block:true}; session_shutdown/agent_end cannot. Maps to v1 stop so
+            # stop-completion-selfcheck fires before the helper is parked.
+            return "stop"
     if event_name == "tool_result" and tool in _WRITE_TOOLS:
         return "post-write"
     return None
+
+
+
+def _stop_session_id(omp_event: dict) -> str:
+    """Stable per-agent id for v1 stop events (yield retries must share one cooldown)."""
+    detached = _detached_agent_id()
+    if detached:
+        return detached
+    for key in ("sessionId", "session_id", "agentId", "agent_id"):
+        val = omp_event.get(key)
+        if val:
+            return str(val)
+    return _cwd(omp_event)
 
 
 def to_v1_event(omp_event: dict, *, point: str) -> dict:
@@ -137,8 +155,10 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
     for key in _FORGED_AGENT_KEYS:
         args.pop(key, None)
     detached_id = _detached_agent_id()
-    if detached_id:
-        args["agent_id"] = detached_id
+    ctx_id = str(omp_event.get("agentId") or omp_event.get("agent_id") or "")
+    trusted_id = detached_id or ctx_id
+    if trusted_id:
+        args["agent_id"] = trusted_id
 
     command = _tool_command(tool, raw_args)
     if command:
@@ -147,9 +167,19 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
     if point in ("pre-write", "post-write"):
         _normalize_write_args(tool, raw_args, args, point=point)
 
+    event_id = _event_id(omp_event)
+    if point == "stop":
+        # stop-completion-selfcheck keys its cooldown on args.session_id / event_id.
+        # omp yield retries are new tool_call ids, so a per-call event_id would block
+        # forever. Prefer a trusted agent id, then a top-level omp session/agent field,
+        # then cwd — never a value from tool args (forgeable).
+        sid = _stop_session_id(omp_event)
+        args["session_id"] = sid
+        event_id = sid
+
     return {
         "hook_api": HOOK_API,
-        "event_id": _event_id(omp_event),
+        "event_id": event_id,
         "tool": tool,
         "point": point,
         "harness": HARNESS,
