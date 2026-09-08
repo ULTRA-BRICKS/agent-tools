@@ -167,9 +167,26 @@ interface DispatcherOutcome {
 // failure here always resolves to "no opinion" (return undefined => allow); only an EXPLICIT
 // `{"decision":"block","reason":...}` from the dispatcher becomes a real block. See README.md
 // "Fail policy" for the full reasoning.
+function ctxString(ctx: any, event: any, prop: string, getter: string): string {
+  // omp's tool ctx (oh-my-pi) exposes getSessionFile()/getAgentId()/getSessionId()
+  // as methods; ctx.agentId is empty (oh-my-pi#11214). Prefer the property, then
+  // the getter, then a same-named field on the event — never tool args.
+  let fromGetter: unknown;
+  try {
+    fromGetter = typeof ctx?.[getter] === "function" ? ctx[getter]() : undefined;
+  } catch {
+    fromGetter = undefined;
+  }
+  const raw = ctx?.[prop] ?? fromGetter ?? event?.[prop];
+  return raw == null ? "" : String(raw).trim();
+}
+
 async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<BridgeResult | undefined> {
   let outcome: DispatcherOutcome;
   try {
+    const agentId = ctxString(ctx, event, "agentId", "getAgentId");
+    const sessionId = ctxString(ctx, event, "sessionId", "getSessionId");
+    const sessionFile = ctxString(ctx, event, "sessionFile", "getSessionFile");
     const payload = JSON.stringify({
       event: eventName,
       toolName: event?.toolName,
@@ -179,10 +196,11 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
       // Trusted subagent identity from omp's hook ctx (not tool args). Without this,
       // orchestrator-stays-thin treats every native omp helper as the main thread
       // (no RIG_AGENT_ID / PI_SESSION_FILE on the Node hook process).
-      agentId: ctx?.agentId ?? event?.agentId,
-      sessionId: ctx?.sessionId ?? event?.sessionId,
+      agentId,
+      sessionId,
+      sessionFile,
     });
-    outcome = await spawnDispatcher(eventName, payload, event?.toolCallId);
+    outcome = await spawnDispatcher(eventName, payload, event?.toolCallId, sessionFile);
   } catch (error: any) {
     console.error(`omp-hook-bridge: dispatcher setup failed, allowing call: ${error?.message}`);
     return undefined;
@@ -203,7 +221,12 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
 // whose bridge has never serialized them either. Two simultaneous dispatchers do interleave
 // their stderr on the one stream, which is why every forwarded line is tagged with its event and
 // tool-call id (`stderrForwarder`) — two hatches both explaining a wait stay attributable.
-function spawnDispatcher(eventName: BridgeEvent, payload: string, toolCallId: unknown): Promise<DispatcherOutcome> {
+function spawnDispatcher(
+  eventName: BridgeEvent,
+  payload: string,
+  toolCallId: unknown,
+  sessionFile: string = "",
+): Promise<DispatcherOutcome> {
   const python = process.env.OMP_HOOK_BRIDGE_PYTHON || "python3";
   const priorPythonPath = process.env.PYTHONPATH || "";
   return new Promise((resolveOutcome) => {
@@ -213,6 +236,9 @@ function spawnDispatcher(eventName: BridgeEvent, payload: string, toolCallId: un
       env: {
         ...process.env,
         PYTHONPATH: priorPythonPath ? `${libDir}${delimiter}${priorPythonPath}` : libDir,
+        // Nested omp Task/eval transcript (ctx.getSessionFile()). Overrides a parent
+        // PI_SESSION_FILE so _omp_nested_agent_id sees the child, not the main session.
+        ...(sessionFile ? { PI_SESSION_FILE: sessionFile } : {}),
       },
     });
     inFlight.add(child);

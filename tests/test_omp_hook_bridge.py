@@ -267,6 +267,23 @@ def test_to_v1_event_main_pi_session_file_has_no_agent_id(monkeypatch):
     assert "agent_id" not in v1["args"]
 
 
+def test_to_v1_event_injects_agent_id_from_payload_session_file(monkeypatch):
+    """agent-tools#647: Node has no nested PI_SESSION_FILE. extension.ts must put the
+    child's getSessionFile() path on the payload; to_v1_event injects args.agent_id
+    from that nested path even when the process env is the MAIN session (or empty)."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("PI_SESSION_FILE", _OMP_MAIN_SESSION)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m 'fix: x'"},
+        "cwd": "/repo",
+        "sessionFile": _OMP_NESTED_SESSION,
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert v1["args"]["agent_id"] == "ThinNotSub"
+
+
 def test_to_v1_event_env_marker_wins_over_forged_agent_id(monkeypatch):
     """Strip-then-inject order: a forged args.agent_id is dropped FIRST, then the env
     marker (the only authority) supplies the identity — never the payload."""
@@ -1154,6 +1171,59 @@ def test_extension_ts_registers_tool_call_and_blocks_via_stub_dispatcher(tmp_pat
     assert proc.returncode == 0, proc.stderr
     result = json.loads(proc.stdout.strip().splitlines()[-1])
     assert result == {"block": True, "reason": "stub blocked it"}
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_forwards_getSessionFile_into_dispatcher_env(tmp_path):
+    """agent-tools#647: omp tool ctx exposes getSessionFile()/getAgentId() methods, not
+    ctx.agentId. The extension must put the nested transcript on PI_SESSION_FILE for the
+    dispatcher AND on payload.sessionFile / payload.agentId."""
+    nested = (
+        "/tmp/omp-sessions/-xp-rig-cli/"
+        "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/ThinNotSub.jsonl"
+    )
+    dump = tmp_path / "dump.json"
+    stub = tmp_path / "stub_dispatcher.py"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "payload = json.loads(sys.stdin.read() or '{}')\n"
+        f"path = {str(dump)!r}\n"
+        "open(path, 'w').write(json.dumps({"
+        "'env_pi': os.environ.get('PI_SESSION_FILE'), "
+        "'sessionFile': payload.get('sessionFile'), "
+        "'agentId': payload.get('agentId')"
+        "}))\n"
+        "print(json.dumps({'decision': 'allow'}))\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    driver = tmp_path / "driver.ts"
+    driver.write_text(
+        "const mod = await import(process.env.EXTENSION_PATH!);\n"
+        "const handlers: Record<string, Function> = {};\n"
+        "const pi = { on: (name: string, cb: Function) => { handlers[name] = cb; } };\n"
+        "mod.default(pi);\n"
+        "const nested = process.env.NESTED_SESSION!;\n"
+        "const ctx = {\n"
+        "  cwd: '/tmp', hasUI: false,\n"
+        "  getSessionFile: () => nested,\n"
+        "  getAgentId: () => 'ThinNotSub',\n"
+        "};\n"
+        "await handlers['tool_call']("
+        "{ toolName: 'bash', input: { command: 'git commit -m x' }, toolCallId: 'c1' }, ctx);\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["EXTENSION_PATH"] = str(_EXTENSION_TS)
+    env["OMP_HOOK_BRIDGE_PYTHON"] = str(stub)
+    env["NESTED_SESSION"] = nested
+    proc = subprocess.run(["bun", "run", str(driver)], capture_output=True, text=True, env=env, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    got = json.loads(dump.read_text())
+    assert got["env_pi"] == nested
+    assert got["sessionFile"] == nested
+    assert got["agentId"] == "ThinNotSub"
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
