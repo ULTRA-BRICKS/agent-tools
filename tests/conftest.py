@@ -29,7 +29,7 @@ shell that happens to export one of ship's gate switches silently changes what t
 the external-review gate in five tests written to exercise it as enabled). This is deliberately a
 plain module-level `os.environ` mutation, run ONCE here at conftest import time, NOT a per-test
 `monkeypatch.delenv` autouse fixture: `tests/test_ship.py` relies on its own module-level
-`os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")` (also present in
+`os.environ.setdefault("SHIP_TEST_DISABLE_REVIEW_QUORUM", "1")` (also present in
 `tests/test_ship_notify_task_cli.py`) plus `os.environ["SHIP_TASK_NOTIFY_ENABLED"] = "0"`
 (test_ship.py only), applied once at each module's own collection time, which a per-test fixture
 would strip during every test body (monkeypatch only restores the pre-test value AFTER each test's

@@ -29,13 +29,11 @@ import pytest
 
 _SHIP = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
 
-# The review-quorum gate (Guard-B, see the "review-quorum preflight gate" section of
-# ship.sh) defaults to ENABLED in the product, but almost every test in this file predates
-# it and exercises unrelated gates via a fake `gh` with no `review` CLI on PATH. Force it
-# off process-wide here; the quorum-gate tests below opt back in explicitly by setting
-# SHIP_REVIEW_QUORUM=1 in their own env dict (each test builds `env = dict(os.environ)`,
-# so a later explicit assignment there still wins over this default).
-os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")
+# The review-quorum gate (Guard-B) defaults to ENABLED in the product. SHIP_REVIEW_QUORUM=0
+# is forbidden (agent-tools#644) and no longer disables it. Unrelated tests in this file
+# isolate via the test-only SHIP_TEST_DISABLE_REVIEW_QUORUM=1 (mirrors SHIP_TEST_CI_DOWN);
+# quorum-gate tests pop that env and set SHIP_REVIEW_QUORUM=1.
+os.environ.setdefault("SHIP_TEST_DISABLE_REVIEW_QUORUM", "1")
 # The two pre-merge ticket gates (acceptance + magic-close, agent-tools#521) default ENABLED
 # too and have their own fixtures in tests/test_ship_ticket_gates.py; off here so a fixture
 # PR body that happens to say "Fixes HYP-999", or a fake `task` that logs every call, is not
@@ -5616,7 +5614,8 @@ def _run_ship_quorum(main, gh_bindir, review_bindir, *, branch="feat", extra_arg
     env["SHIP_TEST_BRANCH"] = branch
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
-    env["SHIP_REVIEW_QUORUM"] = "1"   # opt back into the gate (module default is 0)
+    env["SHIP_REVIEW_QUORUM"] = "1"   # product default: gate on
+    env.pop("SHIP_TEST_DISABLE_REVIEW_QUORUM", None)  # module default is test-only isolation
     # Never let an ambient hatch-request env var leak into a test that doesn't set one (it would
     # turn a plain refusal into a live tg-ctl call). Tests that exercise the hatch set it via
     # env_extra AFTER this pop.
@@ -5640,13 +5639,13 @@ def _run_ship_quorum(main, gh_bindir, review_bindir, *, branch="feat", extra_arg
 
 
 def test_review_quorum_blocks_when_bar_short(tmp_path):
-    """Fewer recorded iterations/models than the default 3/3 floor -> ship REFUSES."""
+    """Fewer distinct BOARD ROLES than the default 3-role floor -> ship REFUSES."""
     main, _wt = _make_repo_with_branch(tmp_path, "feat")
     gh = _fake_gh_quorum_dir(tmp_path)
     rv = _fake_review_dir(tmp_path)
     r = _run_ship_quorum(
         main, gh, rv,
-        env_extra={"REVIEW_TASK_CODE": "HYP-100", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_MODELS": "1"},
+        env_extra={"REVIEW_TASK_CODE": "HYP-100", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_MODELS": "1", "SHIP_TEST_REVIEW_ROLES": "1"},
     )
     assert r.returncode != 0, f"a short quorum must be refused\n{r.stdout}\n{r.stderr}"
     assert "bar NOT met" in r.stderr, r.stderr
@@ -5816,42 +5815,128 @@ def test_review_quorum_ignores_role_data_never_actually_requested(tmp_path):
     assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
 
 
-def test_review_quorum_refuses_when_models_field_is_absent(tmp_path):
-    """Defense-in-depth for the reverse direction: the real review-cli always includes
-    distinct_models_passed/models regardless of --min-models (verified against
-    reviewlib.stats.quorum_check's source and a live CLI call), so this can't happen against the
-    real binary — but if a non-conforming build ever omitted the field, ship's QMODELS_N -gt 0
-    sanity check (independent of whether an explicit model floor is even requested) must still
-    refuse rather than treat the missing count as satisfied. 3 iterations and 3 roles alone must
-    NOT be enough when the models data a genuine record always carries is simply absent."""
+def test_review_quorum_complete_roles_zero_models_authorizes_without_hatch(tmp_path):
+    """Astra 2026-09-08 / agent-tools#644: distinct_models is telemetry, not the predicate.
+    One padded model (review-cli#433) fills every board role; distinct_models_passed may be 0.
+    Complete roles must AUTHORIZE and must NOT open the Telegram hatch."""
     main, _wt = _make_repo_with_branch(tmp_path, "feat")
     gh = _fake_gh_quorum_dir(tmp_path)
     rv = _fake_review_dir(tmp_path)
     r = _run_ship_quorum(
         main, gh, rv,
         env_extra={
-            "REVIEW_TASK_CODE": "HYP-323",
+            "REVIEW_TASK_CODE": "HYP-644",
             "SHIP_TEST_REVIEW_ITER": "3",
             "SHIP_TEST_REVIEW_ROLES": "3",
-            "SHIP_TEST_REVIEW_OMIT_MODELS": "1",
+            "SHIP_TEST_REVIEW_MODELS": "0",
+            "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM": (
+                "must not be consulted; roles are already filled"
+            ),
+        },
+    )
+    assert r.returncode == 0, (
+        f"3 roles with 0 models (padded astra) must ship without hatch\n{r.stdout}\n{r.stderr}"
+    )
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert "3 iterations across 3 roles" in r.stdout, r.stdout
+    assert "APPROVED by Alex" not in r.stdout, "hatch must not fire when roles are filled"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_quorum_roles_met_despite_short_iter_and_failed_passed_flag(tmp_path):
+    """Live proof (review-cli#433 / astra pad): distinct_roles_passed=3, distinct_models_passed=1,
+    passed_iterations=2, passed=false (review-cli still ANDs default min_iter=3). Ship must
+    authorize on the role floor and must not hatch."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-433",
+            "SHIP_TEST_REVIEW_ITER": "2",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+            "SHIP_TEST_REVIEW_MODELS": "1",
+            "SHIP_TEST_REVIEW_FORCE_PASSED": "false",
+            "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM": (
+                "must not be consulted; roles are already filled"
+            ),
+        },
+    )
+    assert r.returncode == 0, (
+        f"3 roles must ship even with 2 iterations and passed=false\n{r.stdout}\n{r.stderr}"
+    )
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert "APPROVED by Alex" not in r.stdout, "hatch must not fire when roles are filled"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_quorum_zero_iterations_with_roles_is_empty_evidence(tmp_path):
+    """Hollow-payload guard (#242 / review finding on #644): 3 roles with 0 passed
+    iterations is not astra padding — no review ran. Must refuse. Distinct from
+    passed_iterations=2 / passed=false, which still authorizes."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-644D",
+            "SHIP_TEST_REVIEW_ITER": "0",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+            "SHIP_TEST_REVIEW_MODELS": "0",
+            "SHIP_TEST_REVIEW_FORCE_PASSED": "true",
         },
     )
     assert r.returncode != 0, (
-        f"a payload missing the models count entirely must refuse, not silently authorize\n{r.stdout}\n{r.stderr}"
+        f"0 iterations with 3 roles must refuse as empty evidence\n{r.stdout}\n{r.stderr}"
     )
     assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
     assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
 
 
-def test_review_quorum_disabled_via_env(tmp_path):
-    """SHIP_REVIEW_QUORUM=0 disables the gate entirely — merges even with no review CLI on
-    PATH and no derivable task code."""
+def test_review_quorum_omitted_models_field_still_authorizes_on_roles(tmp_path):
+    """Models are telemetry: a payload that omits distinct_models_passed entirely but carries
+    complete role coverage must still authorize. The old QMODELS_N -gt 0 sanity check treated
+    telemetry absence as empty evidence and wrongly hatched (agent-tools#644)."""
     main, _wt = _make_repo_with_branch(tmp_path, "feat")
     gh = _fake_gh_quorum_dir(tmp_path)
-    r = _run_ship_quorum(main, gh, review_bindir=None, env_extra={"SHIP_REVIEW_QUORUM": "0"})
-    assert r.returncode == 0, f"disabled gate must not block the ship\n{r.stdout}\n{r.stderr}"
-    assert "review-quorum gate disabled" in r.stdout, r.stdout
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-644B",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+            "SHIP_TEST_REVIEW_OMIT_MODELS": "1",
+        },
+    )
+    assert r.returncode == 0, (
+        f"3 roles must authorize even when the models key is absent\n{r.stdout}\n{r.stderr}"
+    )
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
     assert "merged #1" in r.stdout, r.stdout
+
+
+
+
+def test_review_quorum_zero_env_is_rejected_at_parse(tmp_path):
+    """SHIP_REVIEW_QUORUM=0 is forbidden: reject it at parse. The gate stays enabled, so a
+    ship with no review CLI still fail-closes instead of merging unverified (#644)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, review_bindir=None,
+        env_extra={"SHIP_REVIEW_QUORUM": "0", "REVIEW_TASK_CODE": "HYP-644C"},
+    )
+    assert r.returncode != 0, (
+        f"SHIP_REVIEW_QUORUM=0 must not disable Guard-B\n{r.stdout}\n{r.stderr}"
+    )
+    assert "review-quorum gate disabled" not in r.stdout, r.stdout
+    assert "forbidden" in r.stderr or "SHIP_REVIEW_QUORUM=0" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
 
 
 def test_review_quorum_fails_closed_when_review_cli_missing(tmp_path):
@@ -6402,6 +6487,7 @@ def test_review_quorum_audit_log_records_refused(tmp_path):
         main, gh, rv,
         env_extra={
             "REVIEW_TASK_CODE": "HYP-108", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_MODELS": "1",
+            "SHIP_TEST_REVIEW_ROLES": "1",
             "SHIP_AUDIT_FILE": str(audit),
         },
     )
@@ -6411,10 +6497,8 @@ def test_review_quorum_audit_log_records_refused(tmp_path):
     assert rec["task_code"] == "HYP-108", rec
     assert rec["iterations"] == 1, rec
     assert rec["models"] == 1, rec
-    # Refused on the iteration floor (1 < 3) even though the default 3 roles were reported —
-    # the audit line still carries the real role count/floor and the unenforced model-floor
-    # sentinel (0), so an auditor can tell exactly which numbers gated this decision.
-    assert rec["roles"] == 3, rec
+    # Refused on the role floor (1 < 3) — the predicate is distinct_roles_passed (#644).
+    assert rec["roles"] == 1, rec
     assert rec["min_roles"] == 3, rec
     assert rec["min_models"] == 0, rec
 
@@ -6451,9 +6535,9 @@ def test_review_quorum_audit_log_skipped_in_dry_run(tmp_path):
 
 
 def test_review_quorum_refuses_forged_pass_with_zero_counts(tmp_path):
-    """#242 core: review-cli returns `passed:true` but 0 passed iterations across 0 models
-    (an older build without the min>=1 guard, a task-code miss, or a hostile `review` on PATH).
-    ship must NOT trust the boolean — its independent arithmetic sees 0/3 and REFUSES."""
+    """#242 / #644: empty evidence (0 iterations, 0 roles, 0 models) with a forged
+    `passed:true` must FAIL. Distinct from the padded-astra case (3 roles, 0 models),
+    which is complete role coverage and must pass."""
     main, _wt = _make_repo_with_branch(tmp_path, "feat")
     gh = _fake_gh_quorum_dir(tmp_path)
     rv = _fake_review_dir(tmp_path)
@@ -6463,13 +6547,16 @@ def test_review_quorum_refuses_forged_pass_with_zero_counts(tmp_path):
             "REVIEW_TASK_CODE": "HYP-242",
             "SHIP_TEST_REVIEW_ITER": "0",
             "SHIP_TEST_REVIEW_MODELS": "0",
-            "SHIP_TEST_REVIEW_FORCE_PASSED": "true",  # forge the hollow authorization
+            "SHIP_TEST_REVIEW_ROLES": "0",
+            "SHIP_TEST_REVIEW_FORCE_PASSED": "true",
         },
     )
-    assert r.returncode != 0, f"a forged 0/0 pass MUST be refused\n{r.stdout}\n{r.stderr}"
+    assert r.returncode != 0, f"empty evidence with a forged pass MUST be refused\n{r.stdout}\n{r.stderr}"
     assert "AUTHORITY CONFIRMED" not in r.stdout, f"must not authorize a hollow quorum\n{r.stdout}"
     assert "bar NOT met" in r.stderr, r.stderr
     assert "[fake gh] merged" not in r.stdout and "merged #1" not in r.stdout, "must refuse BEFORE merging"
+
+
 
 
 def test_review_quorum_reads_real_passed_iteration_keys(tmp_path):
@@ -6531,6 +6618,7 @@ def test_review_quorum_floor_clamped_when_env_sets_zero(tmp_path):
             "SHIP_REVIEW_QUORUM_MIN_MODELS": "0",
             "SHIP_TEST_REVIEW_ITER": "0",
             "SHIP_TEST_REVIEW_MODELS": "0",
+            "SHIP_TEST_REVIEW_ROLES": "0",
             "SHIP_TEST_REVIEW_FORCE_PASSED": "true",
         },
     )
@@ -6927,6 +7015,32 @@ def test_hatch_reason_triggers_tg_ask_and_approval_returns_0(tmp_path, monkeypat
     assert "approved by tg-ctl ask" in rec.get("override_reason", ""), rec
 
 
+def test_hatch_payload_reports_roles_not_zero_models(tmp_path, monkeypatch):
+    """#644: when hatch DOES fire, Telegram context must lead with distinct_roles_passed.
+    A padded-astra miss must not show `distinct_models: 0` / `iterations: 0` as the predicate
+    — those are telemetry zeros that made Alex approve every ship."""
+    question_file = tmp_path / "question.txt"
+    tg = _write_fake_tg_ctl(
+        tmp_path, name="tg-ctl",
+        body=f'cat > "{question_file}"\n' + _ALLOW_REPLY_SH,
+    )
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("SHIP_HATCH_ROLES", "2")
+    monkeypatch.setenv("SHIP_HATCH_ITER", "0")
+    monkeypatch.setenv("SHIP_HATCH_MODELS", "0")
+    rc = _run_hatch_main(
+        monkeypatch, tmp_path,
+        request="Roles short; asking for a one-time bypass.",
+        resolve_home=home, audit=audit,
+    )
+    assert rc == 0, "live-approved hatch must return 0"
+    question = question_file.read_text()
+    assert "distinct_roles_passed" in question, question
+    assert "distinct_models: 0" not in question, question
+    assert "iterations: 0" not in question, question
+
+
 def test_hatch_denial_returns_1_and_audits(tmp_path, monkeypatch):
     """When Alex declines (tg-ctl exits non-zero) the helper returns 1 and audits bypass:denied."""
     import json
@@ -7100,9 +7214,11 @@ def test_audit_line_written_without_jq(tmp_path):
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     env["SHIP_REVIEW_QUORUM"] = "1"
+    env.pop("SHIP_TEST_DISABLE_REVIEW_QUORUM", None)
     env["REVIEW_TASK_CODE"] = "HYP-200"
     env["SHIP_TEST_REVIEW_ITER"] = "1"
     env["SHIP_TEST_REVIEW_MODELS"] = "1"
+    env["SHIP_TEST_REVIEW_ROLES"] = "1"
     env["SHIP_AUDIT_FILE"] = str(audit)
     env.pop("RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM", None)
     # A PR selector containing a double-quote: the jq-less fallback must escape it (the raw path
@@ -7219,9 +7335,11 @@ def _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy, *, request, audi
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     env["SHIP_REVIEW_QUORUM"] = "1"
+    env.pop("SHIP_TEST_DISABLE_REVIEW_QUORUM", None)
     env["REVIEW_TASK_CODE"] = "HYP-200"
     env["SHIP_TEST_REVIEW_ITER"] = "1"
     env["SHIP_TEST_REVIEW_MODELS"] = "1"
+    env["SHIP_TEST_REVIEW_ROLES"] = "1"
     env["RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM"] = request
     # --skip-ci is now hatch-gated too; request it so the fake approving skip_ci_hatch.py beside the
     # copy is consulted (deny-by-default otherwise refuses before the merge, masking the quorum path).
@@ -7371,9 +7489,11 @@ def test_ship_fails_closed_when_python3_exits_zero_without_sentinel(tmp_path):
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     env["SHIP_REVIEW_QUORUM"] = "1"
+    env.pop("SHIP_TEST_DISABLE_REVIEW_QUORUM", None)
     env["REVIEW_TASK_CODE"] = "HYP-200"
     env["SHIP_TEST_REVIEW_ITER"] = "1"
     env["SHIP_TEST_REVIEW_MODELS"] = "1"
+    env["SHIP_TEST_REVIEW_ROLES"] = "1"
     env["SHIP_AUDIT_FILE"] = str(audit)
     env["RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM"] = "genuine reason but python3 is faked"
     r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)

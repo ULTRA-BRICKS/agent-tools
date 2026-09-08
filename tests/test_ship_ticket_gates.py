@@ -27,10 +27,10 @@ import pytest
 
 _SHIP = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
 
-# The review-quorum gate defaults ENABLED in the product but has no fixture here — force it off
-# process-wide (same rationale as tests/test_ship.py). The post-merge notify is off too: this
+# The review-quorum gate defaults ENABLED in the product but has no fixture here — isolate via
+# SHIP_TEST_DISABLE_REVIEW_QUORUM=1 (SHIP_REVIEW_QUORUM=0 is forbidden, #644). The post-merge notify is off too: this
 # file asserts on the fake `task`'s call log and only wants the GATE's calls in it.
-os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")
+os.environ.setdefault("SHIP_TEST_DISABLE_REVIEW_QUORUM", "1")
 os.environ.setdefault("SHIP_TASK_NOTIFY_ENABLED", "0")
 
 # A fake `gh` answering exactly the calls ship.sh makes up to and including the merge: the

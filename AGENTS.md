@@ -230,7 +230,7 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   explicit "upgrade review-cli" refusal instead of a generic error. There is **NO self-service override flag** — a one-time bypass
   is requested via `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"`, which asks Alex live
   on Telegram (shared `agenttools_hatch_escalation` lib) and proceeds ONLY on his real-time
-  approval. Disable the whole gate with `SHIP_REVIEW_QUORUM=0`. Every non-dry-run gated ship is
+  approval. `SHIP_REVIEW_QUORUM=0` is forbidden and does not disable the gate. Every non-dry-run gated ship is
   audited to `SHIP_AUDIT_FILE`; dry-runs print the would-be audit without writing it. **Every
   `RIG_HATCH_REQUEST_*` hatch across every agent-hook** (not just ship's own two) is separately
   audited by the shared lib itself: any attempt that REACHES `request_hatch_approval` with the env

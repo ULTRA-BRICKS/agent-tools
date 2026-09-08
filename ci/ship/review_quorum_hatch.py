@@ -106,6 +106,7 @@ def _audit(decision: str, reason: str) -> None:
             "task_code": os.environ.get("SHIP_HATCH_CODE", ""),
             "iterations": int(os.environ.get("SHIP_HATCH_ITER", "0") or 0),
             "models": int(os.environ.get("SHIP_HATCH_MODELS", "0") or 0),
+            "roles": int(os.environ.get("SHIP_HATCH_ROLES", "0") or 0),
             "decision": decision,
         }
         if reason:
@@ -129,14 +130,21 @@ def _dry_run_denial_reason() -> str:
 
 
 def main() -> int:
+    # Predicate is role coverage (agent-tools#644). Zero models/iterations are telemetry
+    # and must not lead the Telegram payload — that is how Alex saw distinct_models: 0.
     ctx = {
         "pr": os.environ.get("SHIP_HATCH_PR", ""),
         "task_code": os.environ.get("SHIP_HATCH_CODE", ""),
-        "iterations": os.environ.get("SHIP_HATCH_ITER", ""),
-        "distinct_models": os.environ.get("SHIP_HATCH_MODELS", ""),
+        "distinct_roles_passed": os.environ.get("SHIP_HATCH_ROLES", ""),
         "repo": os.getcwd(),
         "gate": "ship review-quorum (self-merge-authority Guard-B)",
     }
+    iter_n = (os.environ.get("SHIP_HATCH_ITER") or "").strip()
+    models_n = (os.environ.get("SHIP_HATCH_MODELS") or "").strip()
+    if iter_n not in {"", "0"}:
+        ctx["iterations"] = iter_n
+    if models_n not in {"", "0"}:
+        ctx["distinct_models"] = models_n
     kw: dict[str, float] = {}
     timeout_s = _float_env("SHIP_HATCH_TIMEOUT_S")
     if timeout_s is not None:

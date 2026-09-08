@@ -125,7 +125,7 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
 | `SHIP_REVIEW_DWELL` | `600` | Minimum seconds since the PR's last code push before a merge is allowed, so async review has time to **form** its comments. `0` disables the gate. |
 | `SHIP_EXTERNAL_REVIEW_ENABLED` / `SHIP_EXTERNAL_REVIEW` | ignored as env | Env `=0` no longer disables the external-review gate (agent-tools#624 — the ambient-export hole #528/#609 left open). Durable disable is a `SHIP_EXTERNAL_REVIEW=0` `.ship-config` line already merged to the PR's **base branch** (`origin/<baseRefName>`, fetched fresh), never the PR's own HEAD: reading it from HEAD would let a PR disable the gate on its own merge by committing the line to its own branch, recreating PR #764 inside the fix for #764. The line only takes effect once it has itself been merged to the base through a normal, reviewed PR. One-time bypass: `RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW`. |
 | `RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW` | (unset) | One-time bypass request for the external-review gate, same shape/hardening as `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM` — see `ci/ship/external_review_hatch.py`. |
-| `SHIP_REVIEW_QUORUM` / `SHIP_REVIEW_QUORUM_ENABLED` | enabled | Set either to `0` to disable the review-quorum gate (Guard-B) entirely (ops off-switch). |
+| `SHIP_REVIEW_QUORUM` / `SHIP_REVIEW_QUORUM_ENABLED` | enabled | `0`/`false`/`no` is **forbidden** (agent-tools#644) and is rejected at parse — the gate stays enabled. There is no ops off-switch. One-time bypass: `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM`. |
 | `SHIP_REVIEW_QUORUM_MIN_ITER` | `3` | Quorum floor: PASSED review-cli iterations for the task. **Clamped to a hard minimum of 3** — this knob can only RAISE the bar, never lower it (an unset / `0` / negative / below-3 value resolves to 3, fail-closed #242). |
 | `SHIP_REVIEW_QUORUM_MIN_ROLES` | `3` | Quorum floor: distinct **BOARD ROLES** across those PASSED iterations. **Clamped to a hard minimum of 3**, same as `MIN_ITER`. This is the **PRIMARY/default gate mechanism** — always enforced, matching review-cli's own default (review-cli#246). |
 | `SHIP_REVIEW_QUORUM_MIN_MODELS` | `3` if set, else unenforced | Quorum floor: distinct models across those PASSED iterations. **Only takes effect if you explicitly set this env var** — there is no default model floor any more (role-based coverage is the default); `3` is merely the clamp floor the value resolves to once you opt in, same as `MIN_ITER`. Setting it to ANY value — including `0` or blank — counts as opting in and is clamped up to 3 (never treated as "explicitly disabled"; only leaving the var **completely unset** skips the model floor). When set, ship also passes `--min-models` to review-cli, so BOTH floors are required together (mirrors review-cli's own explicit-vs-default AND logic, review-cli#246). |
@@ -161,8 +161,8 @@ every deployment that never touches `SHIP_REVIEW_QUORUM_MIN_MODELS`:
 
 If you're mid-migration and genuinely need to merge now, the one-time
 `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM` Telegram hatch (see below) is the intended relief valve —
-prefer it over `SHIP_REVIEW_QUORUM=0`, which disables the ENTIRE gate (iteration and any explicit
-model floor too), not just the role requirement.
+do not set `SHIP_REVIEW_QUORUM=0`: that value is forbidden and is rejected at parse (the gate
+stays enabled). Role coverage is the predicate; `distinct_models_passed` is telemetry.
 
 ## Flags
 

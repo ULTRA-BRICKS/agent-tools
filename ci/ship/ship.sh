@@ -103,7 +103,7 @@
 # genuinely need to proceed, request a one-time bypass by setting the env var
 #   RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"
 # which asks Alex live on Telegram (via the shared agenttools_hatch_escalation lib) and proceeds
-# ONLY on his real-time approval. SHIP_REVIEW_QUORUM=0 disables the whole gate (ops off-switch).
+# ONLY on his real-time approval. SHIP_REVIEW_QUORUM=0 is forbidden and does not disable the gate.
 #
 # NOTE: --skip-ci has NO override flag either and is deny-by-default. Request a one-time bypass by
 # setting RIG_HATCH_REQUEST_SHIP_SKIP_CI="<justification>" (same shared hatch lib, same live
@@ -142,8 +142,9 @@
 #                          issue URL of THIS repo (https://github.com/<owner>/<repo>/issues/<n>
 #                          — the shape task-cli's links gate demands; both yield the literal
 #                          `#<n>`). If none is found, the gate refuses (fail-closed) with guidance.
-#   SHIP_REVIEW_QUORUM_ENABLED / SHIP_REVIEW_QUORUM  set either to 0 to disable the
-#                          review-quorum gate entirely (default: enabled).
+#   SHIP_REVIEW_QUORUM_ENABLED / SHIP_REVIEW_QUORUM  0/false/no is FORBIDDEN (agent-tools#644)
+#                          and is rejected at parse — the gate stays enabled. There is no ops
+#                          off-switch; the only bypass is RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM.
 #   SHIP_TASK_NOTIFY_ENABLED  set to 0/false/no to disable the post-merge task-cli notify step
 #                          (default: enabled). Best-effort and never blocks the merge either
 #                          way — this only controls whether `task mark-shipped` gets called at
@@ -2082,7 +2083,7 @@ fi
 # agent genuinely needs to proceed, it sets RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>";
 # that routes through the shared agenttools_hatch_escalation lib (the SAME lib the
 # pin-primary-worktree / block-reset-hard agent-hooks use) to ask Alex live on Telegram, and the
-# gate proceeds ONLY on his real-time approval. SHIP_REVIEW_QUORUM=0 disables the whole gate.
+# gate proceeds ONLY on his real-time approval. SHIP_REVIEW_QUORUM=0 is forbidden (gate stays on).
 #
 # Runs independently of --skip-ci, same posture as the review-dwell gate above.
 
@@ -2388,6 +2389,7 @@ _review_quorum_hatch_check() {  # uses $TASK_CODE $QITER $QMODELS_N $PR
   SHIP_HATCH_CODE="${TASK_CODE:-}" \
   SHIP_HATCH_ITER="${QITER:-0}" \
   SHIP_HATCH_MODELS="${QMODELS_N:-0}" \
+  SHIP_HATCH_ROLES="${QROLES_N:-0}" \
   SHIP_DRY_RUN="$DRY_RUN" \
   python3 -I "$_SHIP_HATCH_PY"
 }
@@ -2403,11 +2405,11 @@ _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
   # set (even blank) -> route through the helper, which denies blank/bare and asks on a real reason.
   if [ -z "${RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM+x}" ]; then
     { echo "Refusing: review-quorum gate — ${summary}."
-      echo "  Run more independent review iterations (e.g. \`review diff --task ${TASK_CODE:-<code>}\`) across distinct models, then re-run ship."
+      echo "  Run more independent review iterations (e.g. \`review diff --task ${TASK_CODE:-<code>}\`) across distinct BOARD ROLES, then re-run ship."
       echo "  There is NO self-service override. To request a ONE-TIME bypass, set:"
       echo "    RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM=\"<justification>\""
       echo "  which asks Alex live on Telegram and proceeds ONLY on his real-time approval."
-      echo "  SHIP_REVIEW_QUORUM=0 disables the gate entirely (ops off-switch)."; } >&2
+      echo "  SHIP_REVIEW_QUORUM=0 is forbidden and does not disable this gate."; } >&2
     _review_quorum_audit_log refused "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "" "${QROLES_N:-0}" "${MIN_ROLES:-0}" "${AUDIT_MIN_MODELS:-0}"
     exit 1
   fi
@@ -2428,7 +2430,7 @@ _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
   fi
   { echo "Refusing: review-quorum gate — ${summary}."
     echo "  A Telegram hatch escalation was requested but NOT approved: ${hreason:-no approval}."
-    echo "  Obtain live approval, add more independent review iterations, or set SHIP_REVIEW_QUORUM=0 (ops off-switch)."; } >&2
+    echo "  Obtain live approval, or add more independent review iterations across distinct BOARD ROLES."; } >&2
   # The real helper logs bypass:denied itself only when it emitted the DENIED sentinel during a
   # real run. Under --dry-run it deliberately writes nothing, so ask the shared audit helper to
   # print the would-be audit line. In every other non-DENIED case (fake/broken/absent interpreter,
@@ -2537,11 +2539,24 @@ _skip_ci_hatch_gate() {
 }
 
 QUORUM_ENABLED=1
-case "${SHIP_REVIEW_QUORUM_ENABLED:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
-case "${SHIP_REVIEW_QUORUM:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
+# SHIP_REVIEW_QUORUM=0 / SHIP_REVIEW_QUORUM_ENABLED=0 is forbidden (agent-tools#644).
+# Reject at parse: never disable Guard-B. A 0 is not an ops off-switch.
+# Test-only isolation (mirrors SHIP_TEST_CI_DOWN): SHIP_TEST_DISABLE_REVIEW_QUORUM=1.
+# Never set in production.
+case "${SHIP_REVIEW_QUORUM_ENABLED:-1}" in
+  0|false|no)
+    echo "[ship] SHIP_REVIEW_QUORUM_ENABLED=${SHIP_REVIEW_QUORUM_ENABLED} is forbidden — review-quorum gate stays enabled." >&2
+    ;;
+esac
+case "${SHIP_REVIEW_QUORUM:-1}" in
+  0|false|no)
+    echo "[ship] SHIP_REVIEW_QUORUM=${SHIP_REVIEW_QUORUM} is forbidden — review-quorum gate stays enabled." >&2
+    ;;
+esac
+case "${SHIP_TEST_DISABLE_REVIEW_QUORUM:-0}" in 1|true|yes) QUORUM_ENABLED=0 ;; esac
 
 if [ "$QUORUM_ENABLED" = "0" ]; then
-  echo "[ship] review-quorum gate disabled (SHIP_REVIEW_QUORUM_ENABLED/SHIP_REVIEW_QUORUM=0)."
+  echo "[ship] review-quorum gate disabled (SHIP_TEST_DISABLE_REVIEW_QUORUM=1, test-only)."
 else
   # Hard fail-closed floor: the self-merge bar is >=3 passed iterations across >=3 distinct
   # BOARD ROLES (the primary/default mechanism — review-cli#246) and, ONLY when the operator
@@ -2669,23 +2684,24 @@ else
         [ "$QMODELS_N" -gt 0 ] && [ "$QMODELS_N" -ge "$MIN_MODELS" ] && MODELS_GATE_OK=1
       fi
 
-      # FAIL-CLOSED authorization (#242): NEVER authorize on the subprocess's `.passed` boolean
-      # alone. ship re-derives the verdict from the numbers it read and its own hard floors, so a
-      # review-cli that returns `passed:true` with a hollow 0/0 record (an older build without the
-      # min>=1 guard, a task-code miss, or an attacker-controlled `review` on PATH) is refused.
-      # Authorize ONLY when EVERY condition holds: the subprocess agreed (passed==true), there is
-      # NO error key, ship itself actually ASKED for role coverage on the query that answered
-      # (QUORUM_ROLES_REQUESTED — never trust an external contract that review-cli only emits
-      # role keys when asked; re-derive that independently too, same #242 philosophy), the
-      # iteration and role counts are strictly positive and independently meet their >=3 floors,
-      # a genuine record always carries at least one model (QMODELS_N -gt 0 is a hollow-payload
-      # sanity check, not a diversity floor — kept unconditionally, same as the pre-existing #242
-      # guard, independent of whether an explicit model floor is even in play), and (only when
-      # explicitly requested) the model floor is met too.
-      if [ "$QPASSED" = "true" ] && [ -z "$QERR" ] \
+      # FAIL-CLOSED authorization (#242 / #644): NEVER authorize on the subprocess's `.passed`
+      # boolean alone. The predicate is ROLE coverage: QROLES_N must be strictly positive and
+      # meet MIN_ROLES. distinct_models_passed is telemetry — a padded one-model record may
+      # report 0 models and still authorize (review-cli#433). Empty evidence (0 roles) with a
+      # forged passed:true still refuses. Authorize ONLY when EVERY condition holds: the
+      # subprocess agreed (passed==true), there is NO error key, ship itself actually ASKED for
+      # role coverage on the query that answered (QUORUM_ROLES_REQUESTED), iteration and role
+      # counts independently meet their >=3 floors, and (only when explicitly requested) the
+      # model floor is met too.
+      # Predicate is ROLE coverage (agent-tools#644 / review-cli#433). distinct_models_passed
+      # and passed_iterations are telemetry: a padded one-model record may report 1 model,
+      # fewer than MIN_ITER iterations, and even passed=false (review-cli still ANDs min_iter)
+      # and must still authorize when distinct_roles_passed meets the role floor.
+      # Empty evidence (0 roles) still fails closed, even with a forged passed:true.
+      if [ -z "$QERR" ] \
          && [ "$QUORUM_ROLES_REQUESTED" = "1" ] \
-         && [ "$QITER" -gt 0 ] && [ "$QROLES_N" -gt 0 ] && [ "$QMODELS_N" -gt 0 ] \
-         && [ "$QITER" -ge "$MIN_ITER" ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] \
+         && [ "$QROLES_N" -gt 0 ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] \
+         && [ "$QITER" -gt 0 ] \
          && [ "$MODELS_GATE_OK" = "1" ]; then
         if [ "$MIN_MODELS_EXPLICIT" = "1" ]; then
           echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QROLES_N} roles and ${QMODELS_N} models for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
