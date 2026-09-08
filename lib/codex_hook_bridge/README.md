@@ -29,7 +29,7 @@ Codex's plain block JSON:
 | `PreToolUse` + `Bash` | `pre-bash` | `tool_input.command` becomes `event.command` and `args.command`. |
 | `PreToolUse` + `apply_patch` | `pre-write` | `tool_input.command` becomes raw `args.patch` / `args.command`; `args.content` is the added patch content with leading `+` markers stripped; each patch target is exposed to hooks as `args.file_path` / `args.path`. |
 | `PostToolUse` + `apply_patch` | `post-write` | Runs path-based hooks once per patch target; carries raw `args.patch` but no synthetic `args.content`; exit 10 is feedback surfaced through Codex's block JSON shape. |
-| `Stop` | `stop` | Carries the session id when Codex provides one. |
+| `Stop` | `stop` | Stable session id from `session_id` / `conversation_id` / detached agent / cwd even when Codex sends a unique `event_id`/`turn_id`; so stop-completion-selfcheck cooldown works (agent-tools#655). Native session wins over a reused launcher `RIG_AGENT_ID`. |
 
 Multi-file `apply_patch` calls expose `args.file_paths` in the base translated event and
 fan out descriptor execution so existing singular-path hooks receive one `args.file_path`
