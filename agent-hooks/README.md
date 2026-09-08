@@ -137,14 +137,15 @@ These are the *logical* points; map them to your harness's actual tool-use event
 > extension (`pi.on(...)`) plus Python dispatcher: rig symlinks the extension into omp's
 > extension directory (default `~/.omp/agent/extensions`), and it calls the dispatcher for
 > `tool_call` (`bash` -> `pre-bash`, `edit`/`write`/`apply_patch`/`notebook` -> `pre-write`,
-> `task` -> `pre-agent`) and `tool_result` file edits (`post-write`). It reads descriptors
+> `task` -> `pre-agent`, `yield` -> `stop`) and `tool_result` file edits (`post-write`). It reads descriptors
 > from `~/.omp/agent/hooks`. Unlike opencode's plugin, the extension does **not** throw to
 > fail closed on a bridge-infrastructure failure at the `tool_call` (pre-tool) point — it
 > always fails OPEN there, because a thrown error would block every tool call in Alex's
 > interactive omp session; only an explicit block decision from a loaded descriptor becomes
 > a real block. post-write exit 10 is logged as feedback, same as the other bridges, because
-> the write already landed. omp `stop` is **not** mapped: its documented session-lifecycle
-> events (`session_shutdown`, `agent_end`, ...) carry no pre-stop block contract either.
+> the write already landed. omp session-lifecycle events (`session_shutdown`, `agent_end`)
+> are still unmapped (no blocking contract); the hidden `yield` tool_call is the Stop
+> equivalent (agent-tools#640).
 
 | point          | fires when…                                  | hooks                                   |
 | -------------- | -------------------------------------------- | --------------------------------------- |
