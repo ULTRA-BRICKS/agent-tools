@@ -2625,7 +2625,10 @@ else
     #      pre-rename builds; same honest 0-roles refusal as tier 2 if it succeeds.
     # In --json mode review-cli always prints JSON to stdout (pass or fail) — only an
     # unsupported-flag argparse error leaves stdout empty, which is each tier's trigger.
-    REVIEW_CHECK_ARGS_NOROLES=(--min-iter "$MIN_ITER")
+    # --no-verify-identity: a padded one-model `--task -m astra` record often has empty
+    # recorded_diff_files; identity verification then zeros roles and ship hatches (PR 87).
+    # Task code still scopes the record. review-cli#433 padding + role floor remain the bar.
+    REVIEW_CHECK_ARGS_NOROLES=(--min-iter "$MIN_ITER" --no-verify-identity)
     [ "$MIN_MODELS_EXPLICIT" = "1" ] && REVIEW_CHECK_ARGS_NOROLES+=(--min-models "$MIN_MODELS")
     REVIEW_CHECK_ARGS=("${REVIEW_CHECK_ARGS_NOROLES[@]}" --min-roles "$MIN_ROLES")
 
@@ -2700,9 +2703,12 @@ else
       # fewer than MIN_ITER iterations, and even passed=false (review-cli still ANDs min_iter)
       # and must still authorize when distinct_roles_passed meets the role floor.
       # Empty evidence (0 roles) still fails closed, even with a forged passed:true.
-      if [ -z "$QERR" ] \
-         && [ "$QUORUM_ROLES_REQUESTED" = "1" ] \
-         && [ "$QROLES_N" -gt 0 ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] \
+      # .error / passed=false (review-cli min_iter AND, identity warnings) must NOT hatch
+      # when role coverage is met (PR 87 / #648). One live model occupies every seat.
+      ROLES_OK=0
+      [ "$QROLES_N" -gt 0 ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] && ROLES_OK=1
+      if [ "$QUORUM_ROLES_REQUESTED" = "1" ] \
+         && [ "$ROLES_OK" = "1" ] \
          && [ "$QITER" -gt 0 ] \
          && [ "$MODELS_GATE_OK" = "1" ]; then
         if [ "$MIN_MODELS_EXPLICIT" = "1" ]; then
