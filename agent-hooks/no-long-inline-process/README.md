@@ -64,13 +64,23 @@ first (`cd repo && RIG_HATCH_REQUEST_…="why" <cmd>`). Exporting the var into t
 environment works too and takes precedence over an inline value.
 
 If the env var is unset, no Telegram call is made and the command simply blocks. If it is
-present but blank, whitespace-only, or a bare flag value (`1`/`true`/`yes`/`on`), the hook does
-not contact Telegram and denies — a bare `1` is not a justification. A real justification runs
-`tg-ctl ask` through a trusted absolute path (never ambient `PATH`) with the question as a JSON
-ButtonRequest on stdin; only a reply on stdout whose decision is explicitly `allow` allows — an
-empty or unparseable reply, an explicit deny, any nonzero exit, launch error, or timeout denies
-(`tg-ctl ask` exits 0 regardless of outcome, so a clean exit alone is never approval). An agent
-can *request*, not self-grant — the human taps to approve.
+present but blank, whitespace-only, a bare flag (`1`/`true`/`yes`/`on`), or too short
+(the screenshot case: `RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS=pytest`), the hook does not
+contact Telegram and denies — that is not a written justification. A real justification
+says why this one-shot is needed. It runs `tg-ctl ask` through a trusted absolute
+path (never ambient `PATH`) with the question as a JSON ButtonRequest on stdin; only a reply
+on stdout whose decision is explicitly `allow` allows — an empty or unparseable reply, an
+explicit deny, any nonzero exit, launch error, or timeout denies (`tg-ctl ask` exits 0
+regardless of outcome, so a clean exit alone is never approval). When a hatch was attempted
+and denied, the hook prints that deny reason (unreachable / too short / declined) and does
+**not** reprint the "set `RIG_HATCH_REQUEST_…`" usage blurb. An agent can *request*, not
+self-grant — the human taps to approve.
+
+The inline prefix is also the **classifier-safe** path ([agent-tools#336](https://github.com/alex-mextner/agent-tools/issues/336)):
+auto-mode may block exporting `RIG_HATCH_REQUEST_*` into the harness environment. The prefix
+lives on the command string, so no export is required. If even the inline command is
+classifier-blocked, ask the human via `tg --tag decision`.
+
 
 ## Fail-open, on purpose
 

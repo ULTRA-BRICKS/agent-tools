@@ -343,6 +343,8 @@ them to *every* project and user. If you want the catalog of always-apply behavi
   destroys both the signal and a probably-useful-but-broken capability. This applies to the
   catalog's own skills/hooks AND to a user's installed toolset: never propose pruning a user's
   tools because they "look unused" — find out why they aren't used and fix that.
+- **Hatch requests (`RIG_HATCH_REQUEST_*`) are an ask, not a grant — and the inline prefix is the sanctioned invocation.** Setting one of these vars only queues a Telegram approval; it cannot bypass a gate by itself. A blank value, a bare `1`/`true`/`yes`/`on`, or a single token like `pytest` is rejected with no Telegram call. Claude Code auto-mode's classifier has blocked *exporting* these vars into the harness environment ([agent-tools#336](https://github.com/alex-mextner/agent-tools/issues/336)). For **pre-bash** hooks, put the assignment on the gated command itself (`RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="why this one-shot is needed" pytest`) — the hook parses it out of the command string, so no process-env export is required and the classifier is not asked to approve an export. If even that command is classifier-blocked, ask the human via `tg --tag decision`; do not invent a self-grant. An unreachable/declined/`tg-ctl` miss is a **deny**, never an approve ([agent-tools#512](https://github.com/alex-mextner/agent-tools/issues/512)).
+
 
 ---
 

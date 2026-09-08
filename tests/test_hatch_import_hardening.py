@@ -188,8 +188,13 @@ def test_hook_replaces_preloaded_module_that_spoofs_repo_file(
 
 
 @pytest.mark.parametrize("hook_rel", HATCH_HOOKS)
-def test_missing_hatch_lib_fails_with_clear_import_error(tmp_path: Path, hook_rel: str):
-    """A corrupt install missing the repo-local hatch lib should fail clearly at hook import."""
+def test_missing_hatch_lib_loads_stub_instead_of_crashing(tmp_path: Path, hook_rel: str):
+    """#547: a missing repo-local hatch lib must not crash the hook at import.
+
+    A crash is what on_error:open turns into an ALLOW. The hook must load a
+    stub whose request_hatch_approval never approves, so main() can still
+    classify the event.
+    """
 
     source = ROOT / hook_rel
     copied = tmp_path / "repo" / hook_rel
@@ -198,6 +203,7 @@ def test_missing_hatch_lib_fails_with_clear_import_error(tmp_path: Path, hook_re
 
     code = """
 import importlib.util
+import json
 from pathlib import Path
 
 hook = Path({hook!r})
@@ -205,6 +211,13 @@ spec = importlib.util.spec_from_file_location("copied_hook", hook)
 assert spec and spec.loader
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
+hatch = mod.hatch_escalation
+result = hatch.request_hatch_approval("probe", {{}}, cwd=".")
+print(json.dumps({{
+    "has_api": callable(getattr(hatch, "request_hatch_approval", None)),
+    "approved": bool(result.approved),
+    "should_stop": bool(result.should_stop),
+}}))
 """.format(hook=str(copied))
 
     proc = subprocess.run(
@@ -215,9 +228,11 @@ spec.loader.exec_module(mod)
         check=False,
     )
 
-    assert proc.returncode not in (0, 10)
-    assert "cannot load hatch escalation helper from" in proc.stderr
-    assert "FileNotFoundError" not in proc.stderr
+    assert proc.returncode == 0, proc.stderr
+    loaded = json.loads(proc.stdout)
+    assert loaded["has_api"] is True
+    assert loaded["approved"] is False
+    assert loaded["should_stop"] is False
 
 
 @pytest.mark.parametrize("failure", ["raise RuntimeError('broken hatch import')", "raise SystemExit(7)"])
@@ -249,19 +264,16 @@ hook = Path({hook!r})
 spec = importlib.util.spec_from_file_location("copied_hook", hook)
 assert spec and spec.loader
 mod = importlib.util.module_from_spec(spec)
-try:
-    spec.loader.exec_module(mod)
-except ImportError as exc:
-    print(json.dumps({{
-        "message": str(exc),
-        "remaining": sorted(
-            name for name in sys.modules
-            if name == "agenttools_hatch_escalation"
-            or name.startswith("agenttools_hatch_escalation.")
-        ),
-    }}))
-else:
-    raise AssertionError("broken hatch import unexpectedly succeeded")
+spec.loader.exec_module(mod)
+result = mod.hatch_escalation.request_hatch_approval("probe", {{}}, cwd=".")
+print(json.dumps({{
+    "approved": bool(result.approved),
+    "remaining": sorted(
+        name for name in sys.modules
+        if name == "agenttools_hatch_escalation"
+        or name.startswith("agenttools_hatch_escalation.")
+    ),
+}}))
 """.format(hook=str(copied))
 
     proc = subprocess.run(
@@ -274,8 +286,9 @@ else:
 
     assert proc.returncode == 0, proc.stderr
     result = json.loads(proc.stdout)
-    assert "cannot execute hatch escalation helper from" in result["message"]
+    assert result["approved"] is False
     assert result["remaining"] == []
+
 
 
 def test_keyboard_interrupt_during_hatch_import_restores_previous_modules(
@@ -367,6 +380,99 @@ def test_copied_catalog_layout_hatch_hook_still_enforces_gate(
 
     assert proc.returncode == 10, proc.stderr
     assert expected_message in proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("hook_rel", "gated_event"),
+    [
+        (
+            "agent-hooks/no-long-inline-process/no_long_inline_process.py",
+            {
+                "hook_api": "agents-hooks/v1",
+                "point": "pre-bash",
+                "args": {"command": "pytest tests/"},
+            },
+        ),
+        (
+            "agent-hooks/block-raw-pr-merge/block_raw_pr_merge.py",
+            {
+                "hook_api": "agents-hooks/v1",
+                "point": "pre-bash",
+                "args": {"command": "gh pr merge 123"},
+            },
+        ),
+        (
+            "agent-hooks/block-reset-hard/block_reset_hard.py",
+            {
+                "hook_api": "agents-hooks/v1",
+                "point": "pre-bash",
+                "args": {"command": "git reset --hard"},
+            },
+        ),
+    ],
+)
+def test_missing_hatch_helper_denial_class_hook_still_blocks(
+    tmp_path: Path, hook_rel: str, gated_event: dict[str, object]
+):
+    """#547: a missing hatch helper must not fail-open a denial-class hook.
+
+    The hook process has to classify the event even when
+    lib/agenttools_hatch_escalation/__init__.py is absent. A crash (nonzero
+    non-10) is what on_error:open turns into an ALLOW — the gated command
+    must instead BLOCK (exit 10).
+    """
+    source = ROOT / hook_rel
+    copied = tmp_path / "repo" / hook_rel
+    copied.parent.mkdir(parents=True)
+    copied.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    # Deliberately do NOT copy lib/agenttools_hatch_escalation.
+
+    gated_event = dict(gated_event)
+    gated_event["cwd"] = str(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, "-I", str(copied)],
+        input=json.dumps(gated_event),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env={k: v for k, v in os.environ.items() if not k.startswith("RIG_HATCH_REQUEST_")},
+    )
+    assert proc.returncode == 10, (
+        f"missing helper must block, not crash-open (exit {proc.returncode}): "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    payload = json.loads(proc.stdout)
+    assert payload["decision"] == "block"
+
+
+def test_missing_hatch_helper_still_allows_ungated_command(tmp_path: Path):
+    """Classification must still run: an ungated command is allowed even when
+    the hatch helper is missing (the helper is only the exception path)."""
+    hook_rel = "agent-hooks/no-long-inline-process/no_long_inline_process.py"
+    source = ROOT / hook_rel
+    copied = tmp_path / "repo" / hook_rel
+    copied.parent.mkdir(parents=True)
+    copied.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, "-I", str(copied)],
+        input=json.dumps(
+            {
+                "hook_api": "agents-hooks/v1",
+                "point": "pre-bash",
+                "args": {"command": "echo hello"},
+                "cwd": str(tmp_path),
+            }
+        ),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env={k: v for k, v in os.environ.items() if not k.startswith("RIG_HATCH_REQUEST_")},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["decision"] == "allow"
 
 
 def _loader_block(hook_path: Path) -> str:

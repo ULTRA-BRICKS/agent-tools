@@ -48,6 +48,24 @@ _DETAIL_CAP = 500
 _ASK_AGENT = "claude"
 _RIG_TG_CTL_KEY = "tg_ctl_path"
 _BARE_FLAG_VALUES = frozenset({"1", "true", "yes", "on"})
+# Long enough to reject a command name used as the value (`pytest`) and
+# short enough that a real phrase still qualifies.
+_MIN_JUSTIFICATION_CHARS = 8
+
+
+def _is_written_justification(text: str) -> bool:
+    """True when `text` is a real written reason, not a flag or a stub.
+
+    Agents have used the gated command name itself (`pytest`) as the hatch
+    value; that is not a justification and must not open a Telegram round-trip.
+    """
+    if not text:
+        return False
+    if text.lower() in _BARE_FLAG_VALUES:
+        return False
+    return len(text) >= _MIN_JUSTIFICATION_CHARS
+
+
 _TRUSTED_TG_CTL_PATHS = (
     Path("/Users/ultra/.files/bin/tg-ctl"),
     Path("/usr/local/bin/tg-ctl"),
@@ -213,8 +231,10 @@ def request_hatch_approval(
     of an already-exported var.
 
     Unset (in both sources) means "hatch not requested" and does not block later mechanisms. A
-    present but blank/bare-flag value is an invalid request: no Telegram call is made and the
-    hook should deny rather than falling through to `approval_cmd`.
+    present but blank, bare-flag, or too-short value (a command name like `pytest`) is an
+    invalid request: no Telegram call is made and the hook should deny rather than falling
+    through to `approval_cmd`.
+
 
     Every attempt where the env var carries ANY value (blank, bare-flag, or a real justification —
     i.e. `env_present` ends up `True`) is a hatch USE and is appended, best-effort, to the
@@ -289,14 +309,17 @@ def _request_present_hatch_approval(
             env_var=env_var,
             env_present=True,
         )
-    if justification.lower() in _BARE_FLAG_VALUES:
+    if not _is_written_justification(justification):
         return HatchApprovalResult(
             requested=True,
             approved=False,
-            reason=f"{env_var} needs a written justification, not bare {justification!r}",
+            reason=(
+                f"{env_var} needs a written justification, not {justification!r}"
+            ),
             env_var=env_var,
             env_present=True,
         )
+
 
     tg_ctl = _find_tg_ctl(tg_ctl_candidates)
     if tg_ctl is None:
