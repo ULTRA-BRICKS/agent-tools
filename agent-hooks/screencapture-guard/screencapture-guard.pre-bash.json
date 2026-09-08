@@ -1,0 +1,9 @@
+{
+  "id": "screencapture-guard",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/screencapture-guard/screencapture_guard.py",
+  "priority": 12,
+  "timeout_ms": 5000,
+  "on_error": "closed",
+  "description": "Blocks macOS `screencapture` (path-qualified and wrapper-prefixed forms included). Screenshots go through Playwright or CDP — screencapture black-frames windows on other Spaces and trips Screen Recording grants (2026-07-01 agent-ecosystem retrospective, gap G-6). A command that only mentions the word as text is allowed. Deny-by-default, no self-service hatch."
+}

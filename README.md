@@ -280,7 +280,8 @@ that nobody is required to stop at — see #543.
   representative sample: block-no-verify, block-raw-pr-merge, block-secrets-write,
   require-review-before-commit, enforce-timeout-on-bash, block-raw-process-env,
   stop-completion-selfcheck, pkill-guard (blocks a pattern-based kill of a shared process
-  name), **format-on-write** (runs the project's configured formatter
+  name), screencapture-guard (blocks macOS screencapture; Playwright/CDP instead),
+  **format-on-write** (runs the project's configured formatter
   on each file the agent writes — oxfmt/prettier/biome/ruff/black/gofmt/rustfmt; never
   blocks).
 - **Git-hooks:** 4 templates — pre-commit, commit-msg, pre-push, no-secrets-scan (+ a
