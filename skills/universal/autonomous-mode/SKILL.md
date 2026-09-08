@@ -2,9 +2,9 @@
 name: autonomous-mode
 description: >-
   Use whenever the repo has a rig.yaml, harness mode is autonomous, or the user
-  says autonomous. Extra-approval for unattributed changes is OFF; do not turn
-  it on; do not wait for human Approve on agent-authored PRs when gates are
-  green; do not invent a hold-for-human class.
+  says autonomous. In autonomous mode, extra-approval for unattributed changes
+  is OFF; do not turn it on; do not wait for human Approve on agent-authored
+  PRs when gates are green; do not invent a hold-for-human class.
 ---
 
 # Autonomous mode: extra-approval OFF, ship when gates pass
@@ -17,8 +17,8 @@ In **autonomous** mode (harness mode autonomous, or the user says autonomous):
 
 - Do **not** wait for a human Approve on agent-authored PRs when the ship gates
   are green. Ship.
-- Do **not** invent a "gate-behavior hold for Alex" class. That class does not
-  exist.
+- Do **not** invent a "gate-behavior hold for a human" class (including a
+  "hold for Alex"). That class does not exist.
 - Autonomous agents send key status via `tg --tag report`, not chat-only.
 - If extra-approval (or another GitHub/ship **knob**) is wrongly ON, **fix that
   knob** — [rig-cli#404](https://github.com/alex-mextner/rig-cli/pull/404)
