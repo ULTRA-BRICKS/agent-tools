@@ -20,7 +20,8 @@ GUARD, not named killer:
   phrase (`Raycast Helper (Extensions)` at a token/`/` boundary), never
   a generic `Raycast` substring.
 - We NEVER signal Raycast.app itself (user-facing GUI), pid 1, our own
-  pid, or a parent whose re-read argv no longer matches (PID reuse).
+  pid, or a parent whose re-read argv or process start time no longer
+  matches (PID reuse, including a same-argv respawned Helper).
 - Age gate: at least one Z child older than MIN_ZOMBIE_AGE_S so a brief
   fork/exec race is not a kill.
 - Kill is PID-targeted SIGTERM, then SIGKILL if still alive — the only
@@ -231,6 +232,31 @@ def _reread_args(
     return args or None
 
 
+def _process_start_time(
+    pid: int,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run,
+) -> Optional[str]:
+    """Return `ps -o lstart=` for pid: a fixed wall-clock timestamp for the
+    life of the process. Unlike `etime` (elapsed time, ticks every second),
+    this is stable identity — it lets us tell "same process" apart from "a
+    different process, even one with identical argv, that reused this pid"
+    (review P1 #669: argv alone cannot catch a same-argv Helper respawn).
+    """
+    try:
+        proc = run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    start_time = (proc.stdout or "").strip()
+    return start_time or None
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -261,7 +287,9 @@ def _stop_pid(
     if not pid_alive(pid):
         return
     # PID-reuse during the grace window: kill(pid, 0) succeeds on an
-    # unrelated replacement. Re-validate argv before SIGKILL (review P1 #669).
+    # unrelated replacement — including a freshly respawned Helper with the
+    # SAME argv. Re-validate argv AND start time before SIGKILL (review P1
+    # #669): start time is the only thing a pid-reusing respawn can't share.
     if not identity_ok(pid):
         return
     try:
@@ -304,9 +332,17 @@ def sweep(
         current = _reread_args(parent.pid)
         if current is None or not is_leaky_helper(current):
             continue
-        def _identity_ok(pid: int) -> bool:
+        start_time = _process_start_time(parent.pid)
+        if start_time is None:
+            # Cannot fingerprint the process we're about to signal — do not
+            # act (review P1 #669).
+            continue
+
+        def _identity_ok(pid: int, _start_time: str = start_time) -> bool:
             again = _reread_args(pid)
-            return bool(again) and is_leaky_helper(again)
+            if not again or not is_leaky_helper(again):
+                return False
+            return _process_start_time(pid) == _start_time
 
         _stop_pid(
             parent.pid,

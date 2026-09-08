@@ -140,6 +140,7 @@ def test_sweep_signals_only_the_helper_pid(monkeypatch):
     killed = []
 
     monkeypatch.setattr(reaper, "_reread_args", lambda pid, run=None: HELPER_ARGS)
+    monkeypatch.setattr(reaper, "_process_start_time", lambda pid, run=None: "start-1")
     report = reaper.sweep(
         list_processes=lambda: procs,
         kill=lambda pid, sig: killed.append((pid, sig)),
@@ -200,6 +201,7 @@ def test_sweep_escalates_to_sigkill_if_helper_survives_sigterm(monkeypatch):
     procs = [helper, _zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S)]
     killed = []
     monkeypatch.setattr(reaper, "_reread_args", lambda pid, run=None: HELPER_ARGS)
+    monkeypatch.setattr(reaper, "_process_start_time", lambda pid, run=None: "start-1")
     report = reaper.sweep(
         list_processes=lambda: procs,
         kill=lambda pid, sig: killed.append((pid, sig)),
@@ -225,6 +227,7 @@ def test_sweep_no_sigkill_when_pid_is_reused_during_grace(monkeypatch):
         return HELPER_ARGS if calls["n"] == 1 else RAYCAST_APP_ARGS
 
     monkeypatch.setattr(reaper, "_reread_args", fake_reread)
+    monkeypatch.setattr(reaper, "_process_start_time", lambda pid, run=None: "start-1")
     report = reaper.sweep(
         list_processes=lambda: procs,
         kill=lambda pid, sig: killed.append((pid, sig)),
@@ -242,6 +245,7 @@ def test_sweep_no_sigkill_when_helper_dies_on_sigterm(monkeypatch):
     procs = [helper, _zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S)]
     killed = []
     monkeypatch.setattr(reaper, "_reread_args", lambda pid, run=None: HELPER_ARGS)
+    monkeypatch.setattr(reaper, "_process_start_time", lambda pid, run=None: "start-1")
     report = reaper.sweep(
         list_processes=lambda: procs,
         kill=lambda pid, sig: killed.append((pid, sig)),
@@ -250,6 +254,52 @@ def test_sweep_no_sigkill_when_helper_dies_on_sigterm(monkeypatch):
     )
     assert killed == [(49954, signal.SIGTERM)]
     assert report.killed_pids == [49954]
+
+
+def test_sweep_no_sigkill_when_pid_reused_by_identical_argv_process(monkeypatch):
+    """Review P1: a pid-reuse respawn can share the EXACT same argv (Raycast
+    respawns the Helper) — argv alone cannot tell "same process" from "a new
+    Helper that reused the freed pid". Start time must differ and abort the
+    SIGKILL even though argv still matches."""
+    import signal
+
+    helper = _proc(49954, 49498, args=HELPER_ARGS)
+    procs = [helper, _zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S)]
+    killed = []
+    calls = {"n": 0}
+
+    def fake_start_time(pid, run=None):
+        calls["n"] += 1
+        return "start-1" if calls["n"] == 1 else "start-2"
+
+    monkeypatch.setattr(reaper, "_reread_args", lambda pid, run=None: HELPER_ARGS)
+    monkeypatch.setattr(reaper, "_process_start_time", fake_start_time)
+    report = reaper.sweep(
+        list_processes=lambda: procs,
+        kill=lambda pid, sig: killed.append((pid, sig)),
+        sleeper=lambda _s: None,
+        pid_alive=lambda _pid: True,
+    )
+    assert killed == [(49954, signal.SIGTERM)]
+    assert report.killed_pids == [49954]
+
+
+def test_sweep_skips_when_start_time_unavailable(monkeypatch):
+    """If the process we're about to signal can't be fingerprinted, do not
+    act at all (review P1 #669)."""
+    helper = _proc(49954, 49498, args=HELPER_ARGS)
+    procs = [helper, _zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S)]
+    killed = []
+    monkeypatch.setattr(reaper, "_reread_args", lambda pid, run=None: HELPER_ARGS)
+    monkeypatch.setattr(reaper, "_process_start_time", lambda pid, run=None: None)
+    report = reaper.sweep(
+        list_processes=lambda: procs,
+        kill=lambda pid, sig: killed.append((pid, sig)),
+        sleeper=lambda _s: None,
+        pid_alive=lambda _pid: True,
+    )
+    assert killed == []
+    assert report.reaped == []
 
 
 def test_sweep_empty_process_list():
