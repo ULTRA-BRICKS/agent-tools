@@ -330,3 +330,15 @@ def test_gh_pr_create_review_uncommitted_title_allowed(tmp_path, monkeypatch):
     )
     assert code == 0, out
     assert _decision(out) == "allow"
+
+
+def test_review_uncommitted_attached_short_title_flag_blocked(tmp_path, monkeypatch):
+    """gh accepts -tVALUE / -t\"VALUE\"; that form must not slip past the extractor."""
+    out, code = _run(
+        'gh issue create -t"Review uncommitted foo diff"',
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_empty_path(),
+    )
+    assert code == brt.BLOCK_EXIT_CODE, out
+    assert _decision(out) == "block"

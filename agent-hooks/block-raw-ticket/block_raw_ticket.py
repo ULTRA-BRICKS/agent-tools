@@ -236,6 +236,10 @@ def _extract_title_flag(argv: list[str]) -> str | None:
             return None
         if tok.startswith("--title="):
             return tok.split("=", 1)[1]
+        if tok.startswith("-t=") and len(tok) > 3:
+            return tok[3:]
+        if tok.startswith("-t") and tok != "-t" and not tok.startswith("--"):
+            return tok[2:]
         i += 1
     return None
 
