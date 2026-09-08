@@ -7,7 +7,8 @@ delivers by typing into the pane. An interactive `claude` / `codex` started from
 terminal tab has no pane; `tg-ctl status` now lists it as `unreachable: not in tmux (tty …,
 cwd …, name …)` and a `/agent <name> <text>` addressed to it is **queued to an inbox file**.
 This package is the other half: the harness Stop bridges (`cc_hook_bridge`,
-`codex_hook_bridge`) call it at every `Stop`, and when the inbox holds entries they answer
+`codex_hook_bridge`, and `omp_hook_bridge` on yield) call it at every Stop-equivalent, and
+when the inbox holds entries they answer
 `{"decision":"block","reason":"<the messages>"}` — the harness then feeds that text to the
 agent as its next instruction, exactly like a `[TG from … tg#<id>] …` line typed into a tmux
 pane.
@@ -28,9 +29,15 @@ pane.
   unnamed Claude next to a Codex included) both key on `cwd-<hash>`; whichever Stops first
   consumes the other's messages. Inherent to the contract — tg-ctl refuses to queue when it
   sees such a live collision, and distinct `--name` values avoid it.
-- Only harnesses with a Stop hook take part: Claude Code and Codex. opencode's plugin bridge
-  and the omp bridge have no Stop point, so such a session outside tmux stays listed as
-  unreachable with no fallback.
+- Claude Code and Codex consume the inbox on their Stop hook. omp consumes it on
+  `tool_call` + `yield` (mapped to v1 `stop`) — omp's Stop equivalent, including a helper
+  completing. The inbox key is the cwd hash: omp has no `--name`, so `omp_hook_bridge`
+  calls `agent_key(None, cwd)` and never `agent_key_for_process` (an omp started from a
+  Claude-owned shell inherits `CLAUDE_PID`). A helper in the same cwd shares that key with
+  its parent (the two-sessions-one-key contract above). Delivery is at the next yield, not
+  while idle — live Telegram→idle omp still needs ACP. pi still has no session-end block
+  contract, so a pi session outside tmux stays listed as unreachable with no fallback
+  (tmux send-keys or ACP). opencode's plugin bridge has no Stop point either.
 
 ## The inbox key contract (shared with tg-cli — keep both sides identical)
 
@@ -80,9 +87,10 @@ the `--name` parsed from it. Without `CLAUDE_PID` the reader climbs the parent c
 its own parent (a few hops: `sh -c` → the agent) to the first argv that looks like an agent
 binary. When nothing is found the key is the cwd hash of the event's `cwd`.
 
-Codex has no `--name`, so `codex_hook_bridge` calls `agent_key(None, cwd)` directly and
-never `agent_key_for_process`: a Codex started from a Claude-owned shell inherits
-`CLAUDE_PID`, and the process lookup would otherwise key it on the Claude session's name.
+Codex and omp have no `--name`, so `codex_hook_bridge` and `omp_hook_bridge` call
+`agent_key(None, cwd)` directly and never `agent_key_for_process`: a Codex/omp started
+from a Claude-owned shell inherits `CLAUDE_PID`, and the process lookup would otherwise
+key it on the Claude session's name.
 
 ## API
 
@@ -119,5 +127,5 @@ uv run --with pytest python -m pytest tests/test_tg_inbox.py -q
 Covers the shared key vectors, `CLAUDE_PID` / ancestry / fallback key resolution, the
 pending → block + archive round trip (idempotent second call), empty / missing / malformed
 inboxes never blocking, an unwritable archive keeping the claim, and the real
-`cc_hook_bridge` + `codex_hook_bridge` dispatchers run as subprocesses against a temp
-`TG_CTL_CONFIG_DIR`.
+`cc_hook_bridge` + `codex_hook_bridge` + `omp_hook_bridge` dispatchers run as subprocesses
+against a temp `TG_CTL_CONFIG_DIR`.
