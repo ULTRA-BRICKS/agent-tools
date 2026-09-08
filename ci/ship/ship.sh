@@ -186,7 +186,9 @@
 #   SHIP_ACCEPTANCE_GATE   set to 0/false/no to disable the pre-merge ACCEPTANCE gate (default:
 #                          enabled) — the gate that runs `task gate <code> --json` (task-cli) and
 #                          refuses the merge while the ticket has unchecked criteria or checks
-#                          without a proof. Also settable as a committed `.ship-config` line
+#                          without a proof, OR when no ticket code is derivable (a PR with no
+#                          ticket has no acceptance — agent-tools#639). Also settable as a
+#                          committed `.ship-config` line
 #                          (see "Knobs (file)"). Ops off-switch; the per-ticket opt-out is
 #                          `task change <code> --post-merge-acceptance "<reason>"`, recorded ON
 #                          the ticket and reported in the audit line. See "acceptance gate" below.
@@ -3288,13 +3290,14 @@ fi
 # number `task check <id> <n>` takes. The VERDICT is the exit code; the JSON only shapes the
 # message and the audit detail, so a jq-less machine still gates correctly.
 #
-# Skips (logged, never a refusal) when task-cli is absent, the invocation targets a foreign
-# --repo, or no ticket code is derivable — the same three "not every PR is tied to a tracked
-# ticket" cases the post-merge notify below already skips on; the code derivation IS
-# _ship_derive_task_code_for_notify (never a second matcher). Exit 2 is also a logged skip: an
-# unknown ticket (the digit-check false positives that matcher documents — "UTF-8") or a
-# backend outage is not evidence that the ticket is unaccepted, and the ops off-switch exists
-# for the case where an operator wants the gate silent for other reasons.
+# Skips (logged, never a refusal) when task-cli is absent or the invocation targets a foreign
+# --repo — a repo that never adopted task-cli, or a --repo that would read the wrong project.
+# No ticket code is a REFUSAL (agent-tools#639): a PR with no ticket has no acceptance
+# criteria, so nothing can be proven. The code derivation IS _ship_derive_task_code_for_notify
+# (never a second matcher). Exit 2 is a logged skip: an unknown ticket (the digit-check false
+# positives that matcher documents — "UTF-8") or a backend outage is not evidence that the
+# ticket is unaccepted, and the ops off-switch exists for the case where an operator wants the
+# gate silent for other reasons.
 # `below_minimum` (task-cli#115 round 2) can be true with BOTH unchecked/proofless EMPTY — a
 # ticket below its configured acceptance_min (e.g. one fully-proven criterion, minimum two)
 # refuses `task gate` on count alone, not on any specific criterion's proof — so it needs its
@@ -3452,8 +3455,11 @@ _acceptance_gate() {
   fi
   local code; code=$(_ship_derive_task_code_for_notify)
   if [ -z "$code" ]; then
-    echo "[ship] acceptance gate: could not derive a task code for #$PR — skipping (not every PR is tied to a tracked ticket)." >&2
-    _ticket_gate_audit_log acceptance skipped "" "no task code"; return 0
+    { echo "Refusing: acceptance gate — could not derive a task code for #$PR. A PR with no ticket has no acceptance criteria, so nothing can be proven."
+      echo "  Fix: task create   (open a ticket with acceptance criteria) and reference it from the branch, title, or body (Refs #N / Refs HYP-N), then task gate <code> must exit 0."
+      echo "  SHIP_ACCEPTANCE_GATE=0 (env, or a committed .ship-config line) disables this gate entirely (ops off-switch)."; } >&2
+    _ticket_gate_audit_log acceptance refused "" "no task code"
+    exit 1
   fi
   # Same rewrite the post-merge notify step applies: a "GH-<n>" derived code (or
   # $REVIEW_TASK_CODE set that way) is task-cli's convention, not its own id argument — it
