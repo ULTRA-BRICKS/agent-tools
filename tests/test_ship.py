@@ -7889,9 +7889,11 @@ def test_external_review_gh_query_failure_refuses_with_friendly_message_not_sile
     assert rec["gate"] == "external-review", rec
 
 
-def test_external_review_disabled_via_env_lets_zero_reviews_through(repo_with_two_worktrees, tmp_path):
-    """SHIP_EXTERNAL_REVIEW_ENABLED=0 is the ops off-switch: with it set, zero reviews no longer
-    blocks the merge."""
+def test_external_review_env_enabled_zero_does_not_disable_gate(repo_with_two_worktrees, tmp_path):
+    """agent-tools#624: SHIP_EXTERNAL_REVIEW_ENABLED=0 is no longer an ops off-switch.
+    Env alone must not waive the zero-review refusal (the ambient-export hole #528/#609
+    left open). Durable disable is a base-branch .ship-config line; one-time bypass is
+    RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW."""
     main, _wt1, _wt2 = repo_with_two_worktrees
     bindir = _fake_gh_dir(tmp_path)
     env = dict(os.environ)
@@ -7902,15 +7904,18 @@ def test_external_review_disabled_via_env_lets_zero_reviews_through(repo_with_tw
     env["SHIP_TEST_REVIEW_COUNT"] = "0"
     env["SHIP_EXTERNAL_REVIEW_ENABLED"] = "0"
     r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
-    assert r.returncode == 0, f"the ops off-switch must let a zero-review PR merge\n{r.stdout}\n{r.stderr}"
-    assert "external-review gate disabled" in r.stdout, r.stdout
-    assert "[fake gh] merged" in r.stdout, r.stdout
+    assert r.returncode != 0, (
+        f"env SHIP_EXTERNAL_REVIEW_ENABLED=0 must NOT waive a zero-review PR\n"
+        f"{r.stdout}\n{r.stderr}"
+    )
+    assert "ZERO GitHub-side reviews" in r.stderr, r.stderr
+    assert "external-review gate disabled" not in r.stdout, r.stdout
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
 
 
-def test_external_review_short_alias_env_var_also_disables_gate(repo_with_two_worktrees, tmp_path):
-    """SHIP_EXTERNAL_REVIEW=0 (the short alias) must behave identically to
-    SHIP_EXTERNAL_REVIEW_ENABLED=0 -- both are documented as the ops off-switch in README.md and
-    AGENTS.md, but only the long form had a test until now."""
+def test_external_review_env_short_alias_zero_does_not_disable_gate(repo_with_two_worktrees, tmp_path):
+    """agent-tools#624: SHIP_EXTERNAL_REVIEW=0 (the short alias) is likewise ignored as
+    an env off-switch. Same contract as the _ENABLED form."""
     main, _wt1, _wt2 = repo_with_two_worktrees
     bindir = _fake_gh_dir(tmp_path)
     env = dict(os.environ)
@@ -7921,9 +7926,13 @@ def test_external_review_short_alias_env_var_also_disables_gate(repo_with_two_wo
     env["SHIP_TEST_REVIEW_COUNT"] = "0"
     env["SHIP_EXTERNAL_REVIEW"] = "0"
     r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
-    assert r.returncode == 0, f"the short-alias off-switch must let a zero-review PR merge\n{r.stdout}\n{r.stderr}"
-    assert "external-review gate disabled" in r.stdout, r.stdout
-    assert "[fake gh] merged" in r.stdout, r.stdout
+    assert r.returncode != 0, (
+        f"env SHIP_EXTERNAL_REVIEW=0 must NOT waive a zero-review PR\n"
+        f"{r.stdout}\n{r.stderr}"
+    )
+    assert "ZERO GitHub-side reviews" in r.stderr, r.stderr
+    assert "external-review gate disabled" not in r.stdout, r.stdout
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
 
 
 def test_external_review_disabled_via_committed_ship_config(repo_with_two_worktrees, tmp_path):
@@ -7955,10 +7964,9 @@ def test_external_review_disabled_via_committed_ship_config(repo_with_two_worktr
 def test_external_review_ship_config_off_switch_wins_even_with_env_explicitly_enabled(
     repo_with_two_worktrees, tmp_path
 ):
-    """Same OR-not-AND precedence _acceptance_gate already has between its env var and its
-    .ship-config key: an explicit SHIP_EXTERNAL_REVIEW=1 does not resurrect the gate once the
-    base-branch .ship-config says 0 -- either source disabling it is enough, and neither can force
-    the gate back ON when the other says off."""
+    """A base-branch `.ship-config` SHIP_EXTERNAL_REVIEW=0 remains the durable per-repo
+    off-switch after #624 killed the env path. An explicit SHIP_EXTERNAL_REVIEW=1 in the
+    environment is ignored — env can neither disable nor resurrect the gate."""
     main, _wt1, _wt2 = repo_with_two_worktrees
     (main / ".ship-config").write_text("SHIP_EXTERNAL_REVIEW=0\n", encoding="utf-8")
     _git("add", ".ship-config", cwd=main)
@@ -7973,7 +7981,7 @@ def test_external_review_ship_config_off_switch_wins_even_with_env_explicitly_en
     env["SHIP_TEST_REVIEW_COUNT"] = "0"
     env["SHIP_EXTERNAL_REVIEW"] = "1"
     r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
-    assert r.returncode == 0, f"a committed .ship-config off-switch must win over an explicit env=1\n{r.stdout}\n{r.stderr}"
+    assert r.returncode == 0, f"a committed .ship-config off-switch must still disable the gate\n{r.stdout}\n{r.stderr}"
     assert "external-review gate disabled by the committed .ship-config on origin/main (SHIP_EXTERNAL_REVIEW=0)" in r.stdout, r.stdout
     assert "[fake gh] merged" in r.stdout, r.stdout
 

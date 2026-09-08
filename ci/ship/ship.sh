@@ -171,13 +171,14 @@
 #                          the PR's repo), then a trusted-paths allowlist. Neither the lib dir nor
 #                          tg-ctl is env- or repo-overridable, so nothing the shipper/PR controls
 #                          can redirect approval to a stub.
-#   SHIP_EXTERNAL_REVIEW_ENABLED / SHIP_EXTERNAL_REVIEW  set either to 0 to disable the
-#                          external-review gate entirely (default: enabled). This gate refuses a
-#                          merge when `gh pr view --json reviews` is empty — see that gate below.
-#                          Also settable as a `.ship-config` line (`SHIP_EXTERNAL_REVIEW=0`
-#                          only — the `_ENABLED` alias is env-only), same pattern as
-#                          `SHIP_ACCEPTANCE_GATE` (see "Knobs (file)" below) EXCEPT this key is
-#                          read from the PR's own BASE branch, never HEAD — see that section.
+#   SHIP_EXTERNAL_REVIEW_ENABLED / SHIP_EXTERNAL_REVIEW  IGNORED as env vars (agent-tools#624).
+#                          A bare `SHIP_EXTERNAL_REVIEW=0` export no longer disables this gate
+#                          — that was the ambient-leak hole #528/#609 left open. Durable
+#                          disable is a `.ship-config` line (`SHIP_EXTERNAL_REVIEW=0` only —
+#                          the `_ENABLED` alias is not a recognized file key), read from the
+#                          PR's own BASE branch, never HEAD — see "Knobs (file)" and the
+#                          external-review gate below. One-time per-PR bypass is
+#                          RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW (see that knob).
 #   RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW  one-time bypass request for the external-review
 #                          gate, same shape/hardening as RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM
 #                          above — see ci/ship/external_review_hatch.py.
@@ -250,11 +251,12 @@
 #                                                  the same name; any other value keeps it on).
 #                            SHIP_EXTERNAL_REVIEW=0       ops off-switch for the external-review gate
 #                                                  (zero-GitHub-reviews refusal, see that gate
-#                                                  below), per repo, read from the BASE branch (same
-#                                                  effect as the SHIP_EXTERNAL_REVIEW/
-#                                                  SHIP_EXTERNAL_REVIEW_ENABLED env vars; any other
-#                                                  value keeps it on — the `_ENABLED` alias is
-#                                                  env-only, not a recognized .ship-config key).
+#                                                  below), per repo, read from the BASE branch.
+#                                                  Env SHIP_EXTERNAL_REVIEW=0 /
+#                                                  SHIP_EXTERNAL_REVIEW_ENABLED=0 is ignored
+#                                                  (agent-tools#624); this committed line is
+#                                                  the only durable off-switch. Any other value
+#                                                  keeps the gate on.
 #                            SHIP_LOCAL_TEST_DIR=<path>   directory (relative to repo root) to run
 #                                                  the test command from, or to scope
 #                                                  auto-detection to when SHIP_LOCAL_TEST_CMD is
@@ -2756,20 +2758,16 @@ fi
 # PR only via a one-time live Telegram approval: RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW=
 # "<justification>" (see external_review_hatch.py, which mirrors skip_ci_hatch.py's hardening).
 #
-# SHIP_EXTERNAL_REVIEW_ENABLED=0 / SHIP_EXTERNAL_REVIEW=0 is the ops off-switch for the WHOLE
-# gate (default: enabled) — a different kind of decision from the per-PR bypass above: it is a
-# durable, repo-level policy call, not a one-off. That off-switch is settable two ways (same
-# precedence pattern as SHIP_ACCEPTANCE_GATE, agent-tools#600):
-#   1. the env var, per-invocation (or exported for a session/machine — but see agent-tools#528:
-#      a machine-wide `~/.zshenv` export of SHIP_EXTERNAL_REVIEW=0 once broke this script's own
-#      gate tests, because the test SUITE inherited the same override).
-#   2. a committed `SHIP_EXTERNAL_REVIEW=0` line in the repo's `.ship-config` (see "Knobs (file)"
-#      above) — an AUDITED, per-repo, reviewed-like-any-other-code alternative that a test
-#      process never inherits, closing the agent-tools#528 gap without going back to a leaky
-#      global env export.
-# Either source disabling it is enough (OR, not AND) — matching _acceptance_gate's existing
-# precedence: an explicit env=1 does not override a `.ship-config` SHIP_EXTERNAL_REVIEW=0, since
-# neither mechanism can force the gate back ON when the other says off.
+# A committed `SHIP_EXTERNAL_REVIEW=0` line in the repo's `.ship-config` (see "Knobs (file)"
+# above) is the ops off-switch for the WHOLE gate (default: enabled) — a durable, repo-level
+# policy call, not a one-off. It is an AUDITED, per-repo, reviewed-like-any-other-code
+# alternative that a test process never inherits, closing the agent-tools#528 gap (a
+# machine-wide `~/.zshenv` export of SHIP_EXTERNAL_REVIEW=0 once broke this script's own
+# gate tests because the test SUITE inherited the same override). Env
+# SHIP_EXTERNAL_REVIEW=0 / SHIP_EXTERNAL_REVIEW_ENABLED=0 is IGNORED (agent-tools#624): an
+# unreviewed ambient export must not waive a merge-safety gate whose entire purpose is
+# closing the PR #764 zero-review hole. One-time per-PR bypass remains the live Telegram
+# hatch (RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW), same as --skip-ci.
 #
 # UNLIKE _acceptance_gate/the local-test-cmd knobs, this `.ship-config` key is read from the PR's
 # own BASE branch (`origin/<baseRefName>`, fetched fresh — same resolution as
@@ -2782,13 +2780,9 @@ fi
 # real, reviewed merge to the base branch — matching the ticket's own framing ("a normal,
 # reviewed PR"). A `--repo`/foreign-target ship never reads this checkout's file for a DIFFERENT
 # repo's PR either (same reasoning _acceptance_gate already applies to its own foreign-repo skip)
-# — the env-var off-switch still applies there (an explicit, per-invocation operator choice, not
-# an ambient file read).
+# — and with the env path gone, a foreign invoke has no off-switch at all (hatch only).
 EXTREV_ENABLED=1
-EXTREV_DISABLED_BY_SHIP_CONFIG=0
-case "${SHIP_EXTERNAL_REVIEW_ENABLED:-1}" in 0|false|no) EXTREV_ENABLED=0 ;; esac
-case "${SHIP_EXTERNAL_REVIEW:-1}" in 0|false|no) EXTREV_ENABLED=0 ;; esac
-if [ "$EXTREV_ENABLED" = "1" ] && [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ]; then
+if [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ]; then
   EXTREV_PR_BASE=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null) || EXTREV_PR_BASE=""
   case "$EXTREV_PR_BASE" in
     ''|-*|*[!A-Za-z0-9._/-]*)
@@ -2800,8 +2794,8 @@ if [ "$EXTREV_ENABLED" = "1" ] && [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ]; then
       # which does not, but a flaky SECOND `gh pr view` call defaults this lookup back to `main`
       # and merges `production` with zero reviews anyway). So: skip the file lookup entirely and
       # leave the gate ENABLED — matching --known-flake's existing "unreadable base -> refuse,
-      # never guess" convention (same file, `_known_flake_confirmed`). The env-var off-switch is
-      # unaffected; only the `.ship-config` lookup is skipped.
+      # never guess" convention (same file, `_known_flake_confirmed`). Env cannot disable the
+      # gate either (agent-tools#624); only the `.ship-config` lookup is skipped.
       echo "[ship] external-review gate: could not read PR #$PR's base branch — skipping the .ship-config off-switch lookup (gate stays enabled)." >&2
       ;;
     *)
@@ -2835,7 +2829,7 @@ if [ "$EXTREV_ENABLED" = "1" ] && [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ]; then
           # — snapshotting removes that hazard for this value at least.
           EXTREV_CFG_VALUE="$SHIP_CFG_EXTERNAL_REVIEW"
           case "$EXTREV_CFG_VALUE" in
-            0|false|no) EXTREV_ENABLED=0; EXTREV_DISABLED_BY_SHIP_CONFIG=1 ;;
+            0|false|no) EXTREV_ENABLED=0 ;;
           esac
         fi
       fi
@@ -2879,11 +2873,7 @@ _external_review_hatch_check() {  # uses $PR $BRANCH $DRY_RUN
 }
 
 if [ "$EXTREV_ENABLED" = "0" ]; then
-  if [ "$EXTREV_DISABLED_BY_SHIP_CONFIG" = "1" ]; then
-    echo "[ship] external-review gate disabled by the committed .ship-config on origin/${EXTREV_BASE} (SHIP_EXTERNAL_REVIEW=${EXTREV_CFG_VALUE})."
-  else
-    echo "[ship] external-review gate disabled (SHIP_EXTERNAL_REVIEW_ENABLED/SHIP_EXTERNAL_REVIEW=0)."
-  fi
+  echo "[ship] external-review gate disabled by the committed .ship-config on origin/${EXTREV_BASE} (SHIP_EXTERNAL_REVIEW=${EXTREV_CFG_VALUE})."
 else
   # Guarded like every other `$(gh ...)` in this file (see the dwell/threads gates above) --
   # under `set -euo pipefail`, an UNGUARDED substitution would abort the whole script the
@@ -2929,7 +2919,7 @@ else
       echo "  There is NO self-service override. To request a ONE-TIME bypass, set:"
       echo "    RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW=\"<justification>\""
       echo "  which asks Alex live on Telegram and proceeds ONLY on his real-time approval."
-      echo "  SHIP_EXTERNAL_REVIEW_ENABLED=0 (env), or a SHIP_EXTERNAL_REVIEW=0 .ship-config line already MERGED to the base branch, disables this gate entirely (ops off-switch; a .ship-config committed only on THIS PR's own branch does not count)."; } >&2
+      echo "  A SHIP_EXTERNAL_REVIEW=0 .ship-config line already MERGED to the base branch disables this gate entirely (ops off-switch; env SHIP_EXTERNAL_REVIEW=0 is ignored; a .ship-config committed only on THIS PR's own branch does not count)."; } >&2
     _external_review_audit_log "external-review:refused" ""
     exit 1
   fi
