@@ -192,6 +192,7 @@ def _clear_agent_env_markers(monkeypatch) -> None:
     them and the dispatcher injects args.agent_id from process env."""
     monkeypatch.delenv("RIG_AGENT_ID", raising=False)
     monkeypatch.delenv("RIG_DETACHED_AGENT", raising=False)
+    monkeypatch.delenv("PI_SESSION_FILE", raising=False)
 
 
 def test_to_v1_event_injects_agent_id_from_env_marker(monkeypatch):
@@ -223,6 +224,46 @@ def test_to_v1_event_without_env_marker_has_no_agent_id(monkeypatch):
 
     v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
 
+    assert "agent_id" not in v1["args"]
+
+
+_OMP_NESTED_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/ThinNotSub.jsonl"
+)
+_OMP_MAIN_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e.jsonl"
+)
+
+
+def test_to_v1_event_injects_agent_id_from_nested_pi_session_file(monkeypatch):
+    """agent-tools#634: a native omp Task/eval child has nested PI_SESSION_FILE and no
+    RIG_AGENT_ID. The bridge must inject args.agent_id so EVERY subagent-aware hook
+    (not only orchestrator-stays-thin) classifies the worker."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("PI_SESSION_FILE", _OMP_NESTED_SESSION)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m 'fix: x'"},
+        "cwd": "/repo",
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert v1["args"]["agent_id"] == "ThinNotSub"
+
+
+def test_to_v1_event_main_pi_session_file_has_no_agent_id(monkeypatch):
+    """The MAIN omp session file is not a child — do not inject agent_id."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("PI_SESSION_FILE", _OMP_MAIN_SESSION)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m 'fix: x'"},
+        "cwd": "/repo",
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
     assert "agent_id" not in v1["args"]
 
 

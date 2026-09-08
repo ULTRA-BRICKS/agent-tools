@@ -124,14 +124,17 @@ any **`gh`** head forfeits it (`tg done && sed -i …`, `gh pr view && git push`
 `curl -X POST`/`-d` mutates and `ssh host '…'` runs any remote command, so neither can be reliably
 classified read-only; use the escape hatch or a subagent for those.
 
-**Subagent-exempt:** a dispatched subagent (`agent_id` present) does the actual work, so it is
-always allowed. This gate governs the orchestrator only. Because the hook uses `agent_id` to
-**relax**, it reads **only** the sanitized `args.agent_id` — never a top-level `event.agent_id`
-fallback, and never model-controlled `tool_input`. `cc_hook_bridge` forwards `args.agent_id` only
-from CC's authoritative top-level event and drops any `tool_input`-forged copy (T2 precedence), and
-never writes a top-level `agent_id`; a non-CC carrier wiring this hook must replicate that filtering
-or a forged `agent_id` self-exempts the orchestrator (see `background-subagent-gate/README.md` for
-the full contract). This matches the sibling `skills-read-gate`'s narrowed read (agent-tools#115).
+**Subagent-exempt:** a dispatched subagent does the actual work, so it is always allowed. This
+gate governs the orchestrator only. `_is_subagent` trusts, in order: (1) sanitized
+`args.agent_id` — Claude Code child (`cc_hook_bridge` T2: CC's top-level field overwrites,
+model/tool_input copies dropped); (2) process env `RIG_AGENT_ID` / `RIG_DETACHED_AGENT=1` —
+detached launcher child, read here as well as by the bridges, because a worker whose
+`args.agent_id` was not injected was still gated; (3) a nested omp `PI_SESSION_FILE`
+(`.../<session-id>/<agent>.jsonl`) — Task/eval child. Never a top-level `event.agent_id`
+fallback, never model-controlled `tool_input` (agent-tools#115). A running orchestrator
+cannot retroactively mutate its process env. Empty/whitespace is not a subagent. The MAIN
+omp session file (`.../<session-id>.jsonl`) is not nested and stays governed
+(agent-tools#634).
 
 **Harness-unified (agent-tools#573):** an earlier revision exempted the WHOLE codex, opencode,
 and omp harnesses from this gate entirely (`EXEMPT_HARNESSES = {"codex", "opencode", "omp"}`,
@@ -161,13 +164,14 @@ Code's, and the only thing that ever relaxes the gate is a real subagent identit
 (`_is_subagent`), which now works correctly across all four harnesses instead of only Claude
 Code and (partially) opencode.
 
-Neither Codex nor omp expose a genuinely trustworthy HARNESS-OWN child-spawn record beyond the
-launcher-env signal today: Codex's `SubagentStart`/`SubagentStop` events exist but carry no
+Neither Codex nor omp expose a genuinely trustworthy HARNESS-OWN child-spawn record in the
+event payload today: Codex's `SubagentStart`/`SubagentStop` events exist but carry no
 captured, confirmed parent/child linkage in `codex_hook_bridge`'s payload, and omp's
 `tool_call`/`tool_result` extension events document no session/task-spawn marker either (both
 bridges' own module docstrings record exactly what was checked and ruled out). Until one of
-those is confirmed and wired up, the launcher-env marker is the ONLY non-forgeable identity
-source for those two harnesses, same as opencode.
+those is confirmed and wired into the event, this hook also reads the launcher env itself
+(not only a bridge-injected `args.agent_id`) and treats a nested omp `PI_SESSION_FILE` as a
+Task/eval child — otherwise those workers are gated as the orchestrator (agent-tools#634).
 
 ## `gh ship <PR#>` — restored narrow carve-out (agent-tools#159, Alex tg#9977; narrowed by agent-tools#363)
 
