@@ -7459,8 +7459,9 @@ def test_ship_fails_closed_when_helper_unreachable(tmp_path):
     # ship.sh (not the helper) writes this fail-closed line, so it must carry the same
     # roles/min_roles/min_models fields as the other review-quorum decision types — this is the
     # ONLY non-dry-run path that exercises the shell-side bypass:denied call with real gate state
-    # (the short bar here reports the default 3 roles, no explicit model floor was set).
-    assert rec["roles"] == 3, rec
+    # (the short bar now reports 1 role so the role floor is unmet and hatch fires; no explicit
+    # model floor was set).
+    assert rec["roles"] == 1, rec
     assert rec["min_roles"] == 3, rec
     assert rec["min_models"] == 0, rec
 
