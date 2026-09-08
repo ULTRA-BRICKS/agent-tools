@@ -316,9 +316,9 @@ def test_dep_audit_python_requirements_vuln_fails(tmp_path: Path):
 
 
 def test_dep_audit_pyproject_only_fails_closed(tmp_path: Path):
-    """SECURITY/COVERAGE (agent-tools#131): a pyproject.toml/poetry.lock with NO pinned
-    requirements*.txt can be audited only by BUILDING the project (RCE under
-    pull_request_target), so it fails CLOSED rather than falling back to the env-only
+    """SECURITY/COVERAGE (agent-tools#131 / task-cli#144): a pyproject.toml with NO pinned
+    requirements*.txt and no uv.lock/poetry.lock can be audited only by BUILDING the project
+    (RCE under pull_request_target), so it fails CLOSED rather than falling back to the env-only
     `pip-audit` (which would audit the runner's packages, not the PR's). pip-audit is present on
     PATH but must NOT be invoked for a project-only tree. DEP_AUDIT_ALLOW_MISSING=1 is the escape."""
     tree = tmp_path / "pyproj"
@@ -336,6 +336,123 @@ def test_dep_audit_pyproject_only_fails_closed(tmp_path: Path):
         env_extra={"PATH": path, "DEP_AUDIT_ALLOW_MISSING": "1"},
     )
     assert rc_ok == 0, "DEP_AUDIT_ALLOW_MISSING=1 must turn the project-only fail-closed into a skip"
+
+
+# uv.lock [[package]] shape copied from rig-cli (registry pin vs local editable).
+_UV_LOCK_REGISTRY = (
+    "version = 1\n"
+    "\n"
+    "[[package]]\n"
+    'name = "colorama"\n'
+    'version = "0.4.6"\n'
+    'source = { registry = "https://pypi.org/simple" }\n'
+)
+_UV_LOCK_EDITABLE_ONLY = (
+    "version = 1\n"
+    "\n"
+    "[[package]]\n"
+    'name = "mypkg"\n'
+    'version = "0.1.0"\n'
+    'source = { editable = "." }\n'
+)
+_POETRY_LOCK_PYPI = (
+    "[[package]]\n"
+    'name = "colorama"\n'
+    'version = "0.4.6"\n'
+    'description = "Cross-platform colored terminal text."\n'
+    "optional = false\n"
+    'python-versions = "*"\n'
+)
+
+
+def _assert_lockfile_data_audit_argv(out: str) -> None:
+    """Lockfile pins are written to a temp -r file: --no-deps -r, never the lock/project path."""
+    stub = [ln for ln in out.splitlines() if "STUB_PIP_AUDIT_ARGV:" in ln]
+    assert stub, f"pip-audit must run for an auditable lockfile:\n{out}"
+    joined = "\n".join(stub)
+    assert "--no-deps -r" in joined, out
+    assert "uv.lock" not in joined, out
+    assert "poetry.lock" not in joined, out
+    assert "pyproject.toml" not in joined, out
+    assert "STUB_PIP_AUDIT_ARGV:[]" not in out, f"bare pip-audit must not run:\n{out}"
+
+
+def test_dep_audit_python_uv_lock_registry_audits_as_data(tmp_path: Path):
+    """task-cli#144: pyproject + uv.lock with a registry pin is auditable as data (no build)."""
+    tree = tmp_path / "pyuv"
+    tree.mkdir()
+    (tree / "pyproject.toml").write_text("[project]\nname='x'\nversion='0.1.0'\n")
+    (tree / "uv.lock").write_text(_UV_LOCK_REGISTRY)
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 0, out
+    _assert_lockfile_data_audit_argv(out)
+
+
+def test_dep_audit_python_uv_lock_registry_vuln_fails(tmp_path: Path):
+    """A non-zero pip-audit on uv.lock-extracted pins must FAIL the gate."""
+    tree = tmp_path / "pyuvvuln"
+    tree.mkdir()
+    (tree / "pyproject.toml").write_text("[project]\nname='x'\nversion='0.1.0'\n")
+    (tree / "uv.lock").write_text(_UV_LOCK_REGISTRY)
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=1)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 1, out
+    _assert_lockfile_data_audit_argv(out)
+
+
+def test_dep_audit_python_uv_lock_editable_only_fails_closed(tmp_path: Path):
+    """uv.lock whose only [[package]] is the local editable project has no registry pin to
+    audit as data — fail closed, and do not invoke pip-audit (nothing safe to pass it)."""
+    tree = tmp_path / "pyuvedit"
+    tree.mkdir()
+    (tree / "pyproject.toml").write_text("[project]\nname='x'\nversion='0.1.0'\n")
+    (tree / "uv.lock").write_text(_UV_LOCK_EDITABLE_ONLY)
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 1, out
+    assert "STUB_PIP_AUDIT_ARGV" not in out, f"pip-audit must NOT run for editable-only lock:\n{out}"
+
+
+def test_dep_audit_python_lockfile_does_not_invoke_uv_or_poetry(tmp_path: Path):
+    """Parse lockfiles as text; never shell out to uv/poetry (export would resolve/build)."""
+    tree = tmp_path / "pynoinvo"
+    tree.mkdir()
+    (tree / "pyproject.toml").write_text("[project]\nname='x'\nversion='0.1.0'\n")
+    (tree / "uv.lock").write_text(_UV_LOCK_REGISTRY)
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    for name, marker in (("uv", "UV_INVOKED"), ("poetry", "POETRY_INVOKED")):
+        stub = bin_dir / name
+        stub.write_text(f"#!/bin/sh\nprintf '%s\\n' '{marker}' >&2\nexit 1\n")
+        os.chmod(stub, 0o755)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 0, out
+    assert "UV_INVOKED" not in out, out
+    assert "POETRY_INVOKED" not in out, out
+    _assert_lockfile_data_audit_argv(out)
+
+
+def test_dep_audit_python_poetry_lock_pypi_audits_as_data(tmp_path: Path):
+    """poetry.lock [[package]] name/version with no [package.source] is a PyPI pin — data audit."""
+    tree = tmp_path / "pypoetry"
+    tree.mkdir()
+    (tree / "pyproject.toml").write_text("[tool.poetry]\nname='x'\nversion='0.1.0'\n")
+    (tree / "poetry.lock").write_text(_POETRY_LOCK_PYPI)
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 0, out
+    _assert_lockfile_data_audit_argv(out)
+
 
 
 # A requirements line that forces pip-audit to BUILD the input (RCE under pull_request_target).
@@ -436,6 +553,25 @@ def test_dep_audit_empty_requirements_does_not_mask_pyproject(tmp_path: Path):
     assert rc == 1, out
     assert "no pinned requirements" in out
     assert "STUB_PIP_AUDIT_ARGV" not in out, "pip-audit must not run when only an empty req + pyproject exist"
+
+
+def test_dep_audit_empty_req_plus_uv_lock_covers(tmp_path: Path):
+    """Empty/stub requirements.txt must not mask pyproject, but a uv.lock with registry pins
+    is the data source — the lockfile covers, so the gate must NOT fail closed."""
+    tree = tmp_path / "pyemptyuv"
+    tree.mkdir()
+    (tree / "requirements.txt").write_text("# only a comment, no pinned spec\n\n")
+    (tree / "pyproject.toml").write_text(
+        "[project]\nname='x'\nversion='0.1.0'\ndependencies=['colorama']\n"
+    )
+    (tree / "uv.lock").write_text(_UV_LOCK_REGISTRY)
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 0, out
+    assert "no pinned requirements" not in out
+    _assert_lockfile_data_audit_argv(out)
 
 
 def test_dep_audit_empty_requirements_alone_passes(tmp_path: Path):
