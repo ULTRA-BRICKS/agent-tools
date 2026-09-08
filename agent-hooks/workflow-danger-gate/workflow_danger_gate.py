@@ -43,7 +43,7 @@ _SHORT_N = r"(?<![-\w])-[a-zA-Z]*n[a-zA-Z]*(?![-\w])"
 # (and a human) can see WHICH form fired. `git -C <dir>` wrappers are allowed
 # between `git` and the subcommand — the same shape the bash hooks peel.
 RULES: list[tuple[str, re.Pattern[str]]] = [
-    ("raw-pr-merge", re.compile(r"\bgh\b[^\n;]*\spr\s+merge\b")),
+    ("raw-pr-merge", re.compile(r"\bgh\b[^\n;&|]*\spr\b[^\n;&|]*\smerge\b")),
     ("reset-hard", re.compile(r"\bgit\b[^\n;]*\sreset\b[^\n;]*\s--hard\b")),
     (
         "force-push",
@@ -157,15 +157,67 @@ def blank_prompt_strings(src: str) -> str:
                 while j < n and src[j].isspace():
                     j += 1
                 if j < n and src[j] in ("'", '"', "`"):
-                    end = _quoted_end(src, j)
-                    if end is not None:
-                        for k in range(j + 1, end):
-                            if chars[k] not in _LINE_TERMINATORS:
-                                chars[k] = " "
-                        i = end + 1
+                    nxt = _blank_prompt_literal(chars, src, j)
+                    if nxt is not None:
+                        i = nxt
                         continue
         i += 1
     return "".join(chars)
+
+
+def _blank_prompt_literal(chars: list[str], src: str, quote_i: int) -> int | None:
+    """Blank a prompt string. For `...` templates, keep `${...}` interpolations
+    visible — those expressions still evaluate while the prompt is built."""
+    quote = src[quote_i]
+    if quote != "`":
+        end = _quoted_end(src, quote_i)
+        if end is None:
+            return None
+        for k in range(quote_i + 1, end):
+            if chars[k] not in _LINE_TERMINATORS:
+                chars[k] = " "
+        return end + 1
+    i = quote_i + 1
+    n = len(src)
+    while i < n:
+        ch = src[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "`":
+            return i + 1
+        if ch == "$" and i + 1 < n and src[i + 1] == "{":
+            end = _matching_brace(src, i + 1)
+            i = (end + 1) if end is not None else i + 2
+            continue
+        if ch not in _LINE_TERMINATORS:
+            chars[i] = " "
+        i += 1
+    return n
+
+
+def _matching_brace(src: str, open_i: int) -> int | None:
+    """`open_i` points at `{`. Return the matching `}` index, skipping strings."""
+    depth = 0
+    i = open_i
+    n = len(src)
+    while i < n:
+        c = src[i]
+        if c in ("'", '"', "`"):
+            _, i = _consume_quoted(src, i)
+            continue
+        if c == "{":
+            depth += 1
+            i += 1
+            continue
+        if c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+            i += 1
+            continue
+        i += 1
+    return None
 
 
 def _is_ident(src: str, i: int, name: str) -> bool:
@@ -202,8 +254,14 @@ def find_danger(src: str) -> str | None:
     return None
 
 
+def collapse_line_continuations(src: str) -> str:
+    """Turn `\\\n` (and other JS line-continuations) into a space so
+    `git push \\\n--force` still matches as one command."""
+    return re.sub(r"\\[\n\r\u2028\u2029]+", " ", src)
+
+
 def inspectable_source(src: str) -> str:
-    return blank_prompt_strings(strip_js_comments(src))
+    return blank_prompt_strings(collapse_line_continuations(strip_js_comments(src)))
 
 
 def script_from_event(event: dict) -> str | None:

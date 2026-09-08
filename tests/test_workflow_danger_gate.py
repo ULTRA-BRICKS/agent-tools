@@ -89,6 +89,8 @@ def test_agent_prompt_mentioning_danger_is_allowed(monkeypatch):
         ('exec("gh pr merge 1");', "raw-pr-merge"),
         ("await $`gh -R o/r pr merge 12`;", "raw-pr-merge"),
         ("await $`gh --repo o/r pr merge 12`;", "raw-pr-merge"),
+        ("await $`gh pr --repo o/r merge 12`;", "raw-pr-merge"),
+        ("await $`gh pr -R o/r merge 12`;", "raw-pr-merge"),
         ("await $`git commit -n -m x`;", "no-verify"),
         ("await $`sudo -n rm -rf /tmp/x`;", "sudo-rm"),
         ("await $`sudo /bin/rm -rf /tmp/x`;", "sudo-rm"),
@@ -189,6 +191,22 @@ def test_line_separator_does_not_hide_danger(monkeypatch):
     out, _err, code = _run(_event(script), monkeypatch)
     assert code == 10
     assert "raw-pr-merge" in json.loads(out)["message"]
+
+
+def test_prompt_template_interpolation_still_scanned(monkeypatch):
+    """`${exec(...)}` inside a prompt template still evaluates. Blanking the
+    whole template would hide it."""
+    script = "return await agent({ prompt: `hi ${exec('git reset --hard HEAD')}` });"
+    out, _err, code = _run(_event(script), monkeypatch)
+    assert code == 10
+    assert "reset-hard" in json.loads(out)["message"]
+
+
+def test_backslash_newline_force_push_is_blocked(monkeypatch):
+    script = "await $`git push \\\n--force origin main`;"
+    out, _err, code = _run(_event(script), monkeypatch)
+    assert code == 10
+    assert "force-push" in json.loads(out)["message"]
 
 
 def test_strip_js_comments_keeps_code():
