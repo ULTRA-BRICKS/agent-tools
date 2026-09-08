@@ -7,6 +7,9 @@ Assumptions: Codex hook events use ``hook_event_name``, ``tool_name``,
 ``tool_input``, ``cwd``, ``model``, and ``permission_mode`` fields; blocking is
 the plain top-level ``{"decision":"block","reason":"..."}`` JSON shape; file
 edits arrive as the ``apply_patch`` tool with patch text in ``tool_input.command``.
+Stop uses a stable session key (detached agent id, then top-level session_id /
+conversation_id, then cwd) so stop-completion-selfcheck can cooldown across
+unique per-Stop event_id/turn_id values (agent-tools#655).
 """
 
 from __future__ import annotations
@@ -132,9 +135,20 @@ def to_v1_event(codex_event: dict, *, point: str) -> dict:
                 args.setdefault("file_path", paths[-1])
                 args.setdefault("path", paths[-1])
 
+    event_id = _event_id(codex_event)
+    if point == "stop":
+        # stop-completion-selfcheck keys its cooldown on args.session_id / event_id.
+        # Codex Stop often omits session_id and sends a unique per-call event_id/turn_id,
+        # so a per-call event_id would re-block forever. Prefer a trusted agent id, then
+        # a top-level Codex session/conversation field, then cwd — never event_id/turn_id/
+        # tool_call_id/call_id, never a value from tool_input (forgeable).
+        sid = _stop_session_id(codex_event)
+        args["session_id"] = sid
+        event_id = sid
+
     return {
         "hook_api": HOOK_API,
-        "event_id": _event_id(codex_event),
+        "event_id": event_id,
         "tool": codex_event.get("tool_name"),
         "point": point,
         "harness": HARNESS,
@@ -305,6 +319,18 @@ def _strip_env_wrapper(parts: list[str]) -> list[str]:
             break
         index += 1
     return parts[index:] if index < len(parts) else parts
+
+
+def _stop_session_id(codex_event: dict) -> str:
+    """Stable per-session id for v1 stop events (unique per-Stop ids must share one cooldown)."""
+    detached = _detached_agent_id()
+    if detached:
+        return detached
+    for key in ("session_id", "conversation_id"):
+        val = codex_event.get(key)
+        if val:
+            return str(val)
+    return str(codex_event.get("cwd") or os.getcwd())
 
 
 def _event_id(codex_event: dict) -> str:
