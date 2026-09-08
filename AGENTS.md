@@ -196,7 +196,13 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   the unresolved-threads check above cannot: zero reviews means zero threads, which is
   vacuously "clean". Real incident: hyperide/hyper-saas PR #764 merged with zero reviews on
   Guard-B alone. Disable with `SHIP_EXTERNAL_REVIEW_ENABLED=0` (or the shorter
-  `SHIP_EXTERNAL_REVIEW=0`); no self-service override — a one-time bypass is
+  `SHIP_EXTERNAL_REVIEW=0`), or with a `SHIP_EXTERNAL_REVIEW=0` line in the repo's
+  `.ship-config` **once merged to the base branch** — a durable, per-repo, reviewed alternative
+  to exporting the env var machine-wide (agent-tools#528/#600). Unlike every other `.ship-config`
+  key, this one is read from the PR's base branch (`origin/<baseRefName>`), never the shipping
+  PR's own HEAD — otherwise a PR could disable the gate on its own merge by committing the line
+  to its own branch, recreating #764 inside the fix for #764. No self-service override for a
+  single PR — a one-time bypass is
   `RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW="<justification>"` (same shared hatch lib as
   `--skip-ci`/review-quorum; see `ci/ship/external_review_hatch.py`);
 - a UI-touching PR carries an embedded **screenshot** (override with `--no-screenshot-ok
