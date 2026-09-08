@@ -188,6 +188,41 @@ def test_to_v1_event_native_skill_name_wins_over_forged_skill_key():
     assert v1["args"]["skill"] == "strict-ticket-discipline"
 
 
+def test_to_v1_event_drops_forged_skill_when_native_name_missing():
+    event = {
+        "hook": "tool.execute.before",
+        "cwd": "/repo",
+        "input": {"tool": "skill"},
+        "output": {"args": {"skill": "delegate-work-to-subagents"}},
+    }
+    v1 = dispatch.to_v1_event(event, point="pre-skill")
+    assert "skill" not in v1["args"]
+
+
+def test_to_v1_event_drops_forged_skill_when_native_name_blank():
+    v1 = dispatch.to_v1_event(
+        _skill_event(name="  ", extra_args={"skill": "delegate-work-to-subagents"}),
+        point="pre-skill",
+    )
+    assert v1["args"].get("skill") != "delegate-work-to-subagents"
+    assert "skill" not in v1["args"] or not str(v1["args"].get("skill") or "").strip()
+
+
+def test_to_v1_event_drops_forged_session_id_on_skill():
+    v1 = dispatch.to_v1_event(
+        _skill_event(extra_args={"session_id": "forged-session"}),
+        point="pre-skill",
+    )
+    assert v1["args"].get("session_id") != "forged-session"
+
+
+def test_to_v1_event_skill_uses_trusted_plugin_session_id():
+    event = _skill_event(extra_args={"session_id": "forged-session"})
+    event["input"]["sessionID"] = "ses-real"
+    v1 = dispatch.to_v1_event(event, point="pre-skill")
+    assert v1["args"]["session_id"] == "ses-real"
+
+
 def test_opencode_skill_tool_writes_skills_read_gate_marker(tmp_path):
     """End-to-end: opencode skill tool.execute.before -> real skills-marker-writer marker."""
     hooks_dir = tmp_path / "hooks"
