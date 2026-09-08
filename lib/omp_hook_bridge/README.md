@@ -85,15 +85,16 @@ TRUSTED per-tool-call subagent identity in the extension event either (confirmed
 from the documented `tool_call`/`tool_result` shape). Every translated v1 event also
 carries a top-level `harness: "omp"` — a hardcoded module constant (`dispatch.HARNESS`),
 never derived from the omp event, so it can't be forged the way the identity fields above
-must be actively stripped. The bridge restores a TRUSTED `args.agent_id` from the process environment via
-`_detached_agent_id`: `RIG_AGENT_ID`/`RIG_DETACHED_AGENT` (the `rig-detached-omp`
-launcher, agent-tools#573) and, for a native omp Task/eval child, a nested
-`PI_SESSION_FILE` (`.../<session-id>/<agent>.jsonl` → `args.agent_id` = the agent stem;
-agent-tools#634). The main session file (`.../<session-id>.jsonl`) is not a child and
-does not inject. `extension.ts` spawns this dispatcher with `{...process.env}`.
-`agent-hooks/orchestrator-stays-thin` and the other delegation gates then see
-`args.agent_id` the same way they do for a Claude Code child. omp's `tool_call`/
-`tool_result` payload still has no per-call spawn marker of its own.
+must be actively stripped. The bridge restores a TRUSTED `args.agent_id` from, in order: `RIG_AGENT_ID` /
+`RIG_DETACHED_AGENT` (rig-detached-omp, agent-tools#573); a nested transcript path
+(`.../<session-id>/<agent>.jsonl` → stem) from **payload `sessionFile`**
+(`extension.ts` copies `ctx.getSessionFile()`, agent-tools#647) or process env
+`PI_SESSION_FILE` (agent-tools#634); then payload `agentId` (`ctx.getAgentId()` /
+`ctx.agentId`, agent-tools#643). The Node hook process inherits the **parent**
+session env, so env `PI_SESSION_FILE` alone is the main session file — the nested
+child path has to be forwarded. The main session file is not a child and does
+not inject. omp's `tool_call` payload still has no per-call spawn marker of its
+own; identity comes from ctx getters and launcher env.
 
 ## Hashline content extraction is an approximation
 

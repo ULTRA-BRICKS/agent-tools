@@ -58,14 +58,9 @@ _OMP_SESSION_DIR = re.compile(
 )
 
 
-def _omp_nested_agent_id() -> str:
-    """Agent id from a nested omp Task/eval `PI_SESSION_FILE`, or empty.
-
-    Main:  .../<session-id>.jsonl          (not a child)
-    Child: .../<session-id>/<agent>.jsonl  (stem is the worker id)
-    Path shape only — no filesystem probe.
-    """
-    raw = os.environ.get("PI_SESSION_FILE", "").strip()
+def _nested_id_from_session_file(raw: str) -> str:
+    """Agent id from a nested omp transcript path, or empty. Path shape only."""
+    raw = (raw or "").strip()
     if not raw:
         return ""
     path = Path(raw)
@@ -76,7 +71,24 @@ def _omp_nested_agent_id() -> str:
     return path.stem.strip()
 
 
-def _detached_agent_id() -> str:
+def _omp_nested_agent_id(omp_event: dict | None = None) -> str:
+    """Agent id from a nested omp Task/eval transcript, or empty.
+
+    Main:  .../<session-id>.jsonl          (not a child)
+    Child: .../<session-id>/<agent>.jsonl  (stem is the worker id)
+
+    Prefer ``omp_event["sessionFile"]`` (extension.ts copies ctx.getSessionFile() —
+    agent-tools#647) over process env ``PI_SESSION_FILE``. The Node hook process
+    inherits the parent session env, so env alone never sees the nested child path.
+    """
+    if omp_event:
+        nested = _nested_id_from_session_file(str(omp_event.get("sessionFile") or ""))
+        if nested:
+            return nested
+    return _nested_id_from_session_file(os.environ.get("PI_SESSION_FILE", ""))
+
+
+def _detached_agent_id(omp_event: dict | None = None) -> str:
     """Trusted subagent identity for omp sessions (agent-tools#573 / #634).
 
     The forge-strip above removes any model/tool-supplied agent_id; omp's own `tool_call`/
@@ -98,7 +110,7 @@ def _detached_agent_id() -> str:
         return val
     if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
         return "detached"
-    return _omp_nested_agent_id()
+    return _omp_nested_agent_id(omp_event)
 
 
 # A hashline section header: `[RELATIVE/PATH#TAG]` where TAG is 4 uppercase hex chars.
@@ -154,7 +166,7 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
         _normalize_task_args(args)
     for key in _FORGED_AGENT_KEYS:
         args.pop(key, None)
-    detached_id = _detached_agent_id()
+    detached_id = _detached_agent_id(omp_event)
     ctx_id = str(omp_event.get("agentId") or omp_event.get("agent_id") or "")
     trusted_id = detached_id or ctx_id
     if trusted_id:
