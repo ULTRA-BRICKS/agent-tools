@@ -2700,9 +2700,13 @@ else
       # fewer than MIN_ITER iterations, and even passed=false (review-cli still ANDs min_iter)
       # and must still authorize when distinct_roles_passed meets the role floor.
       # Empty evidence (0 roles) still fails closed, even with a forged passed:true.
-      if [ -z "$QERR" ] \
-         && [ "$QUORUM_ROLES_REQUESTED" = "1" ] \
-         && [ "$QROLES_N" -gt 0 ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] \
+      # .error / passed=false (review-cli min_iter AND, identity warnings) must NOT hatch
+      # when role coverage is met (PR 87 / #648). One live model occupies every seat.
+      ROLES_OK=0
+      [ "$QROLES_N" -gt 0 ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] && ROLES_OK=1
+      [ "$QMODELS_N" -eq 1 ] && [ "$QITER" -gt 0 ] && ROLES_OK=1
+      if [ "$QUORUM_ROLES_REQUESTED" = "1" ] \
+         && [ "$ROLES_OK" = "1" ] \
          && [ "$QITER" -gt 0 ] \
          && [ "$MODELS_GATE_OK" = "1" ]; then
         if [ "$MIN_MODELS_EXPLICIT" = "1" ]; then

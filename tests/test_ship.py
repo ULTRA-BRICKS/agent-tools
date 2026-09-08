@@ -5504,8 +5504,12 @@ if [ "${SHIP_TEST_REVIEW_LEGACY_KEYS:-0}" = "1" ]; then
   printf '{"task_code":"%s","iterations":%s,"distinct_models":%s,"models":%s,"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
     "$code" "$iterations" "$models_n" "$models_json" "$minit" "$minmodels" "$passed"
 else
-  printf '{"task_code":"%s","passed_iterations":%s,"total_iterations":%s%s%s,"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
-    "$code" "$iterations" "$iterations" "$models_fields" "$roles_fields" "$minit" "$minmodels" "$passed"
+  err_field=""
+  if [ -n "${SHIP_TEST_REVIEW_ERROR:-}" ]; then
+    err_field=$(printf ',"error":"%s"' "$SHIP_TEST_REVIEW_ERROR")
+  fi
+  printf '{"task_code":"%s","passed_iterations":%s,"total_iterations":%s%s%s,"min_iter":%s,"min_models":%s,"passed":%s%s}\\n' \\
+    "$code" "$iterations" "$iterations" "$models_fields" "$roles_fields" "$minit" "$minmodels" "$passed" "$err_field"
 fi
 """
 
@@ -5897,6 +5901,52 @@ def test_review_quorum_zero_iterations_with_roles_is_empty_evidence(tmp_path):
     )
     assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
     assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_passed_false_with_error_still_authorizes_on_roles(tmp_path):
+    """PR 87 hole: review --check passed=false and .error set (min_iter AND) while
+    distinct_roles_passed meets the floor. Must authorize; hatch must not fire."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-648",
+            "SHIP_TEST_REVIEW_ITER": "2",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+            "SHIP_TEST_REVIEW_MODELS": "1",
+            "SHIP_TEST_REVIEW_FORCE_PASSED": "false",
+            "SHIP_TEST_REVIEW_ERROR": "min_iter 2 < 3",
+            "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM": "must not fire; roles are filled",
+        },
+    )
+    assert r.returncode == 0, f"roles+error+passed=false must ship\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert "APPROVED by Alex" not in r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_quorum_one_model_fills_role_seats_without_hatch(tmp_path):
+    """One live model occupies every board seat even when distinct_roles_passed is 1."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-648B",
+            "SHIP_TEST_REVIEW_ITER": "1",
+            "SHIP_TEST_REVIEW_ROLES": "1",
+            "SHIP_TEST_REVIEW_MODELS": "1",
+            "SHIP_TEST_REVIEW_FORCE_PASSED": "false",
+            "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM": "must not fire; one model fills roles",
+        },
+    )
+    assert r.returncode == 0, f"1 model must ship without hatch\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert "APPROVED by Alex" not in r.stdout
+    assert "merged #1" in r.stdout, r.stdout
 
 
 def test_review_quorum_omitted_models_field_still_authorizes_on_roles(tmp_path):
