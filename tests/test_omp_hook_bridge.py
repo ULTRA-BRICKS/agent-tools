@@ -1207,6 +1207,7 @@ def test_extension_forwards_getSessionFile_into_dispatcher_env(tmp_path):
         "const nested = process.env.NESTED_SESSION!;\n"
         "const ctx = {\n"
         "  cwd: '/tmp', hasUI: false,\n"
+        "  agentId: '', sessionFile: '   ',\n"
         "  getSessionFile: () => nested,\n"
         "  getAgentId: () => 'ThinNotSub',\n"
         "};\n"

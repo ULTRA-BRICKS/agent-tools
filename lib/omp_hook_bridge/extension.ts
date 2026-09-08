@@ -167,18 +167,27 @@ interface DispatcherOutcome {
 // failure here always resolves to "no opinion" (return undefined => allow); only an EXPLICIT
 // `{"decision":"block","reason":...}` from the dispatcher becomes a real block. See README.md
 // "Fail policy" for the full reasoning.
+function firstNonBlank(...vals: unknown[]): string {
+  for (const v of vals) {
+    if (v == null) continue;
+    const s = String(v).trim();
+    if (s) return s;
+  }
+  return "";
+}
+
 function ctxString(ctx: any, event: any, prop: string, getter: string): string {
   // omp's tool ctx (oh-my-pi) exposes getSessionFile()/getAgentId()/getSessionId()
-  // as methods; ctx.agentId is empty (oh-my-pi#11214). Prefer the property, then
-  // the getter, then a same-named field on the event — never tool args.
+  // as methods; ctx.agentId is empty (oh-my-pi#11214). A blank property must not
+  // shadow the getter (`??` only skips null/undefined). Prefer a non-blank
+  // property, then the getter, then a same-named field on the event — never tool args.
   let fromGetter: unknown;
   try {
     fromGetter = typeof ctx?.[getter] === "function" ? ctx[getter]() : undefined;
   } catch {
     fromGetter = undefined;
   }
-  const raw = ctx?.[prop] ?? fromGetter ?? event?.[prop];
-  return raw == null ? "" : String(raw).trim();
+  return firstNonBlank(ctx?.[prop], fromGetter, event?.[prop]);
 }
 
 async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<BridgeResult | undefined> {
