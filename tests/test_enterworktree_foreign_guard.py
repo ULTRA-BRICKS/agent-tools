@@ -208,24 +208,41 @@ def test_allow_reentering_own_worktree(monkeypatch):
     assert _decision(out) == "allow"
 
 
-def test_block_uppercase_hex_foreign_worktree_is_still_recognized(monkeypatch):
-    """RECOGNIZING the `agent-<id>` shape is case-insensitive — an uppercase-hex worktree name
-    must NOT fall through the "unfamiliar naming shape" fail-open path (that was itself a
-    bypass: a review pass proved a case-sensitive-only pattern let a mismatched-case foreign
-    worktree through unblocked). It must still be BLOCKED like any other foreign worktree."""
+def test_allow_reentering_own_worktree_case_variant(monkeypatch):
+    """Case-insensitive filesystem false-block, fixed: a worktree path segment spelled in a
+    DIFFERENT case than the caller's own `agent_id` (`agent-DEADBEEF01` vs own id
+    `deadbeef01`) is still a legitimate re-entry into the SAME worktree — `realpath` does not
+    canonicalize case on a case-insensitive-but-case-preserving filesystem, so the path
+    segment's case can differ from the id's canonical spelling with no ownership change.
+    OWNERSHIP comparison folds case for exactly this reason; only RECOGNITION was
+    case-insensitive before this fix, which wrongly BLOCKED this legitimate call."""
     out, _e, code = _run(
         monkeypatch, path="/repo/.claude/worktrees/agent-DEADBEEF01", agent_id="deadbeef01"
     )
-    assert code == hook.BLOCK_EXIT_CODE
-    assert _decision(out) == "block"
+    assert code == 0
+    assert _decision(out) == "allow"
 
 
-def test_block_case_variant_id_is_not_treated_as_ownership(monkeypatch):
-    """A lowercase-hex target with a DIFFERENT own agent_id is BLOCKED even though the two
-    strings would collide under case-folding — OWNERSHIP comparison is exact, never folded,
-    even though shape RECOGNITION is case-insensitive (the two are deliberately separate)."""
+def test_allow_reentering_own_worktree_case_variant_reverse(monkeypatch):
+    """Same case-fold fix, other direction: a lowercase-hex path segment
+    (`agent-deadbeef01`) with the caller's own `agent_id` spelled uppercase (`DEADBEEF01`) is
+    likewise a legitimate re-entry, not a foreign worktree — folded comparison treats the two
+    as the same id."""
     out, _e, code = _run(
         monkeypatch, path="/repo/.claude/worktrees/agent-deadbeef01", agent_id="DEADBEEF01"
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_block_uppercase_hex_foreign_worktree_with_different_id(monkeypatch):
+    """RECOGNIZING the `agent-<id>` shape is case-insensitive — an uppercase-hex worktree name
+    must NOT fall through the "unfamiliar naming shape" fail-open path (that was itself a
+    bypass: a review pass proved a case-sensitive-only pattern let a mismatched-case foreign
+    worktree through unblocked). A genuinely DIFFERENT own agent_id (not merely a case variant
+    of the same id) is still BLOCKED like any other foreign worktree."""
+    out, _e, code = _run(
+        monkeypatch, path="/repo/.claude/worktrees/agent-DEADBEEF01", agent_id="sub-1"
     )
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"

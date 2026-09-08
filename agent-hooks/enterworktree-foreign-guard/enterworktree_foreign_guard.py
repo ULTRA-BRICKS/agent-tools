@@ -147,6 +147,16 @@ def _extract_worktree_agent_id(path_str: str) -> str | None:
     Walks EVERY path segment (not just the last) so a path like
     `/repo/.claude/worktrees/agent-abc123/nested/dir` still resolves to `abc123` even when
     EnterWorktree's `path` points somewhere inside the worktree rather than at its root.
+
+    When MULTIPLE `.claude/worktrees/agent-<id>` segments appear in the same path — a
+    worktree nested inside another agent's worktree, e.g.
+    `/repo/.claude/worktrees/agent-aaaaaa/nested/.claude/worktrees/agent-bbbbbb` — the
+    INNERMOST (rightmost/deepest) segment wins, not the first one encountered. That innermost
+    segment is the worktree `path` actually resolves into; returning the OUTERMOST one (a
+    review-caught bug in an earlier version) let a caller owning `agent-aaaaaa` pass the
+    ownership check for a `path` that really lands inside `agent-bbbbbb`'s nested worktree,
+    bypassing the guard entirely. The loop below therefore keeps overwriting its result as it
+    walks root-to-leaf, so the LAST match found — the innermost one — is what gets returned.
     Deliberately requires the LITERAL `.claude`/`worktrees` parent segments (case-insensitive,
     see below) — a directory that merely happens to be named `agent-<hex>` elsewhere on disk
     (outside that convention) is not treated as an owned/foreign worktree signal.
@@ -168,16 +178,17 @@ def _extract_worktree_agent_id(path_str: str) -> str | None:
     `/.CLAUDE/WORKTREES/agent-<id>` is the SAME directory `git worktree list` would report, and
     an exact-case-only comparison here was itself a review-caught bypass: it fell through to
     the "unfamiliar shape" fail-open ALLOW instead of being recognized and gated. As with the
-    `agent-<id>` id itself, RECOGNIZING the shape is permissive; only the id comparison in
-    `main()` stays exact.
+    `agent-<id>` id itself, RECOGNIZING the shape is permissive; the id comparison in `main()`
+    now folds case too (see the comment there) — for the same reason.
     """
     parts = PurePath(os.path.realpath(path_str)).parts
+    innermost: str | None = None
     for i in range(len(parts) - 2):
         if parts[i].lower() == ".claude" and parts[i + 1].lower() == "worktrees":
             match = _WORKTREE_AGENT_SEGMENT_RE.match(parts[i + 2])
             if match:
-                return match.group(1)
-    return None
+                innermost = match.group(1)
+    return innermost
 
 
 def _own_agent_id(event: dict) -> str | None:
@@ -239,24 +250,22 @@ def main() -> int:
         return 0
 
     own_agent_id = _own_agent_id(event)
-    # EXACT, case-sensitive compare — deliberately NOT case-folded, even though
-    # `_WORKTREE_AGENT_SEGMENT_RE` (above) recognizes EITHER case for the path segment.
-    #
-    # CONSIDERED AND REJECTED twice across review rounds, in BOTH directions — recorded so a
-    # future reader doesn't "fix" this back and forth again:
-    #   1. Case-sensitive segment RECOGNITION (an earlier version) let an uppercase-hex foreign
-    #      worktree fall through the "unfamiliar shape" fail-open ALLOW entirely, skipping the
-    #      ownership check — closed by making RECOGNITION case-insensitive (above).
-    #   2. Case-FOLDED id comparison (tried next) would let a case-VARIANT id belonging to a
-    #      DIFFERENT agent pass as an ownership match — a real bypass, not hypothetical.
-    #   3. Verified empirically (not assumed) that `os.path.realpath` does NOT canonicalize
-    #      case on this machine's case-insensitive-but-case-preserving APFS volume — it returns
-    #      whatever case the caller passed in, unresolved — so realpath does not rescue #2 either.
-    # Between "a same-agent re-entry spelled in an unexpected case gets BLOCKED and has to go
-    # through hatch escalation" (safe: fails toward asking a human) and "a foreign agent whose
-    # id merely differs in case is silently granted ownership" (unsafe: the exact incident this
-    # hook exists to prevent), the exact/case-sensitive comparison is the correct trade-off for
-    # a security gate — deny-by-default beats a convenience-motivated fold.
+    # CASE-FOLDED compare — `_WORKTREE_AGENT_SEGMENT_RE` (above) recognizes EITHER case for the
+    # path segment, so `own_agent_id`/`target_agent_id` must be folded the same way or that
+    # permissive recognition is pointless: a real, confirmed bug (not hypothetical) is a
+    # same-agent re-entry whose worktree path segment happens to be spelled in a different case
+    # than the caller's own `agent_id` (e.g. path segment `agent-DEADBEEF01`, own id
+    # `deadbeef01`) — `os.path.realpath` does NOT canonicalize case on a case-insensitive-but-
+    # case-preserving APFS volume (verified empirically, not assumed), so the raw path segment's
+    # case is whatever the caller happened to pass in, independent of the id's canonical spelling.
+    # An earlier version compared exact/case-sensitive here specifically to guard against a
+    # case-VARIANT id belonging to a genuinely DIFFERENT agent passing as an ownership match —
+    # but CC's own `agent_id` field is generated once per dispatch in one canonical case; two
+    # distinct agents whose ids differ ONLY by letter case is not a real identity collision this
+    # hook needs to defend against, while the case-insensitive-filesystem mismatch above IS a
+    # real, review-confirmed false-block (an own-worktree re-entry wrongly treated as foreign and
+    # routed through Telegram hatch escalation). Folding case here closes that false-block
+    # without reopening a real bypass.
     #
     # UNVERIFIED ASSUMPTION, flagged explicitly rather than asserted as fact: this entire
     # module presumes CC names a dispatched subagent's worktree directory `agent-<agent_id>`
@@ -274,7 +283,7 @@ def main() -> int:
     # EVERY EnterWorktree(path=...) — including a fully legitimate self re-entry — would
     # BLOCK and route through Telegram hatch escalation. Verify with a real captured
     # PreToolUse event before trusting this in production; see the hook's README.
-    if own_agent_id is not None and own_agent_id == target_agent_id:
+    if own_agent_id is not None and own_agent_id.lower() == target_agent_id.lower():
         # Re-entering / switching into a worktree THIS agent owns — legitimate, unaffected.
         emit("allow")
         return 0
