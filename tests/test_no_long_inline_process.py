@@ -577,8 +577,6 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert "one-shot review, output needed now" in question.read_text()
-
-
 _USAGE_BLURB = (
     'RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="<written justification>"'
 )
@@ -654,6 +652,114 @@ def test_bare_or_too_short_justification_denies_without_telegram(
     assert "justification" in lowered
     assert value in message
     assert _USAGE_BLURB not in message
+
+
+# ── #584: a suite behind a LAUNCHER that executes it must BLOCK ──────────────────────────────
+# `_DIRECT_RUNNERS` matched only a bare `pytest` at argv[0], so the most common spellings of a
+# test run — `python3 -m pytest -q` (this repo's documented replay command), `uv run --with pytest
+# pytest tests/` (every rig.yaml test script), `npx vitest` — passed the gate ungated. The launcher
+# is peeled (its own value-taking options skipped WITH their value) and what it executes is
+# classified, recursively.
+
+@pytest.mark.parametrize("command", [
+    "python -m pytest",
+    "python3 -m pytest -q",
+    "python3.12 -m pytest tests/",
+    "python -m unittest discover",
+    "python -um pytest",
+    "python -mpytest",
+    "python -Wignore -m pytest",
+    "python -W ignore -m pytest",
+    "python -X dev -m pytest",
+    "PYTHONPATH=lib python3 -m pytest -q",
+    "timeout 600 python3 -m pytest",
+    "uv run pytest tests/",
+    "uv run --with pytest pytest tests/",
+    "uv run --with pytest python -m pytest tests/x.py -q",
+    "uv --directory /repo run pytest",
+    "uv run env CI=1 pytest",
+    "uvx pytest",
+    "poetry run pytest",
+    "pipenv run pytest",
+    "pdm run pytest",
+    "coverage run -m pytest",
+    "coverage run --source=lib -m pytest",
+    "tox",
+    "tox -e py312",
+    "npx vitest run",
+    "npx -- vitest",
+    "npx playwright test",
+    "bunx vitest",
+    "pnpm exec vitest",
+    "pnpm dlx vitest",
+    "yarn dlx jest",
+    "yarn run vitest",
+    "bun run vitest",
+    "npm exec vitest",
+    'npm exec --call "vitest run"',               # `-c/--call` runs a SHELL STRING: classified,
+    'npx -c "vitest run"',                        # not skipped as a value (round-1 bypass)
+    'npx --call="vitest run"',
+    "npx -c 'echo hi && pytest'",                 # any command in the nested string counts
+    "pnpm test",
+    "bun run build",
+    "yarn run test",
+])
+def test_block_suite_behind_launcher(command, monkeypatch):
+    out, _e, code = _run(command, monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE, command
+    payload = json.loads(out)
+    assert payload["decision"] == "block"
+    assert "build/test suite" in payload["message"]
+
+
+@pytest.mark.parametrize("command", [
+    "python3 -m cc_hook_bridge PreToolUse",
+    "python -m http.server",
+    "python -m pip install x",
+    "python tests/smoke.py",
+    "python -c 'import pytest'",
+    "python - < x",
+    "uv run ruff check .",
+    "uv run --with pytest ruff check .",
+    "uv run --python 3.12 ruff check .",
+    "uv run script.py",
+    "uvx ruff check .",
+    "poetry run ruff check .",
+    "pdm run lint",
+    "coverage run script.py",
+    "npx cowsay hi",
+    "npm run dev",                                # `npm run <script>` is not modelled as a launcher
+    'npx -c "echo hi"',                           # a nested shell string that is not a suite
+    "uv run --unknown-boolean-flag ruff check .", # an option the table does not model: its
+                                                  # value (here: ruff) lands at argv[0] → allow
+    "bun x cowsay hi",
+])
+def test_allow_launcher_running_something_else(command, monkeypatch):
+    out, _e, code = _run(command, monkeypatch)
+    assert code == 0, command
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    "python3 -m pytest -q",
+    "uv run --with pytest pytest tests/",
+    "npx vitest run",
+])
+def test_subagent_exempt_allows_suite_behind_launcher(command, monkeypatch):
+    """The subagent exemption is decided BEFORE classification, so the new launcher forms are
+    exempt exactly like a bare `pytest` — a dispatched agent is expected to run them."""
+    out, _e, code = _run(command, monkeypatch, agent_id="agent-abc123")
+    assert code == 0, command
+    assert _decision(out) == "allow"
+
+
+def test_launcher_peel_is_bounded(monkeypatch):
+    """A pathological launcher chain stops at the nesting cap and falls through to allow (the
+    gate's fail-open default) instead of recursing without bound."""
+    command = " ".join(["uv run"] * (nlip._MAX_LAUNCHER_NESTING + 2)) + " pytest"
+    out, _e, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
 
 
 if __name__ == "__main__":  # pragma: no cover

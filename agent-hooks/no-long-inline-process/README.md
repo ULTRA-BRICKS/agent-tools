@@ -17,8 +17,24 @@ followed by a runner (`tg "(" review`) — see the module docstring's RESIDUAL L
 - the **`review`** CLI invoked as a command (multi-model, minutes-long)
 - any **`--watch`** flag (`gh pr checks --watch`, `vitest --watch`, `tsc --watch`, …)
 - a **build/test suite**: `npm|pnpm|yarn|bun|deno test|build`, `pytest`/`vitest`/`jest`/
-  `cypress`/`playwright`, `cargo test|build`, `go test|build`, `make|rake|msbuild test|build|all`,
-  `mvn|gradle test|build|verify|package`
+  `cypress`/`playwright`/`unittest`/`tox`/`nose2`, `cargo test|build`, `go test|build`,
+  `make|rake|msbuild test|build|all`, `mvn|gradle test|build|verify|package`
+- the same suite behind a **launcher** that executes it (agent-tools#584 — before this, the
+  most common spellings of a test run passed ungated because only a bare `pytest` at `argv[0]`
+  matched): `python -m pytest` / `python3.12 -m unittest` (any `python[3[.X]]`/`pypy` `-m`, including
+  clustered/glued forms like `-um pytest`, `-Wignore -m pytest`), `uv run pytest`,
+  `uv run --with pytest pytest tests/`, `uvx pytest`, `poetry|pipenv|pdm run pytest`,
+  `coverage run -m pytest`, `npx|bunx vitest`, `npm exec vitest`, `pnpm exec|dlx vitest`,
+  `yarn exec|dlx|run vitest`, `bun run|x vitest`. The launcher's own value-taking options are
+  skipped with their value, so `uv run --with pytest ruff check .` runs `ruff` and stays allowed;
+  launchers peel recursively (`uv run python -m pytest`, `uv run env CI=1 pytest`); an `npx`/`npm
+  exec` `-c`/`--call` value is a shell string the launcher runs, so it is classified as a nested
+  command line (`npx -c "vitest run"` blocks). The flag table is hand-maintained and incomplete
+  by design; the residual runs both ways but stays small: an option it does not model leaves that
+  option's *value* at `argv[0]` — an allow (this gate's fail-open direction) unless the value
+  happens to spell a runner name (`--future-flag pytest`), a false block on a spelling nobody
+  uses. The sibling `subagent-no-bg-longproc` hook carries the same peel (its drift guard pins
+  both the table and the behaviour).
 - **`sleep N`** with `N >= 10` (short sleeps like `sleep 2` are fine)
 
 Leading **no-op wrappers** are peeled off each segment before matching, so a wrapped long
