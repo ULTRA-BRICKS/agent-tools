@@ -51,32 +51,54 @@ _FORGED_AGENT_KEYS = (
 )
 
 
+# omp Task/eval child transcript: .../<session-id>/<agent-id>.jsonl
+# (same shape orchestrator-stays-thin._OMP_SESSION_DIR matches; keep in lockstep).
+_OMP_SESSION_DIR = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-fA-F-]+$"
+)
+
+
+def _omp_nested_agent_id() -> str:
+    """Agent id from a nested omp Task/eval `PI_SESSION_FILE`, or empty.
+
+    Main:  .../<session-id>.jsonl          (not a child)
+    Child: .../<session-id>/<agent>.jsonl  (stem is the worker id)
+    Path shape only — no filesystem probe.
+    """
+    raw = os.environ.get("PI_SESSION_FILE", "").strip()
+    if not raw:
+        return ""
+    path = Path(raw)
+    if path.suffix.lower() != ".jsonl" or not path.stem.strip():
+        return ""
+    if not _OMP_SESSION_DIR.match(path.parent.name):
+        return ""
+    return path.stem.strip()
+
+
 def _detached_agent_id() -> str:
-    """The ONE authoritative subagent identity source for omp sessions (agent-tools#573).
+    """Trusted subagent identity for omp sessions (agent-tools#573 / #634).
 
     The forge-strip above removes any model/tool-supplied agent_id; omp's own `tool_call`/
     `tool_result` extension events carry no session/task-spawn marker to restore it from
-    (`extension.ts`'s payload is `toolName`/`input`/`cwd`/`toolCallId` only — confirmed
-    absent, same as `opencode_hook_bridge._detached_agent_id`'s finding for opencode's plugin
-    payload). The sanctioned source is the omp PROCESS ENVIRONMENT, read at launch:
-    `RIG_AGENT_ID=<name>` (identity) or `RIG_DETACHED_AGENT=1` (anonymous marker), set by the
-    `rig-detached-omp` launcher skill. `extension.ts` spawns this dispatcher with
-    `{...process.env}`, so a marker set when the child omp process was launched is visible
-    here on every tool call.
+    (`extension.ts`'s payload is `toolName`/`input`/`cwd`/`toolCallId` only). Identity is
+    restored from the PROCESS ENVIRONMENT, in order:
+      1. ``RIG_AGENT_ID=<name>`` (rig-detached-omp launcher)
+      2. ``RIG_DETACHED_AGENT=1`` (anonymous ``detached``)
+      3. nested ``PI_SESSION_FILE`` (native omp Task/eval child — agent-tools#634)
 
-    Trust reasoning (ported unchanged from `opencode_hook_bridge._detached_agent_id`,
-    agent-tools#476): a running orchestrator cannot retroactively mutate its own process
-    environment — it can only set these vars for a CHILD process it dispatches, which is
-    exactly the sanctioned act of dispatching a subagent. Cooperative-orchestrator threat
-    model, on_error=open: discipline, not a security boundary. A bare/whitespace value is not
-    a marker.
+    ``extension.ts`` spawns this dispatcher with ``{...process.env}``, so a marker set
+    when the child was launched (or omp's own nested session file) is visible here on
+    every tool call. A running orchestrator cannot retroactively mutate its process
+    environment. Cooperative-orchestrator threat model, on_error=open. A bare/whitespace
+    value is not a marker.
     """
     val = os.environ.get("RIG_AGENT_ID", "").strip()
     if val:
         return val
     if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
         return "detached"
-    return ""
+    return _omp_nested_agent_id()
 
 
 # A hashline section header: `[RELATIVE/PATH#TAG]` where TAG is 4 uppercase hex chars.

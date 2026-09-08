@@ -36,6 +36,16 @@ ost = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ost)
 
 
+@pytest.fixture(autouse=True)
+def _no_host_agent_markers(monkeypatch):
+    """A nested omp pytest host carries PI_SESSION_FILE; a detached launcher carries
+    RIG_AGENT_ID. Strip them so to_v1_event tests (which run before `_run`) cannot
+    false-allow an orchestrator case."""
+    monkeypatch.delenv("RIG_AGENT_ID", raising=False)
+    monkeypatch.delenv("RIG_DETACHED_AGENT", raising=False)
+    monkeypatch.delenv("PI_SESSION_FILE", raising=False)
+
+
 def _run(event, monkeypatch, marker_dir: Path, env: dict | None = None) -> tuple[str, str, int]:
     out, err = io.StringIO(), io.StringIO()
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
@@ -181,6 +191,27 @@ def test_subagent_git_commit_allowed_for_omp_nested_session(tmp_path, monkeypatc
     env = {"PI_SESSION_FILE": _OMP_NESTED_SESSION}
     _run(event, monkeypatch, tmp_path / "m", env=env)
     out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_omp_bridge_nested_pi_session_git_commit_is_allowed(tmp_path, monkeypatch):
+    """agent-tools#634 review: the omp bridge injects args.agent_id from nested
+    PI_SESSION_FILE, so a repeat git commit through a REAL bridge event is allowed —
+    every subagent-aware hook sees the worker, not only this classifier's env fallback."""
+    import importlib
+    monkeypatch.setenv("PI_SESSION_FILE", _OMP_NESTED_SESSION)
+    dispatch = importlib.import_module("omp_hook_bridge.dispatch")
+    raw = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m 'fix: x'"},
+        "cwd": "/repo",
+        "toolCallId": "call_1",
+    }
+    v1 = dispatch.to_v1_event(raw, point="pre-bash")
+    assert v1["args"]["agent_id"] == "ThinNotSub"
+    _run(v1, monkeypatch, tmp_path / "m")
+    out, _e, c = _run(v1, monkeypatch, tmp_path / "m")
     assert c == 0 and _decision(out) == "allow"
 
 
