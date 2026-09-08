@@ -17,7 +17,7 @@ exercises the real `_strip_ambient_ship_env` function rather than reimplementing
 IMPORTANT: `_strip_ambient_ship_env` mutates `os.environ` directly (that is its whole job), and by
 the time this test runs in a full-suite invocation, `tests/test_ship.py` /
 `tests/test_ship_notify_task_cli.py` have already applied their own module-level
-`SHIP_REVIEW_QUORUM` / `SHIP_TASK_NOTIFY_ENABLED` defaults to the REAL process environment at
+`SHIP_TEST_DISABLE_REVIEW_QUORUM` / `SHIP_TASK_NOTIFY_ENABLED` defaults to the REAL process environment at
 collection time. Calling the function against the real `os.environ` here would permanently delete
 those defaults for the rest of the pytest session (an earlier version of this test did exactly
 that and broke ~130 unrelated tests later in the run). So every test below first swaps in a throwaway

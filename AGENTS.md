@@ -216,21 +216,20 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token, else a purely descriptive
   ALL-CAPS/hyphenated code (`SME-ROADMAP-WORKTREE-NOTE`-shaped, 3+ segments, no digits) — all
   tried against the branch name or PR
-  body) has ≥ `SHIP_REVIEW_QUORUM_MIN_ITER` PASSED review-cli iterations across ≥
-  `SHIP_REVIEW_QUORUM_MIN_ROLES` distinct BOARD ROLES (`review task <code> --check`) — this is
-  the DEFAULT check and is always enforced, matching review-cli's own role-based coverage
-  (review-cli#246). `SHIP_REVIEW_QUORUM_MIN_MODELS` is an OPT-IN extra: unset by default (no
-  model floor), and if an operator sets it, both the role floor AND the model floor apply
-  together. Both floors, when in force, are **clamped to a hard minimum of 3** — the env knobs
-  can only RAISE the bar, never lower it (a `0`/negative/below-3 value resolves to 3). This is
+  body) has ≥ `SHIP_REVIEW_QUORUM_MIN_ROLES` distinct BOARD ROLES (`review task <code> --check`)
+  — role coverage is the DEFAULT/only authorization predicate (agent-tools#644 / review-cli#433
+  padding). `distinct_models_passed` and `passed_iterations` are telemetry: one padded model
+  filling every role ships even when models=0/1 and iterations are below the old min-iter 3
+  (a hollow 0-iteration record still refuses). `SHIP_REVIEW_QUORUM_MIN_MODELS` remains an
+  OPT-IN extra model floor. This is
   the gate that makes self-merge *strictly controlled*; it **fails closed** (a missing task
-  code / `review` CLI / unreadable store, OR a quorum reading 0 iterations / 0 distinct roles,
-  all refuse — ship re-derives the verdict from the counts, never trusts the subprocess's
-  `passed` boolean alone, #242). An installed `review-cli` too old to report roles gets an
+  code / `review` CLI / unreadable store, OR a quorum reading 0 distinct roles,
+  all refuse — ship re-derives the verdict from the role counts, never trusts the subprocess's
+  `passed` boolean alone, #242/#644). An installed `review-cli` too old to report roles gets an
   explicit "upgrade review-cli" refusal instead of a generic error. There is **NO self-service override flag** — a one-time bypass
   is requested via `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"`, which asks Alex live
   on Telegram (shared `agenttools_hatch_escalation` lib) and proceeds ONLY on his real-time
-  approval. Disable the whole gate with `SHIP_REVIEW_QUORUM=0`. Every non-dry-run gated ship is
+  approval. `SHIP_REVIEW_QUORUM=0` is forbidden and does not disable the gate. Every non-dry-run gated ship is
   audited to `SHIP_AUDIT_FILE`; dry-runs print the would-be audit without writing it. **Every
   `RIG_HATCH_REQUEST_*` hatch across every agent-hook** (not just ship's own two) is separately
   audited by the shared lib itself: any attempt that REACHES `request_hatch_approval` with the env

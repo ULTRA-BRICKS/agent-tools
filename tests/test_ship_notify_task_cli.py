@@ -21,9 +21,9 @@ import pytest
 _SHIP = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
 
 # See tests/test_ship.py's identical rationale: the review-quorum gate defaults ENABLED in the
-# product but this file never exercises it (no `review`/`jq` quorum fixture here) — force it off
-# process-wide; nothing here re-enables it.
-os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")
+# product but this file never exercises it (no `review`/`jq` quorum fixture here). Isolate via
+# the test-only SHIP_TEST_DISABLE_REVIEW_QUORUM=1 — SHIP_REVIEW_QUORUM=0 is forbidden (#644).
+os.environ.setdefault("SHIP_TEST_DISABLE_REVIEW_QUORUM", "1")
 # The two pre-merge ticket gates (acceptance + magic-close, agent-tools#521) default ENABLED
 # too and have their own fixtures in tests/test_ship_ticket_gates.py; off here so a fixture
 # PR body that happens to say "Fixes HYP-999", or a fake `task` that logs every call, is not
