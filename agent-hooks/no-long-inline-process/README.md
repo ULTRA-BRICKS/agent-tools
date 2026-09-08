@@ -27,12 +27,16 @@ process is still caught — `timeout 600 npm test`, `env CI=1 pytest`, `timeout 
 own args (`timeout`'s duration, `env`'s `KEY=VALUE` assignments, `-k`/`-n`/`--signal` flags) are
 skipped; only the *wrapped* command's long-running-ness decides (`timeout 5 ls` stays allowed).
 
-**Subagent-exempt:** a dispatched subagent (`agent_id` present) is *expected* to run these in
-the background, so it is always allowed. This gate governs the orchestrator only. `args.agent_id`
-must originate from a **trusted, transport-level** signal — never from model-controlled
-`tool_input`. `cc_hook_bridge` forwards it only from CC's top-level event and drops any
-`tool_input`-forged copy; a non-CC carrier must replicate that filtering or a forged `agent_id`
-self-exempts the orchestrator (full contract in `background-subagent-gate/README.md`).
+**Subagent-exempt:** a dispatched subagent is *expected* to run these in the background, so
+it is always allowed. This gate governs the orchestrator only. Identity (any one): sanitized
+`args.agent_id` (Claude Code child — `cc_hook_bridge` T2: CC's top-level field overwrites,
+model/tool_input copies dropped), process env `RIG_AGENT_ID` / `RIG_DETACHED_AGENT=1`
+(detached launcher), or a nested omp `PI_SESSION_FILE` (`.../<session-id>/<agent>.jsonl`,
+Task/eval child). Never model-controlled `tool_input`. omp Task children share the
+orchestrator's pre-bash hook with no `args.agent_id`; without the env/session signals they
+were gated as the orchestrator ([agent-tools#635](https://github.com/alex-mextner/agent-tools/issues/635)).
+Do not harness-allowlist omp: the orchestrator still blocks; dispatch with `hub start`
+(argv[0] is hub, so this hook does not fire). Full contract in `background-subagent-gate/README.md`.
 
 ## Why a hard block (not warn-first)
 
@@ -99,4 +103,7 @@ echo '{"args":{"command":"npm test"}}' | ./no_long_inline_process.py; rc=$?; ech
 echo '{"args":{"command":"sleep 2"}}'  | ./no_long_inline_process.py; rc=$?; echo "exit=$rc"   # → exit=0 (allow)
 echo '{"args":{"command":"cat docs/review-notes.md"}}' | ./no_long_inline_process.py; rc=$?; echo "exit=$rc"  # → exit=0 (path, not a command)
 echo '{"args":{"agent_id":"sub-1","command":"npm test"}}' | ./no_long_inline_process.py; rc=$?; echo "exit=$rc"  # → exit=0 (subagent-exempt)
+echo '{"harness":"omp","args":{"command":"review diff"}}' | ./no_long_inline_process.py; rc=$?; echo "exit=$rc"  # → exit=10 (orchestrator still blocked)
+echo '{"harness":"omp","args":{"command":"review diff"}}' | RIG_AGENT_ID=worker ./no_long_inline_process.py; rc=$?; echo "exit=$rc"  # → exit=0
+echo '{"harness":"omp","args":{"command":"hub start name=rev application=review"}}' | ./no_long_inline_process.py; rc=$?; echo "exit=$rc"  # → exit=0 (argv[0] is hub)
 ```
