@@ -6,8 +6,9 @@ Two layers:
     channel silently splits);
   - the consuming reader — pending → block reason + archive (at-most-once), and the
     fail-open cases: empty, missing, malformed, unwritable archive.
-The last tests run the real ``cc_hook_bridge`` / ``codex_hook_bridge`` dispatchers as a
-SUBPROCESS (how the harness invokes them) against a temp ``TG_CTL_CONFIG_DIR``.
+The last tests run the real ``cc_hook_bridge`` / ``codex_hook_bridge`` /
+``omp_hook_bridge`` dispatchers as a SUBPROCESS (how the harness invokes them)
+against a temp ``TG_CTL_CONFIG_DIR``.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from agenttools_tg_inbox import (  # noqa: E402
 from agenttools_tg_inbox import core as inbox_core  # noqa: E402
 from cc_hook_bridge import dispatch as cc_dispatch  # noqa: E402
 from codex_hook_bridge import dispatch as codex_dispatch  # noqa: E402
+import omp_hook_bridge.dispatch as omp_dispatch  # noqa: E402
 
 
 def _entry(i: int, wrapped: str) -> str:
@@ -199,6 +201,27 @@ def _run_bridge(module: str, event: dict, *, cfg: Path, home: Path) -> subproces
     )
 
 
+def _run_omp_bridge(event: dict, *, cfg: Path, home: Path) -> subprocess.CompletedProcess:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("RIG_HATCH_REQUEST_")}
+    hooks = home / ".omp" / "agent" / "hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    env.update({
+        "HOME": str(home),
+        "TG_CTL_CONFIG_DIR": str(cfg),
+        "PYTHONPATH": str(_LIB),
+        "OMP_HOOKS_DIR": str(hooks),
+        "CLAUDE_PID": "1",
+    })
+    return subprocess.run(
+        [sys.executable, "-m", "omp_hook_bridge", "tool_call"],
+        input=json.dumps(event),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+
 def test_cc_bridge_stop_delivers_pending_inbox_as_block_reason(tmp_path):
     cfg = tmp_path / "cfg"
     home = tmp_path / "home"
@@ -297,6 +320,117 @@ def test_cc_bridge_stop_hook_block_and_inbox_ride_in_one_block(tmp_path):
     assert json.loads(res2.stdout)["reason"].strip() == "stay: gate says no"
 
 
+def test_omp_bridge_yield_delivers_pending_inbox(tmp_path):
+    cfg = tmp_path / "cfg"
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = "/Users/ultra/work/landing"
+    d = cfg / "inbox" / "cwd-ccfe64bae2f277d7"
+    d.mkdir(parents=True)
+    (d / "pending.jsonl").write_text(_entry(7, "[TG from Alex tg#7] hello omp") + "\n")
+    event = {"toolName": "yield", "cwd": cwd, "input": {}, "toolCallId": "y1"}
+    res = _run_omp_bridge(event, cfg=cfg, home=home)
+    assert res.returncode == 0, res.stderr
+    assert json.loads(res.stdout) == {"decision": "block", "reason": "[TG from Alex tg#7] hello omp"}
+    assert len(list(d.glob("delivered-*.jsonl"))) == 1
+    res2 = _run_omp_bridge(event, cfg=cfg, home=home)
+    assert res2.stdout == ""
+
+
+def test_omp_bridge_bash_does_not_consume_inbox(tmp_path):
+    cfg = tmp_path / "cfg"
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = "/Users/ultra/work/landing"
+    d = cfg / "inbox" / "cwd-ccfe64bae2f277d7"
+    d.mkdir(parents=True)
+    pending = d / "pending.jsonl"
+    pending.write_text(_entry(7, "[TG from Alex tg#7] hello omp") + "\n")
+    res = _run_omp_bridge(
+        {"toolName": "bash", "cwd": cwd, "input": {"command": "true"}, "toolCallId": "b1"},
+        cfg=cfg,
+        home=home,
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == ""
+    assert pending.exists()
+    assert not list(d.glob("delivered-*"))
+
+
+def test_omp_bridge_yield_empty_and_malformed_never_block(tmp_path):
+    cfg = tmp_path / "cfg"
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = "/Users/ultra/work/landing"
+    event = {"toolName": "yield", "cwd": cwd, "input": {}, "toolCallId": "y1"}
+    res = _run_omp_bridge(event, cfg=cfg, home=home)
+    assert res.returncode == 0 and res.stdout == ""
+    d = cfg / "inbox" / "cwd-ccfe64bae2f277d7"
+    d.mkdir(parents=True)
+    (d / "pending.jsonl").write_text("{{{ garbage\n")
+    res = _run_omp_bridge(event, cfg=cfg, home=home)
+    assert res.returncode == 0 and res.stdout == ""
+    assert "malformed" in res.stderr
+
+
+def test_omp_bridge_ignores_inherited_claude_pid_and_keys_on_cwd(tmp_path):
+    # omp has no --name; an omp started from a Claude-owned shell inherits CLAUDE_PID
+    # and must still key on the cwd hash, never the Claude session's --name.
+    cfg = tmp_path / "cfg"
+    home = tmp_path / "home"
+    home.mkdir()
+    hooks = home / ".omp" / "agent" / "hooks"
+    hooks.mkdir(parents=True)
+    cwd = "/Users/ultra/work/landing"
+    d = cfg / "inbox" / "cwd-ccfe64bae2f277d7"
+    d.mkdir(parents=True)
+    (d / "pending.jsonl").write_text(_entry(7, "for omp") + "\n")
+    named = cfg / "inbox" / "rig-fable"
+    named.mkdir(parents=True)
+    (named / "pending.jsonl").write_text(_entry(6, "for the claude session") + "\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("RIG_HATCH_REQUEST_")}
+    env.update({
+        "HOME": str(home),
+        "TG_CTL_CONFIG_DIR": str(cfg),
+        "PYTHONPATH": str(_LIB),
+        "OMP_HOOKS_DIR": str(hooks),
+        "CLAUDE_PID": str(os.getppid()),
+    })
+    res = subprocess.run(
+        [sys.executable, "-m", "omp_hook_bridge", "tool_call"],
+        input=json.dumps({"toolName": "yield", "cwd": cwd, "input": {}, "toolCallId": "y1"}),
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+    assert json.loads(res.stdout) == {"decision": "block", "reason": "for omp"}
+    assert (named / "pending.jsonl").exists()  # untouched
+
+
+def test_omp_bridge_stop_hook_block_and_inbox_ride_in_one_block(tmp_path):
+    cfg = tmp_path / "cfg"
+    home = tmp_path / "home"
+    hooks = home / ".omp" / "agent" / "hooks"
+    hooks.mkdir(parents=True)
+    gate = tmp_path / "gate.py"
+    gate.write_text("#!/usr/bin/env python3\nimport sys, json; print(json.dumps({'message': 'stay: gate says no'})); sys.exit(10)\n")
+    gate.chmod(0o755)
+    (hooks / "gate.stop.json").write_text(json.dumps({
+        "id": "gate", "point": "stop", "cmd": str(gate), "priority": 10, "timeout_ms": 3000, "on_error": "closed",
+    }))
+    cwd = "/Users/ultra/work/landing"
+    d = cfg / "inbox" / "cwd-ccfe64bae2f277d7"
+    d.mkdir(parents=True)
+    (d / "pending.jsonl").write_text(_entry(1, "[TG from Alex tg#1] hi") + "\n")
+    event = {"toolName": "yield", "cwd": cwd, "input": {}, "toolCallId": "y1"}
+    res = _run_omp_bridge(event, cfg=cfg, home=home)
+    assert res.returncode == 0, res.stderr
+    out = json.loads(res.stdout)
+    assert out["decision"] == "block"
+    assert out["reason"].startswith("[TG from Alex tg#1] hi\n\n")
+    assert "gate says no" in out["reason"]
+    res2 = _run_omp_bridge(event, cfg=cfg, home=home)
+    assert json.loads(res2.stdout)["reason"].strip() == "stay: gate says no"
+
+
 # --- review-round hardening (PR #563, round 3) ---
 
 
@@ -351,13 +485,14 @@ def test_stop_inbox_text_is_fail_open_on_a_broken_key_lookup(cfg):
 
 
 @pytest.mark.parametrize(
-    ("module", "event"),
+    ("module", "dispatch_event", "event"),
     [
-        (cc_dispatch, {"hook_event_name": "Stop", "cwd": "/Users/ultra/work/landing"}),
-        (codex_dispatch, {"hook_event_name": "Stop", "cwd": "/Users/ultra/work/landing", "session_id": "s"}),
+        (cc_dispatch, "Stop", {"hook_event_name": "Stop", "cwd": "/Users/ultra/work/landing"}),
+        (codex_dispatch, "Stop", {"hook_event_name": "Stop", "cwd": "/Users/ultra/work/landing", "session_id": "s"}),
+        (omp_dispatch, "tool_call", {"toolName": "yield", "cwd": "/Users/ultra/work/landing", "input": {}, "toolCallId": "y1"}),
     ],
 )
-def test_dispatch_runs_the_stop_hooks_before_consuming_the_inbox(cfg, monkeypatch, module, event):
+def test_dispatch_runs_the_stop_hooks_before_consuming_the_inbox(cfg, monkeypatch, module, dispatch_event, event):
     # Consuming is irreversible; a hook that raises must not eat a message the agent
     # never saw (all three round-3 reviewers). pid 1 is never an agent → cwd key.
     monkeypatch.setattr(inbox_core, "_ps_line", lambda pid: None)
@@ -370,7 +505,7 @@ def test_dispatch_runs_the_stop_hooks_before_consuming_the_inbox(cfg, monkeypatc
 
     monkeypatch.setattr(module, "_first_hook_block", exploding_hooks)
     with pytest.raises(RuntimeError):
-        module.dispatch("Stop", event)
+        module.dispatch(dispatch_event, event)
     assert (d / "pending.jsonl").exists()
     assert not list(d.glob("delivered-*"))
 
@@ -392,6 +527,9 @@ def test_combine_block_empty_hook_reason_still_blocks():
     assert codex_dispatch._combine_block("", "") == codex_dispatch.codex_block_output("")
     assert codex_dispatch._combine_block("", None) is None
     assert codex_dispatch._combine_block("msg", "gate") == codex_dispatch.codex_block_output("msg\n\ngate")
+    assert omp_dispatch._combine_block("", "") == omp_dispatch.omp_block_output("")
+    assert omp_dispatch._combine_block("", None) is None
+    assert omp_dispatch._combine_block("msg", "gate") == omp_dispatch.omp_block_output("msg\n\ngate")
 
 
 def test_consume_pending_requeues_a_record_appended_to_the_claim_mid_consume(cfg, monkeypatch, capsys):

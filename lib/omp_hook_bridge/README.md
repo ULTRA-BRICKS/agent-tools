@@ -67,13 +67,17 @@ JSON to the extension:
 | `tool_call` + `apply_patch` | `pre-write` | The wire name omp uses for `edit` in apply_patch custom-tool mode (docs/tools/edit.md); the payload is the classic `*** Update File:` / `*** Add File:` / `*** Delete File:` / `*** Move to:` envelope, not hashline. Parsed with logic ported from the opencode bridge (see below). |
 | `tool_call` + `notebook` | `pre-write` | omp has no confirmed public tool schema for a dedicated notebook tool in the docs consulted while building this bridge. Best-effort passthrough only: whichever of `path`/`notebook_path`/`file_path` is present in `input` is normalized onto `args.notebook_path`/`file_path`/`path`. Kept as a mapped point (not dropped) on the assumption that IF omp ships one, its shape is path-like enough for this passthrough to still work; revisit once the real schema is confirmed. |
 | `tool_call` + `task` | `pre-agent` | omp's task item shape is `{name?, agent?, task, effort?, outputSchema?, schemaMode?, isolated?}` (flat) or `{context, tasks: item[]}` (batch, the default). Normalized onto the shared pre-agent contract the `background-subagent-gate` reads: `agent` → `args.subagent_type`, `task` → `args.prompt` (a batch joins every item's `task` with newlines), and `args.run_in_background: true` — see "omp `task` dispatches are background by contract" below. Raw `task`/`name`/`tasks`/`context` fields are kept alongside. |
-| `tool_call` + `yield` | `stop` | The hidden completion tool a helper must call (docs/tools/task.md). `tool_call` can return `{block: true, reason}` (docs/hooks.md); this is the omp Stop equivalent so `stop-completion-selfcheck` can block a premature yield. |
+| `tool_call` + `yield` | `stop` | The hidden completion tool a helper must call (docs/tools/task.md). `tool_call` can return `{block: true, reason}` (docs/hooks.md); this is the omp Stop equivalent so `stop-completion-selfcheck` can block a premature yield, **and** so the tg-ctl Stop-hook inbox can deliver without tmux (agent-tools#656). The inbox key is the cwd hash (omp has no `--name`). |
 | `tool_result` + `edit`/`write`/`apply_patch` | `post-write` | Runs path-based hooks after the write; a block decision is logged only because omp cannot un-run a completed write. |
 
 omp's session-lifecycle events (`session_shutdown`, `agent_end`, etc.) have no documented
 blocking return contract in docs/hooks.md — this bridge does not map any of them to the v1
 `stop` point, same reasoning the opencode bridge's README gives for `session.idle`.
-The hidden `yield` tool is a `tool_call`, so it *does* map to `stop` (agent-tools#640).
+The hidden `yield` tool is a `tool_call`, so it *does* map to `stop` (agent-tools#640) and
+consumes the tg-ctl inbox on that path (agent-tools#656). Delivery is at the next yield,
+not while idle — live Telegram→idle omp still needs ACP. A helper in the same cwd shares
+the cwd-hash inbox with its parent. pi has no equivalent session-end block, so a pi
+session outside tmux stays unreachable without ACP.
 
 For a multi-section `edit` call or a multi-file `apply_patch` call, the dispatcher fans out
 one v1 event per file path, mirroring `opencode_hook_bridge`'s `_v1_events_for_dispatch`.

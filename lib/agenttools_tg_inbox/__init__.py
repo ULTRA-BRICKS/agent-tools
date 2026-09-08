@@ -1,10 +1,11 @@
 """agenttools_tg_inbox — the tg-ctl Stop-hook inbox reader (agent-tools#526, tg-cli#306).
 
-Accessed via: the harness Stop bridges (``cc_hook_bridge``, ``codex_hook_bridge``) call
-:func:`consume_pending` at every Stop and, when it returns entries, block the stop with
-the messages as the reason — Claude Code / Codex then feed that text to the agent as its
-next instruction. This is the tmux-free delivery channel for an agent that tg-ctl cannot
-reach with ``tmux send-keys`` (started from a plain terminal tab).
+Accessed via: the harness Stop bridges (``cc_hook_bridge``, ``codex_hook_bridge``, and
+``omp_hook_bridge`` on yield→stop) call :func:`consume_pending` at every Stop-equivalent
+and, when it returns entries, block the stop with the messages as the reason — Claude
+Code / Codex / omp then feed that text to the agent as its next instruction. This is the
+tmux-free delivery channel for an agent that tg-ctl cannot reach with ``tmux send-keys``
+(started from a plain terminal tab). pi has no session-end block contract.
 
 THE INBOX KEY CONTRACT — shared byte-for-byte with tg-cli ``features/tg-ctl/unreachable.ts``
 (both READMEs document it; the test vectors in ``tests/test_tg_inbox.py`` and tg-cli's
