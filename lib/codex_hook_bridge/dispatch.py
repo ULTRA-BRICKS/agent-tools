@@ -7,9 +7,10 @@ Assumptions: Codex hook events use ``hook_event_name``, ``tool_name``,
 ``tool_input``, ``cwd``, ``model``, and ``permission_mode`` fields; blocking is
 the plain top-level ``{"decision":"block","reason":"..."}`` JSON shape; file
 edits arrive as the ``apply_patch`` tool with patch text in ``tool_input.command``.
-Stop uses a stable session key (detached agent id, then top-level session_id /
-conversation_id, then cwd) so stop-completion-selfcheck can cooldown across
-unique per-Stop event_id/turn_id values (agent-tools#655).
+Stop uses a stable session key (top-level session_id, then conversation_id,
+then detached agent id, then cwd) so stop-completion-selfcheck can cooldown
+across unique per-Stop event_id/turn_id values without collapsing distinct
+native sessions that reuse a launcher name (agent-tools#655).
 """
 
 from __future__ import annotations
@@ -139,9 +140,11 @@ def to_v1_event(codex_event: dict, *, point: str) -> dict:
     if point == "stop":
         # stop-completion-selfcheck keys its cooldown on args.session_id / event_id.
         # Codex Stop often omits session_id and sends a unique per-call event_id/turn_id,
-        # so a per-call event_id would re-block forever. Prefer a trusted agent id, then
-        # a top-level Codex session/conversation field, then cwd — never event_id/turn_id/
-        # tool_call_id/call_id, never a value from tool_input (forgeable).
+        # so a per-call event_id would re-block forever. Prefer a native Codex session/
+        # conversation id, then a trusted agent id, then cwd — never event_id/turn_id/
+        # tool_call_id/call_id, never a value from tool_input (forgeable). Native session
+        # wins over RIG_AGENT_ID so two detached processes that reuse a launcher name do
+        # not share the 30-minute self-check marker.
         sid = _stop_session_id(codex_event)
         args["session_id"] = sid
         event_id = sid
@@ -323,13 +326,13 @@ def _strip_env_wrapper(parts: list[str]) -> list[str]:
 
 def _stop_session_id(codex_event: dict) -> str:
     """Stable per-session id for v1 stop events (unique per-Stop ids must share one cooldown)."""
-    detached = _detached_agent_id()
-    if detached:
-        return detached
     for key in ("session_id", "conversation_id"):
         val = codex_event.get(key)
         if val:
             return str(val)
+    detached = _detached_agent_id()
+    if detached:
+        return detached
     return str(codex_event.get("cwd") or os.getcwd())
 
 

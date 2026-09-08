@@ -103,3 +103,24 @@ def test_stop_session_id_prefers_detached_agent_id_across_cwds(monkeypatch):
     )
     assert a["args"]["session_id"] == b["args"]["session_id"] == "Helper"
     assert a["event_id"] == b["event_id"] == "Helper"
+
+
+
+def test_stop_session_id_prefers_native_session_id_over_detached_agent(monkeypatch):
+    """Native Codex session_id must win over a reused launcher RIG_AGENT_ID.
+
+    Two detached processes that share a launcher name must not share the
+    30-minute self-check marker (PR 667 P2).
+    """
+    monkeypatch.setenv("RIG_AGENT_ID", "Helper")
+    ev = dispatch.to_v1_event(
+        {
+            "hook_event_name": "Stop",
+            "cwd": "/repo",
+            "event_id": "unique-xyz",
+            "session_id": "sess-real",
+        },
+        point="stop",
+    )
+    assert ev["args"]["session_id"] == "sess-real"
+    assert ev["event_id"] == "sess-real"
