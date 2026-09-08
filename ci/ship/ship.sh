@@ -3434,6 +3434,18 @@ _ship_normalize_gh_code_for_task_cli() {  # $1 = candidate code -> prints the ta
   fi
 }
 
+_acceptance_gate_is_task_cli() {
+  # command -v task is not enough (Taskwarrior / go-task also install as `task`).
+  # The JSON-shape guard below only runs AFTER a ticket code is derived; the no-ticket
+  # refusal must use the same identity check first or it blocks every ship on a machine
+  # that merely has a different `task` (Codex P1 on agent-tools#641).
+  local help
+  help=$(task --help 2>/dev/null) || return 1
+  case "$help" in
+    *'pre-merge gate'*|*'acceptance criteria'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 _acceptance_gate() {
   # The ops off-switches only echo, like the other gates' off-switches (no audit line: the
   # env one is a per-invocation operator choice, the .ship-config one is audited by being
@@ -3455,6 +3467,10 @@ _acceptance_gate() {
   fi
   local code; code=$(_ship_derive_task_code_for_notify)
   if [ -z "$code" ]; then
+    if ! _acceptance_gate_is_task_cli; then
+      echo "[ship] WARNING: acceptance gate could not evaluate — '$(command -v task)' on PATH did not look like task-cli (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping." >&2
+      _ticket_gate_audit_log acceptance skipped "" "'task' on PATH does not look like task-cli"; return 0
+    fi
     { echo "Refusing: acceptance gate — could not derive a task code for #$PR. A PR with no ticket has no acceptance criteria, so nothing can be proven."
       echo "  Fix: task create   (open a ticket with acceptance criteria) and reference it from the branch, title, or body (Refs #N / Refs HYP-N), then task gate <code> must exit 0."
       echo "  SHIP_ACCEPTANCE_GATE=0 (env, or a committed .ship-config line) disables this gate entirely (ops off-switch)."; } >&2
