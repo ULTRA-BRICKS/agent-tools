@@ -33,6 +33,7 @@ HARNESS = "opencode"
 _KNOWN_EVENTS = frozenset({"tool.execute.before", "tool.execute.after"})
 _WRITE_TOOLS = frozenset({"edit", "write", "apply_patch"})
 _TASK_TOOL = "task"
+_SKILL_TOOL = "skill"
 _ID_KEYS = (
     "event_id",
     "sessionID",
@@ -65,6 +66,8 @@ def point_for_event(hook_name: str, tool_name: str | None) -> str | None:
             return "pre-write"
         if tool == _TASK_TOOL:
             return "pre-agent"
+        if tool == _SKILL_TOOL:
+            return "pre-skill"
     if hook_name == "tool.execute.after" and tool in _WRITE_TOOLS:
         return "post-write"
     return None
@@ -113,6 +116,18 @@ def to_v1_event(opencode_event: dict, *, point: str) -> dict:
     if detached_id:
         args["agent_id"] = detached_id
     _normalize_task_args(args)
+    if tool == _SKILL_TOOL:
+        _normalize_skill_args(args)
+    # T2: session_id on tool args is model-controlled. skills-marker-writer nests
+    # the freshness marker under args.session_id, so a forged value would let one
+    # session satisfy another. Drop every session-id spelling from args, then
+    # restore only a plugin-payload id (input.sessionID / top-level), never
+    # output.args.
+    for key in ("session_id", "sessionID", "sessionId"):
+        args.pop(key, None)
+    trusted_sid = _trusted_session_id(opencode_event)
+    if trusted_sid:
+        args["session_id"] = trusted_sid
 
     command = _tool_command(tool, raw_args)
     if command:
@@ -306,6 +321,38 @@ def _background_subagents_enabled() -> bool:
         return os.environ.get(env, "").strip().lower() in _TRUTHY_ENV_FLAG
 
     return on("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS") or on("OPENCODE_EXPERIMENTAL")
+
+
+def _trusted_session_id(opencode_event: dict) -> str:
+    """Session id from the plugin payload, never from model-controlled tool args."""
+    sources = [opencode_event]
+    inp = opencode_event.get("input")
+    if isinstance(inp, dict):
+        sources.append(inp)
+        nested = inp.get("session")
+        if isinstance(nested, dict):
+            sources.append(nested)
+    for source in sources:
+        for key in ("sessionID", "sessionId", "session_id"):
+            val = source.get(key)
+            if val:
+                return str(val)
+    return ""
+
+
+def _normalize_skill_args(args: dict) -> None:
+    """Map opencode skill-tool ``name`` onto ``args.skill``.
+
+    skills-marker-writer reads ``args.skill`` (the CC Skill ``tool_input`` key).
+    OpenCode's native parameter is ``name`` (``skill({ name: "git-release" })``,
+    packages/opencode/src/tool/skill.ts). Drop a model-forged ``skill`` key
+    first; only a non-empty native ``name`` may set ``args.skill``, so a
+    CC-shaped or blank-name call cannot record a skill OpenCode did not load.
+    """
+    args.pop("skill", None)
+    name = args.get("name")
+    if isinstance(name, str) and name.strip():
+        args["skill"] = name
 
 
 def _normalize_task_args(args: dict) -> None:

@@ -80,7 +80,8 @@ side spoofing here is low severity (worst case: a marker lands somewhere useless
 side (`skills-read-gate`) trusts the T2-hardened `session_id` to key its PRIMARY lookup, but
 still also checks the global path as a lower-precedence fallback (see that hook's own README,
 "The marker contract") — not because the write side can be spoofed into it, but because a
-harness with no `pre-skill` producer of its own (Codex/opencode today) can only ever write
+harness with no session-aware `pre-skill` producer of its own (Codex today; opencode maps
+skill->pre-skill but still writes the global path unless `args.session_id` is present) can only ever write
 the global marker, and losing that would silently break its only workaround the moment ANY
 session id happens to ride along on the event.
 
@@ -88,9 +89,10 @@ session id happens to ride along on the event.
 
 Claude Code: live once `rig` registers a `Skill` `PreToolUse` matcher for the bridge
 (`riglib` `hook_bridge_entries`; the bridge half — the `pre-skill` point mapping in
-`lib/cc_hook_bridge/dispatch.py` — ships in the same change as this hook). Codex/opencode:
-not mapped yet — see `agent-hooks/README.md`'s `pre-skill` section for the current
-per-harness table (the same gap the `pre-agent` point had before its bridges were wired).
+`lib/cc_hook_bridge/dispatch.py` — ships in the same change as this hook). opencode: live
+via `lib/opencode_hook_bridge` mapping `tool.execute.before` + `skill` to `pre-skill` and
+copying native `args.name` onto `args.skill` (agent-tools#661). Codex: not mapped yet —
+see `agent-hooks/README.md`'s `pre-skill` section for the current per-harness table.
 
 ## Fail-open, on purpose
 

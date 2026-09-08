@@ -16,8 +16,9 @@ How it knows a skill was invoked — the MARKER CONTRACT:
   check is what closes the leak: without it, one Claude Code session invoking a skill would
   silently satisfy every other concurrent session's gate too, and in practice CC's own
   writer never touches the global path anymore once a session id is available. The global
-  fallback stays only for a harness with no session-aware writer of its own (Codex/opencode
-  today) or a manual `touch`. The wrapper that touches it is the honest, satisfiable
+  fallback stays only for a harness with no session-aware writer of its own (Codex today;
+  opencode maps skill->pre-skill but still writes the global path unless args.session_id is
+  present) or a manual `touch`. The wrapper that touches it is the honest, satisfiable
   action — see the README. Configure the dir with SKILLS_INVOKED_DIR; the mandatory set with
   MANDATORY_SKILLS (comma-separated, default `delegate-work-to-subagents,visual-proof-cycle`).
 
@@ -444,8 +445,9 @@ def _missing_skills(*, subagent: bool = False, session_seg: str | None = None) -
       path when a real CC session id is available, which it always is on live CC traffic, so
       in practice CC's own writes never land on the global path at all.
     - The global path is still the ONLY marker path any harness/workflow WITHOUT a session-
-      aware producer can write to — e.g. Codex/opencode (no `pre-skill` mapping yet, see
-      `agent-hooks/README.md`'s `pre-skill` section), or the documented manual `touch` recipe
+      aware producer can write to — e.g. Codex (no `pre-skill` mapping yet) or opencode when
+      no `args.session_id` is present (agent-tools#661), see
+      `agent-hooks/README.md`'s `pre-skill` section, or the documented manual `touch` recipe
       in this hook's own README. Making the session-scoped check exclusive would silently
       break that pre-existing, still-relied-on fallback the moment ANY session id rides along
       on the event (Codex's own bridge forwards one on `pre-bash` too) even though nothing

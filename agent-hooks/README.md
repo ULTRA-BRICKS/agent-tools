@@ -127,7 +127,7 @@ These are the *logical* points; map them to your harness's actual tool-use event
 > JavaScript plugin plus Python dispatcher: rig symlinks the plugin into
 > `.opencode/plugins/zz-agent-tools-hook-bridge.js`, and the plugin calls the dispatcher for
 > `tool.execute.before` (`bash` -> `pre-bash`, `edit`/`write`/`apply_patch` -> `pre-write`,
-> `task` -> `pre-agent`) and `tool.execute.after` file edits (`post-write`). It reads
+> `task` -> `pre-agent`, `skill` -> `pre-skill`) and `tool.execute.after` file edits (`post-write`). It reads
 > descriptors from `~/.config/opencode/hooks`; pre-tool exit 10 blocks by throwing an opencode
 > plugin error, while post-write exit 10 is logged as feedback because the write already
 > landed. opencode `stop` is **not** mapped: documented session
@@ -152,7 +152,7 @@ These are the *logical* points; map them to your harness's actual tool-use event
 | `pre-agent` **(live in Claude Code and opencode when rig provisions their bridges; mapped by the omp bridge too; NOT mapped in Codex yet)** | before a subagent dispatch (Agent/Task/opencode or omp task tool) | background-subagent-gate                 |
 | `pre-bash`     | before a shell command runs                  | block-devserver-primary, block-no-verify, block-raw-pr-merge, block-raw-ticket, block-reset-hard, pin-primary-worktree, pkill-guard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format, heavy-op-memory-gate |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, worktree-only-writes |
-| `pre-skill` **(live in Claude Code when rig provisions the bridge; NOT mapped in Codex/opencode yet)** | before a Skill-tool invocation | skills-marker-writer |
+| `pre-skill` **(live in Claude Code when rig provisions the bridge; live in opencode via the native `skill` tool; NOT mapped in Codex yet)** | before a Skill-tool invocation | skills-marker-writer |
 | `pre-monitor` **(live in Claude Code when rig provisions the bridge; Codex/opencode have no Monitor-equivalent tool)** | before a Monitor-tool call | subagent-no-monitor |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
 | `stop`         | when the agent is about to end its turn      | chat-dictionary-gate (priority 10), model-error-fallback (priority 20, advisory-only), stop-completion-selfcheck (priority 50) |
@@ -181,7 +181,8 @@ child — see `lib/opencode_hook_bridge/README.md` "Identity contract".
 
 ### `pre-skill` — record a skill invocation
 
-`pre-skill` fires before a Skill-tool call runs (CC's `PreToolUse` on the `Skill` tool). It
+`pre-skill` fires before a Skill-tool call runs (CC's `PreToolUse` on the `Skill` tool, and
+opencode's native `skill` tool via `lib/opencode_hook_bridge`). It
 exists for exactly one consumer today: `skills-marker-writer`, which touches
 `~/.cache/agent-tools/skills-invoked/<session-id>/<skill-name>` (session-scoped by CC's own
 session id, so one session invoking a skill can't satisfy another concurrent session's gate)

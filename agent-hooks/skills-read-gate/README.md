@@ -26,9 +26,9 @@ precedence as `agent_id` (CC's own top-level value is authoritative; a value rid
 practice, `skills-marker-writer` (CC's own producer) always writes to the session-scoped
 path when a real CC session id is available (i.e. on every live CC invocation), so CC's own
 writes never land on the shared global path anymore. The global-path fallback exists for
-harnesses that have NO session-aware producer of their own — Codex/opencode have no
-`pre-skill` mapping yet (same gap the `pre-agent` point had before it was wired — see
-`agent-hooks/README.md`'s `pre-skill` section for the current per-harness status) — and for
+harnesses that have NO session-aware producer of their own — Codex has no
+`pre-skill` mapping yet; opencode maps `skill` to `pre-skill` (agent-tools#661) but still
+writes the global marker unless `args.session_id` is present — and for
 the manual `touch` recipe further down in this README; without the fallback, either one
 would silently stop working the moment ANY session id happens to ride along on the event
 (Codex's own bridge forwards one on `pre-bash` too, even with no writer behind it). The
@@ -37,9 +37,9 @@ WARN/BLOCK escalation TIER (below) is also session-scoped, with no such fallback
 `pre-skill` point): it fires on every Skill-tool invocation and touches the marker for the
 invoked skill under the same session-id nesting — see
 `agent-hooks/skills-marker-writer/README.md`. In Claude Code this is live once rig registers
-a `Skill` PreToolUse matcher for the bridge (`riglib` `hook_bridge_entries`); Codex/opencode
-are not mapped yet (same gap the `pre-agent` point had before it was wired — see
-`agent-hooks/README.md`'s `pre-skill` section for the current per-harness status).
+a `Skill` PreToolUse matcher for the bridge (`riglib` `hook_bridge_entries`); opencode maps
+its native `skill` tool (agent-tools#661); Codex is not mapped yet — see
+`agent-hooks/README.md`'s `pre-skill` section for the current per-harness status.
 
 This is the honest, satisfiable action: invoking the skill writes its marker, which is what
 the gate checks — it is real wiring, not a forge.
