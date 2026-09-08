@@ -92,6 +92,13 @@ _SKILL_TOOLS = frozenset({"Skill"})
 # read at session start, not live), and the bridge itself enabled at all (see this module's
 # README's Installation section) for the block to actually take effect.
 _MONITOR_TOOLS = frozenset({"Monitor"})
+# CC's Workflow tool (ultracode / dynamic multi-agent scripts). A PreToolUse on it
+# maps to `pre-workflow`, the point workflow-danger-gate uses to inspect the script
+# BEFORE it runs. Workflow is auto-allowed at the harness permissions layer so
+# ultracode is not prompted on every spawn; this point is the script-level backstop
+# for destructive commands. Same two-repo split as pre-skill: the mapping here is
+# inert in a live CC session until rig-cli registers a `Workflow` PreToolUse matcher.
+_WORKFLOW_TOOLS = frozenset({"Workflow"})
 
 
 def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
@@ -109,6 +116,8 @@ def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
             return "pre-skill"
         if tool_name in _MONITOR_TOOLS:
             return "pre-monitor"
+        if tool_name in _WORKFLOW_TOOLS:
+            return "pre-workflow"
     if hook_event_name == "PostToolUse" and tool_name in _WRITE_TOOLS:
         # The write already landed on disk → the REACTIVE point (format-on-write,
         # lint-on-write). A post-write hook's exit-10 is FEEDBACK to the model, not
