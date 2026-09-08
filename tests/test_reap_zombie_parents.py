@@ -77,6 +77,18 @@ def test_empty_args_is_not_leaky():
     assert reaper.is_leaky_helper("") is False
 
 
+def test_helper_phrase_as_someone_elses_argument_is_not_leaky():
+    """Review P2: args= is a flattened display string. A python worker whose
+    last argument happens to be the helper phrase must not be classified as
+    the helper (that would SIGTERM an unrelated process)."""
+    assert reaper.is_leaky_helper(
+        "python worker.py Raycast Helper (Extensions)"
+    ) is False
+    assert reaper.is_leaky_helper(
+        "python worker.py /Applications/Raycast.app/Contents/MacOS/Raycast Helper (Extensions)"
+    ) is False
+
+
 def test_helper_with_old_zombie_is_reaped():
     parent = _proc(49954, 49498, args=HELPER_ARGS)
     kids = [_zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S)]
@@ -195,6 +207,31 @@ def test_sweep_escalates_to_sigkill_if_helper_survives_sigterm(monkeypatch):
         pid_alive=lambda _pid: True,
     )
     assert killed == [(49954, signal.SIGTERM), (49954, signal.SIGKILL)]
+    assert report.killed_pids == [49954]
+
+
+def test_sweep_no_sigkill_when_pid_is_reused_during_grace(monkeypatch):
+    """Review P1: between SIGTERM and SIGKILL the pid can be reused. kill(pid, 0)
+    then succeeds on the unrelated replacement. Re-read argv before SIGKILL."""
+    import signal
+
+    helper = _proc(49954, 49498, args=HELPER_ARGS)
+    procs = [helper, _zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S)]
+    killed = []
+    calls = {"n": 0}
+
+    def fake_reread(pid, run=None):
+        calls["n"] += 1
+        return HELPER_ARGS if calls["n"] == 1 else RAYCAST_APP_ARGS
+
+    monkeypatch.setattr(reaper, "_reread_args", fake_reread)
+    report = reaper.sweep(
+        list_processes=lambda: procs,
+        kill=lambda pid, sig: killed.append((pid, sig)),
+        sleeper=lambda _s: None,
+        pid_alive=lambda _pid: True,
+    )
+    assert killed == [(49954, signal.SIGTERM)]
     assert report.killed_pids == [49954]
 
 

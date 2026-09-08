@@ -39,18 +39,26 @@ _python3_runs() { "$1" -c '' >/dev/null 2>&1; }
 
 if [[ -x /usr/bin/python3 ]] && _python3_runs /usr/bin/python3; then
   PYTHON3=/usr/bin/python3
-else
-  PYTHON3="$(command -v python3 || true)"
-  if [[ -z "$PYTHON3" ]] || ! _python3_runs "$PYTHON3"; then
-    echo "install.sh: no working python3 interpreter" >&2
-    exit 127
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON3="$(command -v python3)"
+  if ! _python3_runs "$PYTHON3"; then
+    echo "install.sh: the only python3 found (${PYTHON3}) does not run (likely the CLT-less macOS stub) -- install real developer tools or a Homebrew python3 and re-run." >&2
+    exit 1
   fi
-  case "$PYTHON3" in
-    "$SCRIPT_DIR"/*|"$SCRIPT_DIR"/../../*)
-      echo "install.sh: refusing worktree-local python3: ${PYTHON3}" >&2
-      exit 1
-      ;;
-  esac
+  REPO_ROOT_FOR_CHECK="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$REPO_ROOT_FOR_CHECK" && "$PYTHON3" == "$REPO_ROOT_FOR_CHECK"/* ]]; then
+    echo "install.sh: the only python3 found (${PYTHON3}) lives inside this checkout/worktree -- it will break once this worktree is removed. Install a system/Homebrew python3 (outside any worktree) and re-run." >&2
+    exit 1
+  fi
+  VIRTUAL_ENV_NO_TRAILING_SLASH="${VIRTUAL_ENV:-}"
+  VIRTUAL_ENV_NO_TRAILING_SLASH="${VIRTUAL_ENV_NO_TRAILING_SLASH%/}"
+  if [[ -n "$VIRTUAL_ENV_NO_TRAILING_SLASH" && "$PYTHON3" == "$VIRTUAL_ENV_NO_TRAILING_SLASH"/* ]]; then
+    echo "install.sh: the only python3 found (${PYTHON3}) is inside the currently active virtualenv (\$VIRTUAL_ENV=${VIRTUAL_ENV:-}) -- it will break once that environment is removed. Deactivate it, install a system/Homebrew python3, and re-run." >&2
+    exit 1
+  fi
+else
+  echo "install.sh: python3 not found (neither /usr/bin/python3 nor on PATH)" >&2
+  exit 1
 fi
 
 SOURCE_SCRIPT_PATH="${SCRIPT_DIR}/reap_zombie_parents.py"
@@ -75,9 +83,10 @@ xml_escape() {
 }
 
 sed_replacement_escape() {
-  local s=$1
-  s=${s//\\/\\\\}
-  s=${s//&/\\&}
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//&/\\&}"
+  s="${s//#/\\#}"  # '#' is this script's sed delimiter (s#...#...#)
   printf '%s' "$s"
 }
 

@@ -48,10 +48,11 @@ from typing import Callable, Optional
 MIN_ZOMBIE_AGE_S = 15 * 60
 STOP_GRACE_S = 2.0
 
-# Token or path-segment boundary, not a raw substring: `--note=Raycast Helper
-# (Extensions)` must not match, while a comm name or
-# `.../MacOS/Raycast Helper (Extensions)` must.
-_HELPER_RE = re.compile(r"(?:^|[\s/])Raycast Helper \(Extensions\)(?:\s|$)")
+# The helper's comm contains spaces, so we cannot split args= on whitespace
+# to get argv[0]. Match ONLY the entire args string: the bare comm, or a
+# single absolute path whose basename is that comm (no extra argv, no
+# `python worker.py …Helper`). Review P2 on #669.
+_HELPER_COMM = "Raycast Helper (Extensions)"
 
 # pid ppid stat etime args. etime is NO-SPACE (`[[dd-]hh:]mm:ss`).
 _PS_ROW = re.compile(r"^(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$")
@@ -118,10 +119,24 @@ class ReapReport:
 
 
 def is_leaky_helper(args: str) -> bool:
-    """True iff argv is the Raycast Extensions helper, not the GUI app."""
+    """True iff argv is the Raycast Extensions helper, not the GUI app.
+
+    The helper comm contains spaces, so ``args=`` cannot be split on
+    whitespace to recover argv[0]. Accept only (a) the bare comm as the
+    entire display string, or (b) a single absolute path whose *entire*
+    remaining string is ``/<comm>`` and whose directory prefix has no
+    spaces — so ``python worker.py …Helper`` cannot match.
+    """
+    args = args.strip()
     if not args:
         return False
-    return _HELPER_RE.search(args) is not None
+    if args == _HELPER_COMM:
+        return True
+    suffix = "/" + _HELPER_COMM
+    if not args.endswith(suffix):
+        return False
+    prefix = args[: -len(_HELPER_COMM)]
+    return prefix.startswith("/") and prefix.endswith("/") and " " not in prefix
 
 
 def should_reap_parent(parent: ProcessInfo, children: list[ProcessInfo]) -> bool:
@@ -236,6 +251,7 @@ def _stop_pid(
     kill: Callable[[int, int], None],
     sleeper: Callable[[float], None],
     pid_alive: Callable[[int], bool],
+    identity_ok: Callable[[int], bool],
 ) -> None:
     try:
         kill(pid, signal.SIGTERM)
@@ -243,6 +259,10 @@ def _stop_pid(
         return
     sleeper(STOP_GRACE_S)
     if not pid_alive(pid):
+        return
+    # PID-reuse during the grace window: kill(pid, 0) succeeds on an
+    # unrelated replacement. Re-validate argv before SIGKILL (review P1 #669).
+    if not identity_ok(pid):
         return
     try:
         kill(pid, signal.SIGKILL)
@@ -284,7 +304,17 @@ def sweep(
         current = _reread_args(parent.pid)
         if current is None or not is_leaky_helper(current):
             continue
-        _stop_pid(parent.pid, kill=kill, sleeper=sleeper, pid_alive=pid_alive)
+        def _identity_ok(pid: int) -> bool:
+            again = _reread_args(pid)
+            return bool(again) and is_leaky_helper(again)
+
+        _stop_pid(
+            parent.pid,
+            kill=kill,
+            sleeper=sleeper,
+            pid_alive=pid_alive,
+            identity_ok=_identity_ok,
+        )
         report.reaped.append(parent)
         report.killed_pids.append(parent.pid)
     return report
