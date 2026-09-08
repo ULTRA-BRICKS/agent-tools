@@ -106,14 +106,15 @@ These are the *logical* points; map them to your harness's actual tool-use event
 > **Claude Code:** CC does NOT run these descriptors directly — it only runs hooks declared
 > in `settings.json`. The `lib/cc_hook_bridge` dispatcher is the carrier that makes them
 > fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`/`pre-agent`/
-> `pre-skill`/`pre-monitor`, PostToolUse for `post-write`, Stop for `stop`) and translates
+> `pre-skill`/`pre-monitor`/`pre-workflow`, PostToolUse for `post-write`, Stop for `stop`) and translates
 > the exit-10 BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. Without
 > that bridge these hooks are inert in CC (agent-tools#18). `pre-monitor` is the newest of
 > these, following the same two-repo staging `pre-agent`/`pre-skill` went through — its
 > rig-cli-side `Monitor` matcher (rig-cli#296) has now shipped, so `pre-monitor` is live once
 > rig has provisioned the bridge (same prerequisites as `pre-agent`/`pre-skill` below: a
 > `claude-code` harness block, `agent_hooks` enabled, `harness.hook_bridge` not opted out)
-> and `rig apply` has run on a given machine.
+> and `rig apply` has run on a given machine. `pre-workflow` is mapped in the bridge; it
+> stays inert in a live CC session until rig-cli registers a `Workflow` PreToolUse matcher.
 
 > **Codex:** Codex also needs a carrier bridge. `lib/codex_hook_bridge` is the first
 > dispatcher for the confirmed Codex hooks contract: TOML hooks call it for `PreToolUse`
@@ -154,6 +155,7 @@ These are the *logical* points; map them to your harness's actual tool-use event
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, worktree-only-writes |
 | `pre-skill` **(live in Claude Code when rig provisions the bridge; NOT mapped in Codex/opencode yet)** | before a Skill-tool invocation | skills-marker-writer |
 | `pre-monitor` **(live in Claude Code when rig provisions the bridge; Codex/opencode have no Monitor-equivalent tool)** | before a Monitor-tool call | subagent-no-monitor |
+| `pre-workflow` **(mapped in cc_hook_bridge; live in Claude Code only after rig-cli registers a `Workflow` PreToolUse matcher — same two-repo split as pre-skill)** | before a Claude Code Workflow script runs | workflow-danger-gate |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
 | `stop`         | when the agent is about to end its turn      | chat-dictionary-gate (priority 10), model-error-fallback (priority 20, advisory-only), stop-completion-selfcheck (priority 50) |
 
@@ -178,6 +180,18 @@ trusted subagent identity, so forged `agent_id` / `agent_type` values inside too
 stripped, and the ONE trusted source is the process env set by the `rig-detached-opencode`
 launcher (`RIG_AGENT_ID` / `RIG_DETACHED_AGENT`), which covers only a rig-launched detached
 child — see `lib/opencode_hook_bridge/README.md` "Identity contract".
+
+### `pre-workflow` — gate a Workflow script
+
+`pre-workflow` fires before Claude Code runs a `Workflow` tool call (ultracode /
+dynamic multi-agent scripts). The harness may auto-allow `Workflow` in
+`permissions.allow` so ultracode is not prompted on every spawn — that allow is
+**not** a blank cheque. `workflow-danger-gate` inspects the script and denies
+destructive commands (`gh pr merge`, `git reset --hard`, force-push, `sudo rm`,
+`--no-verify`, screencapture). JS comments and `agent()` prompt strings that
+merely *mention* those forms stay allowed. Codex and opencode have no Workflow
+tool; this point is Claude Code only. The bridge mapping is inert in a live
+session until rig-cli registers a `Workflow` PreToolUse matcher.
 
 ### `pre-skill` — record a skill invocation
 

@@ -1,0 +1,9 @@
+{
+  "id": "workflow-danger-gate",
+  "point": "pre-workflow",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/workflow-danger-gate/workflow_danger_gate.py",
+  "priority": 10,
+  "timeout_ms": 3000,
+  "on_error": "closed",
+  "description": "Blocks a Claude Code Workflow whose executable JS runs a destructive command (raw gh pr merge, git reset --hard, force-push, git clean -f, sudo rm, --no-verify, screencapture). JS comments and agent() prompt strings that merely mention those forms are allowed so ultracode keeps working and operators can document the allow-vs-gate split. on_error=closed: an unreadable/missing script is denied rather than auto-run. The harness permissions.allow entry for Workflow is the ultracode prompt-skip; this hook is the script-level backstop."
+}
