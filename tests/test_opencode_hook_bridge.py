@@ -1372,3 +1372,35 @@ def test_opencode_bridge_skips_malformed_descriptor_and_runs_valid_hook(tmp_path
     recorded = json.loads(log.read_text(encoding="utf-8"))
     assert recorded["point"] == "pre-bash"
     assert recorded["command"] == "echo recorded"
+
+
+def test_plugin_clean_allow_stderr_suppressed_to_debug_log(tmp_path):
+    """A dispatcher stub that writes stderr but exits 0 with empty stdout is a
+    clean allow: plugin stderr must stay empty and the chatter lands in the
+    debug log instead of toasting every allowed call."""
+    stub = _dispatcher_stub(
+        tmp_path,
+        "import sys\n"
+        "sys.stdin.read()\n"
+        "sys.stderr.write('orchestrator-stays-thin: By design advisory chatter\\n')\n",
+    )
+    debug_log = tmp_path / "logs" / "hook-bridge-debug.log"
+
+    proc = _run_plugin_js(
+        dedent(
+            """
+            const { AgentToolsHookBridge: plugin } = await import(process.env.PLUGIN_URL);
+            const hooks = await plugin({ directory: "/repo", worktree: "/repo" });
+            await hooks["tool.execute.before"]({ tool: "bash", cwd: "/repo" }, { args: { command: "echo ok" } });
+            """
+        ),
+        env={
+            "OPENCODE_HOOK_BRIDGE_PYTHON": str(stub),
+            "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(debug_log),
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
+    assert debug_log.is_file()
+    assert "By design advisory chatter" in debug_log.read_text(encoding="utf-8")

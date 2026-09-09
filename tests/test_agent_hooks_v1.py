@@ -184,3 +184,24 @@ def test_run_hook_non_utf8_exit10_still_blocks(tmp_path):
     assert outcome == "block"
     assert reason == "Blocked by agent-hook 'binary'."
     assert seen == []
+
+
+def test_run_hook_clean_allow_stderr_stays_silent(tmp_path):
+    """Exit-0 allow with advisory stderr chatter (e.g. first-offense WARNs that
+    also emit allow) must stay silent: no warning recorded."""
+    cmd = _script(
+        tmp_path,
+        "import sys\n"
+        "sys.stderr.write('By design advisory chatter\\n')\n"
+        "sys.exit(0)\n",
+    )
+    seen, warn = _warnings()
+
+    outcome, reason = run_hook(
+        {"id": "chatty-allow", "point": "pre-bash", "cmd": str(cmd), "on_error": "open"},
+        {"hook_api": "agents-hooks/v1"},
+        warn=warn,
+    )
+
+    assert (outcome, reason) == ("allow", "")
+    assert seen == []

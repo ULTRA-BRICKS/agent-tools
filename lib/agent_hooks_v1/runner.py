@@ -102,7 +102,10 @@ def run_hook(spec: dict, v1_event: dict, *, warn: Warn) -> tuple[str, str]:
         # fail-open guard instead of masquerading as descriptor failures.
         return _on_error_outcome(spec, hook_id, f"could not run {cmd}: {exc}", warn)
 
-    if proc.stderr:
+    # Clean-allow stderr is advisory chatter (e.g. first-offense WARNs that also
+    # emit allow); warning on it used to toast every allowed call. Real hook
+    # failures (block exit, nonzero exit, timeout, launch failure) still warn.
+    if proc.stderr and proc.returncode != 0:
         warn(f"{hook_id}: {proc.stderr.strip()}")
 
     if proc.returncode == V1_BLOCK_EXIT_CODE:
