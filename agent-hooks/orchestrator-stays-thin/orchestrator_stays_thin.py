@@ -13,7 +13,7 @@ ONE script binds TWO points via two descriptors; it branches on ``event["point"]
                 blocked — a single one-liner (git status, ls, cat, grep, find, a print-only
                 `sed -n`) OR a chain of any
                 length whose every segment is read-only OR an orchestration command (tg, review,
-                git worktree list). ALMOST ALL `gh` is DELEGATED (Alex tg#7103): CI/PR verification
+                task, git worktree list). ALMOST ALL `gh` is DELEGATED (Alex tg#7103): CI/PR verification
                 (`gh pr checks/view`, `gh run`, `gh api`) and every other gh subcommand are a
                 subagent's job, not inline orchestrator work — treated as implementation and
                 warn-then-block, exactly like a commit. The ONE exception, restored narrowly (Alex
@@ -44,6 +44,19 @@ ONE script binds TWO points via two descriptors; it branches on ``event["point"]
                 (agent-tools#370) — the same laundering-resistance a mutation elsewhere on the line
                 still gets (head match only, never a substring/needle; chain-splitting and the
                 substitution-liveness scanner still catch a mutation smuggled alongside it).
+
+                `task` (task-cli, this repo's own ticket-tracking/orchestration CLI: `task new`,
+                `task list`, `task read`, `task find`, `task change`, `task link`, `task check`,
+                `task accept`, `task gate`, `task done`, `task status`, `task classify`, `task
+                session`) is likewise sanctioned for the orchestrator to run inline — ALL
+                subcommands, ALL flags, AT ANY CHAIN LENGTH, the SAME breadth as the `tg` carve-out
+                above (Alex, direct, 2026-09-10: "разреши оркестратору пользоваться task-cli тоже
+                как исключение" — "allow the orchestrator to use task-cli too, as an exception").
+                task-cli is read-tracking/orchestration tooling, not implementation, so it gets the
+                same treatment as `tg`, not `gh ship`'s single-shape carve-out. Granted by its own
+                shlex-based predicate, `_is_task_command`, built the SAME way as `_is_tg_command`
+                (bare `task` head only, `VAR=val` env-prefix skip, no path-qualification, rejects a
+                hyphen-suffixed lookalike like `task-foo`) — see that predicate's own docstring.
 
 TIERED (warn → block): the FIRST offense in the TTL window WARNs (allow + message); a REPEAT
 in the window BLOCKs. The tier is tracked by a marker file keyed by a hash of cwd. This gives
@@ -282,6 +295,18 @@ READ_ONLY_BASH = re.compile(
 # regex. `review\b`/`git worktree list` remain here unchanged; `review\b` has the SAME `\b`-boundary
 # quirk (`review-foo` also matches) — out of scope for this PR, tracked as the surviving half of
 # agent-tools#370.
+#
+# `task` (task-cli) is likewise DELIBERATELY ABSENT from this head-only regex, for the SAME reason
+# `tg` is: a plain `task\b` would also match a hyphen-suffixed lookalike (`task-foo`). Sanctioned
+# for the orchestrator to run inline — ANY subcommand, ANY flags, AT ANY CHAIN LENGTH, the SAME
+# breadth `tg` gets (Alex, direct, 2026-09-10: "разреши оркестратору пользоваться task-cli тоже как
+# исключение" — "allow the orchestrator to use task-cli too, as an exception") — task-cli is this
+# repo's own ticket-tracking/orchestration CLI, not implementation, so it earns the same per-segment
+# treatment as `tg`, not `gh ship`'s narrower per-LINE carve-out. Granted by `_is_task_command`, a
+# shlex-based predicate built identically to `_is_tg_command` (see that predicate's own docstring
+# for the two-review-round rationale this one inherits verbatim: no path-qualification, basename-
+# exact `task` token match, self-contained `VAR=val` env-prefix skip), consulted directly by
+# `_seg_is_allowed` alongside `_is_tg_command`.
 ORCH_ALLOW = re.compile(
     r"^\s*(?:"
     r"review\b"                                           # multi-model review CLI (read-only)
@@ -986,7 +1011,8 @@ def _seg_is_allowed(segment: str) -> bool:
     `git log | rg gh`) stays allowed on its real head, not the needle (the anchor invariant, #5/#80).
     `gh` (ANY subcommand, INCLUDING `ship`) is NOT allowed here — it is delegated (`_is_gh_command`);
     this predicate covers `review`/`git worktree list` (via `ORCH_ALLOW`), `tg` (via its own
-    shlex-based `_is_tg_command`), read-only inspection, and the `cd` companion.
+    shlex-based `_is_tg_command`), `task` (via its own shlex-based `_is_task_command`), read-only
+    inspection, and the `cd` companion.
 
     `gh ship <PR#>` is DELIBERATELY ABSENT from this per-segment allow-list (agent-tools#363,
     reverting a #159/#162 regression): the ship carve-out is granted ONLY by
@@ -1033,6 +1059,7 @@ def _seg_is_allowed(segment: str) -> bool:
         or _dev_segment_is_allowed(segment)
         or CD_HEAD.match(segment)
         or _is_tg_command(segment)
+        or _is_task_command(segment)
     ):
         return True
     return _git_subcommand(segment) in _GIT_READ_SUBS  # `git -C d status`, `/usr/bin/git log`, …
@@ -1287,6 +1314,48 @@ def _is_tg_command(segment: str) -> bool:
     while i < len(toks) and _ASSIGN_RE.match(toks[i]):
         i += 1
     return i < len(toks) and toks[i] == "tg"
+
+
+def _is_task_command(segment: str) -> bool:
+    """True when a segment's COMMAND head is `task` (task-cli, this repo's own ticket-tracking/
+    orchestration CLI) — ANY subcommand, ANY flag combination is sanctioned: `new`/`create`,
+    `list`, `read`, `find`, `change`, `link`, `check`, `accept`, `gate`, `done`, `status`,
+    `classify`, `session`, and everything else task-cli exposes. Authorized explicitly by Alex,
+    direct, 2026-09-10: "разреши оркестратору пользоваться task-cli тоже как исключение" — "allow
+    the orchestrator to use task-cli too, as an exception" — the SAME breadth `_is_tg_command`
+    grants `tg`: task-cli is read-tracking/orchestration tooling the orchestrator legitimately
+    drives itself, not implementation, so it does not narrow by subcommand or argument position
+    the way `gh ship <PR#>` does.
+
+    Built identically to `_is_tg_command` (see that predicate's own docstring for the full
+    two-review-round rationale this one inherits verbatim, not re-litigated here):
+
+    - shlex-based, with a self-contained `VAR=val` env-prefix skip, so a caller that invokes this
+      predicate directly (without `_strip_wrappers` first) still classifies `FOO=x task new 'x'`
+      correctly.
+    - Basename-EXACT token check (`toks[i] == "task"`), NOT a `\b`-boundary regex — a `task-foo`
+      lookalike is a DIFFERENT command and must not be waved through as sanctioned orchestration
+      (the same laundering `tg-foo` guards against, agent-tools#370).
+    - Deliberately NO path-qualification (`/usr/local/bin/task`, `./task`): a relative path is
+      trivial to place anywhere near the working directory, and narrowing to "absolute paths only"
+      narrows nothing real either — the same reasoning `_is_tg_command` documents at length.
+    - On an UNPARSEABLE (unbalanced-quote) segment, shlex raises — return `False` (deny-by-default;
+      a GRANT-direction predicate facing uncertain input must not grant).
+    - Recognized only at a segment HEAD (argv), never as a substring/needle (`cat task.md`,
+      `grep 'task done' log` are NOT this command) — the same anchor invariant every allow-list
+      predicate in this file gets.
+
+    Consulted directly by `_seg_is_allowed`, per-segment, exactly where `_is_tg_command` is — the
+    tg allowance's laundering guards (chain-splitting, the substitution-liveness scanner, the bare
+    `&` split) apply to `task` the same way, unconditionally, since they are not predicate-specific."""
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return False
+    i = 0
+    while i < len(toks) and _ASSIGN_RE.match(toks[i]):
+        i += 1
+    return i < len(toks) and toks[i] == "task"
 
 
 def _seg_is_impl_signal(segment: str) -> bool:
@@ -1644,7 +1713,7 @@ def _is_all_inline_allowed(command: str) -> bool:
     or a chain that is PURELY read-only with zero orchestration heads at all, both satisfy this the
     SAME way. Moving `tg` out of `ORCH_ALLOW` and into its own predicate therefore does not change
     which chains get the any-length exemption — every `_seg_is_allowed` source (`READ_ONLY_BASH`,
-    `ORCH_ALLOW`, `_is_tg_command`, `_dev_segment_is_allowed`, `CD_HEAD`) contributes equally to
+    `ORCH_ALLOW`, `_is_tg_command`, `_is_task_command`, `_dev_segment_is_allowed`, `CD_HEAD`) contributes equally to
     this `all(...)`. `gh ship <PR#>` is deliberately NOT one of those sources any more
     (agent-tools#363) — it is granted only by the separate `_is_unchained_gh_ship` check below,
     which is per-LINE, not per-segment; see that function's own docstring for why.
