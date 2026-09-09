@@ -70,6 +70,10 @@ def _run_dispatch(
 ) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["CODEX_HOOKS_DIR"] = str(hooks_dir)
+    # Hermetic file log: bridge diagnostics must never touch process stderr (TUI
+    # noise), so they go to this file; default it into the test sandbox unless
+    # the caller overrides it explicitly.
+    env.setdefault("HOOKS_DEBUG_LOG", str(Path(hooks_dir).parent / "hooks-debug.log"))
     env["PYTHONPATH"] = str(_LIB) + os.pathsep + env.get("PYTHONPATH", "")
     return subprocess.run(
         [sys.executable, "-m", "codex_hook_bridge", event],
@@ -1089,6 +1093,7 @@ def test_stop_hook_blocks_with_plain_codex_shape(tmp_path):
 def test_top_level_dispatcher_errors_fail_open(tmp_path):
     env = dict(os.environ)
     env["CODEX_HOOKS_DIR"] = str(tmp_path / "hooks")
+    env["HOOKS_DEBUG_LOG"] = str(tmp_path / "hooks-debug.log")
     env["PYTHONPATH"] = str(_LIB) + os.pathsep + env.get("PYTHONPATH", "")
     proc = subprocess.run(
         [sys.executable, "-m", "codex_hook_bridge", "PreToolUse"],
@@ -1101,4 +1106,5 @@ def test_top_level_dispatcher_errors_fail_open(tmp_path):
 
     assert proc.returncode == 0
     assert proc.stdout.strip() == ""
-    assert "failing OPEN" in proc.stderr
+    assert proc.stderr == ""
+    assert "failing OPEN" in (tmp_path / "hooks-debug.log").read_text(encoding="utf-8")
