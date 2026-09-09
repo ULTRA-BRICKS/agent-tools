@@ -339,7 +339,7 @@ def _target_dir(cwd: str, args: dict) -> str:
     for key in ("file_path", "path", "notebook_path"):
         raw = args.get(key)
         if isinstance(raw, str) and raw.strip():
-            target = Path(raw)
+            target = Path(raw).expanduser()
             if not target.is_absolute():
                 target = Path(base) / target
             return _existing_ancestor(target.parent, base)

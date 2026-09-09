@@ -68,6 +68,20 @@ def _decision(out: str) -> str:
     return json.loads(out)["decision"]
 
 
+# ── unit: _target_dir tilde expansion (SYNC with worktree-only-writes, agent-tools#698/#700) ─
+
+def test_target_dir_expands_tilde_before_absolute_check(monkeypatch, tmp_path):
+    """agent-tools#698 / #700: mirrors worktree-only-writes._target_dir (SYNC) — a leading ~
+    is not absolute to pathlib; expanduser() must run before joining onto cwd."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    result = ost._target_dir("/some/other/cwd", {"file_path": "~/notes/a.txt"})
+    assert str(home) in result
+    assert "/some/other/cwd" not in result
+
+
+
 # ── BLOCK (warn first, then block on repeat) ───────────────────────────────────────────
 
 def test_block_code_write_on_repeat(tmp_path, monkeypatch):

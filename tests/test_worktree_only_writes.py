@@ -307,6 +307,34 @@ def test_target_dir_no_usable_path_always_uses_cwd(args):
     assert wow._target_dir("/tmp", args) == "/tmp"
 
 
+def test_target_dir_expands_tilde_before_absolute_check(monkeypatch, tmp_path):
+    """agent-tools#698 / #700: a leading ~ is not absolute to pathlib — expanduser() must run
+    before the is_absolute() join onto cwd."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    result = wow._target_dir("/some/other/cwd", {"file_path": "~/notes/a.txt"})
+    assert str(home) in result
+    assert "/some/other/cwd" not in result
+
+
+def test_tilde_target_outside_repo_allows_even_when_cwd_is_enrolled_main(tmp_path, monkeypatch):
+    """agent-tools#698 / #700: before expanduser(), a literal ~/... target was joined onto the
+    enrolled main-branch cwd and BLOCKed. After the fix, the write resolves outside any git
+    checkout and is ALLOWed even when cwd sits on an enrolled default branch."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    repo = _make_repo(tmp_path, branch="main")
+    out, code = _run(
+        repo,
+        monkeypatch,
+        {"RIG_WORKTREE_ONLY": "1"},
+        target=Path("~/notes/a.txt"),
+    )
+    assert code == 0 and _decision(out) == "allow"
+
+
 def test_no_path_key_blocks_on_enrolled_main_cwd(tmp_path, monkeypatch):
     """An event whose args carry NONE of file_path/path/notebook_path, on an enrolled
     default-branch cwd, still BLOCKs — the deliberate `cwd` fallback (agent-tools#615), not
