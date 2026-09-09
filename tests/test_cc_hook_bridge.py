@@ -97,6 +97,10 @@ def _run_dispatch(event: str, cc_event: dict, *, home: Path) -> subprocess.Compl
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith("RIG_HATCH_REQUEST_")}
     env["HOME"] = str(home)
+    # Hermetic file log: bridge diagnostics must never touch process stderr (TUI
+    # noise), so they go to this file; default it into the test sandbox unless
+    # the caller overrides it explicitly.
+    env.setdefault("HOOKS_DEBUG_LOG", str(home / "hooks-debug.log"))
     env["PYTHONPATH"] = str(_LIB) + os.pathsep + env.get("PYTHONPATH", "")
     return subprocess.run(
         [sys.executable, "-m", "cc_hook_bridge", event],
