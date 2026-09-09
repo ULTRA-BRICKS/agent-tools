@@ -425,18 +425,26 @@ _OMP_SESSION_DIR = re.compile(
 )
 
 
-def _is_omp_nested_session(event: dict) -> bool:
-    """True when this is an omp event AND PI_SESSION_FILE is a Task/eval child transcript.
+def _is_omp_nested_session() -> bool:
+    """True when PI_SESSION_FILE is an omp Task/eval child transcript.
 
     Main:  .../<session-id>.jsonl
     Child: .../<session-id>/<agent-id>.jsonl
 
-    Restricted to ``event["harness"] == "omp"`` (bridge-set, unforgeable) so a leftover
-    ``PI_SESSION_FILE`` in a Claude Code / Codex process cannot self-exempt. omp sets
-    the var on the process; a running orchestrator cannot retroactively mutate it.
-    Path shape only — no filesystem probe, so tests stay hermetic."""
-    if str(event.get("harness") or "").strip() != "omp":
-        return False
+    NOT restricted to ``event["harness"] == "omp"`` (agent-tools#676): omp sets this var on
+    every Task/eval child's process regardless of which model harness backs that omp
+    session. When the backing harness is Claude Code (`rig.yaml` default `harness.kind:
+    claude-code`), the nested child's own tool calls fire through `cc_hook_bridge`, which
+    stamps `event["harness"] == "claude-code"` (it identifies the HOOK TRANSPORT, not
+    whether omp is orchestrating) — so gating this tier on harness=="omp" made the tier
+    unreachable for exactly that default configuration, misclassifying every nested
+    Claude-Code-backed omp subagent as the orchestrator (live incident: CommitReconcile /
+    ThinNotSub, agent-tools#676). `no_long_inline_process._is_omp_nested_session` (the
+    sibling hook with the identical trust tier) never had this restriction; this brings the
+    two back into lockstep. omp sets PI_SESSION_FILE on the process; a running orchestrator
+    cannot retroactively mutate its own process environment (same trust model as
+    RIG_AGENT_ID — cooperative-orchestrator threat model, on_error=open). Path shape only —
+    no filesystem probe, so tests stay hermetic."""
     raw = os.environ.get("PI_SESSION_FILE", "").strip()
     if not raw:
         return False
@@ -468,7 +476,7 @@ def _is_subagent(event: dict) -> bool:
         return True
     if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
         return True
-    return _is_omp_nested_session(event)
+    return _is_omp_nested_session()
 
 
 def _marker(event: dict) -> Path:
