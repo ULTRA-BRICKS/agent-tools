@@ -2029,6 +2029,103 @@ def test_cidown_local_gate_passes_merges(repo_with_pr_worktree, tmp_path):
     assert "merged #1" in r.stdout, r.stdout
 
 
+# Fake gh proving the REAL (non-escape-hatch) billing-block annotation detection path:
+# no SHIP_TEST_CI_DOWN here — statusCheckRollup shows two real FAILED checks, and `gh api`
+# answers the two calls _ci_billing_block_annotation_detected actually makes (list check-runs
+# for the head SHA, then fetch annotations for each failed one) with GitHub's own fixed
+# billing-block message. Confirmed live 2026-09-09 (sme-archiving-gc PR #401): the run-level
+# timing heuristic missed this shape (run queued 2m33s before rejecting a job that itself ran
+# for 2s), so this fixture deliberately leaves the actions/runs endpoint on the generic
+# `api) echo 0` fallback (making _ci_runs_timing_suspicious report "0" via its own JSON-parse
+# failure path) — only the annotation signal must carry detection here.
+_FAKE_GH_BILLING_BLOCK = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
+        elif printf '%s ' "$@" | grep -q headRefOid; then
+          echo "deadbeef0000000000000000000000000000cafe"
+        elif printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          printf '[{"name":"pytest","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"codeql","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"}]'
+        elif printf '%s ' "$@" | grep -q reviewThreads; then
+          echo "0"
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then
+          printf 'src/a.py'
+        elif [ -n "${SHIP_TEST_DIFF_FILE:-}" ]; then
+          [ -r "$SHIP_TEST_DIFF_FILE" ] || { echo "fake gh: SHIP_TEST_DIFF_FILE not readable: $SHIP_TEST_DIFF_FILE" >&2; exit 1; }
+          cat < "$SHIP_TEST_DIFF_FILE"
+        else
+          printf '%s\\n' "${SHIP_TEST_DIFF:-+new line without markers}"
+        fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api)
+    if printf '%s ' "$@" | grep -q 'check-runs?per_page'; then
+      printf '{"check_runs":[{"id":111,"conclusion":"failure"},{"id":222,"conclusion":"failure"}]}'
+    elif printf '%s ' "$@" | grep -q annotations; then
+      printf '[{"message":"The job was not started because recent account payments have failed or your spending limit needs to be increased."}]'
+    else
+      echo 0
+    fi ;;
+  *) : ;;
+esac
+"""
+
+
+def _fake_gh_billing_block_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "binbb"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_BILLING_BLOCK, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def test_billing_block_annotation_detected_without_escape_hatch(repo_with_pr_worktree, tmp_path):
+    """Real (non-SHIP_TEST_CI_DOWN) path: two checks FAILED, run-level timing is NOT
+    suspicious (actions/runs falls through the fake's generic fallback), but the check-run
+    annotations carry GitHub's fixed billing-block message. _ci_billing_block_annotation_detected
+    must catch this and let ci_appears_structurally_down fall through to the local gate, same as
+    the timing/status signals do. SHIP_CI_STATUS_URL points at a closed local port so the
+    real network-touching status probe fails fast and deterministically instead of depending on
+    sandbox DNS/network behavior."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_billing_block_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_LOCAL_TEST_CMD": "true",  # trivially-passing stand-in for the test suite
+        "SHIP_REVIEW_DWELL": "0",  # disable dwell gate: fake PR has no review timestamps
+        "SHIP_CI_STATUS_URL": "http://127.0.0.1:1/unreachable",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed once the billing-block annotation signal fires\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    # Proves the annotation signal specifically fired, not the timing/status ones.
+    assert "billing_block=1" in r.stderr, r.stderr
+    assert "timing_suspicious=0" in r.stderr, r.stderr
+    assert "CI infrastructure appears structurally unavailable" in r.stderr, r.stderr
+    assert "ALL gates passed" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
 def _add_workflow(main: Path, on_value: str, *, name: str = "ci.yml", body: str | None = None,
                   commit: bool = True, push: bool = True) -> None:
     """Write .github/workflows/<name>. By default a one-trigger file `on: <on_value>`; pass
