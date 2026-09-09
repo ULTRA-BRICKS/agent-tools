@@ -183,4 +183,110 @@ def test_run_hook_non_utf8_exit10_still_blocks(tmp_path):
 
     assert outcome == "block"
     assert reason == "Blocked by agent-hook 'binary'."
+
+
+# ── "grant" outcome (rig-cli#418) ─────────────────────────────────────────────────────────────
+
+def test_run_hook_exit0_with_grant_decision_returns_grant_and_message(tmp_path):
+    cmd = _script(
+        tmp_path,
+        "import json, sys\n"
+        "print(json.dumps({'decision': 'grant', 'message': 'pre-approved for test'}))\n"
+        "sys.exit(0)\n",
+    )
+    seen, warn = _warnings()
+
+    outcome, reason = run_hook(
+        {"id": "granter", "point": "pre-worktree-enter", "cmd": str(cmd), "on_error": "open"},
+        {"hook_api": "agents-hooks/v1"},
+        warn=warn,
+    )
+
+    assert outcome == "grant"
+    assert reason == "pre-approved for test"
+    assert seen == []
+
+
+def test_run_hook_exit0_grant_with_no_message_returns_empty_reason(tmp_path):
+    cmd = _script(
+        tmp_path,
+        "import json, sys\n"
+        "print(json.dumps({'decision': 'grant'}))\n"
+        "sys.exit(0)\n",
+    )
+    seen, warn = _warnings()
+
+    outcome, reason = run_hook(
+        {"id": "granter", "point": "pre-worktree-enter", "cmd": str(cmd), "on_error": "open"},
+        {"hook_api": "agents-hooks/v1"},
+        warn=warn,
+    )
+
+    assert (outcome, reason) == ("grant", "")
+
+
+def test_run_hook_exit0_plain_allow_decision_stays_allow(tmp_path):
+    # an EXISTING hook's shape (emits `{"decision": "allow", "message": "..."}` on its allow
+    # path, e.g. block-raw-worktree-add's hatch-approved case) must be byte-for-byte unaffected
+    # by the new grant parsing — still a plain "allow", never promoted to "grant".
+    cmd = _script(
+        tmp_path,
+        "import json, sys\n"
+        "print(json.dumps({'decision': 'allow', 'message': 'approved via hatch'}))\n"
+        "sys.exit(0)\n",
+    )
+    seen, warn = _warnings()
+
+    outcome, reason = run_hook(
+        {"id": "existing", "point": "pre-bash", "cmd": str(cmd), "on_error": "open"},
+        {"hook_api": "agents-hooks/v1"},
+        warn=warn,
+    )
+
+    assert (outcome, reason) == ("allow", "")
+
+
+def test_run_hook_exit0_empty_stdout_stays_allow(tmp_path):
+    cmd = _script(tmp_path, "import sys\nsys.exit(0)\n")
+    seen, warn = _warnings()
+
+    outcome, reason = run_hook(
+        {"id": "silent", "point": "pre-bash", "cmd": str(cmd), "on_error": "open"},
+        {"hook_api": "agents-hooks/v1"},
+        warn=warn,
+    )
+
+    assert (outcome, reason) == ("allow", "")
+
+
+def test_run_hook_exit0_malformed_json_stays_allow(tmp_path):
+    cmd = _script(tmp_path, "import sys\nsys.stdout.write('not json')\nsys.exit(0)\n")
+    seen, warn = _warnings()
+
+    outcome, reason = run_hook(
+        {"id": "malformed", "point": "pre-bash", "cmd": str(cmd), "on_error": "open"},
+        {"hook_api": "agents-hooks/v1"},
+        warn=warn,
+    )
+
+    assert (outcome, reason) == ("allow", "")
+
+
+def test_run_hook_exit0_unrecognized_decision_value_stays_allow(tmp_path):
+    # a typo'd/forward-incompatible decision value must degrade to plain allow, never escalate.
+    cmd = _script(
+        tmp_path,
+        "import json, sys\n"
+        "print(json.dumps({'decision': 'grnat'}))\n"
+        "sys.exit(0)\n",
+    )
+    seen, warn = _warnings()
+
+    outcome, reason = run_hook(
+        {"id": "typo", "point": "pre-bash", "cmd": str(cmd), "on_error": "open"},
+        {"hook_api": "agents-hooks/v1"},
+        warn=warn,
+    )
+
+    assert (outcome, reason) == ("allow", "")
     assert seen == []

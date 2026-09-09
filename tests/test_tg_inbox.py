@@ -503,7 +503,11 @@ def test_dispatch_runs_the_stop_hooks_before_consuming_the_inbox(cfg, monkeypatc
     def exploding_hooks(hook_event_name, ev):
         raise RuntimeError("hook discovery crashed")
 
-    monkeypatch.setattr(module, "_first_hook_block", exploding_hooks)
+    # cc_hook_bridge's hook-evaluation entry point was renamed to `_evaluate_point` (agent-tools,
+    # rig-cli#418) when it grew a second verdict ("grant", alongside "block") to aggregate; codex
+    # has no grant concept and still calls it `_first_hook_block`.
+    attr = "_evaluate_point" if module is cc_dispatch else "_first_hook_block"
+    monkeypatch.setattr(module, attr, exploding_hooks)
     with pytest.raises(RuntimeError):
         module.dispatch(dispatch_event, event)
     assert (d / "pending.jsonl").exists()

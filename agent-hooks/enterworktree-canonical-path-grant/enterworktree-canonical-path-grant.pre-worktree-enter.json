@@ -1,0 +1,9 @@
+{
+  "id": "enterworktree-canonical-path-grant",
+  "point": "pre-worktree-enter",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/enterworktree-canonical-path-grant/enterworktree_canonical_path_grant.py",
+  "priority": 40,
+  "timeout_ms": 5000,
+  "on_error": "open",
+  "description": "GRANTs (pre-approves, suppressing Claude Code's own interactive permission prompt) an EnterWorktree(path=...) call whose target resolves under this repo's rig-sanctioned <repo-root>/.worktrees/<name> location -- the ONLY sanctioned worktree location per rig-cli's own AGENTS.md. Fixes rig-cli#418: nothing in rig's permission provisioning ever granted EnterWorktree, so every entry into even the canonical location triggered an avoidable interactive prompt, stalling autonomous/background sessions with nobody around to answer it. Deliberately NOT a blanket EnterWorktree grant (that would reopen the same worktree-location-bypass hole block-raw-worktree-add/agent-tools#608 closes for the raw `git worktree add` Bash path) -- a target outside .worktrees/ gets no opinion from this hook (plain allow) and CC's prompt still fires unchanged. Reuses (SYNC-copied, not imported) the same repo_root/_target_is_sanctioned canonical-path primitives block-raw-worktree-add already uses. Never blocks anything; on_error=open (a crash here just means the canonical case goes back to prompting, never a new restriction). Separate concern from enterworktree-foreign-guard (also on pre-worktree-enter): that hook BLOCKS entering a DIFFERENT agent's .claude/worktrees/agent-<id> worktree; this hook only ever GRANTS for the rig .worktrees/ location -- a block from either wins outright over this hook's grant (cc_hook_bridge's aggregation). Registration note: firing requires a rig-cli EnterWorktree PreToolUse matcher (shipped, rig-cli#298) and a cc_hook_bridge build that understands the agents-hooks/v1 'grant' verdict (agent-tools, this same change) -- inert on an older bridge until both are current."
+}

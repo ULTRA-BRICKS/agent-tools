@@ -11,6 +11,24 @@ Confirmed CC contract (https://code.claude.com/docs/en/hooks, CC 2.1.177):
                        "permissionDecision": "deny", "permissionDecisionReason": "..."}}
                        (we use the STRUCTURED JSON form, not exit 2, because it carries a
                        rich reason; exit 2 also blocks but discards any JSON.)
+  - PreToolUse grant : exit 0 + {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                       "permissionDecision": "allow", "permissionDecisionReason": "..."}}
+                       — documented alongside "deny"/"ask"/"defer" (code.claude.com/docs/en/
+                       hooks); UNLIKE plain exit-0-with-no-output (which defers to CC's normal
+                       permission flow — the classifier/interactive prompt still runs), an
+                       explicit "allow" is meant to suppress that prompt outright (a hook
+                       affirmatively vetted the call, not merely "no objection"). KNOWN
+                       UPSTREAM RISK, not assumed fixed: anthropics/claude-code#52822 reports
+                       versions where this did not suppress the prompt in interactive mode —
+                       our translation is written to the documented contract; if a live CC
+                       build still prompts despite a "allow" verdict, that is an upstream bug
+                       to verify/track, not a bridge bug. Produced only for the agents-hooks/v1
+                       "grant" outcome (see :func:`cc_grant_output`) — no shipped hook emits it
+                       yet except ``enterworktree-canonical-path-grant`` (rig-cli#418); a plain
+                       v1 "allow" (the default) still emits nothing, unchanged from before.
+                       A hook's "allow" cannot override a user's own settings ``deny`` rule —
+                       same as CC's own docs state; this is a prompt-suppression, not a
+                       privilege escalation.
   - PostToolUse      : the tool already ran — cannot block; feedback via
                        {"decision": "block", "reason": "..."} (surfaces the reason to the
                        model, not un-running the tool). Maps to the `post-write` point for
@@ -26,7 +44,9 @@ Confirmed CC contract (https://code.claude.com/docs/en/hooks, CC 2.1.177):
 agents-hooks/v1 (agent-hooks/README.md):
   - descriptor : {id, point, cmd (ABSOLUTE), args[], priority, timeout_ms, on_error}
   - hook stdin : {hook_api, event_id, tool, point, command, cwd, args{}}
-  - hook exit  : 0 allow · 10 BLOCK (canonical, even if stdout malformed) · other → on_error
+  - hook exit  : 0 allow (optionally GRANT via stdout {"decision":"grant",...}, see
+                 agent_hooks_v1.runner._allow_outcome) · 10 BLOCK (canonical, even if stdout
+                 malformed) · other → on_error
 """
 
 from __future__ import annotations
@@ -99,6 +119,20 @@ _MONITOR_TOOLS = frozenset({"Monitor"})
 # for destructive commands. Same two-repo split as pre-skill: the mapping here is
 # inert in a live CC session until rig-cli registers a `Workflow` PreToolUse matcher.
 _WORKFLOW_TOOLS = frozenset({"Workflow"})
+# CC's EnterWorktree tool (switches the session into a new or existing git worktree). A
+# PreToolUse on it maps to `pre-worktree-enter`. Two independent hooks target this point for
+# two DIFFERENT concerns: `enterworktree-foreign-guard` BLOCKS entering a worktree a different
+# dispatched agent owns (`.claude/worktrees/agent-<id>` ownership check); rig-cli#418's
+# `enterworktree-canonical-path-grant` GRANTS (suppresses CC's own interactive permission
+# prompt) when the target resolves under the repo's rig-sanctioned `<repo>/.worktrees/<name>`
+# — the same canonical-location policy `block-raw-worktree-add` enforces for the raw
+# `git worktree add`/`remove`/`move` Bash-tool path (agent-tools#608). Neither hook's
+# verdict needs to know about the other: a block from either wins outright (see
+# `dispatch()`'s aggregation), and a grant only ever softens CC's own prompt, never a hook's
+# block. Same two-repo split as `_AGENT_TOOLS`/`_SKILL_TOOLS`/`_MONITOR_TOOLS` above: this
+# half only maps the point, rig-cli's `hook_bridge_entries` must register an `EnterWorktree`
+# PreToolUse matcher for it to actually fire (rig-cli#298, shipped).
+_WORKTREE_ENTER_TOOLS = frozenset({"EnterWorktree"})
 
 
 def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
@@ -118,6 +152,8 @@ def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
             return "pre-monitor"
         if tool_name in _WORKFLOW_TOOLS:
             return "pre-workflow"
+        if tool_name in _WORKTREE_ENTER_TOOLS:
+            return "pre-worktree-enter"
     if hook_event_name == "PostToolUse" and tool_name in _WRITE_TOOLS:
         # The write already landed on disk → the REACTIVE point (format-on-write,
         # lint-on-write). A post-write hook's exit-10 is FEEDBACK to the model, not
@@ -274,6 +310,26 @@ def cc_block_output(hook_event_name: str, reason: str) -> dict:
     }
 
 
+def cc_grant_output(hook_event_name: str, reason: str) -> dict | None:
+    """The CC JSON that PRE-APPROVES a PreToolUse call, suppressing its interactive prompt.
+
+    Only PreToolUse has a documented ``permissionDecision`` shape at all (see the module
+    docstring's "PreToolUse grant" note) — Stop/PostToolUse have no "pre-approve" concept (the
+    tool already ran, or there is no tool call to approve), so a v1 "grant" verdict on those
+    events has nothing to translate into and is a no-op here (``None`` — the caller falls back
+    to its normal allow/None handling, identical to a plain v1 "allow").
+    """
+    if hook_event_name != "PreToolUse":
+        return None
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": hook_event_name,
+            "permissionDecision": "allow",
+            "permissionDecisionReason": reason or "granted by an installed agent-hook",
+        }
+    }
+
+
 def hooks_dir() -> Path:
     """Where CC-installed v1 descriptors live (overridable for tests)."""
     override = os.environ.get("CC_HOOKS_DIR")
@@ -325,21 +381,39 @@ def _combine_block(hook_event_name: str, inbox_text: str, hook_reason: str | Non
 
 
 def dispatch(hook_event_name: str, cc_event: dict) -> dict | None:
-    """Run the applicable v1 hooks for this CC event; return the CC block JSON or None.
+    """Run the applicable v1 hooks for this CC event; return the CC JSON to emit, or None.
 
-    None = no hook blocked → emit nothing (the tool proceeds through CC's normal flow).
-    First block wins; its reason is surfaced to the model. Errors here are caught by the
-    caller and turned into a fail-OPEN allow. On Stop, pending tg-ctl inbox messages are
-    delivered in the same block (see `_inbox_text` / `_combine_block`) — consumed LAST,
-    after the hooks ran: consuming is irreversible, and a hook that raises would
-    otherwise have eaten a message the agent never saw.
+    None = nothing to say → emit nothing (the tool proceeds through CC's normal permission
+    flow — its own classifier/interactive prompt still runs, exactly as if no hook were
+    installed). A BLOCK from any hook wins outright, regardless of another hook's grant or
+    priority order (see `_evaluate_point`); its reason is surfaced to the model. Absent a
+    block, a GRANT from any hook (agents-hooks/v1's affirmative pre-approval verdict —
+    see the module docstring's "PreToolUse grant" note) is translated into CC's own
+    ``permissionDecision: "allow"`` to suppress the interactive prompt. Errors here are
+    caught by the caller and turned into a fail-OPEN allow (same as today: no hook installed
+    at all, no worse). On Stop, pending tg-ctl inbox messages are delivered alongside a
+    block (see `_inbox_text` / `_combine_block`) — consumed LAST, after the hooks ran:
+    consuming is irreversible, and a hook that raises would otherwise have eaten a message
+    the agent never saw. A grant is never combined with the inbox text — grants only ever
+    arise on PreToolUse (no v1 point on `Stop` emits one today), where there is no inbox to
+    combine with in the first place.
     """
-    hook_reason = _first_hook_block(hook_event_name, cc_event)
-    return _combine_block(hook_event_name, _inbox_text(hook_event_name, cc_event), hook_reason)
+    result = _evaluate_point(hook_event_name, cc_event)
+    if result is not None:
+        verdict, reason = result
+        if verdict == "block":
+            return _combine_block(hook_event_name, _inbox_text(hook_event_name, cc_event), reason)
+        grant_output = cc_grant_output(hook_event_name, reason)
+        if grant_output is not None:
+            return grant_output
+        # a grant on an event with no pre-approve shape (Stop/PostToolUse) — nothing to
+        # translate it into; fall through to the ordinary allow/None handling below.
+    return _combine_block(hook_event_name, _inbox_text(hook_event_name, cc_event), None)
 
 
-def _first_hook_block(hook_event_name: str, cc_event: dict) -> str | None:
-    """The reason of the FIRST blocking v1 hook for this event, or None.
+def _evaluate_point(hook_event_name: str, cc_event: dict) -> tuple[str, str] | None:
+    """The aggregate v1 verdict for this event's point: ``("block", reason)``,
+    ``("grant", reason)``, or ``None`` (no hook had an opinion — ordinary allow).
 
     Runs EVERY descriptor for this point to completion, even after one already
     blocked: a hatch-using hook records its `RIG_HATCH_REQUEST_*` attempt to
@@ -348,7 +422,12 @@ def _first_hook_block(hook_event_name: str, cc_event: dict) -> str | None:
     the first block would silently skip that audit line for every hatch var set
     on a LATER descriptor in the same invocation (agent-tools#713) — the CC-
     visible decision is unaffected, since only the first block's reason is
-    ever returned."""
+    ever returned.
+
+    A BLOCK from ANY hook wins, unconditionally — even one that runs AFTER a grant
+    already seen, and regardless of priority. Absent any block, the FIRST grant seen
+    wins (grants are not expected to disagree with each other).
+    """
     tool_name = cc_event.get("tool_name")
     point = point_for_event(hook_event_name, tool_name)
     if point is None:
@@ -362,11 +441,18 @@ def _first_hook_block(hook_event_name: str, cc_event: dict) -> str | None:
         return None
     v1_event = to_v1_event(cc_event, point=point)
     first_block_reason: str | None = None
+    grant_reason: str | None = None
     for spec in specs:
         outcome, reason = run_hook(spec, v1_event, warn=_warn)
         if outcome == "block" and first_block_reason is None:
             first_block_reason = reason
-    return first_block_reason
+        if outcome == "grant" and grant_reason is None:
+            grant_reason = reason
+    if first_block_reason is not None:
+        return "block", first_block_reason
+    if grant_reason is not None:
+        return "grant", grant_reason
+    return None
 
 
 def _load_runner():
