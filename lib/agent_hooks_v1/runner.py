@@ -24,6 +24,30 @@ _DEFAULT_PRIORITY = 50  # the agents-hooks/v1 default (agent-hooks/README.md)
 Warn = Callable[[str], None]
 
 
+def _debug_log_path() -> Path:
+    """File log for swallowed hook stderr, overridable for tests."""
+    override = os.environ.get("HOOKS_DEBUG_LOG")
+    if override:
+        return Path(override)
+    return Path(os.path.expanduser("~/.cache/agent-tools/hooks-debug.log"))
+
+
+def _log_hook_chatter(hook_id: str, text: str) -> None:
+    """Hook stderr never reaches the terminal: every harness (opencode, CC,
+    Codex, OMP) surfaces dispatcher stderr as TUI noise. Decisions travel via
+    stdout JSON + exit codes; raw chatter lands here only."""
+    try:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return
+        path = _debug_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{hook_id}: {cleaned}\n")
+    except OSError:
+        pass
+
+
 def load_descriptors(point: str, descriptor_dir: Path, *, warn: Warn) -> list[dict]:
     """Read every descriptor for ``point``, sorted by priority then id.
 
@@ -102,8 +126,15 @@ def run_hook(spec: dict, v1_event: dict, *, warn: Warn) -> tuple[str, str]:
         # fail-open guard instead of masquerading as descriptor failures.
         return _on_error_outcome(spec, hook_id, f"could not run {cmd}: {exc}", warn)
 
+    # Hook stderr is intentionally swallowed here, never forwarded via warn():
+    # unstructured hook chatter (first-offense WARNs, duplicated block text)
+    # used to toast every call in harnesses that surface stderr. The v1 contract
+    # delivers decisions and reasons via stdout JSON + exit codes (exit 10 carries
+    # the human reason); genuine hook-runtime failures below still warn through
+    # the bridge-provided callback, and each bridge routes that callback itself
+    # (file log only, never process stderr).
     if proc.stderr:
-        warn(f"{hook_id}: {proc.stderr.strip()}")
+        _log_hook_chatter(hook_id, proc.stderr)
 
     if proc.returncode == V1_BLOCK_EXIT_CODE:
         return "block", _block_reason(proc.stdout, hook_id)

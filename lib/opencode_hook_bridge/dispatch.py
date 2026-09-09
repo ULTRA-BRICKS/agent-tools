@@ -498,5 +498,22 @@ def _patch_move_target(patch: str) -> str:
     return ""
 
 
+def _debug_log_path() -> Path:
+    """File log for bridge diagnostics, overridable for tests."""
+    override = os.environ.get("HOOKS_DEBUG_LOG") or os.environ.get("OPENCODE_HOOK_BRIDGE_DEBUG_LOG")
+    if override:
+        return Path(override)
+    return Path(os.path.expanduser("~/.cache/agent-tools/hook-bridge-debug.log"))
+
+
 def _warn(msg: str) -> None:
-    sys.stderr.write(f"opencode-hook-bridge: {msg}\n")
+    """File-only diagnostics: opencode surfaces dispatcher stderr as TUI toasts,
+    so the bridge must never write there. The agent receives decisions via stdout
+    JSON; everything else lands in the debug file log."""
+    try:
+        path = _debug_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"opencode-hook-bridge: {msg}\n")
+    except OSError:
+        pass

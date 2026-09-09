@@ -282,9 +282,25 @@ def hooks_dir() -> Path:
     return Path(os.path.expanduser("~/.claude/hooks"))
 
 
+def _debug_log_path() -> Path:
+    """File log for bridge diagnostics, overridable for tests."""
+    override = os.environ.get("HOOKS_DEBUG_LOG") or os.environ.get("CC_HOOK_BRIDGE_DEBUG_LOG")
+    if override:
+        return Path(override)
+    return Path(os.path.expanduser("~/.cache/agent-tools/hooks-debug.log"))
+
+
 def _warn(msg: str) -> None:
-    """Human log to stderr — CC shows the first stderr line as a hook notice; never parsed."""
-    sys.stderr.write(f"cc-hook-bridge: {msg}\n")
+    """File-only diagnostics: every harness surfaces dispatcher stderr as TUI
+    noise, so the bridge must never write there. The agent receives decisions
+    via stdout JSON; everything else lands in the debug file log."""
+    try:
+        path = _debug_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"cc-hook-bridge: {msg}\n")
+    except OSError:
+        pass
 
 
 def _inbox_text(hook_event_name: str, cc_event: dict) -> str:
@@ -293,7 +309,7 @@ def _inbox_text(hook_event_name: str, cc_event: dict) -> str:
     reason text, so CC feeds them to the agent as its next instruction — the tmux-free
     delivery channel for a session tg-ctl cannot reach with send-keys. "" when there is
     nothing: empty / missing / malformed inbox, the reader lib absent, or any failure
-    locating the agent (never blocks on its own; one stderr line).
+    locating the agent (never blocks on its own; one file-log line).
     """
     if hook_event_name != "Stop":
         return ""
@@ -372,7 +388,7 @@ def main(argv: list[str]) -> int:
     """CLI entry: ``cc_hook_bridge <EventName>``. Always exit 0 (block is via JSON stdout).
 
     Fail-OPEN is the top-level contract: ANY unexpected error in the dispatcher itself is
-    swallowed (logged to stderr) and the call is allowed, so a broken bridge can never wedge
+    swallowed (logged to the file log) and the call is allowed, so a broken bridge can never wedge
     every tool call. A hook that DELIBERATELY blocks still blocks — that path returns the CC
     block JSON above and never raises.
     """

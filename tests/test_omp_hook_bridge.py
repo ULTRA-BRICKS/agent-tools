@@ -64,6 +64,10 @@ def _install_descriptor(
 def _run_dispatch(event_name: str, omp_event: dict, *, hooks_dir: Path) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["OMP_HOOKS_DIR"] = str(hooks_dir)
+    # Hermetic file log: bridge diagnostics must never touch process stderr (TUI
+    # noise), so they go to this file; default it into the test sandbox unless
+    # the caller overrides it explicitly.
+    env.setdefault("HOOKS_DEBUG_LOG", str(Path(hooks_dir).parent / "hooks-debug.log"))
     env["PYTHONPATH"] = str(_LIB) + os.pathsep + env.get("PYTHONPATH", "")
     return subprocess.run(
         [sys.executable, "-m", "omp_hook_bridge", event_name],
@@ -1309,8 +1313,18 @@ def _run_bun_driver(tmp_path: Path, source: str, env_overrides: dict[str, str]) 
     env = dict(os.environ)
     env["EXTENSION_PATH"] = str(_EXTENSION_TS)
     env["STUB_READY"] = str(tmp_path / "stub.ready")
+    # Hermetic file log: extension diagnostics must never touch process stderr
+    # (TUI noise), so they go to this file; default it into the test sandbox
+    # unless the caller overrides it explicitly.
+    env.setdefault("HOOKS_DEBUG_LOG", str(tmp_path / "extension-debug.log"))
     env.update(env_overrides)
     return subprocess.run(["bun", "run", str(driver)], capture_output=True, text=True, env=env, timeout=60)
+
+
+def _debug_log_text(tmp_path: Path, name: str = "extension-debug.log") -> str:
+    """Extension file-log content for the hermetic default path in `_run_bun_driver`."""
+    log = tmp_path / name
+    return log.read_text(encoding="utf-8") if log.is_file() else ""
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
@@ -1376,9 +1390,11 @@ def test_extension_ts_async_path_fails_open_when_the_dispatcher_crashes(tmp_path
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out == {"threw": None, "result": None}
-    # The dispatcher's own stderr still reaches the user — tagged per line with the event and the
-    # tool-call id, so two overlapping dispatches stay attributable.
-    assert "omp-hook-bridge[tool_call c1] boom" in proc.stderr.splitlines(), proc.stderr
+    # The dispatcher's own stderr never reaches the terminal — it is captured to
+    # the file log, tagged per line with the event and the tool-call id, so two
+    # overlapping dispatches stay attributable.
+    assert proc.stderr == ""
+    assert "omp-hook-bridge[tool_call c1] boom" in _debug_log_text(tmp_path)
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
@@ -1398,7 +1414,8 @@ def test_extension_ts_honors_the_dispatcher_timeout_budget(tmp_path):
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out["result"] is None
     assert out["elapsedMs"] < 10000, f"the 500 ms budget was not honored: {out['elapsedMs']} ms"
-    assert "timed out" in proc.stderr
+    assert proc.stderr == ""
+    assert "timed out" in _debug_log_text(tmp_path)
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
@@ -1416,31 +1433,40 @@ def test_extension_ts_tool_result_awaits_the_dispatcher(tmp_path):
         {"OMP_HOOK_BRIDGE_PYTHON": str(stub)},
     )
     assert proc.returncode == 0, proc.stderr
-    assert "post-write hook would have blocked" in proc.stderr
-    assert "post-write says no" in proc.stderr
+    assert proc.stderr == ""
+    logged = _debug_log_text(tmp_path)
+    assert "post-write hook would have blocked" in logged
+    assert "post-write says no" in logged
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
 def test_extension_ts_explains_a_slow_tool_call_but_stays_quiet_on_tool_result(tmp_path):
     """A long wait is now silent by itself (the freeze used to be its own explanation), so the
-    bridge says once, on stderr, why the call is being held and which omp setting decides how
+    bridge says once, in the file log, why the call is being held and which omp setting decides how
     long it may be held. Only for `tool_call`: that is the event omp can refuse. A slow
     `tool_result` is nobody's problem — the write already landed — so it stays quiet."""
     stub = _write_stub_dispatcher(tmp_path, "time.sleep(1.5)\n")
     env = {"OMP_HOOK_BRIDGE_PYTHON": str(stub), "OMP_HOOK_BRIDGE_NOTICE_MS": "300"}
 
-    called = _run_bun_driver(tmp_path, "await handlers['tool_call'](event, ctx);\n", env)
+    called = _run_bun_driver(
+        tmp_path,
+        "await handlers['tool_call'](event, ctx);\n",
+        {**env, "HOOKS_DEBUG_LOG": str(tmp_path / "called-debug.log")},
+    )
     assert called.returncode == 0, called.stderr
-    assert "holding this call for" in called.stderr
-    assert "extensionHandlers.toolCallTimeoutMs" in called.stderr
+    assert called.stderr == ""
+    called_log = _debug_log_text(tmp_path, "called-debug.log")
+    assert "holding this call for" in called_log
+    assert "extensionHandlers.toolCallTimeoutMs" in called_log
 
     result = _run_bun_driver(
         tmp_path,
         "await handlers['tool_result']({ toolName: 'write', input: { path: '/tmp/x' } }, ctx);\n",
-        env,
+        {**env, "HOOKS_DEBUG_LOG": str(tmp_path / "result-debug.log")},
     )
     assert result.returncode == 0, result.stderr
-    assert "holding this call for" not in result.stderr
+    assert result.stderr == ""
+    assert "holding this call for" not in _debug_log_text(tmp_path, "result-debug.log")
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
@@ -1500,8 +1526,10 @@ def test_extension_ts_timeout_sends_sigterm_first_and_lets_the_dispatcher_clean_
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out["result"] is None
-    assert "stub: got SIGTERM, cleaning up" in proc.stderr
-    assert "timed out" in proc.stderr
+    assert proc.stderr == ""
+    logged = _debug_log_text(tmp_path)
+    assert "stub: got SIGTERM, cleaning up" in logged
+    assert "timed out" in logged
     # budget + the dispatcher's own exit; well under budget + the 2000 ms SIGKILL grace.
     assert out["elapsedMs"] < _BUDGET_MS + 1500, f"the bridge waited out the SIGKILL grace: {out['elapsedMs']} ms"
 
@@ -1526,7 +1554,8 @@ def test_extension_ts_timeout_escalates_to_sigkill_when_sigterm_is_ignored(tmp_p
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out["result"] is None
-    assert "timed out" in proc.stderr
+    assert proc.stderr == ""
+    assert "timed out" in _debug_log_text(tmp_path)
     # Must outlast budget + the 2000 ms grace (SIGTERM alone did nothing), never the 30 s sleep.
     assert _BUDGET_MS + 2000 <= out["elapsedMs"] < 15000, f"SIGKILL did not follow the grace: {out['elapsedMs']} ms"
 
@@ -1552,7 +1581,8 @@ def test_extension_ts_reaps_in_flight_dispatcher_when_the_process_exits(tmp_path
         {"OMP_HOOK_BRIDGE_PYTHON": str(stub)},
     )
     assert proc.returncode == 0, proc.stderr
-    assert "in-flight dispatcher" in proc.stderr
+    assert proc.stderr == ""
+    assert "in-flight dispatcher" in _debug_log_text(tmp_path)
     pid = int(pid_file.read_text())
     assert _pid_gone_within(pid, seconds=3), f"dispatcher {pid} was orphaned by the exiting host"
 
@@ -1576,8 +1606,10 @@ def test_extension_ts_reaps_in_flight_dispatcher_on_session_shutdown(tmp_path):
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out["result"] is None
     assert out["elapsedMs"] < 1000, f"the dispatcher outlived the shutdown's SIGTERM: {out['elapsedMs']} ms"
-    assert "session shutdown" in proc.stderr
-    assert "terminated by SIGTERM" in proc.stderr
+    assert proc.stderr == ""
+    logged = _debug_log_text(tmp_path)
+    assert "session shutdown" in logged
+    assert "terminated by SIGTERM" in logged
 
 
 def _pid_gone_within(pid: int, *, seconds: float) -> bool:
@@ -1617,7 +1649,8 @@ def test_extension_ts_session_shutdown_escalates_to_sigkill(tmp_path):
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out["result"] is None
     assert 1000 <= out["elapsedMs"] < 4000, f"SIGKILL did not follow the shutdown grace: {out['elapsedMs']} ms"
-    assert "terminated by SIGKILL" in proc.stderr
+    assert proc.stderr == ""
+    assert "terminated by SIGKILL" in _debug_log_text(tmp_path)
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
@@ -1648,7 +1681,7 @@ def test_extension_ts_stop_reaches_the_dispatcher_process_group(tmp_path):
 def test_extension_ts_caps_dispatcher_stdout(tmp_path):
     """A dispatcher that never stops writing stdout must not grow omp's memory until it dies (the
     old spawnSync had a bounded buffer): past 1 MiB the child is stopped and the call resolves
-    fail-open, promptly, with the reason on stderr."""
+    fail-open, promptly, with the reason in the file log."""
     stub = _write_stub_dispatcher(
         tmp_path,
         "sys.stdout.write('x' * (2 * 1024 * 1024))\n"
@@ -1666,13 +1699,14 @@ def test_extension_ts_caps_dispatcher_stdout(tmp_path):
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out["result"] is None
     assert out["elapsedMs"] < 8000, f"the overflowing dispatcher was not stopped: {out['elapsedMs']} ms"
-    assert "output limit" in proc.stderr
+    assert proc.stderr == ""
+    assert "output limit" in _debug_log_text(tmp_path)
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
 def test_extension_ts_flushes_a_stderr_line_that_never_ends(tmp_path):
-    """An unterminated stderr stream is forwarded in bounded pieces (64 KiB) rather than held in
-    memory waiting for a newline; each piece still carries the call tag."""
+    """An unterminated stderr stream is captured to the file log in bounded pieces (64 KiB)
+    rather than held in memory waiting for a newline; each piece still carries the call tag."""
     stub = _write_stub_dispatcher(
         tmp_path,
         "sys.stderr.write('y' * (200 * 1024))\n"
@@ -1685,7 +1719,12 @@ def test_extension_ts_flushes_a_stderr_line_that_never_ends(tmp_path):
     )
     assert proc.returncode == 0
     assert json.loads(proc.stdout.strip().splitlines()[-1]) is None
-    tagged = [line for line in proc.stderr.splitlines() if line.startswith("omp-hook-bridge[tool_call c1] y")]
+    assert proc.stderr == ""
+    tagged = [
+        line
+        for line in _debug_log_text(tmp_path).splitlines()
+        if "omp-hook-bridge[tool_call c1] y" in line
+    ]
     assert len(tagged) >= 3, f"expected the 200 KiB line in bounded pieces, got {len(tagged)} piece(s)"
     assert all(len(line) <= 64 * 1024 + 64 for line in tagged)
     assert sum(line.count("y") for line in tagged) == 200 * 1024

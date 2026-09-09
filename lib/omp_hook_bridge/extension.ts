@@ -11,8 +11,9 @@
 // or not that cache-buster is present.
 
 import { spawn } from "node:child_process";
-import { realpathSync } from "node:fs";
-import { delimiter, dirname, resolve } from "node:path";
+import { appendFileSync, mkdirSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const extensionPath = realpathSync(fileURLToPath(import.meta.url));
@@ -38,7 +39,7 @@ const libDir = resolve(dirname(extensionPath), "..");
 // in `~/.omp/agent/config.yml`; see README.md "omp's own handler timeout".
 const DEFAULT_DISPATCHER_TIMEOUT_MS = 2000000;
 // After this long a dispatch is no longer a normal descriptor run — most often it is a hook
-// holding the call open for a human (a Telegram approval). Say so once, on stderr, so the wait
+// holding the call open for a human (a Telegram approval). Say so once, in the file log, so the wait
 // is explainable instead of just slow: the old synchronous spawn "explained" it by freezing the
 // whole interface. Overridable with OMP_HOOK_BRIDGE_NOTICE_MS (the tests use a small value).
 const DEFAULT_SLOW_DISPATCH_NOTICE_MS = 10000;
@@ -90,7 +91,7 @@ function registerExitReaper(): InFlightRegistry {
   const created: InFlightRegistry = { children: new Set(), stopping: new WeakSet() };
   process.on("exit", () => {
     if (created.children.size === 0) return;
-    console.error(`omp-hook-bridge: omp is exiting — stopping ${created.children.size} in-flight dispatcher(s)`);
+    logToDebugFile(`omp-hook-bridge: omp is exiting — stopping ${created.children.size} in-flight dispatcher(s)`);
     for (const child of created.children) signalDispatcher(child, created.stopping.has(child) ? "SIGKILL" : "SIGTERM");
     created.children.clear();
   });
@@ -126,8 +127,31 @@ function stopDispatcher(child: DispatcherChild, graceMs: number): () => void {
 
 function reapInFlight(why: string): void {
   if (inFlight.size === 0) return;
-  console.error(`omp-hook-bridge: ${why} — stopping ${inFlight.size} in-flight dispatcher(s)`);
+  logToDebugFile(`omp-hook-bridge: ${why} — stopping ${inFlight.size} in-flight dispatcher(s)`);
   for (const child of inFlight) stopDispatcher(child, SHUTDOWN_KILL_GRACE_MS);
+}
+
+// Silence contract: omp surfaces extension stderr over the TUI, so NOTHING here may
+// reach stderr — every diagnostic lands in the debug file log. The agent receives
+// block reasons programmatically via the returned {block, reason}, never via stderr.
+function resolveDebugLogPath(): string {
+  return (
+    process.env.HOOKS_DEBUG_LOG ||
+    process.env.OMP_HOOK_BRIDGE_DEBUG_LOG ||
+    join(homedir(), ".cache", "agent-tools", "hooks-debug.log")
+  );
+}
+
+function logToDebugFile(text: string): void {
+  try {
+    if (!text) return;
+    const logPath = resolveDebugLogPath();
+    mkdirSync(dirname(logPath), { recursive: true });
+    const line = text.endsWith("\n") ? text : `${text}\n`;
+    appendFileSync(logPath, `${new Date().toISOString()} ${line}`);
+  } catch {
+    // Debug logging must never break the hook path.
+  }
 }
 
 // Read per call, not once at module load: a test (and a one-off debugging run) must be able to
@@ -211,7 +235,7 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
     });
     outcome = await spawnDispatcher(eventName, payload, event?.toolCallId, sessionFile);
   } catch (error: any) {
-    console.error(`omp-hook-bridge: dispatcher setup failed, allowing call: ${error?.message}`);
+    logToDebugFile(`omp-hook-bridge: dispatcher setup failed, allowing call: ${error?.message}`);
     return undefined;
   }
   return interpretDispatcherResult(eventName, outcome);
@@ -220,15 +244,15 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
 // AWAITED, never synchronous: omp is single-threaded, so a synchronous spawn here froze the
 // whole interface — no repaints, no keypresses — for the entire dispatch (agent-tools#558).
 // omp's `emitToolCall` awaits whatever the handler returns, so the decision still arrives before
-// the tool runs. The dispatcher's own stderr is streamed through as it arrives rather than
-// buffered to the end, so a hook that explains itself while it waits (a hatch posting its
-// Telegram card) is visible while it is still waiting.
+// the tool runs. The dispatcher's own stderr is captured to the debug file log as it arrives
+// rather than buffered to the end, so a hook that explains itself while it waits (a hatch
+// posting its Telegram card) is recorded while it is still waiting.
 //
 // Dispatches can now OVERLAP, which the synchronous spawn made impossible as a side effect of
 // blocking the loop. That is fine: nothing here is shared between calls (each gets its own
 // child, buffer and timers), and the descriptors already run concurrently under claude-code,
-// whose bridge has never serialized them either. Two simultaneous dispatchers do interleave
-// their stderr on the one stream, which is why every forwarded line is tagged with its event and
+// whose bridge has never serialized them either. Two simultaneous dispatchers interleave
+// their lines in the file log, which is why every captured line is tagged with its event and
 // tool-call id (`stderrForwarder`) — two hatches both explaining a wait stay attributable.
 function spawnDispatcher(
   eventName: BridgeEvent,
@@ -291,14 +315,15 @@ interface StderrForwarder {
   flush: () => void;
 }
 
-// The dispatcher's own stderr, forwarded as it arrives but LINE by line under `tag`, so a chunk
-// boundary never splits a line and the tag lands once per line. `flush` writes a trailing
+// The dispatcher's own stderr is captured to the debug file log as it arrives,
+// line by line under `tag`, so a chunk boundary never splits a line and the tag
+// lands once per line — never streamed to the terminal. `flush` writes a trailing
 // unterminated fragment when the child closes — or, for a line that never ends, once it exceeds
 // MAX_STDERR_LINE_BYTES, so an unterminated stream is bounded instead of held.
 function stderrForwarder(tag: string): StderrForwarder {
   let pending = "";
   const flush = () => {
-    if (pending) process.stderr.write(`${tag} ${pending}\n`);
+    if (pending) logToDebugFile(`${tag} ${pending}`);
     pending = "";
   };
   return {
@@ -306,9 +331,9 @@ function stderrForwarder(tag: string): StderrForwarder {
       pending += chunk;
       const lines = pending.split("\n");
       pending = lines.pop() ?? "";
-      for (const line of lines) process.stderr.write(`${tag} ${line}\n`);
+      for (const line of lines) logToDebugFile(`${tag} ${line}`);
       while (pending.length > MAX_STDERR_LINE_BYTES) {
-        process.stderr.write(`${tag} ${pending.slice(0, MAX_STDERR_LINE_BYTES)}\n`);
+        logToDebugFile(`${tag} ${pending.slice(0, MAX_STDERR_LINE_BYTES)}`);
         pending = pending.slice(MAX_STDERR_LINE_BYTES);
       }
     },
@@ -356,7 +381,7 @@ function armDispatchTimers(child: DispatcherChild, eventName: BridgeEvent): Disp
 function warnSlowDispatch(eventName: BridgeEvent): void {
   const seconds = Math.round(resolveSlowDispatchNotice() / 1000);
   const ompDefaultSeconds = Math.round(OMP_DEFAULT_TOOL_CALL_TIMEOUT_MS / 1000);
-  console.error(
+  logToDebugFile(
     `omp-hook-bridge[${eventName}]: a hook has been holding this call for ${seconds}s — usually a ` +
       "Telegram approval hatch waiting for a human, sometimes just a slow multi-file dispatch. omp " +
       "stays responsive, but it refuses the call at its own extensionHandlers.toolCallTimeoutMs " +
@@ -366,25 +391,25 @@ function warnSlowDispatch(eventName: BridgeEvent): void {
 
 function interpretDispatcherResult(eventName: BridgeEvent, outcome: DispatcherOutcome): BridgeResult | undefined {
   if (outcome.timedOut) {
-    console.error(`omp-hook-bridge[${eventName}]: dispatcher timed out, allowing call`);
+    logToDebugFile(`omp-hook-bridge[${eventName}]: dispatcher timed out, allowing call`);
     return undefined;
   }
   if (outcome.overflowed) {
-    console.error(
+    logToDebugFile(
       `omp-hook-bridge[${eventName}]: dispatcher stdout exceeded the ${MAX_STDOUT_BYTES}-byte output limit, allowing call`,
     );
     return undefined;
   }
   if (outcome.error) {
-    console.error(`omp-hook-bridge[${eventName}]: dispatcher launch failed, allowing call: ${outcome.error.message}`);
+    logToDebugFile(`omp-hook-bridge[${eventName}]: dispatcher launch failed, allowing call: ${outcome.error.message}`);
     return undefined;
   }
   if (outcome.signal) {
-    console.error(`omp-hook-bridge[${eventName}]: dispatcher terminated by ${outcome.signal}, allowing call`);
+    logToDebugFile(`omp-hook-bridge[${eventName}]: dispatcher terminated by ${outcome.signal}, allowing call`);
     return undefined;
   }
   if (outcome.status !== 0) {
-    console.error(`omp-hook-bridge[${eventName}]: dispatcher exited ${outcome.status}, allowing call`);
+    logToDebugFile(`omp-hook-bridge[${eventName}]: dispatcher exited ${outcome.status}, allowing call`);
     return undefined;
   }
   const stdout = (outcome.stdout || "").trim();
@@ -395,7 +420,7 @@ function interpretDispatcherResult(eventName: BridgeEvent, outcome: DispatcherOu
   try {
     result = JSON.parse(stdout);
   } catch (error: any) {
-    console.error(`omp-hook-bridge[${eventName}]: invalid dispatcher JSON, allowing call: ${error?.message}`);
+    logToDebugFile(`omp-hook-bridge[${eventName}]: invalid dispatcher JSON, allowing call: ${error?.message}`);
     return undefined;
   }
   if (result?.decision === "block") {
@@ -417,7 +442,7 @@ export default function (pi: any): void {
       // Belt-and-braces: runBridge already catches internally, but a bridge-infrastructure
       // bug must NEVER escape as a throw here — that would block the tool call (see the
       // module-level comment on runBridge).
-      console.error(`omp-hook-bridge: unexpected pre-call bridge error, allowing call: ${error?.message}`);
+      logToDebugFile(`omp-hook-bridge: unexpected pre-call bridge error, allowing call: ${error?.message}`);
       return undefined;
     }
   });
@@ -428,10 +453,10 @@ export default function (pi: any): void {
     try {
       const result = await runBridge("tool_result", event, ctx);
       if (result?.block) {
-        console.error(`omp-hook-bridge: post-write hook would have blocked; write already landed: ${result.reason}`);
+        logToDebugFile(`omp-hook-bridge: post-write hook would have blocked; write already landed: ${result.reason}`);
       }
     } catch (error: any) {
-      console.error(`omp-hook-bridge: unexpected post-call bridge error (ignored): ${error?.message}`);
+      logToDebugFile(`omp-hook-bridge: unexpected post-call bridge error (ignored): ${error?.message}`);
     }
     return undefined;
   });

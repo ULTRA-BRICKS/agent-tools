@@ -184,3 +184,72 @@ def test_run_hook_non_utf8_exit10_still_blocks(tmp_path):
     assert outcome == "block"
     assert reason == "Blocked by agent-hook 'binary'."
     assert seen == []
+
+
+def test_run_hook_clean_allow_stderr_stays_silent(tmp_path, monkeypatch):
+    """Exit-0 allow with advisory stderr chatter (e.g. first-offense WARNs that
+    also emit allow) must stay silent: no warning recorded."""
+    cmd = _script(
+        tmp_path,
+        "import sys\n"
+        "sys.stderr.write('By design advisory chatter\\n')\n"
+        "sys.exit(0)\n",
+    )
+    seen, warn = _warnings()
+    debug_log = tmp_path / "hooks-debug.log"
+    monkeypatch.setenv("HOOKS_DEBUG_LOG", str(debug_log))
+
+    outcome, reason = run_hook(
+        {"id": "chatty-allow", "point": "pre-bash", "cmd": str(cmd), "on_error": "open"},
+        {"hook_api": "agents-hooks/v1"},
+        warn=warn,
+    )
+
+    assert (outcome, reason) == ("allow", "")
+    assert seen == []
+    assert "By design advisory chatter" in debug_log.read_text(encoding="utf-8")
+
+
+def test_run_hook_block_stderr_stays_silent(tmp_path):
+    """Exit-10 block with stderr chatter (hooks duplicating the reason on stderr):
+    no warning recorded — the reason travels in stdout JSON, never as TUI trash."""
+    cmd = _script(
+        tmp_path,
+        "import json, sys\n"
+        "sys.stderr.write('block-secrets-write: chatter duplicated from stdout\\n')\n"
+        "print(json.dumps({'message': 'blocked for test'}))\n"
+        "sys.exit(10)\n",
+    )
+    seen, warn = _warnings()
+
+    outcome, reason = run_hook(
+        {"id": "chatty-blocker", "point": "pre-bash", "cmd": str(cmd), "on_error": "closed"},
+        {"hook_api": "agents-hooks/v1"},
+        warn=warn,
+    )
+
+    assert outcome == "block"
+    assert reason == "blocked for test"
+    assert seen == []
+
+
+def test_run_hook_error_keeps_structured_warn_without_raw_chatter(tmp_path):
+    """A crashing hook (nonzero, non-10) still warns structurally via the callback
+    (`exited N (on_error=…)`), but its raw stderr text is never forwarded."""
+    cmd = _script(
+        tmp_path,
+        "import sys\n"
+        "sys.stderr.write('traceback-ish raw chatter\\n')\n"
+        "sys.exit(1)\n",
+    )
+    seen, warn = _warnings()
+
+    outcome, reason = run_hook(
+        {"id": "crasher", "point": "pre-bash", "cmd": str(cmd), "on_error": "open"},
+        {"hook_api": "agents-hooks/v1"},
+        warn=warn,
+    )
+
+    assert (outcome, reason) == ("allow", "")
+    assert any("exited 1" in msg for msg in seen)
+    assert not any("traceback-ish" in msg for msg in seen)
