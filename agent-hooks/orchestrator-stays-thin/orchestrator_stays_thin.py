@@ -331,6 +331,43 @@ _WRAPPERS = frozenset(_WRAPPER_OPT_ARGS)
 _CMD_START = r"(?:^|&&|\|\||;|\||\()\s*"
 # A heredoc, or an obvious build/edit invocation, marks implementation-shaped shell.
 HEREDOC = re.compile(r"<<-?\s*['\"]?\w+")
+# ── data-only heredoc carve-out (agent-tools#699) ──────────────────────────────────────────
+# `HEREDOC` above is intentionally blunt — ANY heredoc marks implementation-shaped shell, because
+# a heredoc's BODY can pipe to `bash`/`python`/`ssh` and execute arbitrary code, or its target can
+# write a file (`cat <<EOF > out`). But a live incident (Alex, 2026-09-09) showed this veto firing
+# on a heredoc used ONLY to build a LITERAL TEXT ARGUMENT — `tg --tag report --format html
+# "$(cat <<'EOF' …multi-paragraph report… EOF)"` — the standard, quote-safe way to hand a large
+# multi-line message to a sanctioned `tg`/`review` call without hand-escaping every embedded
+# quote/apostrophe. That shape can never write a file or execute anything: `cat`'s stdout is
+# captured ONLY by the substitution itself (its closing delimiter line is followed, ignoring
+# whitespace, by nothing but the substitution's own closing `)`/backtick — no `>`/`>>` redirect),
+# so the whole `$(cat <<'EOF' … EOF)` span is exactly as inert as a quoted string literal (`cat`
+# is ALREADY unconditionally trusted read-only via READ_ONLY_BASH; this just extends that same
+# trust to `cat`'s heredoc-stdin form). A quoted delimiter (`<<'EOF'`) is preferred (no expansion
+# inside) but an unquoted one is accepted too — a shape check, not an injection boundary (this
+# module's stated threat model throughout: discipline, not a sandbox). `cat <<EOF > f` (a real
+# write), `bash <<EOF` (executes the body), and any heredoc that does NOT immediately close its
+# enclosing substitution are UNTOUCHED by this regex and still trip `HEREDOC` exactly as before —
+# see test_tg_command_with_heredoc_still_blocks / test_heredoc_to_file_blocks_on_repeat /
+# test_read_only_pipe_with_heredoc_segment_blocks_on_repeat, all still pinned unmodified.
+_DATA_HEREDOC_SUBST = re.compile(
+    r"(?:\$\(|`)\s*cat\s+<<-?\s*(['\"]?)(\w+)\1"
+    r".*?"
+    r"\n[ \t]*\2[ \t\n]*(?:\)|`)",
+    re.DOTALL,
+)
+
+
+def _neutralize_data_only_heredocs(command: str) -> str:
+    """Blank a `$(cat <<'DELIM' … DELIM)` / backtick-`cat` data-only heredoc SUBSTITUTION down to
+    an inert placeholder, so the rest of this module's heredoc/mutation/chain-length
+    classification sees plain text instead of heredoc syntax it would otherwise (over-)trip on —
+    and so the heredoc BODY's own prose (which may contain a literal `;`/`&&`/`|`) is never
+    re-parsed as shell chain operators by `_split_chain`. Only the narrow, verified-safe shape
+    `_DATA_HEREDOC_SUBST` matches is touched; every other heredoc classifies exactly as before."""
+    return _DATA_HEREDOC_SUBST.sub("HEREDOC_DATA", command)
+
+
 # In-place edit / build invocations. A bare `>`/`>>` redirect is NOT here: a redirect alone
 # ("python foo.py > out.log") is not implementation — the in-place editors (sed -i, tee) and
 # the build tools are the real signals (B7). The build-tool RUNNERS are anchored at a command
@@ -1683,6 +1720,12 @@ def _has_mutating_substitution(command: str) -> bool:
 def _is_implementation_bash(command: str) -> bool:
     if not command.strip():
         return False
+    # Neutralize a data-only `$(cat <<'EOF' … EOF)` heredoc substitution FIRST (agent-tools#699)
+    # — before ANY other check in this function sees the raw text — so it can neither trip the
+    # blunt HEREDOC veto below nor get its own prose (which may contain a literal `;`/`&&`/`|`)
+    # miscounted as extra chain segments by `_split_chain`. Every other heredoc shape is
+    # untouched by the neutralizer and still classifies exactly as before.
+    command = _neutralize_data_only_heredocs(command)
     # A fully read-only / sanctioned-orchestration chain of ANY length is inspection, never
     # implementation (#80 + the tg#5743 flapping fix). Checked FIRST so a build-token that is only
     # an ARGUMENT of a read-only head (`cat tee.log`) is not mis-flagged by the UNANCHORED BUILD_EDIT

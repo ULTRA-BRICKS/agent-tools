@@ -2527,6 +2527,80 @@ def test_tg_command_with_heredoc_still_blocks(tmp_path, monkeypatch):
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
+# ── data-only cat-heredoc-in-substitution carve-out (agent-tools#699) ──────────────────────
+# A live incident (Alex, 2026-09-09): TgReportAndMemoryFix sent a routine Telegram status report
+# via the standard multi-line idiom `tg --tag report --format html "$(cat <<'EOF' … EOF)"` and
+# got hard-BLOCKed, then had to burn a live Telegram hatch escalation just to force it through —
+# despite AGENTS.md documenting `tg`/`review` as "sanctioned orchestration, also never gated".
+# Root cause: the blunt `HEREDOC` veto in `_is_all_inline_allowed`/`_is_implementation_bash` ran
+# BEFORE the tg exemption ever got a chance to matter, treating a pure text-building heredoc
+# exactly like a file-write/exec heredoc. These tests pin the fix.
+
+def test_tg_report_with_data_only_heredoc_allows(tmp_path, monkeypatch):
+    """The EXACT incident shape now allows on both calls (never even warns): a multi-line,
+    multi-byte (Cyrillic) report built via `$(cat <<'EOF' … EOF)` and handed to `tg --tag
+    report`, preceded by a `cd /tmp &&` companion exactly as the incident had it."""
+    command = (
+        "cd /tmp && tg --tag report --format html \"$(cat <<'EOF'\n"
+        "<b>Флот-статус (2026-09-09)</b>\n"
+        "Alex: «все ответы в тг! запомни»\n"
+        "It's a \"quoted\" snippet with (parens), and it's still fine.\n"
+        "EOF\n"
+        ")\""
+    )
+    assert ost._is_implementation_bash(command) is False
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")  # never primes a block
+    assert c2 == 0 and _decision(out2) == "allow"
+
+
+def test_review_with_data_only_heredoc_allows(tmp_path, monkeypatch):
+    """Same carve-out for `review` (the other sanctioned-orchestration head via ORCH_ALLOW),
+    with an unquoted delimiter this time — both quoted and unquoted delimiters are accepted."""
+    command = "review just-ask \"$(cat <<EOF\nIs this the right approach?\nEOF\n)\""
+    assert ost._is_implementation_bash(command) is False
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == 0 and _decision(out2) == "allow"
+
+
+def test_data_only_heredoc_does_not_launder_a_real_mutation(tmp_path, monkeypatch):
+    """The carve-out only neutralizes the HEREDOC *signal* — it never grants a blanket allow.
+    A data-only heredoc feeding a chain that ALSO carries a real mutation still blocks, exactly
+    like the tg-carveout-159 laundering-resistance precedent."""
+    command = "python foo.py \"$(cat <<'EOF'\nsome data\nEOF\n)\" && git commit -m x"
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_backtick_data_only_heredoc_also_allows(tmp_path, monkeypatch):
+    """The backtick substitution form gets the same narrow carve-out as `$(...)`."""
+    command = "tg 'done' --note \"`cat <<EOF\nnote body\nEOF\n`\""
+    assert ost._is_implementation_bash(command) is False
+
+
+@pytest.mark.parametrize("command", [
+    "bash <<EOF\nrm -rf /\nEOF",                                  # executes the body — real signal
+    "cat <<EOF > f\nbody\nEOF",                                   # a real write — real signal
+    "cat <<EOF > notes\nbody\nEOF\ntg 'done' | tail -5",          # write heredoc + tg (pinned above)
+    "tg 'done' \"$(sh -c 'cat <<EOF\nbody\nEOF')\"",               # not a bare `cat` head — real signal
+])
+def test_non_data_only_heredocs_are_unaffected_by_the_carve_out(command, tmp_path, monkeypatch):
+    """The narrow `_DATA_HEREDOC_SUBST` shape must NOT over-match: an executing heredoc, a
+    file-write heredoc, and a heredoc whose command is not a bare `cat` all still trip HEREDOC
+    exactly as before this carve-out landed."""
+    assert ost._is_implementation_bash(command) is True
+
+
+
 def test_tg_command_needle_or_prefix_word_is_not_exempt(tmp_path, monkeypatch):
     """`tg` counts only at a segment HEAD (argv), never as a substring in text — a grep needle
     must not self-exempt a chain (mirrors `test_gh_ship_needle_or_prefix_word_is_not_exempt`)."""
