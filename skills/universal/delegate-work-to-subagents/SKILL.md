@@ -16,7 +16,12 @@ verified**. The orchestrator does not roll up its sleeves and do the work itself
    acceptance check each. Decide what can run in parallel and what must serialize.
 2. **Decompose.** Split into independent units that don't share a working tree
    (separate worktrees / scratch dirs). Group by repo and by file ownership so two
-   units never fight over the same files.
+   units never fight over the same files. When a unit will edit files, tell it explicitly
+   to create its own worktree first, before its first Edit/Write — see `worktree-isolation`.
+   This is a real requirement, not a nice-to-have: a repo's `worktree_only` agent-hook
+   only catches a missing worktree reactively (after a blocked Edit/Write), so a
+   subagent that isn't told up front may waste a turn recovering from the block, or
+   worse, request an unnecessary bypass.
 3. **Dispatch.** Hand each unit to a subagent (the `Agent` tool) or a dynamic workflow.
    Give it a sharp brief and require a **fixed handoff contract** back so you can act
    without re-investigating: branch/commit, changed files, tests run, review status,
