@@ -75,6 +75,13 @@ def _run_dispatch(
 ) -> subprocess.CompletedProcess:
     child = dict(os.environ)
     child["OPENCODE_HOOKS_DIR"] = str(hooks_dir)
+    # Hermetic file log: bridge diagnostics must never touch process stderr (TUI
+    # toasts), so they go to this file; default it into the test sandbox unless
+    # the caller overrides it explicitly via `env`.
+    child.setdefault(
+        "OPENCODE_HOOK_BRIDGE_DEBUG_LOG",
+        str(Path(hooks_dir).parent / "hook-bridge-debug.log"),
+    )
     child["PYTHONPATH"] = str(_LIB) + os.pathsep + child.get("PYTHONPATH", "")
     # Hermetic by default: a rig-dispatched opencode session (this test run's own
     # process) carries the detached-agent env markers, and the dispatcher injects
@@ -131,6 +138,12 @@ def _run_plugin_js(script: str, *, env: dict[str, str] | None = None) -> subproc
         env=full_env,
         timeout=10,
     )
+
+
+def _debug_log_text(tmp_path: Path) -> str:
+    """Bridge file-log content for the hermetic default path in `_run_dispatch`."""
+    log = tmp_path / "hook-bridge-debug.log"
+    return log.read_text(encoding="utf-8") if log.is_file() else ""
 
 
 def _dispatcher_stub(tmp_path: Path, body: str) -> Path:
@@ -310,12 +323,17 @@ def test_plugin_after_block_json_fails_open_as_feedback(tmp_path):
             await hooks["tool.execute.after"]({ tool: "write", cwd: "/repo" }, { args: { filePath: "a.py" } });
             """
         ),
-        env={"OPENCODE_HOOK_BRIDGE_PYTHON": str(stub)},
+        env={
+            "OPENCODE_HOOK_BRIDGE_PYTHON": str(stub),
+            "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(tmp_path / "after-block-debug.log"),
+        },
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "post-write hook reported after tool execution" in proc.stderr
-    assert "write already landed" in proc.stderr
+    assert proc.stderr == ""
+    logged = (tmp_path / "after-block-debug.log").read_text(encoding="utf-8")
+    assert "post-write hook reported after tool execution" in logged
+    assert "write already landed" in logged
 
 
 def test_plugin_fail_open_on_nonzero_and_invalid_json(tmp_path):
@@ -329,13 +347,29 @@ def test_plugin_fail_open_on_nonzero_and_invalid_json(tmp_path):
         """
     )
 
-    nonzero_proc = _run_plugin_js(js, env={"OPENCODE_HOOK_BRIDGE_PYTHON": str(nonzero)})
-    invalid_proc = _run_plugin_js(js, env={"OPENCODE_HOOK_BRIDGE_PYTHON": str(invalid)})
+    nonzero_log = tmp_path / "nonzero-debug.log"
+    invalid_log = tmp_path / "invalid-debug.log"
+    nonzero_proc = _run_plugin_js(
+        js,
+        env={
+            "OPENCODE_HOOK_BRIDGE_PYTHON": str(nonzero),
+            "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(nonzero_log),
+        },
+    )
+    invalid_proc = _run_plugin_js(
+        js,
+        env={
+            "OPENCODE_HOOK_BRIDGE_PYTHON": str(invalid),
+            "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(invalid_log),
+        },
+    )
 
     assert nonzero_proc.returncode == 0, nonzero_proc.stderr
-    assert "dispatcher exited 2, allowing call" in nonzero_proc.stderr
+    assert nonzero_proc.stderr == ""
+    assert "dispatcher exited 2, allowing call" in nonzero_log.read_text(encoding="utf-8")
     assert invalid_proc.returncode == 0, invalid_proc.stderr
-    assert "invalid dispatcher JSON, allowing call" in invalid_proc.stderr
+    assert invalid_proc.stderr == ""
+    assert "invalid dispatcher JSON, allowing call" in invalid_log.read_text(encoding="utf-8")
 
 
 def test_plugin_sets_pythonpath_to_bridge_lib_dir(tmp_path):
@@ -423,10 +457,12 @@ def test_plugin_pre_tool_timeout_blocks(tmp_path):
         env={
             "OPENCODE_HOOK_BRIDGE_PYTHON": str(stub),
             "OPENCODE_HOOK_BRIDGE_TIMEOUT_MS": "50",
+            "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(tmp_path / "pre-timeout-debug.log"),
         },
     )
 
     assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
 
 
 def test_plugin_after_timeout_fails_open_as_feedback(tmp_path):
@@ -443,11 +479,13 @@ def test_plugin_after_timeout_fails_open_as_feedback(tmp_path):
         env={
             "OPENCODE_HOOK_BRIDGE_PYTHON": str(stub),
             "OPENCODE_HOOK_BRIDGE_TIMEOUT_MS": "50",
+            "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(tmp_path / "after-timeout-debug.log"),
         },
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "allowing call" in proc.stderr
+    assert proc.stderr == ""
+    assert "allowing call" in (tmp_path / "after-timeout-debug.log").read_text(encoding="utf-8")
 
 
 def test_plugin_pre_tool_signal_failure_blocks(tmp_path):
@@ -467,10 +505,14 @@ def test_plugin_pre_tool_signal_failure_blocks(tmp_path):
             if (!blocked) throw new Error("pre-tool signal termination did not block");
             """
         ),
-        env={"OPENCODE_HOOK_BRIDGE_PYTHON": str(stub)},
+        env={
+            "OPENCODE_HOOK_BRIDGE_PYTHON": str(stub),
+            "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(tmp_path / "pre-signal-debug.log"),
+        },
     )
 
     assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
 
 
 def test_plugin_after_signal_failure_fails_open_as_feedback(tmp_path):
@@ -484,11 +526,17 @@ def test_plugin_after_signal_failure_fails_open_as_feedback(tmp_path):
             await hooks["tool.execute.after"]({ tool: "write", cwd: "/repo" }, { args: { filePath: "a.py" } });
             """
         ),
-        env={"OPENCODE_HOOK_BRIDGE_PYTHON": str(stub)},
+        env={
+            "OPENCODE_HOOK_BRIDGE_PYTHON": str(stub),
+            "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(tmp_path / "after-signal-debug.log"),
+        },
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "dispatcher terminated by SIGTERM after tool execution, allowing call" in proc.stderr
+    assert proc.stderr == ""
+    assert "dispatcher terminated by SIGTERM after tool execution, allowing call" in (
+        tmp_path / "after-signal-debug.log"
+    ).read_text(encoding="utf-8")
 
 
 def test_to_v1_event_carries_bash_command_and_metadata():
@@ -1304,7 +1352,8 @@ def test_opencode_bridge_fail_open_for_open_descriptor_runtime_error(tmp_path):
 
     assert proc.returncode == 0
     assert proc.stdout == ""
-    assert "on_error=open" in proc.stderr
+    assert proc.stderr == ""
+    assert "on_error=open" in _debug_log_text(tmp_path)
 
 
 def test_opencode_bridge_blocks_closed_descriptor_runtime_error(tmp_path):
@@ -1329,6 +1378,7 @@ def test_opencode_bridge_blocks_closed_descriptor_runtime_error(tmp_path):
     out = json.loads(proc.stdout)
     assert out["decision"] == "block"
     assert "on_error=closed" in out["reason"]
+    assert proc.stderr == ""
 
 
 def test_opencode_bridge_allows_when_hooks_dir_missing(tmp_path):
@@ -1368,7 +1418,8 @@ def test_opencode_bridge_skips_malformed_descriptor_and_runs_valid_hook(tmp_path
 
     assert proc.returncode == 0
     assert proc.stdout == ""
-    assert "bad.pre-bash.json" in proc.stderr
+    assert proc.stderr == ""
+    assert "bad.pre-bash.json" in _debug_log_text(tmp_path)
     recorded = json.loads(log.read_text(encoding="utf-8"))
     assert recorded["point"] == "pre-bash"
     assert recorded["command"] == "echo recorded"
@@ -1404,3 +1455,113 @@ def test_plugin_clean_allow_stderr_suppressed_to_debug_log(tmp_path):
     assert proc.stderr == ""
     assert debug_log.is_file()
     assert "By design advisory chatter" in debug_log.read_text(encoding="utf-8")
+def test_plugin_block_with_dispatcher_chatter_stays_silent_in_stderr(tmp_path):
+    """Block path: dispatcher stderr chatter lands in the file log, plugin stderr
+    stays empty, and the reason still reaches the agent via the thrown Error."""
+    stub = _dispatcher_stub(
+        tmp_path,
+        "import json, sys\n"
+        "sys.stdin.read()\n"
+        "sys.stderr.write('orchestrator-stays-thin: first-offense WARN chatter\\n')\n"
+        "print(json.dumps({'decision': 'block', 'reason': 'blocked by test'}))\n",
+    )
+    debug_log = tmp_path / "block-debug.log"
+
+    proc = _run_plugin_js(
+        dedent(
+            """
+            const { AgentToolsHookBridge: plugin } = await import(process.env.PLUGIN_URL);
+            const hooks = await plugin({ directory: "/repo", worktree: "/repo" });
+            let reason = "";
+            try {
+              await hooks["tool.execute.before"]({ tool: "bash", cwd: "/repo" }, { args: { command: "bad" } });
+            } catch (error) {
+              reason = error.message;
+            }
+            if (!reason.includes("blocked by test")) throw new Error("block reason lost: " + reason);
+            """
+        ),
+        env={
+            "OPENCODE_HOOK_BRIDGE_PYTHON": str(stub),
+            "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(debug_log),
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
+    assert "WARN chatter" in debug_log.read_text(encoding="utf-8")
+
+
+def test_dispatch_allow_with_chatty_hook_stays_silent_in_stderr(tmp_path):
+    """Allow path end-to-end: a hook that WARNs on stderr but exits 0 produces
+    empty stdout AND empty stderr — the advisory is not toast material."""
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    chatty = tmp_path / "chatty_hook.py"
+    chatty.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "sys.stdin.read()\n"
+        "sys.stderr.write('By design advisory chatter\\n')\n"
+        "sys.stdout.write(json.dumps({'hook_api': 'agents-hooks/v1', 'decision': 'allow', 'message': 'advisory'}))\n",
+        encoding="utf-8",
+    )
+    chatty.chmod(0o755)
+    _install_descriptor(
+        hooks_dir,
+        hook_id="chatty-allow",
+        point="pre-bash",
+        cmd=chatty,
+        on_error="open",
+    )
+    event = {
+        "hook": "tool.execute.before",
+        "cwd": str(tmp_path),
+        "input": {"tool": "bash", "sessionID": "ses_1"},
+        "output": {"args": {"command": "echo ok"}},
+    }
+
+    proc = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert proc.stderr == ""
+
+
+def test_dispatch_block_with_chatty_hook_reason_in_stdout_only(tmp_path):
+    """Block path end-to-end: hook stderr chatter never reaches dispatcher stderr;
+    the reason travels in stdout JSON only."""
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    blocker = tmp_path / "chatty_blocker.py"
+    blocker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "sys.stdin.read()\n"
+        "sys.stderr.write('block-secrets-write: chatter duplicated from stdout\\n')\n"
+        "sys.stdout.write(json.dumps({'hook_api': 'agents-hooks/v1', 'decision': 'block', 'message': 'blocked for test'}))\n"
+        "sys.exit(10)\n",
+        encoding="utf-8",
+    )
+    blocker.chmod(0o755)
+    _install_descriptor(
+        hooks_dir,
+        hook_id="chatty-blocker",
+        point="pre-bash",
+        cmd=blocker,
+        on_error="closed",
+    )
+    event = {
+        "hook": "tool.execute.before",
+        "cwd": str(tmp_path),
+        "input": {"tool": "bash", "sessionID": "ses_1"},
+        "output": {"args": {"command": "echo denied"}},
+    }
+
+    proc = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
+
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["decision"] == "block"
+    assert out["reason"] == "blocked for test"
+    assert proc.stderr == ""

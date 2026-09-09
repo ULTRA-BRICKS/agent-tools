@@ -102,11 +102,13 @@ def run_hook(spec: dict, v1_event: dict, *, warn: Warn) -> tuple[str, str]:
         # fail-open guard instead of masquerading as descriptor failures.
         return _on_error_outcome(spec, hook_id, f"could not run {cmd}: {exc}", warn)
 
-    # Clean-allow stderr is advisory chatter (e.g. first-offense WARNs that also
-    # emit allow); warning on it used to toast every allowed call. Real hook
-    # failures (block exit, nonzero exit, timeout, launch failure) still warn.
-    if proc.stderr and proc.returncode != 0:
-        warn(f"{hook_id}: {proc.stderr.strip()}")
+    # Hook stderr is intentionally swallowed here, never forwarded via warn():
+    # unstructured hook chatter (first-offense WARNs, duplicated block text)
+    # used to toast every call in harnesses that surface stderr. The v1 contract
+    # delivers decisions and reasons via stdout JSON + exit codes (exit 10 carries
+    # the human reason); genuine hook-runtime failures below still warn through
+    # the bridge-provided callback, and each bridge routes that callback itself
+    # (opencode: debug file log, never process stderr).
 
     if proc.returncode == V1_BLOCK_EXIT_CODE:
         return "block", _block_reason(proc.stdout, hook_id)

@@ -205,3 +205,46 @@ def test_run_hook_clean_allow_stderr_stays_silent(tmp_path):
 
     assert (outcome, reason) == ("allow", "")
     assert seen == []
+def test_run_hook_block_stderr_stays_silent(tmp_path):
+    """Exit-10 block with stderr chatter (hooks duplicating the reason on stderr):
+    no warning recorded — the reason travels in stdout JSON, never as TUI trash."""
+    cmd = _script(
+        tmp_path,
+        "import json, sys\n"
+        "sys.stderr.write('block-secrets-write: chatter duplicated from stdout\\n')\n"
+        "print(json.dumps({'message': 'blocked for test'}))\n"
+        "sys.exit(10)\n",
+    )
+    seen, warn = _warnings()
+
+    outcome, reason = run_hook(
+        {"id": "chatty-blocker", "point": "pre-bash", "cmd": str(cmd), "on_error": "closed"},
+        {"hook_api": "agents-hooks/v1"},
+        warn=warn,
+    )
+
+    assert outcome == "block"
+    assert reason == "blocked for test"
+    assert seen == []
+
+
+def test_run_hook_error_keeps_structured_warn_without_raw_chatter(tmp_path):
+    """A crashing hook (nonzero, non-10) still warns structurally via the callback
+    (`exited N (on_error=…)`), but its raw stderr text is never forwarded."""
+    cmd = _script(
+        tmp_path,
+        "import sys\n"
+        "sys.stderr.write('traceback-ish raw chatter\\n')\n"
+        "sys.exit(1)\n",
+    )
+    seen, warn = _warnings()
+
+    outcome, reason = run_hook(
+        {"id": "crasher", "point": "pre-bash", "cmd": str(cmd), "on_error": "open"},
+        {"hook_api": "agents-hooks/v1"},
+        warn=warn,
+    )
+
+    assert (outcome, reason) == ("allow", "")
+    assert any("exited 1" in msg for msg in seen)
+    assert not any("traceback-ish" in msg for msg in seen)
