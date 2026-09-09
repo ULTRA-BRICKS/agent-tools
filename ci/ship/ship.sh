@@ -733,6 +733,14 @@ _ci_github_status_indicator() {
 # Check whether ALL workflow runs for the PR's head SHA completed suspiciously fast
 # (< 30 s from creation to update) — a sign of infra/billing failure, not real tests.
 # Stdout: "1" if suspicious, "0" otherwise.
+#
+# NOTE: this catches an outage where the RUN itself never queues (fails immediately),
+# but NOT a billing block where GitHub queues the run for a while before rejecting the
+# job — see _ci_billing_block_annotation_detected below for that shape, confirmed live
+# 2026-09-09 (sme-archiving-gc PR #401): job started_at→completed_at was 2s, but the
+# run's own created_at→updated_at was 2m33s, well past this function's 30s cutoff. Keep
+# both signals — this one still catches a same-second full-run rejection this repo
+# hasn't hit yet, the annotation check catches the queued-then-rejected shape.
 _ci_runs_timing_suspicious() {
   local head_sha="$1" runs_json total fast
   runs_json=$(gh api "repos/{owner}/{repo}/actions/runs?head_sha=$head_sha&per_page=20" \
@@ -746,6 +754,34 @@ _ci_runs_timing_suspicious() {
       | ((.updated_at | fromdateiso8601) - (.created_at | fromdateiso8601))
       | select(. < 30) ] | length' 2>/dev/null || echo 0)
   [ "$fast" = "$total" ] && [ "$total" -gt 0 ] && echo "1" || echo "0"
+}
+
+# Check every FAILED check-run on the PR's head SHA for GitHub's own fixed billing-block
+# annotation text ("recent account payments have failed" / "spending limit needs to be
+# increased" — the literal message GitHub attaches to a check run whose job never started
+# because the account can't pay for compute). This is a direct, unambiguous signal, unlike
+# the timing heuristic above: a billing-blocked run can sit queued for minutes before
+# GitHub marks it completed, so its wall-clock span often does NOT look "suspiciously
+# fast" even though the job itself executed zero real steps.
+# Stdout: "1" if the billing-block message is found on any failed check run, "0" otherwise.
+_ci_billing_block_annotation_detected() {
+  local head_sha="$1" runs_json failed_ids id ann_json
+  runs_json=$(gh api "repos/{owner}/{repo}/commits/$head_sha/check-runs?per_page=100" \
+    2>/dev/null) || { echo "0"; return; }
+  failed_ids=$(printf '%s' "$runs_json" \
+    | jq -r '.check_runs[]? | select(.conclusion == "failure") | .id' 2>/dev/null)
+  [ -n "$failed_ids" ] || { echo "0"; return; }
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    ann_json=$(gh api "repos/{owner}/{repo}/check-runs/$id/annotations" 2>/dev/null) || continue
+    if printf '%s' "$ann_json" | jq -e '
+        .[]? | select(.message
+          | test("account payments have failed|spending limit needs to be increased"; "i"))
+      ' >/dev/null 2>&1; then
+      echo "1"; return
+    fi
+  done <<< "$failed_ids"
+  echo "0"
 }
 
 # Return 0 (exit code) if CI appears structurally down rather than genuinely failing.
@@ -762,14 +798,18 @@ ci_appears_structurally_down() {
   # 2*8/10=1, so 1/2=50% would falsely satisfy the threshold).
   [ $(( failed * 10 )) -ge $(( total * 8 )) ] || return 1
   # Get the PR head SHA for timing analysis.
-  local head_sha timing status
+  local head_sha timing status billing
   head_sha=$(gh pr view "$PR" --json headRefOid -q '.headRefOid' 2>/dev/null) || head_sha=""
   status=$(_ci_github_status_indicator)
   timing="0"
-  [ -n "$head_sha" ] && timing=$(_ci_runs_timing_suspicious "$head_sha")
-  echo "[ship] CI-down probe: github_status=$status timing_suspicious=$timing total=$total failed=$failed" >&2
-  # Positive detection if either signal confirms structural failure.
-  [ "$status" = "degraded" ] || [ "$timing" = "1" ] || return 1
+  billing="0"
+  if [ -n "$head_sha" ]; then
+    timing=$(_ci_runs_timing_suspicious "$head_sha")
+    billing=$(_ci_billing_block_annotation_detected "$head_sha")
+  fi
+  echo "[ship] CI-down probe: github_status=$status timing_suspicious=$timing billing_block=$billing total=$total failed=$failed" >&2
+  # Positive detection if any signal confirms structural failure.
+  [ "$status" = "degraded" ] || [ "$timing" = "1" ] || [ "$billing" = "1" ] || return 1
   return 0
 }
 
