@@ -202,6 +202,393 @@ TICKET_PATTERNS = (
 )
 
 
+# ── heredoc neutralization ────────────────────────────────────────────────────────────────────
+# A `git commit` command is often built with a heredoc feeding a multi-line message — the exact
+# pattern this repo's own CLAUDE.md tells every agent to use for a multi-line commit message:
+#   git commit -m "$(cat <<'EOF'
+#   fix: …
+#   Closes #123
+#   EOF
+#   )"
+# and its `-F <file>` cousin, where the file is written by a heredoc EARLIER in the SAME command:
+#   cat > msg.txt <<'EOF'
+#   fix: …
+#   Refs #143
+#   EOF
+#   git commit -F msg.txt
+# A heredoc BODY is not ordinary shell text: `"`/`'` inside it are LITERAL (never real shell
+# quotes) and `#` is never a comment-starter — but the shlex-based tokenizer below has no heredoc
+# awareness, so raw body characters corrupt its quote-tracking. That corruption goes EITHER way
+# depending on the body's exact quote parity: a `#`-led ticket reference past a stray embedded
+# quote is mistaken for a shell comment and silently dropped (agent-tools#406 — a false BLOCK on a
+# correctly-ticketed commit; reproduced live: a body containing a `"paired quote"` before `Closes
+# #999` truncates the extracted message to nothing past the quote), or an odd embedded-quote count
+# leaves the WHOLE command looking quote-unbalanced, so it fails to tokenize at all and the
+# on_error=open gate fails OPEN — silently ALLOWING a genuinely ticketless commit (the same root
+# cause's other face, also reproduced live). A heredoc body LINE that happens to parse as its own
+# valid shell segment can also be mistaken for a REAL command (agent-tools#570's "bonus repro": a
+# `gh issue create --body-file` heredoc whose markdown body merely MENTIONS `git commit -F …` got
+# gated as if it actually were one, because the tokenizer's line-by-line retry loop treats an
+# independently-parseable body line as a fresh command segment).
+#
+# The fix: before any of the shlex-based parsing below ever runs, replace every heredoc
+# (`<<WORD`/`<<-WORD` … the terminator line) with an opaque SENTINEL token holding no shell
+# metacharacters at all, so its body characters can never perturb quote/comment tracking or be
+# mistaken for a command segment — the same "make the dangerous span an atomic token" idea
+# block-raw-pr-merge uses for a related but different purpose (salvaging a hidden merge out of a
+# heredoc body instead of shielding one from it). `_resolve_message_value` then unwraps the
+# documented `$(cat SENTINEL)` shape back to the real body text for a `-m` value, and
+# `_heredoc_body_for_target` matches a `-F <path>` against a heredoc that WROTE that same path
+# earlier in the command, reading the captured body directly instead of the disk (which does not
+# have the file yet at PreToolUse hook time — the shell has not run).
+_HEREDOC_SENTINEL_FMT = "\x00RTHOOK-HEREDOC-{}\x00"
+# Chars that end an UNQUOTED heredoc delimiter word — mirrors block-raw-pr-merge's identical set;
+# duplicated by design (each hook is its own subprocess, no shared import path).
+_HEREDOC_DELIM_END = frozenset(" \t\n;&|()<>")
+
+
+def _read_heredoc_delimiter(command: str, j: int) -> tuple[str, int, bool] | None:
+    """Read ONE shell word starting at `command[j]` as a heredoc delimiter and return
+    `(dequoted_word, end_index, quoted_delimiter)`, or None on an unterminated quote / empty word.
+    `quoted_delimiter` is True when the delimiter token was single- or double-quoted (`<<'EOF'`,
+    `<<"EOF"`), meaning bash will NOT expand parameters/command substitutions in the heredoc BODY —
+    the captured literal is the actual message content. An unquoted `<<EOF` leaves
+    `quoted_delimiter=False`; its body is expanded by the shell before any consumer sees it, so the
+    literal source must NOT be treated as the final commit message for ticket recovery."""
+    n = len(command)
+    out: list[str] = []
+    k = j
+    quoted_delimiter = k < n and command[k] in ("'", '"')
+    while k < n:
+        ch = command[k]
+        if ch in _HEREDOC_DELIM_END:
+            break
+        if ch == "\\" and k + 1 < n:
+            out.append(command[k + 1])
+            k += 2
+            continue
+        if ch in ("'", '"'):
+            close = command.find(ch, k + 1)
+            if close == -1:
+                return None
+            out.append(command[k + 1 : close])
+            k = close + 1
+            continue
+        out.append(ch)
+        k += 1
+    word = "".join(out)
+    return (word, k, quoted_delimiter) if word else None
+
+
+def _read_heredoc(command: str, i: int) -> tuple[str, bool, int, bool] | None:
+    """If `command[i:]` opens a heredoc (`<<WORD` / `<<-WORD`), return `(delimiter, dash,
+    index_after_the_operator)`; else None. `<<<` (a here-string, one line, no body to capture) is
+    not a heredoc."""
+    if not command.startswith("<<", i) or command.startswith("<<<", i):
+        return None
+    n = len(command)
+    j = i + 2
+    dash = j < n and command[j] == "-"
+    if dash:
+        j += 1
+    while j < n and command[j] in " \t":
+        j += 1
+    if j >= n:
+        return None
+    parsed = _read_heredoc_delimiter(command, j)
+    if parsed is None:
+        return None
+    delim, end, quoted = parsed
+    return delim, dash, end, quoted
+
+
+def _collect_heredoc_body(
+    command: str, body_start: int, delim: str, dash: bool,
+) -> tuple[str, int] | None:
+    """From `body_start` (the first character of the heredoc body), consume whole lines up to (NOT
+    including) the terminator line's OWN trailing newline (bare `delim`, leading tabs ignored when
+    the opener used `<<-`). Returns `(body_text, index_of_that_newline_or_end_of_command)`, or None
+    if no terminator line is found ahead (an unterminated heredoc — the caller leaves it untouched,
+    deferring to the existing fail-open behavior on an unparseable command rather than swallowing
+    the rest of the input).
+
+    Deliberately stops AT the newline rather than past it: that newline is what separated the
+    heredoc's issuing command from whatever came next in the ORIGINAL text (`cat > f <<EOF\\n…\\nEOF
+    \\ngit commit …`), or was itself just a line inside a still-open construct (`"$(cat <<'EOF'\\n…
+    \\nEOF\\n)"`, where the terminator's newline is followed by the substitution's closing `)"` on
+    the SAME logical statement). The caller (`_neutralize_heredocs`) leaves that one character in
+    the output stream to be scanned normally, so `_tokenize`'s own multi-line-quote join logic
+    decides which case it is — exactly as it would with no heredoc involved at all. Swallowing it
+    here instead (the very first version of this function did) glues the heredoc's issuing command
+    directly onto whatever follows with NO separator, corrupting segment-splitting."""
+    n = len(command)
+    pos = body_start
+    lines: list[str] = []
+    while pos <= n:
+        nl = command.find("\n", pos)
+        line_end = n if nl == -1 else nl
+        line = command[pos:line_end]
+        check = line.lstrip("\t") if dash else line
+        if check == delim:
+            return "\n".join(lines), line_end
+        lines.append(check if dash else line)
+        if nl == -1:
+            return None  # ran off the end without finding the terminator
+        pos = line_end + 1
+    return None
+
+
+def _redirect_target_before(text: str) -> str | None:
+    """The `> PATH`/`>> PATH` redirect target ending the CURRENT simple command in `text` (the
+    rewritten command SO FAR, up to but not including a heredoc operator just found), or None.
+    Best-effort text scan (not a full parse): only looks at the tail after the last unquoted
+    command separator, so a `>` belonging to an EARLIER command in a chain is never picked up.
+    Good enough to recognize the documented `cat > FILE <<EOF … EOF` shape (agent-tools#570). The
+    target word itself is read with `_read_heredoc_delimiter` — the SAME quote-removing shell-word
+    reader a heredoc delimiter uses — so a quoted path containing a space (`cat > '/tmp/commit
+    message' <<EOF`) is read whole instead of truncated at the first internal space (review round
+    2: a plain whitespace-delimited regex here previously chopped it). An unrecognized shape
+    simply yields no target and the `-F` value falls back to a normal disk read, same as today."""
+    cut = 0
+    for sep in (";", "&&", "||", "|", "\n", "("):
+        idx = text.rfind(sep)
+        if idx != -1 and idx + len(sep) > cut:
+            cut = idx + len(sep)
+    tail = text[cut:]
+    target = None
+    for m in re.finditer(r"(?:^|\s)>>?\s*", tail):
+        parsed = _read_heredoc_delimiter(tail, m.end())
+        if parsed is not None:
+            target = parsed[0]  # keep the LAST `>`/`>>` on the tail — the one that actually wins  # parsed[0] is dequoted path
+    return target or None
+
+
+class _Heredoc:
+    """One neutralized heredoc. `sentinel` is the opaque placeholder substituted into the rewritten
+    command in place of `<<[-]DELIM … DELIM` (or, for a chained `<<A <<B` group on one line, in
+    place of the WHOLE group — see `_read_heredoc_operators_on_line`); `body` is its EFFECTIVE
+    captured literal text; `target` is the raw (unresolved) `> PATH`/`>> PATH` redirect target
+    immediately preceding it on the same simple command, or None — the file a `cat > PATH <<EOF …
+    EOF` heredoc would write (agent-tools#570).
+
+    `segment_index` is set LATER, by `_assign_heredoc_segment_indices` in `main` (not at
+    construction time — segments aren't parsed yet when a heredoc is captured): the index of the
+    SIMPLE COMMAND segment containing this heredoc's sentinel, among ALL segments in the rewritten
+    command (the SAME enumeration `commit_segments` numbers its own `CommitSegment.index` from).
+    `_heredoc_body_for_target` uses it to reject a heredoc whose segment comes AT OR AFTER the
+    consuming commit's own segment, so a heredoc that writes its target file only AFTER a commit
+    already read it can't retroactively satisfy that commit's ticket gate. Deliberately reuses the
+    real segment parser instead of an independent text search (agent-tools#570 review round 2: a
+    search for a bare word like "commit" could match unrelated prose — `echo commit` — BEFORE the
+    real commit segment and mis-anchor the cutoff)."""
+
+    __slots__ = ("sentinel", "body", "target", "segment_index", "quoted_delimiter")
+
+    def __init__(
+        self, sentinel: str, body: str, target: str | None, quoted_delimiter: bool,
+    ) -> None:
+        self.sentinel = sentinel
+        self.body = body
+        self.target = target
+        self.segment_index: int | None = None
+        self.quoted_delimiter = quoted_delimiter
+
+
+class _Frame:
+    """One quote-tracking frame. `opened_by` is `"paren"` for a frame pushed by `$(` (its matching
+    `)` pops it) or `"backtick"` for a frame pushed by a backtick (the NEXT unescaped backtick at
+    this frame pops it); `None` marks the bare top-level frame, never popped."""
+
+    __slots__ = ("in_single", "in_double", "opened_by")
+
+    def __init__(self, opened_by: str | None) -> None:
+        self.in_single = False
+        self.in_double = False
+        self.opened_by = opened_by
+
+
+def _append_with_boundary(out: list[str], sentinel: str) -> None:
+    """Append `sentinel` to `out`, inserting a separating space first if the preceding character
+    would otherwise glue directly onto it. A COMPACT heredoc opener with no space before it
+    (`cat<<'EOF'`) would otherwise neutralize to `catSENTINEL` — no longer word-boundary-matching
+    `cat` at all, so `_CAT_SUBST_RE`'s `$(cat SENTINEL)` unwrap (and any human/tool reading the
+    rewritten text) sees a corrupted word instead (agent-tools#570 review)."""
+    if out and (out[-1].isalnum() or out[-1] in "_./-"):
+        out.append(" ")
+    out.append(sentinel)
+
+
+def _read_heredoc_operators_on_line(command: str, i: int) -> list[tuple[str, bool, int, bool]]:
+    """Collect every heredoc operator (`<<WORD`/`<<-WORD`) CHAINED on the same line starting at
+    `command[i]` — bash allows `cmd <<A <<B`, each separated only by whitespace — returning each
+    as `(delimiter, dash, index_after_the_operator, quoted_delimiter)` in the order declared.
+    Empty if `command[i]` isn't a heredoc opener at all."""
+    ops: list[tuple[str, bool, int, bool]] = []
+    pos = i
+    while True:
+        opener = _read_heredoc(command, pos)
+        if opener is None:
+            break
+        delim, dash, after, quoted = opener
+        ops.append((delim, dash, after, quoted))
+        j = after
+        while j < len(command) and command[j] in " \t":
+            j += 1
+        if not command.startswith("<<", j) or command.startswith("<<<", j):
+            break
+        pos = j
+    return ops
+
+
+def _consume_chained_heredoc_bodies(
+    command: str, ops: list[tuple[str, bool, int, bool]],
+) -> tuple[str, int, bool] | None:
+    """Consume the bodies of every operator in `ops` (from `_read_heredoc_operators_on_line`) IN
+    THE ORDER DECLARED — real bash reads them off the input stream that way, each terminated by
+    its own delimiter line, one body immediately after the previous terminator line. Returns
+    `(effective_body, index_after_the_last_terminator_line)`, where `effective_body` is the LAST
+    operator's body: when several heredocs are chained onto the SAME fd (`cmd <<A <<B`), shell
+    redirects apply left-to-right and the LAST one wins — `cmd`'s stdin ends up wired to B, not A
+    (agent-tools#570 review: modeling only the first operator let a ticket hidden in an earlier,
+    UNUSED heredoc silently satisfy the gate while the command actually read a different,
+    ticketless body). Returns None if any operator in the group is unterminated — the WHOLE group
+    is then left untouched by the caller, matching the single-heredoc fail-safe."""
+    body_start = None
+    body = None
+    quoted_delimiter = False
+    for delim, dash, after, quoted in ops:
+        if body_start is None:
+            nl = command.find("\n", after)
+            if nl == -1:
+                return None
+            body_start = nl + 1
+        collected = _collect_heredoc_body(command, body_start, delim, dash)
+        if collected is None:
+            return None
+        body, resume_at = collected
+        quoted_delimiter = quoted  # chained `<<A <<B`: the LAST operator's body wins
+        body_start = resume_at + 1  # the next chained heredoc's body starts right after this one
+    return body, body_start - 1, quoted_delimiter  # back off the `+ 1`: caller expects the terminator's own newline
+
+
+def _try_consume_heredoc(
+    command: str, i: int, out: list[str], heredocs: list[_Heredoc],
+) -> int | None:
+    """If a real, TERMINATED heredoc (or chained group, `cmd <<A <<B`) opens at `command[i]`,
+    append its sentinel to `out`, record it in `heredocs`, and return the index right after the
+    group's last terminator line. Returns None (nothing consumed — the caller falls through to
+    normal char handling) when `command[i]` isn't actually a heredoc opener, or any operator in
+    the group has no terminator line ahead (fail-safe: an unterminated heredoc/group is left
+    untouched rather than swallowing the rest of the input)."""
+    ops = _read_heredoc_operators_on_line(command, i)
+    if not ops:
+        return None
+    consumed = _consume_chained_heredoc_bodies(command, ops)
+    if consumed is None:
+        return None
+    body, resume_at, quoted_delimiter = consumed
+    sentinel = _HEREDOC_SENTINEL_FMT.format(len(heredocs))
+    target = _redirect_target_before("".join(out))
+    heredocs.append(_Heredoc(sentinel, body, target, quoted_delimiter))
+    _append_with_boundary(out, sentinel)
+    return resume_at
+
+
+def _is_word_boundary(ch: str) -> bool:
+    """True when `ch` is whitespace or a shell separator that a `#` comment can legally follow —
+    mirrors `_strip_line_comment`'s own `prev_ws` test but also treats `;&|()` as a boundary
+    (block-raw-pr-merge's `_SEGMENT_SEPS`), so `cmd; # note` and `$(# comment ...)` are recognized
+    too, not only a `#` preceded by plain whitespace."""
+    return ch.isspace() or ch in ";&|()"
+
+
+def _neutralize_heredocs(command: str) -> tuple[str, list[_Heredoc]]:  # noqa: C901
+    """Replace every heredoc (or chained `<<A <<B` group) in `command` with an opaque sentinel
+    token, returning the rewritten command plus the list of captured `_Heredoc`s (in the order
+    opened). A single-pass character state machine — kept as one function because the quote/
+    comment/substitution invariants only make sense read together; splitting it hides how they
+    interact rather than clarifying it.
+
+    `$( … )` command substitution and a backtick substitution BOTH start a FRESH parsing context
+    in real shell grammar — quoting and heredocs inside either are independent of whatever quote
+    state surrounds them (`"$(cat <<'EOF' … EOF)"` is valid: the inner heredoc parses normally
+    even though the WHOLE substitution sits inside outer double quotes; without this, `<<` found
+    while `in_double` is already True from the outer quote is never even recognized as a heredoc
+    opener). So quote AND heredoc-eligibility state is tracked per a small stack of `_Frame`s, one
+    pushed for each `$(` (popped at its matching `)`) or each opening backtick (popped at the next
+    unescaped backtick), rather than one flat pair of booleans.
+
+    A `#` at a WORD BOUNDARY, outside quotes, starts a shell comment running to the next literal
+    newline — during which nothing (not `<<`, not `$(`/backtick, not a quote char) is special
+    (review round 2: without this, `# <<EOF` on a comment line was misread as a REAL heredoc
+    opener, and the neutralizer swallowed the next real, ticketless `git commit` line as if it
+    were the heredoc's body — `commit_segments` then found no commit at all and silently ALLOWED
+    it; a genuine gate bypass, not just a false block).
+
+    Fail-safe: an unterminated heredoc (no matching terminator line found) is left AS-IS — the
+    existing tokenizer's fail-open behavior on an unparseable command still applies afterward;
+    this hook is on_error=open, a discipline reminder, not a security boundary."""
+    out: list[str] = []
+    heredocs: list[_Heredoc] = []
+    stack = [_Frame(opened_by=None)]
+    i, n = 0, len(command)
+    in_comment = False
+    prev_boundary = True
+    while i < n:
+        ch = command[i]
+        if in_comment:
+            out.append(ch)
+            in_comment = ch != "\n"
+            prev_boundary = ch == "\n"
+            i += 1
+            continue
+        top = stack[-1]
+        if ch == "\\" and not top.in_single and i + 1 < n:
+            out.append(command[i : i + 2])
+            i += 2
+            prev_boundary = False
+            continue
+        if ch == "'" and not top.in_double:
+            top.in_single = not top.in_single
+        elif ch == '"' and not top.in_single:
+            top.in_double = not top.in_double
+        elif ch == "#" and prev_boundary and not top.in_single and not top.in_double:
+            in_comment = True
+            out.append(ch)
+            i += 1
+            prev_boundary = False
+            continue
+        elif not top.in_single and command.startswith("$(", i):
+            stack.append(_Frame(opened_by="paren"))
+            out.append("$(")
+            i += 2
+            prev_boundary = True  # the position right after `$(` is itself a boundary
+            continue
+        elif (
+            ch == ")" and top.opened_by == "paren" and not top.in_single and not top.in_double
+            and len(stack) > 1
+        ):
+            stack.pop()
+        elif ch == "`" and not top.in_single:
+            if top.opened_by == "backtick":
+                stack.pop()
+            else:
+                stack.append(_Frame(opened_by="backtick"))
+        elif (
+            not top.in_single and not top.in_double
+            and command.startswith("<<", i) and not command.startswith("<<<", i)
+        ):
+            resume_at = _try_consume_heredoc(command, i, out, heredocs)
+            if resume_at is not None:
+                i = resume_at
+                prev_boundary = False  # a sentinel is never whitespace
+                continue
+        out.append(ch)
+        prev_boundary = _is_word_boundary(ch)
+        i += 1
+    return "".join(out), heredocs
+
+
 # ── commit-segment parser ─────────────────────────────────────────────────────────────────────
 # The gate fires ONLY on a real `git commit` invocation. Detecting that means PARSING the command
 # into argv — NOT raw-string matching "git"…"commit", which over-blocked every benign command that
@@ -498,14 +885,20 @@ class CommitSegment:
     - ``argv``     : the tokens AFTER `commit` — the commit's own flags/message/pathspecs.
     - ``git_argv`` : the wrapper-stripped invocation starting at `git` (`git -C <dir> commit …`) —
                      for reading the `git -C <dir>` global that targets a different repo.
+    - ``index``    : this segment's position among ALL simple-command segments in the parsed
+                     command (not only the `git commit` ones) — the SAME enumeration
+                     `_assign_heredoc_segment_indices` numbers a heredoc's own segment from, so a
+                     `-F <path>` can be checked against a heredoc that (textually) precedes it
+                     without an independent, more fragile text search (agent-tools#570 review).
     """
 
-    __slots__ = ("env", "argv", "git_argv")
+    __slots__ = ("env", "argv", "git_argv", "index")
 
-    def __init__(self, env: dict[str, str], argv: list[str], git_argv: list[str]) -> None:
+    def __init__(self, env: dict[str, str], argv: list[str], git_argv: list[str], index: int) -> None:
         self.env = env
         self.argv = argv
         self.git_argv = git_argv
+        self.index = index
 
 
 def commit_segments(command: str) -> list[CommitSegment]:
@@ -516,13 +909,13 @@ def commit_segments(command: str) -> list[CommitSegment]:
     if tokens is None:
         return []
     out: list[CommitSegment] = []
-    for raw_seg in _segments(tokens):
+    for index, raw_seg in enumerate(_segments(tokens)):
         seg = _strip_leading_shell_noise(_strip_redirects(raw_seg))
         env, rest = _split_inline_env(seg)
         git_argv = _strip_wrappers(rest)  # the real `git …` invocation, wrappers peeled
         argv = _commit_argv(git_argv)
         if argv is not None:
-            out.append(CommitSegment(env, argv, git_argv))
+            out.append(CommitSegment(env, argv, git_argv, index))
     return out
 
 
@@ -749,7 +1142,118 @@ def _nonmessage_flag_consumes_next(tok: str) -> bool:
     return False
 
 
-def commit_message_from_argv(argv: list[str], cwd: str | None = None) -> str:
+# A heredoc-sourced `-m "$(cat <<'EOF' … EOF)"` reduces, after `_neutralize_heredocs` has run,
+# to EXACTLY `$(cat SENTINEL)` (or the backtick spelling `` `cat SENTINEL` ``) — recognized here
+# and unwrapped back to the heredoc's captured body (agent-tools#503/#406/#430).
+_CAT_SUBST_RE = re.compile(r"^\$\(\s*cat\s+(\S+)\s*\)$")
+_BACKTICK_CAT_SUBST_RE = re.compile(r"^`\s*cat\s+(\S+)\s*`$")
+
+# Unquoted heredoc bodies are expanded by bash before any consumer sees them — a literal `${UNSET:+#999}`
+# in the source is NOT a real `#999` reference in the final message. Strip simple parameter/command
+# substitution shapes before ticket detection on an unquoted body (quoted bodies are literal).
+_SHELL_PARAM_EXPANSION = re.compile(r"\$\{[^}]*\}")
+_SHELL_SIMPLE_PARAM = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _effective_heredoc_body(body: str, quoted_delimiter: bool) -> str:
+    if quoted_delimiter:
+        return body
+    body = _SHELL_PARAM_EXPANSION.sub("", body)
+    return _SHELL_SIMPLE_PARAM.sub("", body)
+
+
+def _resolve_message_value(value: str, heredocs: list[_Heredoc]) -> str:
+    """Turn a raw `-m`/`--message` VALUE into the real message text after heredoc neutralization.
+    The documented multi-line pattern reduces to EXACTLY `$(cat SENTINEL)` — unwrap that to the
+    heredoc's captured body, the same message text an equivalent single-line `-m` would carry. Any
+    OTHER shape (the sentinel wrapped in some other command, e.g. `$(some-other-cmd SENTINEL)`)
+    falls back to a plain substring substitution of the sentinel for its body — not byte-exact, but
+    `has_ticket_reference`'s substring search still finds a real reference inside the body, which
+    is the property that actually matters for the gate."""
+    if not heredocs:
+        return value
+    m = _CAT_SUBST_RE.match(value) or _BACKTICK_CAT_SUBST_RE.match(value)
+    if m is not None:
+        for hd in heredocs:
+            if hd.sentinel == m.group(1):
+                return _effective_heredoc_body(hd.body, hd.quoted_delimiter)
+    for hd in heredocs:
+        if hd.sentinel in value:
+            value = value.replace(hd.sentinel, _effective_heredoc_body(hd.body, hd.quoted_delimiter))
+    return value
+
+
+def _resolve_path(path: str, cwd: str | None) -> str:
+    """Expand `~` and resolve a relative `path` against `cwd` — shared by `_read_message_file`'s
+    disk read and `_heredoc_body_for_target` below, so the two always agree on what a path means."""
+    resolved = os.path.expanduser(path)
+    if cwd and not os.path.isabs(resolved):
+        resolved = os.path.join(cwd, resolved)
+    return os.path.normpath(resolved)
+
+
+def _assign_heredoc_segment_indices(parse_command: str, heredocs: list[_Heredoc]) -> None:
+    """Set each heredoc's `segment_index` — the index of the SIMPLE COMMAND segment (among ALL
+    segments in `parse_command`, the same enumeration `commit_segments` numbers its own
+    `CommitSegment.index` from) whose tokens contain its sentinel. Re-tokenizes `parse_command`
+    with the SAME real segment parser `commit_segments` uses, rather than an independent text
+    search — a search for a bare word like "commit" could match unrelated prose (`echo commit`)
+    or a comment BEFORE the real commit segment and mis-anchor the ordering check in
+    `_heredoc_body_for_target` (agent-tools#570 review round 2). A sentinel not found in any
+    segment (should not happen — every sentinel `_neutralize_heredocs` emits lands in this SAME
+    text) is left at its default `None`, the permissive fallback (`_heredoc_body_for_target`
+    treats an unknown segment as always eligible rather than silently excluding it)."""
+    tokens = _tokenize(parse_command)
+    if tokens is None:
+        return
+    for index, seg in enumerate(_segments(tokens)):
+        for hd in heredocs:
+            if hd.segment_index is None and any(hd.sentinel in tok for tok in seg):
+                hd.segment_index = index
+
+
+def _heredoc_body_for_target(
+    path: str, cwd: str | None, heredocs: list[_Heredoc], consuming_segment_index: int | None = None,
+) -> str | None:
+    """The body of a heredoc-neutralized `cat > PATH <<EOF … EOF` found EARLIER in the SAME
+    command, when `path` (a `-F`/`--file` VALUE) resolves to that same file — the fix for
+    agent-tools#570: at PreToolUse hook time the shell has not run yet, so the file does not exist
+    on disk and a normal read always fails for this shape; reading the already-captured heredoc
+    body instead sidesteps the timing race entirely.
+
+    `consuming_segment_index` (the `-F`-owning commit's own `CommitSegment.index`) restricts
+    matches to a heredoc whose `segment_index` is STRICTLY LESS — i.e. one whose OWN simple-command
+    segment (textually) precedes the commit reading the file. Without this a heredoc written AFTER
+    the commit — `git commit -F msg; cat > msg <<'EOF'\nRefs #123\nEOF` — could retroactively
+    "satisfy" a commit that, when it actually ran, read whatever `msg` held BEFORE that later write
+    (a real gate bypass found in review). A heredoc with `segment_index=None` (not resolved by
+    `_assign_heredoc_segment_indices`, or `consuming_segment_index=None` for a caller with no
+    meaningful commit position) is treated as always eligible — permissive, not exclusionary, on
+    the unexpected case."""
+    if not heredocs:
+        return None
+    target_path = _resolve_path(path, cwd)
+    matched: str | None = None
+    for hd in heredocs:
+        if not hd.quoted_delimiter:
+            continue
+        if (
+            consuming_segment_index is not None
+            and hd.segment_index is not None
+            and hd.segment_index >= consuming_segment_index
+        ):
+            continue
+        if hd.target is not None and _resolve_path(hd.target, cwd) == target_path:
+            matched = hd.body  # keep scanning — the LAST matching write before the commit wins
+    return matched
+
+
+def commit_message_from_argv(
+    argv: list[str],
+    cwd: str | None = None,
+    heredocs: list[_Heredoc] | None = None,
+    consuming_segment_index: int | None = None,
+) -> str:
     """Pull the commit message out of the already-parsed commit argv: -m/--message and -F/--file.
 
     Returns ONLY the message text — the concatenation of every -m value and the contents of any -F
@@ -758,7 +1262,15 @@ def commit_message_from_argv(argv: list[str], cwd: str | None = None) -> str:
     from the event), since the hook may run elsewhere. A `-F -` (stdin) value contributes NO text —
     git streams that message on its own stdin, which the hook can't read; commit_reads_stdin_message
     detects it separately so the caller can fail closed with a hint. Stops at `--` (the rest are
-    literal pathspecs, never message flags)."""
+    literal pathspecs, never message flags).
+
+    `heredocs` (from `_neutralize_heredocs`, run once per command in `main`) lets a `-m` value that
+    reduces to `$(cat SENTINEL)` recover the real heredoc body (agent-tools#503/#406/#430), and lets
+    a `-F <path>` recover the body of a heredoc that wrote that same path EARLIER in the command,
+    before the disk file exists (agent-tools#570) — `consuming_segment_index` (this segment's own
+    `CommitSegment.index`; see `_heredoc_body_for_target`) is what enforces "earlier", so a heredoc
+    that writes the path only AFTER this commit can't retroactively satisfy it."""
+    heredocs = heredocs or []
     parts: list[str] = []
     i = 0
     while i < len(argv):
@@ -771,13 +1283,19 @@ def commit_message_from_argv(argv: list[str], cwd: str | None = None) -> str:
         glued = _glued_message_long_flag(tok)
         if glued is not None:
             canonical, value = glued
-            parts.append(_read_message_file(value, cwd) if canonical == "--file" else value)
+            if canonical == "--file":
+                parts.append(_read_message_file(value, cwd, heredocs, consuming_segment_index))
+            else:
+                parts.append(_resolve_message_value(value, heredocs))
             i += 1
             continue
         canonical_sep = _canonical_long_value_flag(tok)
         if canonical_sep in _MESSAGE_VALUE_LONG and i + 1 < len(argv):
             value = argv[i + 1]
-            parts.append(_read_message_file(value, cwd) if canonical_sep == "--file" else value)
+            if canonical_sep == "--file":
+                parts.append(_read_message_file(value, cwd, heredocs, consuming_segment_index))
+            else:
+                parts.append(_resolve_message_value(value, heredocs))
             i += 2
             continue
         # Short forms, de-clustered like git: `-m`/`-F`/`-am`/`-aF` (next-token value) and
@@ -791,7 +1309,10 @@ def commit_message_from_argv(argv: list[str], cwd: str | None = None) -> str:
                 value, i = argv[i + 1], i + 2
             else:  # glued value (`-amMSG`/`-aFpath`/`-amF`)
                 value, i = glued, i + 1
-            parts.append(_read_message_file(value, cwd) if letter == "F" else value)
+            if letter == "F":
+                parts.append(_read_message_file(value, cwd, heredocs, consuming_segment_index))
+            else:
+                parts.append(_resolve_message_value(value, heredocs))
             continue
         # A non-message mandatory-value flag (`-C`/`-c`/`-t`/`--reuse-message`/…): SKIP it AND its
         # value token, so a `-m`/`-F`-looking value (`-C -m x`) is not misread as a real message
@@ -880,14 +1401,25 @@ def commit_reads_stdin_message(argv: list[str]) -> bool:
     return any(v == _STDIN_SENTINEL for v in _file_flag_values(argv))
 
 
-def _read_message_file(path: str, cwd: str | None = None) -> str:
+def _read_message_file(
+    path: str,
+    cwd: str | None = None,
+    heredocs: list[_Heredoc] | None = None,
+    consuming_segment_index: int | None = None,
+) -> str:
     # `-F -` is the stdin sentinel, not a file named "-": don't try to open it (it would fail and
     # warn spuriously). commit_reads_stdin_message handles that case at the decision layer.
     if path == _STDIN_SENTINEL:
         return ""
-    resolved = os.path.expanduser(path)
-    if cwd and not os.path.isabs(resolved):
-        resolved = os.path.join(cwd, resolved)
+    # A heredoc EARLIER in the same command already wrote this exact path (`cat > path <<EOF …
+    # EOF`) — read the captured body instead of the disk: at PreToolUse hook time the shell has
+    # not run yet, so the file does not exist (or may hold stale content) and a disk read would
+    # wrongly fail-block a correctly-ticketed commit (agent-tools#570). `consuming_segment_index` rejects a
+    # heredoc that (textually) comes AFTER this commit — see `_heredoc_body_for_target`.
+    heredoc_body = _heredoc_body_for_target(path, cwd, heredocs or [], consuming_segment_index)
+    if heredoc_body is not None:
+        return heredoc_body
+    resolved = _resolve_path(path, cwd)
     try:
         with open(resolved, encoding="utf-8", errors="replace") as fh:
             return fh.read()
@@ -1020,17 +1552,28 @@ def main() -> int:
         command = str(command)
     event_cwd = event.get("cwd") or args.get("cwd")
 
+    # Neutralize every heredoc BEFORE any shlex-based parsing sees the command text (agent-tools#503/
+    # #406/#430/#570 — see the "heredoc neutralization" section above for why raw heredoc bodies
+    # corrupt the tokenizer). `parse_command` is the heredoc-free text used for segment/argv parsing;
+    # `command` (the original, unmodified) is kept for the human-facing hatch/tg-ctl display below.
+    parse_command, heredocs = _neutralize_heredocs(command)
+
     # Detection is now ARGV-SCOPED: parse the command and gate ONLY a real `git commit` segment, so a
     # benign command that merely mentions "git"/"commit" (`gh issue create --body "...git commit..."`,
     # `echo "git commit"`, `git log --grep=commit`) is never gated (agent-tools#97). A chain may hold
     # more than one commit (`git commit … && git commit …`); gate on the FIRST that is non-exempt and
     # ticketless.
-    segments = commit_segments(command)
+    segments = commit_segments(parse_command)
     if not segments:
         return _allow()  # no real `git commit` segment → nothing to gate
 
+    # Assign each heredoc its OWN segment index (reusing the real segment parser — see
+    # `_assign_heredoc_segment_indices`) so a `-F <path>` in a later segment can only be satisfied
+    # by a heredoc whose segment (textually) precedes it, never one written by a LATER command in
+    # the chain (agent-tools#570 review).
+    _assign_heredoc_segment_indices(parse_command, heredocs)
     for segment in segments:
-        decision = _evaluate_commit_segment(segment, event_cwd, command)
+        decision = _evaluate_commit_segment(segment, event_cwd, command, heredocs)
         if decision is not None:
             return decision  # a non-exempt, ticketless commit → block (or warn-allow)
     return _allow()  # every commit segment is exempt / ticketed
@@ -1076,17 +1619,23 @@ _STDIN_ADVISORY = (
 
 
 def _evaluate_commit_segment(
-    segment: CommitSegment, event_cwd: str | None, command: str,
+    segment: CommitSegment,
+    event_cwd: str | None,
+    command: str,
+    heredocs: list[_Heredoc] | None = None,
 ) -> int | None:
     """Decide ONE parsed `git commit` segment. Returns an exit code when the gate fires (block, or a
     warn-only allow), or None when this segment is clean (exempt / ticketed) so the caller moves on
-    to the next segment in the chain."""
+    to the next segment in the chain. `heredocs` (from `_neutralize_heredocs`, with `segment_index`
+    already assigned by `_assign_heredoc_segment_indices`) lets the message extraction recover a
+    heredoc-sourced `-m`/`-F` value (agent-tools#503/#406/#430/#570); `segment.index` restricts the
+    `-F` match to a heredoc whose OWN segment (textually) precedes THIS commit's segment."""
     # `--amend`/`--continue`/`--abort`/`--skip` aren't authoring a fresh change → nothing to gate.
     if is_skip_commit(segment.argv):
         return None
     # Honor `git -C <repo>`: message-file + branch detection must target the repo the commit acts on.
     cwd = effective_cwd(segment, event_cwd)
-    message = commit_message_from_argv(segment.argv, cwd)
+    message = commit_message_from_argv(segment.argv, cwd, heredocs, segment.index)
     # Exemption is judged from the message text only (the real subject line), not the `git commit …`
     # argv — otherwise the command words could mis-trigger it.
     if is_exempt(message):
