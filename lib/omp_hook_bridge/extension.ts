@@ -233,7 +233,7 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
       sessionId,
       sessionFile,
     });
-    outcome = await spawnDispatcher(eventName, payload, event?.toolCallId, sessionFile);
+    outcome = await spawnDispatcher(eventName, payload, event?.toolCallId, sessionFile, agentId);
   } catch (error: any) {
     logToDebugFile(`omp-hook-bridge: dispatcher setup failed, allowing call: ${error?.message}`);
     return undefined;
@@ -259,6 +259,7 @@ function spawnDispatcher(
   payload: string,
   toolCallId: unknown,
   sessionFile: string = "",
+  agentId: string = "",
 ): Promise<DispatcherOutcome> {
   const python = process.env.OMP_HOOK_BRIDGE_PYTHON || "python3";
   const priorPythonPath = process.env.PYTHONPATH || "";
@@ -272,6 +273,7 @@ function spawnDispatcher(
         // Nested omp Task/eval transcript (ctx.getSessionFile()). Overrides a parent
         // PI_SESSION_FILE so _omp_nested_agent_id sees the child, not the main session.
         ...(sessionFile ? { PI_SESSION_FILE: sessionFile } : {}),
+        ...(agentId ? { RIG_AGENT_ID: agentId } : {}),
       },
     });
     inFlight.add(child);
