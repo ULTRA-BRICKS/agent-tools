@@ -1,0 +1,9 @@
+{
+  "id": "agent-browser-session-claim",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/agent-browser-session-claim/claim_agent_browser_session.py",
+  "priority": 90,
+  "timeout_ms": 800,
+  "on_error": "open",
+  "description": "On every Bash command that invokes agent-browser, touches ~/.cache/agent-tools/agent-browser-sessions/<session-id>/<browser-session-name> — the ownership record the SessionEnd cleanup hook (ops/agent-browser-session-reaper/session_end_close.py) reads to know WHICH browser sessions the finishing Claude Code session opened. agent-browser itself records no owner (a session is a bare global name), so without this marker the only possible session-end action is `agent-browser close --all`, which would tear down every parallel agent's live browser on every session exit. Claims the explicit --session/--session=/AGENT_BROWSER_SESSION= names, or `default` when the invocation names none; skips read-only subcommands (session list/info/id, skills, doctor, profiles, plugin, --help, --version) that cannot create a session. Over-claiming is harmless — the SessionEnd hook only closes a claimed name that agent-browser independently reports as live and that no other session also claims. Never blocks: on_error=open and every path emits allow, because a bookkeeping hiccup must not stop a Bash command."
+}

@@ -1,0 +1,44 @@
+# agent-browser cleanup — configuration
+#
+# Installed to ~/.config/agent-tools/agent-browser-reaper.conf.
+# Read by BOTH mechanisms: the launchd periodic sweep (agent_browser_reaper.py)
+# and the Claude Code SessionEnd hook (session_end_close.py).
+#
+# Every key below is also readable as an environment variable with the prefix
+# AGENT_BROWSER_REAPER_ (e.g. AGENT_BROWSER_REAPER_MAX_AGE_MIN=60), and the
+# environment WINS over this file. launchd starts jobs with no shell environment,
+# so this file is the knob that actually applies to the periodic sweep.
+#
+# Changes take effect on the next run — nothing needs reloading.
+
+# Master on/off switch for the PERIODIC SWEEP. 0 disables it (the launchd job still
+# runs every 15 min, notices this, and exits immediately).
+ENABLED=1
+
+# Close a session once its newest verifiable timestamp is this many minutes old.
+# Default 180 (3 hours) — deliberately longer than any observed agent verification
+# run, because "age" here means session lifetime / last navigation, NOT last command
+# (agent-browser exposes no last-command timestamp; see agent_browser_reaper.py's
+# module docstring for the measurements behind that).
+MAX_AGE_MIN=180
+
+# Session names that are NEVER closed by either mechanism. Comma-separated, exact
+# names. This is the hard escape hatch for a long-running session that would
+# otherwise look stale (e.g. one driven for hours without navigating).
+# Example: KEEP=my-long-lived-session,dashboard
+KEEP=
+
+# On/off switch for the SESSION-END HOOK (closes only the sessions the finishing
+# Claude Code session claimed). 0 disables it.
+SESSION_END_ENABLED=1
+
+# Which Claude Code SessionEnd reasons trigger the session-end hook. Claude Code
+# reports one of: clear, resume, logout, prompt_input_exit, other.
+# Default deliberately excludes `clear` and `resume` — the human is still at the same
+# terminal there and very likely still wants their browser.
+SESSION_END_REASONS=logout,prompt_input_exit,other
+
+# The sweep deletes session-end ownership records older than this many hours. A
+# record is normally deleted by the session-end hook itself; one left behind means
+# that Claude Code session crashed.
+CLAIM_TTL_HOURS=24
