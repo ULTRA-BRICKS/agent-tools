@@ -338,34 +338,212 @@ HEREDOC = re.compile(r"<<-?\s*['\"]?\w+")
 # on a heredoc used ONLY to build a LITERAL TEXT ARGUMENT — `tg --tag report --format html
 # "$(cat <<'EOF' …multi-paragraph report… EOF)"` — the standard, quote-safe way to hand a large
 # multi-line message to a sanctioned `tg`/`review` call without hand-escaping every embedded
-# quote/apostrophe. That shape can never write a file or execute anything: `cat`'s stdout is
-# captured ONLY by the substitution itself (its closing delimiter line is followed, ignoring
-# whitespace, by nothing but the substitution's own closing `)`/backtick — no `>`/`>>` redirect),
-# so the whole `$(cat <<'EOF' … EOF)` span is exactly as inert as a quoted string literal (`cat`
-# is ALREADY unconditionally trusted read-only via READ_ONLY_BASH; this just extends that same
-# trust to `cat`'s heredoc-stdin form). A quoted delimiter (`<<'EOF'`) is preferred (no expansion
-# inside) but an unquoted one is accepted too — a shape check, not an injection boundary (this
-# module's stated threat model throughout: discipline, not a sandbox). `cat <<EOF > f` (a real
-# write), `bash <<EOF` (executes the body), and any heredoc that does NOT immediately close its
-# enclosing substitution are UNTOUCHED by this regex and still trip `HEREDOC` exactly as before —
-# see test_tg_command_with_heredoc_still_blocks / test_heredoc_to_file_blocks_on_repeat /
-# test_read_only_pipe_with_heredoc_segment_blocks_on_repeat, all still pinned unmodified.
-_DATA_HEREDOC_SUBST = re.compile(
-    r"(?:\$\(|`)\s*cat\s+<<-?\s*(['\"]?)(\w+)\1"
-    r".*?"
-    r"\n[ \t]*\2[ \t\n]*(?:\)|`)",
-    re.DOTALL,
-)
+# quote/apostrophe.
+#
+# This went through FOUR adversarial review rounds (Opus, Sonnet, Opus-omp, Fable —
+# agent-tools#699) before landing here; each of the first three regex/lookaround-only attempts
+# was broken by a concrete PoC — see the git history of this comment block for the full blow-by-
+# blow, condensed here:
+#   - round 1 (naive `.*?`): unquoted-delimiter live `$(...)` expansion inside the body, a
+#     redirect/pipe on the heredoc's own operator line, an early bare-delimiter line followed by
+#     a live second command, a nested executing heredoc reusing the delimiter word.
+#   - round 2 (`(?<=")…(?=")` lookaround): an EMPTY adjacent quote pair (`""$(cat <<'EOF'…EOF)""`)
+#     looks quoted to a one-character lookaround but is two empty strings concatenated around a
+#     genuinely unquoted (and therefore word-split-and-executed) substitution.
+#   - round 3 (single-pass scanner, flat quote-parity): a `"` inside a bash COMMENT nested inside
+#     an unrelated EARLIER `$(...)` desynced the outer parity count for everything after it; the
+#     terminator-line check over-accepted a delimiter glued to a closing paren with no newline;
+#     the opener/closer accepted a MISMATCHED substitution type (`$(` opened, backtick closed).
+#
+# The round-4 fix (current): the scanner treats every nested `$(...)`/backtick substitution — not
+# just the cat-heredoc shape this carve-out grants — as ITS OWN independent parsing region (own
+# quote state, own `#`-comment recognition, own paren-depth tracking, recursing into further
+# nested substitutions), skipped over as an OPAQUE, UNCHANGED span before the outer scan resumes
+# its own quote tracking. This closes the whole CLASS of "content inside some other substitution
+# confuses the outer scanner" bugs, not just the one comment-shaped instance that broke round 3.
+#
+# A candidate cat-heredoc match must still satisfy ALL of:
+#   1. Attempted ONLY while genuinely, currently inside an open double-quoted span (quote == '"')
+#      at the TOP level of that quote's own nesting (never unquoted, never single-quoted — single-
+#      quoted `$(...)` is already fully inert in real bash and left untouched as literal text).
+#   2. The delimiter is QUOTED (`<<'EOF'`/`<<"EOF"`, never bare `<<EOF`).
+#   3. Nothing but whitespace follows the delimiter before its newline (no redirect/pipe hiding on
+#      the operator line).
+#   4. The body is scanned up to the FIRST bare-delimiter line — a real forward text search, never
+#      a backtracking regex that can skip an early terminator hunting for a later one — and that
+#      line must be genuinely ALONE (only trailing whitespace, then a real newline or end-of-
+#      string; a delimiter glued to anything else, including the substitution's own closer, on
+#      the SAME line does NOT count).
+#   5. That body contains no nested `<<` at all (a second, possibly-executing heredoc laundered
+#      inside the outer one) — defense in depth alongside constraint 4.
+#   6. What immediately follows the terminator (only whitespace/newlines permitted) is the
+#      substitution's OWN closing delimiter, matching the SAME type that opened it (`$(` closes
+#      only with `)`, backtick closes only with a backtick — never mixed).
+#
+# On success the whole span becomes the inert placeholder `HEREDOC_DATA`; the outer scan resumes
+# right after the close, quote state unchanged (the heredoc's raw body, which real bash does not
+# shell-quote-parse at all under a quoted delimiter, is jumped over by index — literal quote/
+# backslash/comment characters inside it can never reach the outer scanner). On ANY failure the
+# span is left completely untouched — still trips the blunt `HEREDOC` veto exactly as before this
+# carve-out existed. `cat <<EOF > f` (no `$()`/backtick wrapper), `bash <<EOF` (executes), and any
+# heredoc failing a constraint above are UNTOUCHED — see test_tg_command_with_heredoc_still_blocks
+# / test_heredoc_to_file_blocks_on_repeat / test_read_only_pipe_with_heredoc_segment_blocks_on_repeat
+# (still pinned unmodified) plus the full round 1-4 regression suite below.
+_HEREDOC_OPENER = re.compile(r"(\$\(|`)\s*cat\s+<<-?\s*(['\"])(\w+)\2(?=[ \t]*\n)")
+
+
+def _skip_nested_substitution(command: str, pos: int) -> int:
+    """`command[pos]` is either a backtick, or `$` immediately followed by `(`. Returns the index
+    right after the MATCHING close (backtick, or the balancing `)`), treating everything in
+    between as this substitution's OWN independent parsing region: its own single/double quote
+    state, its own `#`-starts-a-comment-to-end-of-line recognition (only when `#` is at the start
+    of a word — preceded by whitespace/newline or the very start of this region), its own paren-
+    depth tracking (so a literal `(`/`)` inside a nested quoted string never miscounts), and
+    recursing into any FURTHER nested `$(...)`/backtick substitution found along the way. This is
+    what lets the outer scanner treat an entire nested substitution as an opaque, unchanged span
+    without any of its internal content — including a `"` sitting inside a comment, exactly the
+    class of input that broke an earlier, flatter version of this scanner — leaking out to desync
+    the OUTER quote-tracking state. Unterminated input (no matching close found) consumes to the
+    end of the string, matching this module's fail-toward-blocking default elsewhere: the caller
+    that invoked this on an unquoted `$(`/backtick will simply find nothing left to correctly
+    close its own quote either, so the overall command falls through to `HEREDOC`/other checks
+    unchanged."""
+    n = len(command)
+    backtick_form = command[pos] == "`"
+    j = pos + 1 if backtick_form else pos + 2
+    depth = 1
+    quote: str | None = None
+    while j < n and depth > 0:
+        c = command[j]
+        if c == "\\" and j + 1 < n and quote != "'":
+            j += 2
+            continue
+        if quote == "'":
+            if c == "'":
+                quote = None
+            j += 1
+            continue
+        if quote == '"':
+            if c == '"':
+                quote = None
+            j += 1
+            continue
+        if backtick_form and c == "`":
+            return j + 1
+        if c in ("'", '"'):
+            quote = c
+            j += 1
+            continue
+        if c == "#" and (j == pos + (1 if backtick_form else 2) or command[j - 1] in " \t\n"):
+            newline = command.find("\n", j)
+            j = n if newline == -1 else newline + 1
+            continue
+        if c == "`":
+            j = _skip_nested_substitution(command, j)
+            continue
+        if c == "$" and j + 1 < n and command[j + 1] == "(":
+            j = _skip_nested_substitution(command, j)
+            continue
+        if not backtick_form and c == "(":
+            depth += 1
+            j += 1
+            continue
+        if not backtick_form and c == ")":
+            depth -= 1
+            j += 1
+            continue
+        j += 1
+    return j
+
+
+def _try_consume_data_only_heredoc(command: str, pos: int) -> int | None:
+    """Starting at `pos` (already known to be inside an open double-quote), try to match and
+    fully validate ONE data-only `$(cat <<'DELIM' … DELIM)` / backtick-`cat` substitution per the
+    6 constraints in `_HEREDOC_OPENER`'s neighboring module comment. Returns the END index
+    (exclusive) of the whole consumed span on success, or `None` if `pos` is not the start of a
+    valid one — the caller must then treat `command[pos]` as an ordinary character (or, for a `$`/
+    backtick that fails here, fall back to `_skip_nested_substitution` to safely skip over it as
+    an opaque, un-neutralized span instead)."""
+    opener = _HEREDOC_OPENER.match(command, pos)
+    if opener is None:
+        return None
+    opener_kind = opener.group(1)  # '$(' or '`'
+    delim = opener.group(3)
+    body_start = opener.end()
+    terminator = re.compile(
+        r"\n[ \t]*" + re.escape(delim) + r"[ \t]*(?=\n|$)"
+    ).search(command, body_start)
+    if terminator is None:
+        return None
+    if "<<" in command[body_start : terminator.start()]:
+        return None
+    tail = command[terminator.end() :]
+    closer = re.match(r"[ \t\n]*\)" if opener_kind == "$(" else r"[ \t\n]*`", tail)
+    if closer is None:
+        return None
+    return terminator.end() + closer.end()
 
 
 def _neutralize_data_only_heredocs(command: str) -> str:
-    """Blank a `$(cat <<'DELIM' … DELIM)` / backtick-`cat` data-only heredoc SUBSTITUTION down to
-    an inert placeholder, so the rest of this module's heredoc/mutation/chain-length
-    classification sees plain text instead of heredoc syntax it would otherwise (over-)trip on —
-    and so the heredoc BODY's own prose (which may contain a literal `;`/`&&`/`|`) is never
-    re-parsed as shell chain operators by `_split_chain`. Only the narrow, verified-safe shape
-    `_DATA_HEREDOC_SUBST` matches is touched; every other heredoc classifies exactly as before."""
-    return _DATA_HEREDOC_SUBST.sub("HEREDOC_DATA", command)
+    """Blank each data-only `$(cat <<'DELIM' … DELIM)` / backtick-`cat` heredoc SUBSTITUTION down
+    to the inert placeholder `HEREDOC_DATA`, so the rest of this module's heredoc/mutation/chain-
+    length classification sees plain text instead of heredoc syntax it would otherwise (over-)trip
+    on. A single-pass scanner (see the module comment above for why three lookaround/flat-scan
+    attempts were each broken by a concrete bypass): tracks outer quote state with the same
+    backslash-escape handling `_blank_single_quoted` uses, only ever calls
+    `_try_consume_data_only_heredoc` while genuinely inside an open double-quoted span, and treats
+    every OTHER nested `$(...)`/backtick substitution encountered along the way as its own opaque
+    region via `_skip_nested_substitution` — so content inside one substitution (a comment, a
+    quote, a paren) can never desync tracking for anything that comes after it. Every heredoc that
+    fails any constraint is left completely untouched and still classifies exactly as before this
+    carve-out existed."""
+    out: list[str] = []
+    i, n = 0, len(command)
+    quote: str | None = None
+    while i < n:
+        c = command[i]
+        if c == "\\" and i + 1 < n and quote != "'":
+            out.append(command[i : i + 2])
+            i += 2
+            continue
+        if quote == "'":
+            if c == "'":
+                quote = None
+            out.append(c)
+            i += 1
+            continue
+        if quote == '"':
+            end = _try_consume_data_only_heredoc(command, i)
+            if end is not None:
+                out.append("HEREDOC_DATA")
+                i = end
+                continue
+            if c == '"':
+                quote = None
+                out.append(c)
+                i += 1
+                continue
+            if c == "`" or (c == "$" and i + 1 < n and command[i + 1] == "("):
+                j = _skip_nested_substitution(command, i)
+                out.append(command[i:j])
+                i = j
+                continue
+            out.append(c)
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            out.append(c)
+            i += 1
+            continue
+        if c == "`" or (c == "$" and i + 1 < n and command[i + 1] == "("):
+            j = _skip_nested_substitution(command, i)
+            out.append(command[i:j])
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 # In-place edit / build invocations. A bare `>`/`>>` redirect is NOT here: a redirect alone
