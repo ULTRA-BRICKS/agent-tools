@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "source_version": 4,
+  "context": {
+    "repository": "ultrabricks/agent-tools",
+    "repository_id": 1269421952,
+    "source_ref": "f707ee2b2f643a4621121187df442554aa968244",
+    "snapshot_run": "34541300125",
+    "mutations": "body only",
+    "manual_exclusions": []
+  },
+  "mode": "apply",
+  "started_at": "2026-09-10T23:37:18.828088+00:00",
+  "events": [
+    {
+      "key": "agent-tools#743",
+      "number": 743,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "683241c502d5e23cfb54055c8c4e22bda50f76f6f07cfef5b7d4aab435aeea8a"
+    },
+    {
+      "key": "agent-tools#742",
+      "number": 742,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "c8ccb2f91b1b59195cdaf8c881a17d119e2e31c95c0363ee093709046fe3c572"
+    },
+    {
+      "key": "agent-tools#739",
+      "number": 739,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "3ae585e8bb874f1b296e10c3bdfd4cc97d5c055fb4f9e7d37c7cb0eca4eb780f"
+    },
+    {
+      "key": "agent-tools#738",
+      "number": 738,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "972b4c1517a30df4ee40d98b1ca8a95c61de9f6bc06315eecd8baa73a52dc38a"
+    },
+    {
+      "key": "agent-tools#736",
+      "number": 736,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "c3dd21baecc95d9fe82d7a3b2aa90bd1cca32a8639239d8962cf668b43fce2a8"
+    },
+    {
+      "key": "agent-tools#734",
+      "number": 734,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "dbb8ff4a0a8f06fceada0227e6584959bae3866dfdacae06733de515d579b5b8"
+    },
+    {
+      "key": "agent-tools#732",
+      "number": 732,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "4df800131bbd5e8a02efec7e9e94210fd354c60b28f567a2b2f8fde36898d937"
+    },
+    {
+      "key": "agent-tools#728",
+      "number": 728,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "e4b28ab4ff30aabfbe39a605ea06daa1b2133fa47114673f78ec07100dcea09b"
+    },
+    {
+      "key": "agent-tools#727",
+      "number": 727,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "91e306b60006322505942118f9b177e72ed6a33381b5aa6f1d80f1c3c8087ac4"
+    },
+    {
+      "key": "agent-tools#718",
+      "number": 718,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "6420c56b24dfb0f51366ec8dc721251cfaf9d8b58aecfea6f40ceb1ffd8cf990"
+    },
+    {
+      "key": "agent-tools#717",
+      "number": 717,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "dd1a8801f97b50fa881b7304ee101ec698fc3a4f9513f0a3a17a1fe770e3e634"
+    },
+    {
+      "key": "agent-tools#716",
+      "number": 716,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "251507341522125a7446566a3bbbecb6f9bace6178956d6a0b8f98853d001faa"
+    },
+    {
+      "key": "agent-tools#713",
+      "number": 713,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "5a96e19123c4cbb1ef974b424873ae91fe65622ab30cbcbbe8399fe9bc3c9c53"
+    },
+    {
+      "key": "agent-tools#712",
+      "number": 712,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "a5cf2753b2f0ca37d2324d3fde1e5372d028fea2878137a80d8ff060debfeb09"
+    },
+    {
+      "key": "agent-tools#705",
+      "number": 705,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "900c27241307337c3700531863e2e4a7df59063f04f2cb57a1b4dc13730f1f88"
+    },
+    {
+      "key": "agent-tools#703",
+      "number": 703,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "ec7ec2784f179d01ba2d414a2d9f837a7302818820e02bfc36f792d8024f1de8"
+    },
+    {
+      "key": "agent-tools#702",
+      "number": 702,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "08c96e0be0bd4d0dd97587421740718ace094baaaa47820e7e98d8d94c1b17da"
+    },
+    {
+      "key": "agent-tools#693",
+      "number": 693,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "d0e98fb21c2b84c90c7952a94a34970e80609102ecc7ee9245056290baf26fb1"
+    },
+    {
+      "key": "agent-tools#687",
+      "number": 687,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "e4037185fc43deb7025c131a7e6ad494df97d9bb87589cb07043c89ef400c0dc"
+    },
+    {
+      "key": "agent-tools#682",
+      "number": 682,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "5b5b905a35955a3312aa26f0f4345a6cdeac5991111fdb477655e77c7eedcd3a"
+    },
+    {
+      "key": "agent-tools#679",
+      "number": 679,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "23b10e5c04e3bf7cea117d8ac230d5654046cd0aedcfff51add58c29583af456"
+    },
+    {
+      "key": "agent-tools#674",
+      "number": 674,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "5f6963b153d235f17e74c56fc3e3a29561316a7b3651f126973ddb0c45c51ad9"
+    },
+    {
+      "key": "agent-tools#673",
+      "number": 673,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "d8c8943b29ef45b42e13d334c38e1b3a82ece8fd421992f0b20237ddda5723e5"
+    },
+    {
+      "key": "agent-tools#649",
+      "number": 649,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "a27a5ad14788abd2a1aa9c5ceccb080b85f13e031dd71e0f3ba21764057c933c"
+    },
+    {
+      "key": "agent-tools#630",
+      "number": 630,
+      "result": "patch-received-awaiting-readback",
+      "observed_before_sha256": "266d8ce2b238644d979f44f2c84640d56f52aaf54ee22220196aa1500d694b27"
+    },
+    {
+      "key": "agent-tools#623",
+      "number": 623,
+      "result": "delivery-uncertain",
+      "observed_before_sha256": "d382d097546451d72d51d305fb2960d76fc5fc6c47ff422b28ab257ddb107377"
+    }
+  ],
+  "writes": 25,
+  "complete": false,
+  "fatal": "delivery-uncertain",
+  "product_acceptance": false,
+  "counts": {
+    "patch-received-awaiting-readback": 25,
+    "delivery-uncertain": 1
+  },
+  "pending_write": {
+    "key": "agent-tools#623",
+    "intended_sha256": "fa1a5305647d534ca25d19c04480401cae30f30e2af35505f6dd1b443e386e75"
+  },
+  "readback_error": "HTTPError",
+  "planned": 431,
+  "remaining_or_conflicted": 431,
+  "finished_at": "2026-09-10T23:40:58.394425+00:00"
+}
