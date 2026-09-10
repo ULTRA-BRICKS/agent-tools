@@ -74,17 +74,39 @@ from pathlib import Path
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
+
+def warn(msg: str) -> None:
+    sys.stderr.write(f"stop-selfcheck: {msg}\n")
+
+
+def _env_int(name: str, default: int) -> int:
+    """int(os.environ[name]) that can never crash the module at import time.
+
+    A malformed value (a stray trailing comma from a shell export, an empty string) must
+    not raise ValueError at import — that would exit non-zero before main() even runs,
+    silently disabling the hook for the rest of the session via on_error=open.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        warn(f"{name}={raw!r} is not an int, using default {default}")
+        return default
+
+
 MARKER_DIR = Path(os.path.expanduser(os.environ.get(
     "SELFCHECK_MARKER_DIR", "~/.cache/agent-tools/selfcheck")))
 # After this many seconds a marker is considered stale (a new task in the same session).
-MARKER_TTL_S = max(1, int(os.environ.get("SELFCHECK_TTL_S", "1800")))
+MARKER_TTL_S = max(1, _env_int("SELFCHECK_TTL_S", 1800))
 # How far back to scan the transcript for the current turn. A turn rarely spans more than
 # a few dozen tool round-trips; this is generous headroom, not a tuned limit. <= 0 disables
 # the scan entirely (falls back to FULL_PROMPT, the pre-existing behavior).
-TRANSCRIPT_TAIL_LINES = int(os.environ.get("SELFCHECK_TRANSCRIPT_TAIL_LINES", "500"))
+TRANSCRIPT_TAIL_LINES = _env_int("SELFCHECK_TRANSCRIPT_TAIL_LINES", 500)
 # Byte budget for the bounded tail read (see _read_tail_records) — bounds I/O/decode cost
 # to this window regardless of total transcript file size, independent of TAIL_LINES.
-TAIL_READ_BYTES = int(os.environ.get("SELFCHECK_TRANSCRIPT_TAIL_BYTES", str(2_000_000)))
+TAIL_READ_BYTES = _env_int("SELFCHECK_TRANSCRIPT_TAIL_BYTES", 2_000_000)
 # Where firing decisions are logged for later usefulness analysis (agent-tools#529).
 FIRINGS_LOG = Path(os.path.expanduser(os.environ.get(
     "SELFCHECK_FIRINGS_LOG", str(MARKER_DIR / "firings.jsonl"))))
@@ -137,12 +159,15 @@ def emit(decision: str, message: str | None = None) -> None:
     sys.stdout.flush()
 
 
-def warn(msg: str) -> None:
-    sys.stderr.write(f"stop-selfcheck: {msg}\n")
+def _event_args(event: dict) -> dict:
+    """``event["args"]``, coerced to a dict — a malformed (non-dict) value must degrade to
+    "no args" everywhere rather than crash whatever reads it next."""
+    args = event.get("args")
+    return args if isinstance(args, dict) else {}
 
 
 def session_id(event: dict) -> str:
-    args = event.get("args") or {}
+    args = _event_args(event)
     raw = (
         args.get("session_id")
         or event.get("event_id")
@@ -158,7 +183,26 @@ def marker_file(sid: str) -> Path:
 
 def fresh(p: Path) -> bool:
     try:
-        return p.exists() and (time.time() - p.stat().st_mtime) <= MARKER_TTL_S
+        age = time.time() - p.stat().st_mtime
+    except OSError:
+        return False
+    # A future-dated mtime (clock skew, a restored cache, a tampered/copied file) must
+    # NOT read as "fresh" — since the marker is no longer consumed on allow, a future
+    # mtime would otherwise suppress every self-check until wall-clock time caught up to
+    # it, which could be indefinite. Treat it the same as absent/stale: re-block now.
+    return 0 <= age <= MARKER_TTL_S
+
+
+def _elapsed_ms(start: float) -> float:
+    return (time.monotonic() - start) * 1000
+
+
+def _disabled() -> bool:
+    """Kill switch: an env flag or a sentinel file, checked before any marker/log write."""
+    if DISABLE_ENV.strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    try:
+        return (MARKER_DIR / "DISABLED").exists()
     except OSError:
         return False
 
@@ -469,6 +513,7 @@ def main() -> int:
     try:
         MARKER_DIR.mkdir(parents=True, exist_ok=True)
         marker.write_text(str(time.time()))
+        _sweep_stale_markers()
     except OSError as exc:
         # Can't write a marker → don't risk a loop; allow the stop and just warn.
         warn(f"could not write marker {marker}: {exc} — allowing stop (fail-open)")
