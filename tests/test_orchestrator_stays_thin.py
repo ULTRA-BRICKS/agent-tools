@@ -2942,6 +2942,211 @@ def test_report_verify_allowlist_surface():
     assert impl("tg done & git push origin main; ls") is True
 
 
+# ── task-cli orchestrator exception (Alex, direct, 2026-09-10): `_is_task_command` — mirrors the ──
+# ─── tg-carveout-159 treatment for task-cli, this repo's own ticket-tracking/orchestration CLI.
+# Authorized explicitly: "разреши оркестратору пользоваться task-cli тоже как исключение" — "allow
+# the orchestrator to use task-cli too, as an exception". Built and wired identically to
+# `_is_tg_command` (shlex-based, bare `task` head only, self-contained `VAR=val` env-prefix skip,
+# no path-qualification, basename-exact so `task-foo` is rejected) — the tests below mirror the
+# tg-command test suite's exact structure and naming convention.
+
+@pytest.mark.parametrize("command", [
+    "task new 'Fix the thing'",                                # ticket creation
+    "task list",                                                # this session's tickets
+    "task read 42",                                             # read a ticket
+    "task find 'stale import'",                                 # search
+    "task change 42 --status in-progress",                      # mutate a field
+    "task link 42 blocks 43",                                   # relate two tickets
+    "task check 42 --proof 'ran the repro'",                    # acceptance criterion check
+    "task accept 42",                                           # accept a ticket
+    "task gate 42",                                             # pre-merge verdict
+    "task done 42",                                             # close a ticket
+    "task status 42 in-review",                                 # status transition
+    "task classify 'some free text'",                           # classify subcommand
+    "task session",                                             # session subcommand
+    "TASK_API_TOKEN=x task new 'x'",                            # env-prefixed head
+    "TASK_API_TOKEN=x TASK_BACKEND=github task list",           # multiple env prefixes
+    "gtimeout 30 task new 'x'",                                 # gtimeout-wrapped
+    "cd /repo && task list",                                    # `cd` companion
+    "task list | tail -3 | head -1",                            # ticket list + read-only plumbing
+    "task list && review diff && git worktree list",            # chained with sibling orchestration
+    "task new 'a' && task done 1",                              # chained with itself
+])
+def test_task_command_carve_out_allows(command, tmp_path, monkeypatch):
+    """The task-cli surface (ticket create/list/read/find/change/link/check/accept/gate/done/
+    status/classify/session) is sanctioned for the orchestrator to run inline, including an
+    env-prefixed head — it never even warns, never primes a block, same treatment `tg` gets, at
+    any chain length alongside read-only/orchestration companions."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command
+    assert "message" not in json.loads(out1), command  # does not even warn
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")  # never primes a block
+    assert c2 == 0 and _decision(out2) == "allow", command
+
+
+def test_task_command_unit_predicate():
+    """`_is_task_command` recognizes ONLY a bare `task` token (with a self-contained `VAR=val`
+    env-prefix skip) — deliberately NOT path-qualified, mirroring `_is_tg_command`'s own two-review-
+    round rationale. `task` is recognized only at a segment HEAD (argv), never as a substring/
+    needle, and is basename-exact — `task-foo` is a DIFFERENT command."""
+    assert ost._is_task_command("task new 'x'") is True
+    assert ost._is_task_command("task") is True                     # bare, no args at all
+    assert ost._is_task_command("TASK_API_TOKEN=x task new 'x'") is True
+    assert ost._is_task_command("TASK_API_TOKEN=x TASK_BACKEND=y task list") is True
+    assert ost._is_task_command(ost._strip_wrappers("gtimeout 30 task new 'x'")) is True
+    assert ost._is_task_command(ost._strip_wrappers("env TASK_API_TOKEN=x task list")) is True  # `env` wrapper
+    assert ost._is_task_command("TASK_API_TOKEN=x") is False        # env assignment with no command at all
+    assert ost._is_task_command("cat task.md") is False           # needle, not a head
+    assert ost._is_task_command("grep 'task done' log") is False  # needle inside a quoted arg
+    assert ost._is_task_command("task-foo bar") is False           # basename-exact
+    assert ost._is_task_command("FOO=bar echo x") is False        # env-prefix on a non-task head
+    assert ost._is_task_command("tg 'x'") is False                # a different sanctioned command
+    # unbalanced-quote segment: shlex can't parse it — DENY, mirroring `_is_tg_command`'s own
+    # "no match" fallback direction for a GRANT-direction predicate facing uncertain input.
+    assert ost._is_task_command("task new 'unterminated") is False
+    assert ost._is_task_command("echo 'unterminated") is False
+
+
+def test_task_command_rejects_any_path_qualified_head():
+    """`_is_task_command` grants ONLY a bare `task` token — NEVER a path-qualified one, relative OR
+    absolute, mirroring `_is_tg_command`'s own (Fable-reviewed) rationale: a relative path is
+    trivial to place anywhere, and narrowing to "absolute paths only" narrows nothing real."""
+    for command in ("/opt/homebrew/bin/task 'x'", "/usr/local/bin/task 'x'", "/tmp/task 'x'", "/task 'x'",
+                     "./task 'x'", "scripts/task 'x'", "../task 'x'", "bin/task 'x'", "relative/nested/task 'x'"):
+        assert ost._is_task_command(command) is False, command
+        # a lone, unchained rejected head still falls through to the SAME generic gray-zone
+        # fallthrough every unclassified single command gets — this predicate returning False
+        # does not itself create a block.
+        assert ost._is_implementation_bash(command) is False, command
+    # ...but chained with even fully read-only companions, a rejected path-qualified head now
+    # blocks — unlike a bare `task`, which stays exempt at any chain length (test above).
+    assert ost._is_implementation_bash("/opt/homebrew/bin/task 'x' | tail -3 | head -1") is True
+    assert ost._is_implementation_bash("./task 'x' | tail -3 | head -1") is True
+
+
+def test_task_foo_lookalike_is_rejected():
+    """`_is_task_command` is basename-exact, so a hyphen-suffixed lookalike (`task-foo`, a
+    DIFFERENT command) is correctly rejected — mirroring `test_tg_foo_is_now_rejected_end_to_end`'s
+    coverage for `tg`. Not routed through `ORCH_ALLOW` at all (task never was), so there is no old
+    regex quirk to fix here — this pins the predicate's own correctness directly."""
+    assert ost.ORCH_ALLOW.search("task-foo bar") is None
+    assert ost._is_task_command("task-foo bar") is False
+    assert ost._is_implementation_bash("task-foo bar") is False       # lone segment: generic fallthrough
+    assert ost._is_implementation_bash("task-foo bar | tail") is False  # 2-segment: still gray zone
+    assert ost._is_implementation_bash("task-foo bar | tail -3 | head -1") is True  # 3-seg: now blocks
+
+
+def test_task_subagent_is_exempt(tmp_path, monkeypatch):
+    """A dispatched subagent (`agent_id` present) runs `task` freely regardless — this gate governs
+    the orchestrator only, and was never the thing standing between a subagent and task-cli anyway."""
+    for command in ("task new 'x'", "task done 42"):
+        event = {"point": "pre-bash", "cwd": "/repo",
+                 "args": {"agent_id": "sub-1", "command": command}}
+        _run(event, monkeypatch, tmp_path / "m")  # even on a repeat it must allow
+        out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+        assert c == 0 and _decision(out) == "allow", command
+
+
+@pytest.mark.parametrize("command", [
+    "sed -i 's/a/b/' f.py && task done 1",     # task does not launder an in-place edit
+    "npm run build && task done 1",            # ...nor a build
+    "task done 1; tee out.txt; ls",            # ...nor a tee write
+    "task done $(sed -i 's/a/b/' f)",          # ...nor an edit hidden in a subst
+    "cd $(npm run build) && task list",        # ...nor a build inside `cd`
+    "task done 1 & sed -i 's/a/b/' f.py",      # ...nor behind a single `&`
+    "cd $(git push origin main) && task done 1 | tail -3",  # push in the cd subst
+    "task done 1 & git push origin main; ls",  # bare `&` hides a push
+    "cat <(git push origin main) && task done 1",  # process substitution smuggles a push
+    "task done 1; git branch -D tmp; ls",      # git branch mutating form
+    "task done 1 || git push",                 # `||` is a chain split too
+    "task done 1 --note `git push origin main`",  # backtick substitution
+    "task done 1 > >(git push origin main)",   # output-side process subst
+    "task done 1 --note <(git push origin main)",  # input-side process subst
+    "task list | gh pr merge 606",             # a sibling gh MUTATION
+    "task done 1 |& git push origin main",     # `|&` still splits into 2
+    "task done 1\ngit push origin main",        # a NEWLINE chain-splits too
+    "task done 1; ( git push )",               # a `(...)` subshell group
+    "TASK_API_TOKEN=x task done 1 && git commit -m x",  # env-prefixed head, real mutation
+])
+def test_task_command_does_not_launder_impl_segments(command, tmp_path, monkeypatch):
+    """The task allowance is per-segment, same as `tg`: tacking a (bare or env-prefixed) `task`
+    call onto an implementation chain must NOT exempt the rest of it — a mutation smuggled where
+    no head can see it (inside `$()`/`<()`/backticks, behind a bare `&`, a mutating git-branch
+    form) is caught by the substitution-inner scan, the `&` split, and the companion guards."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block", command
+
+
+def test_task_command_with_heredoc_still_blocks(tmp_path, monkeypatch):
+    """A heredoc anywhere vetoes the task carve-out too, exactly as it vetoes `tg`/read-only."""
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "cat <<EOF > notes\nbody\nEOF\ntask done 1 | tail -5"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_task_command_needle_or_prefix_word_is_not_exempt(tmp_path, monkeypatch):
+    """`task` counts only at a segment HEAD (argv), never as a substring in text — a grep needle
+    must not self-exempt a chain (mirrors `test_tg_command_needle_or_prefix_word_is_not_exempt`)."""
+    command = "python x.py | grep 'task done' | python y.py"
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_task_orchestrator_carve_out_acceptance_matrix(tmp_path, monkeypatch):
+    """End-to-end acceptance for the task-cli carve-out (Alex, direct, 2026-09-10): the
+    orchestrator running ANY task-cli command (bare or env-prefixed) is allowed and never even
+    warns; the orchestrator running `gh pr merge`, another code Edit/Write, or other
+    implementation-shaped Bash still warn-then-blocks exactly as before this change; a dispatched
+    subagent is unaffected either way. Mirrors `test_tg_orchestrator_carve_out_acceptance_matrix`'s
+    structure for `tg`."""
+    # orchestrator: a task-cli call — allowed, never warns, never primes a block
+    task_event = {"point": "pre-bash", "cwd": "/repo",
+                  "args": {"command": "task new 'Fix the thing'"}}
+    out1, _e1, c1 = _run(task_event, monkeypatch, tmp_path / "task")
+    assert c1 == 0 and _decision(out1) == "allow" and "message" not in json.loads(out1)
+    out2, _e2, c2 = _run(task_event, monkeypatch, tmp_path / "task")
+    assert c2 == 0 and _decision(out2) == "allow"
+
+    # orchestrator: gh pr merge — untouched by this change, still warn-then-blocks
+    merge_event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": "gh pr merge 605"}}
+    out1, _e1, c1 = _run(merge_event, monkeypatch, tmp_path / "merge")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(merge_event, monkeypatch, tmp_path / "merge")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+    # orchestrator: a code Edit/Write — still warn-then-blocks (pre-write point, unaffected by task)
+    write_event = {"point": "pre-write", "cwd": "/repo", "args": {"file_path": "/repo/src/a.ts"}}
+    out1, _e1, c1 = _run(write_event, monkeypatch, tmp_path / "write")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(write_event, monkeypatch, tmp_path / "write")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+    # orchestrator: other implementation-shaped Bash (a commit) — still warn-then-blocks
+    commit_event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": "git commit -m x"}}
+    out1, _e1, c1 = _run(commit_event, monkeypatch, tmp_path / "commit")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(commit_event, monkeypatch, tmp_path / "commit")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+    # subagent: unaffected either way — task AND gh pr merge both run freely, even on a repeat
+    for i, cmd in enumerate(("task new 'x'", "gh pr merge 605")):
+        sub_event = {"point": "pre-bash", "cwd": "/repo", "args": {"agent_id": "sub-1", "command": cmd}}
+        marker = tmp_path / f"sub-{i}"
+        _run(sub_event, monkeypatch, marker)
+        out, _e, c = _run(sub_event, monkeypatch, marker)
+        assert c == 0 and _decision(out) == "allow", cmd
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
 

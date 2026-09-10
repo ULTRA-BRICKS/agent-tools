@@ -18,7 +18,7 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   Read-only inspection **and sanctioned orchestration** are **never** blocked — including a chain
   of **any length** where every segment's head is inspection (`git status`/`log`/`diff`/`show`/
   `branch`, `ls`, `cat`, `grep`, `find`, `head`, `tail`, `wc`, a print-only `sed -n`, …) **or** orchestration
-  (`tg`, `review`, `git worktree list`), across `|`, `&&`, `;`, `||` or newline
+  (`tg`, `review`, `task`, `git worktree list`), across `|`, `&&`, `;`, `||` or newline
   (`git status && ls`, `tg 'a' && tg 'b'`, `review diff && tg done`). But a chain that merely
   *starts* allowed (`git status && sed -i ...`, `tg done && git commit`), or that mixes in any
   build/edit/heredoc segment, is judged on its **full** content — not waved through on its prefix.
@@ -79,6 +79,15 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   lookalike like `tg-foo` no longer matches). See "`tg` —
   formalized carve-out" below.
 
+**UPDATE (Alex, direct, 2026-09-10): `task` (task-cli) gets the same exception.** "разреши
+оркестратору пользоваться task-cli тоже как исключение" — "allow the orchestrator to use task-cli
+too, as an exception". task-cli (`task new`, `task list`, `task read`, `task find`, `task change`,
+`task link`, `task check`, `task accept`, `task gate`, `task done`, `task status`, `task classify`,
+`task session`) is this repo's own ticket-tracking/orchestration CLI, not implementation, so it
+gets the SAME breadth as `tg` — every subcommand, every flag, at any chain length — via its own
+predicate, `_is_task_command`, built identically to `_is_tg_command` (see "`task` — formalized
+carve-out" below).
+
 ## Per-repo opt-out (Alex tg#5743)
 
 Default **ON** (opt-OUT — this gate has always been always-on, so an un-enrolled repo keeps
@@ -111,7 +120,8 @@ described above: an impl-signal that warn-then-blocks.
 **Report / verify carve-out — `tg` + read-only inspection (coordinator):** reporting to the user
 and *read-only* verification stay at orchestrator altitude and must **not** require a subagent. A
 line whose every segment head is `tg` (bare or env-prefixed, via `_is_tg_command` — see "`tg` —
-formalized carve-out" below), `review`, `git worktree list`,
+formalized carve-out" below), `task` (via `_is_task_command` — see "`task` — formalized carve-out"
+below), `review`, `git worktree list`,
 read-only inspection (incl. system-info `df`/`du`/`lsblk`/`free`/`ps`/… and filters
 `jq`/`sort`/`cut`/…), or `cd` is never warned or blocked, of **any** length — there is no
 minimum-count or specific-source requirement, it's a per-segment check
@@ -378,6 +388,49 @@ that shared helper, outside this predicate's scope.
 
 **Subagent-exempt, same as everything else in this gate:** a dispatched subagent (`agent_id`
 present) runs `tg` freely regardless of this predicate — it was never gated for a subagent.
+
+## `task` — formalized carve-out (Alex, direct, 2026-09-10)
+
+`task` (task-cli, this repo's own ticket-tracking/orchestration CLI) is sanctioned for the
+orchestrator to run inline, mirroring the `tg` carve-out above exactly. Asked directly whether the
+orchestrator could also use task-cli as an exception, Alex authorized it explicitly: "разреши
+оркестратору пользоваться task-cli тоже как исключение" — "allow the orchestrator to use task-cli
+too, as an exception". task-cli is read-tracking/orchestration tooling — `task new`, `task list`,
+`task read`, `task find`, `task change`, `task link`, `task check`, `task accept`, `task gate`,
+`task done`, `task status`, `task classify`, `task session` — not implementation, so it gets the
+SAME breadth `tg` gets: every subcommand, every flag, at any chain length, not `gh ship`'s
+single-shape, unchained-only carve-out.
+
+**Granted by `_is_task_command`, a shlex-based predicate built identically to `_is_tg_command`.**
+Consulted directly by `_seg_is_allowed`, alongside `_is_tg_command` in the same OR-chain — allow-
+side only, since `task` (like `tg`) was never an impl-signal head, so there is nothing to exempt in
+`_seg_is_impl_signal`. Bare `task` head only, self-contained `VAR=val` env-prefix skip, basename-
+exact (`toks[i] == "task"`, so a hyphen-suffixed lookalike like `task-foo` is correctly rejected —
+the same laundering resistance `tg-foo` gets), and deliberately NO path-qualification — inheriting
+`_is_tg_command`'s own two-review-round rationale verbatim: a relative path (`./task`) is trivial
+to place anywhere, and narrowing to absolute-paths-only narrows nothing real.
+
+**What matches (never warns, never blocks, at any chain length):**
+- `task new 'Fix the thing'`, `task list`, `task read 42`, `task find 'stale import'`
+- `task change 42 --status in-progress`, `task link 42 blocks 43`, `task check 42 --proof '…'`
+- `task accept 42`, `task gate 42`, `task done 42`, `task status 42 in-review`
+- `task classify '…'`, `task session`
+- `TASK_API_TOKEN=x task new 'x'` (env-prefixed)
+- `gtimeout 30 task new 'x'` (wrapper-stripped, same as any other command)
+- `task list | tail -3 | head -1`, `task list && review diff && git worktree list` (companions, any length)
+
+**What does NOT match:** any path-qualified head (`/usr/local/bin/task`, `./task`) falls through to
+the general unclassified-command treatment; an unparseable (unbalanced-quote) segment denies by
+default — both the same fallback directions `_is_tg_command` uses.
+
+**Does not launder a mutation elsewhere on the line** — a build/edit (`sed -i … && task done 1`), a
+recognized companion mutation (`task done 1 && git push`), a mutation smuggled in a substitution
+(`task done $(sed -i 's/a/b/' f)`), behind a bare `&`, a sibling `gh` mutation, a `(...)` subshell
+group, or a heredoc anywhere still warn-then-blocks on the line's full content — identical
+laundering resistance to `tg`.
+
+**Subagent-exempt, same as everything else in this gate:** a dispatched subagent (`agent_id`
+present) runs `task` freely regardless of this predicate.
 
 ## Tiering — WARN then BLOCK
 
