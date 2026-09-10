@@ -309,6 +309,46 @@ def test_exit0_with_empty_stdout_and_stderr_detail_denies_with_detail(tmp_path):
     assert "no reply" in result.reason and "daemon unreachable" in result.reason
 
 
+# tg-cli#317: the client's `ask-forward …` outcome line is the deny reason, verbatim. Before,
+# every empty-stdout outcome collapsed into "returned no reply (declined, timed out, or daemon
+# unreachable)" — and a card the daemon had POSTED (messageId in its log) reached the agent as
+# "not-posted".
+def test_posted_then_expired_card_is_reported_as_expired_not_no_reply(tmp_path):
+    line = ("[2026-09-05T19:48:25.229Z] ask-forward expired: req=hatch-x agent=claude pane=- "
+            "messageId=14880 — posted to Telegram; no decision within 110000ms (daemon expiry, nobody tapped)")
+    result = _ask(tmp_path, f"echo '{line}' >&2\nexit 0\n")
+    assert result.approved is False
+    assert result.reason.startswith("tg-ctl ask: ask-forward expired:")
+    assert "messageId=14880" in result.reason and "posted to Telegram" in result.reason
+    assert "no reply" not in result.reason and "not-posted" not in result.reason
+
+
+def test_daemon_decline_reason_is_forwarded(tmp_path):
+    line = "[2026-09-05T17:47:31.999Z] ask-forward not-posted: req=hatch-y agent=claude pane=- — daemon declined: reason=not-registered"
+    result = _ask(tmp_path, f"echo '{line}' >&2\nexit 0\n")
+    assert result.approved is False
+    assert "daemon declined: reason=not-registered" in result.reason
+    assert "no reply" not in result.reason
+
+
+@pytest.mark.parametrize("kind", [
+    "timed-out", "declined-after-post", "dropped", "unreachable", "multi-question not-completed",
+    "some-future-kind",
+])
+def test_every_ask_forward_outcome_kind_is_forwarded(tmp_path, kind):
+    result = _ask(tmp_path, f"echo '[t] ask-forward {kind}: req=hatch-k agent=claude pane=- — detail' >&2\nexit 0\n")
+    assert result.reason == f"tg-ctl ask: ask-forward {kind}: req=hatch-k agent=claude pane=- — detail"
+
+
+def test_last_ask_forward_line_wins_over_earlier_noise(tmp_path):
+    body = ("echo '[t] ask reconnect: daemon socket dropped — resending' >&2\n"
+            "echo '[t] ask-forward unreachable: req=hatch-z agent=claude pane=- — daemon socket closed or errored without a reply' >&2\n"
+            "exit 0\n")
+    result = _ask(tmp_path, body)
+    assert result.reason == ("tg-ctl ask: ask-forward unreachable: req=hatch-z agent=claude pane=- — "
+                             "daemon socket closed or errored without a reply")
+
+
 def test_exit0_with_unparseable_stdout_denies(tmp_path):
     # The pre-fix fakes printed exactly this and were treated as approval.
     result = _ask(tmp_path, 'printf "approved\\n"\nexit 0\n')

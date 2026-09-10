@@ -397,6 +397,11 @@ def _request_present_hatch_approval(
 
     stdout_text = (out or "").strip()
     if not stdout_text:
+        verdict = _ask_forward_verdict(err or "")
+        if verdict:
+            # The client's own outcome line is the truth (tg-cli#317): a card that was POSTED
+            # and then expired must reach the agent as exactly that, never as "no reply".
+            return _deny(f"tg-ctl ask: {verdict[:_DETAIL_CAP]}")
         reason = "tg-ctl ask returned no reply (declined, timed out, or daemon unreachable)"
         return _deny(f"{reason}: {detail}" if detail else reason)
 
@@ -417,6 +422,22 @@ def _request_present_hatch_approval(
         env_present=True,
         tg_ctl_path=str(tg_ctl),
     )
+
+
+# `tg-ctl ask` logs ONE outcome line for a request that produced no usable reply (tg-cli#317):
+# `ask-forward expired: … messageId=N — posted to Telegram; no decision within …`,
+# `ask-forward not-posted: … daemon declined: reason=not-registered`, `ask-forward timed-out: …`,
+# `ask-forward unreachable: …`. It is what the asking agent must be told, verbatim.
+# Any client-side outcome kind (`expired`, `timed-out`, `not-posted`, `unreachable`, a future
+# one) is forwarded as-is — the daemon-side progress lines (`arrived`, `posted`, `replayed-
+# answer`, …) never reach the client's stderr, so no exclusion list is needed (review note).
+_ASK_FORWARD_VERDICT_RE = re.compile(r"ask-forward [a-z][a-z-]*(?: [a-z-]+)*:[^\n]*")
+
+
+def _ask_forward_verdict(stderr_text: str) -> str | None:
+    """The LAST `ask-forward …` outcome line on tg-ctl's stderr, without the timestamp."""
+    matches = _ASK_FORWARD_VERDICT_RE.findall(stderr_text)
+    return matches[-1].strip() if matches else None
 
 
 def _run_tg_ctl_ask(
