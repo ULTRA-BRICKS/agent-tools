@@ -121,6 +121,16 @@ _SUITE_SUBCOMMANDS = frozenset({"test", "build", "verify", "package", "all"})
 _DIRECT_TEST_RUNNERS = frozenset({"playwright", "cypress", "jest", "vitest", "pytest"})
 _REVIEW_HEAVY_SUBCOMMANDS = frozenset({"diff", "quorum", "brainstorm", "just-ask"})
 
+# Shell chain/pipe/background operators that shlex.split leaves as their own
+# tokens (when space-separated, the common style). Used to scope a
+# `--help`/`-h` exemption to the SAME segment as the matched invocation — see
+# `_segment_requests_help`. Includes `&` (backgrounds the preceding command —
+# `review diff -C . & grep -h pattern` must NOT let the trailing `-h` exempt
+# the backgrounded `review diff`) and `|&` (bash's stdout+stderr pipe) as well
+# as the plain chain/pipe operators — a real code-review catch (P2) on the
+# first version of this fix, which only covered `|`/`||`/`&&`/`;`.
+_SHELL_BOUNDARY_TOKENS = frozenset({"|", "||", "&", "|&", "&&", ";"})
+
 
 def _tokenize(command: str) -> list[str]:
     """Best-effort shell tokenization. Falls back to a bare whitespace split on
@@ -135,6 +145,29 @@ def _tokenize(command: str) -> list[str]:
 
 def _basename(token: str) -> str:
     return token.rsplit("/", 1)[-1]
+
+
+def _segment_requests_help(tokens: list[str], start: int) -> bool:
+    """True if `-h`/`--help` appears between `tokens[start]` and the next shell
+    chain/pipe operator (or end of command) — i.e. in the SAME segment as the
+    invocation matched at `start`. A real CLI's `-h`/`--help` short-circuits to
+    printing usage and exiting, never actually starting the heavy work, so
+    `review diff --help` (confirmed hard-blocking a genuinely non-heavy `--help`
+    call in a 2026-09 incident, agent-tools follow-up) should never match.
+
+    Deliberately SEGMENT-scoped, not "anywhere in the whole command": an
+    unrelated tool's own `-h` further down a pipe (`review diff -C . | grep -h
+    pattern`) must not spuriously exempt a segment that genuinely starts a
+    heavy operation — see the module docstring on why a false NEGATIVE (a
+    genuinely heavy op running unthrottled) is the more dangerous failure
+    direction for this hard-block hook than an occasional unnecessary block.
+    """
+    for tok in tokens[start:]:
+        if tok in _SHELL_BOUNDARY_TOKENS:
+            break
+        if tok in ("-h", "--help"):
+            return True
+    return False
 
 
 def classify_heavy_operation(command: str) -> Optional[str]:
@@ -162,13 +195,18 @@ def classify_heavy_operation(command: str) -> Optional[str]:
     tokens = _tokenize(command)
     basenames = [_basename(t) for t in tokens]
 
-    if any(b == "build-and-install.sh" for b in basenames):
-        return "VS Code extension rebuild/package"
-    for i, tok in enumerate(tokens[:-1]):
-        if _basename(tok) == "vsce" and tokens[i + 1] == "package":
+    for i, b in enumerate(basenames):
+        if b == "build-and-install.sh" and not _segment_requests_help(tokens, i):
             return "VS Code extension rebuild/package"
     for i, tok in enumerate(tokens[:-1]):
-        if _basename(tok) == "review" and tokens[i + 1] in _REVIEW_HEAVY_SUBCOMMANDS:
+        if _basename(tok) == "vsce" and tokens[i + 1] == "package" and not _segment_requests_help(tokens, i):
+            return "VS Code extension rebuild/package"
+    for i, tok in enumerate(tokens[:-1]):
+        if (
+            _basename(tok) == "review"
+            and tokens[i + 1] in _REVIEW_HEAVY_SUBCOMMANDS
+            and not _segment_requests_help(tokens, i)
+        ):
             return "multi-model review-cli pass"
 
     # Match on BASENAMES, not raw tokens (review-caught P2): the earlier
