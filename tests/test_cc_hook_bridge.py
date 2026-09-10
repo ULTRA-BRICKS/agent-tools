@@ -68,6 +68,13 @@ ORCHESTRATOR_STAYS_THIN = (
     _REPO / "agent-hooks" / "orchestrator-stays-thin" / "orchestrator_stays_thin.py"
 )
 
+# The pre-worktree-enter grant: enterworktree-canonical-path-grant (rig-cli#418; suppresses
+# CC's interactive prompt only for a target under <repo>/.worktrees/<name>).
+ENTERWORKTREE_CANONICAL_PATH_GRANT = (
+    _REPO / "agent-hooks" / "enterworktree-canonical-path-grant"
+    / "enterworktree_canonical_path_grant.py"
+)
+
 
 def _install_descriptor(hooks_dir: Path, *, hook_id: str, point: str, cmd: Path,
                         on_error: str = "closed", priority: int = 10) -> Path:

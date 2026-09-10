@@ -57,14 +57,32 @@ its own equivalent process/module isolation.
   doesn't set one, and an absent/unrecognized value must stay GOVERNED by default, exactly like
   this repo's `agent_id` subagent-exemption convention.
 - **stdout**: protocol JSON only — `{ "hook_api": "agents-hooks/v1", "decision": "allow"
-  | "block", "message": "..." }`. Empty stdout = allow.
+  | "grant" | "block", "message": "..." }`. Empty stdout = allow.
 - **stderr**: human logs (never parsed).
 - **exit code is the canonical signal:**
-  - `0` → allow
+  - `0` → allow — a hook may additionally opt into `"grant"` (see below) instead of the
+    default silent allow.
   - `10` → **BLOCK** (un-corruptible: exit 10 blocks even if stdout is malformed, so a
     broken gate can never silently let an action through)
   - any other exit → hook *error*, resolved by the descriptor's `on_error` policy, even if
     stdout is empty, malformed, or a Python traceback.
+
+### `"grant"` — an affirmative pre-approval, not just "no objection" (rig-cli#418)
+
+Exit 0 with empty/plain-`"allow"` stdout means "this hook has no opinion" — the host's own
+permission system (its interactive prompt, its classifier) decides exactly as if no hook were
+installed at all. `"grant"` is a DIFFERENT, stronger signal: `{"decision": "grant", "message":
+"..."}` on stdout, still exit 0, means the hook has POSITIVELY VETTED this specific call and
+wants the host to skip its own prompt for it. A bridge that understands `"grant"` (today: only
+`cc_hook_bridge`, for `pre-worktree-enter` — see `enterworktree-canonical-path-grant`)
+translates it into the host's own "suppress the prompt" shape (Claude Code:
+`permissionDecision: "allow"`); a bridge/point that doesn't understand it treats it exactly like
+a plain allow (nothing emitted) — so a hook that emits `"grant"` is always SAFE to install
+against an older bridge, it just doesn't get the prompt-suppression benefit yet. `"grant"` can
+never win over a `"block"` from a DIFFERENT hook on the same point — see the point's own
+aggregation rule (`cc_hook_bridge.dispatch.py`'s `_evaluate_point`) — and it can never override
+a user's own settings `deny` rule; it only ever removes an otherwise-unnecessary prompt for a
+case a hook has already vetted.
 
 ## Fail policy: `on_error`
 
@@ -106,15 +124,20 @@ These are the *logical* points; map them to your harness's actual tool-use event
 > **Claude Code:** CC does NOT run these descriptors directly — it only runs hooks declared
 > in `settings.json`. The `lib/cc_hook_bridge` dispatcher is the carrier that makes them
 > fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`/`pre-agent`/
-> `pre-skill`/`pre-monitor`/`pre-workflow`, PostToolUse for `post-write`, Stop for `stop`) and translates
-> the exit-10 BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. Without
-> that bridge these hooks are inert in CC (agent-tools#18). `pre-monitor` is the newest of
-> these, following the same two-repo staging `pre-agent`/`pre-skill` went through — its
-> rig-cli-side `Monitor` matcher (rig-cli#296) has now shipped, so `pre-monitor` is live once
-> rig has provisioned the bridge (same prerequisites as `pre-agent`/`pre-skill` below: a
-> `claude-code` harness block, `agent_hooks` enabled, `harness.hook_bridge` not opted out)
-> and `rig apply` has run on a given machine. `pre-workflow` is mapped in the bridge; it
+> `pre-skill`/`pre-monitor`/`pre-workflow`/`pre-worktree-enter`, PostToolUse for `post-write`, Stop for
+> `stop`) and translates the exit-10 BLOCK into CC's `permissionDecision: "deny"` /
+> `decision: "block"` (and, for `pre-worktree-enter` today, a `"grant"` verdict into
+> `permissionDecision: "allow"` — see the `"grant"` note above). Without that bridge these
+> hooks are inert in CC (agent-tools#18). `pre-monitor` is the newest of these before
+> `pre-worktree-enter`, following the same two-repo staging `pre-agent`/`pre-skill` went
+> through — its rig-cli-side `Monitor` matcher (rig-cli#296) has now shipped, so `pre-monitor`
+> is live once rig has provisioned the bridge (same prerequisites as `pre-agent`/`pre-skill`
+> below: a `claude-code` harness block, `agent_hooks` enabled, `harness.hook_bridge` not opted
+> out) and `rig apply` has run on a given machine. `pre-workflow` is mapped in the bridge; it
 > stays inert in a live CC session until rig-cli registers a `Workflow` PreToolUse matcher.
+> `pre-worktree-enter` is the newest of these — its rig-cli-side `EnterWorktree` matcher
+> (rig-cli#298) has shipped, so `pre-worktree-enter` is live once rig has provisioned the
+> bridge and `rig apply` has run on a given machine.
 
 > **Codex:** Codex also needs a carrier bridge. `lib/codex_hook_bridge` is the first
 > dispatcher for the confirmed Codex hooks contract: TOML hooks call it for `PreToolUse`
@@ -156,6 +179,7 @@ These are the *logical* points; map them to your harness's actual tool-use event
 | `pre-skill` **(live in Claude Code when rig provisions the bridge; live in opencode via the native `skill` tool; NOT mapped in Codex yet)** | before a Skill-tool invocation | skills-marker-writer |
 | `pre-monitor` **(live in Claude Code when rig provisions the bridge; Codex/opencode have no Monitor-equivalent tool)** | before a Monitor-tool call | subagent-no-monitor |
 | `pre-workflow` **(mapped in cc_hook_bridge; live in Claude Code only after rig-cli registers a `Workflow` PreToolUse matcher — same two-repo split as pre-skill)** | before a Claude Code Workflow script runs | workflow-danger-gate |
+| `pre-worktree-enter` **(live in Claude Code when rig provisions the bridge; Codex/opencode have no worktree-switching tool of their own)** | before an EnterWorktree-tool call | enterworktree-foreign-guard (block), enterworktree-canonical-path-grant (grant) |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
 | `stop`         | when the agent is about to end its turn      | chat-dictionary-gate (priority 10), model-error-fallback (priority 20, advisory-only), stop-completion-selfcheck (priority 50) |
 
@@ -222,6 +246,33 @@ orchestrator's own Monitor use is unaffected.
 yet if its `~/.claude/settings.json` predates the last `rig apply` run after both halves
 merged, or if the harness process was started before that apply ran (CC reads its hook
 config at session start, not live) — re-run `rig apply` and start a fresh session to confirm.
+
+### `pre-worktree-enter` — gate an EnterWorktree call
+
+`pre-worktree-enter` fires before CC's `EnterWorktree` tool call runs (switching the session
+into a new or existing git worktree). Two hooks target it for two different, non-overlapping
+concerns:
+
+- `enterworktree-foreign-guard` **blocks** entering a worktree a DIFFERENT dispatched agent
+  created (a `.claude/worktrees/agent-<id>` ownership check — CC's own tool validation only
+  confirms the path is a real registered worktree, never that the caller owns it).
+- `enterworktree-canonical-path-grant` **grants** (pre-approves, suppressing CC's own
+  interactive permission prompt) entering a worktree at the rig-sanctioned
+  `<repo-root>/.worktrees/<name>` location (rig-cli#418) — see the `"grant"` verdict note
+  above. It never blocks anything.
+
+A block from either hook wins outright over the other's grant, regardless of priority order
+(`cc_hook_bridge.dispatch.py`'s `_evaluate_point` aggregation) — the two never need to agree
+with each other, because their conditions (foreign-agent ownership vs. canonical-path) never
+overlap in practice: a `.worktrees/<name>` path (rig's convention) never matches the
+`.claude/worktrees/agent-<id>` naming shape the foreign-guard's ownership check keys on.
+**Registration:** the point mapping lives in `lib/cc_hook_bridge/dispatch.py`; the
+`settings.json` `EnterWorktree` matcher that makes CC actually fire it (rig-cli#298, same split
+`pre-agent`/`pre-skill`/`pre-monitor` went through) has shipped — `rig apply` on a given machine
+wires it in. A machine hasn't picked up the `"grant"` half yet if its `agent_hooks_v1`/
+`cc_hook_bridge` predates this change even with the `EnterWorktree` matcher already installed
+(the matcher alone only lets BLOCK-shaped hooks fire; the grant translation needs the updated
+bridge too) — re-run `rig apply` and start a fresh session to confirm.
 
 ### `post-write` — react to a *completed* write
 
