@@ -185,7 +185,16 @@ def hooks_dir() -> Path:
 
 
 def dispatch(hook_name: str, opencode_event: dict) -> dict | None:
-    """Run applicable v1 hooks for this opencode event."""
+    """Run applicable v1 hooks for this opencode event.
+
+    Runs EVERY descriptor (and every v1 event fanned out for it) to completion,
+    even after one already blocked: a hatch-using hook records its
+    `RIG_HATCH_REQUEST_*` attempt to `overrides.log` as a side effect of its own
+    subprocess running (`agenttools_hatch_escalation._append_overrides_log`,
+    gap G-8). Stopping at the first block would silently skip that audit line
+    for every hatch var set on a LATER descriptor in the same invocation
+    (agent-tools#713) — the opencode-visible decision is unaffected, since only
+    the first block's reason is ever returned."""
     tool = _tool_name(opencode_event)
     point = point_for_event(hook_name, tool)
     if point is None:
@@ -197,12 +206,13 @@ def dispatch(hook_name: str, opencode_event: dict) -> dict | None:
     specs = load_descriptors(point, hooks_dir(), warn=_warn)
     if not specs:
         return None
+    first_block_reason: str | None = None
     for spec in specs:
         for v1_event in _v1_events_for_dispatch(opencode_event, point=point):
             outcome, reason = run_hook(spec, v1_event, warn=_warn)
-            if outcome == "block":
-                return opencode_block_output(reason)
-    return None
+            if outcome == "block" and first_block_reason is None:
+                first_block_reason = reason
+    return None if first_block_reason is None else opencode_block_output(first_block_reason)
 
 
 def _load_runner():

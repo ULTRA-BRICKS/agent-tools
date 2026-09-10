@@ -216,7 +216,16 @@ def dispatch(hook_event_name: str, codex_event: dict) -> dict | None:
 
 
 def _first_hook_block(hook_event_name: str, codex_event: dict) -> str | None:
-    """The reason of the first blocking v1 hook for this event, or None."""
+    """The reason of the FIRST blocking v1 hook for this event, or None.
+
+    Runs EVERY descriptor (and every v1 event fanned out for it) to completion,
+    even after one already blocked: a hatch-using hook records its
+    `RIG_HATCH_REQUEST_*` attempt to `overrides.log` as a side effect of its own
+    subprocess running (`agenttools_hatch_escalation._append_overrides_log`,
+    gap G-8). Stopping at the first block would silently skip that audit line
+    for every hatch var set on a LATER descriptor in the same invocation
+    (agent-tools#713) — the Codex-visible decision is unaffected, since only
+    the first block's reason is ever returned."""
     tool_name = codex_event.get("tool_name")
     point = point_for_event(hook_event_name, tool_name)
     if point is None:
@@ -229,12 +238,13 @@ def _first_hook_block(hook_event_name: str, codex_event: dict) -> str | None:
     if not specs:
         return None
     v1_events = _v1_events_for_dispatch(codex_event, point=point)
+    first_block_reason: str | None = None
     for spec in specs:
         for v1_event in v1_events:
             outcome, reason = run_hook(spec, v1_event, warn=_warn)
-            if outcome == "block":
-                return reason
-    return None
+            if outcome == "block" and first_block_reason is None:
+                first_block_reason = reason
+    return first_block_reason
 
 
 def _load_runner():
