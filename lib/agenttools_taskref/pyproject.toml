@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttools-taskref"
+version = "0.1.0"
+description = "Backend-aware task-code validation (github-issues / linear) for the agent-tools ecosystem (stdlib-only at import; lazy PyYAML; shells out to gh)."
+readme = "README.md"
+# 3.9 to match the lowest floor in the ecosystem (review-cli is >=3.9; rig-cli >=3.10).
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+keywords = ["task", "ticket", "validation", "github", "linear", "agent-tools"]
+# PyYAML is the only runtime dep, and it's imported LAZILY (inside the config loader) so
+# importing the package stays stdlib-only. `gh` is an external CLI, not a Python dependency.
+dependencies = ["pyyaml>=6"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/agent-tools"
+
+# This pyproject lives INSIDE the package dir; the package source is this same directory.
+# Point discovery one level up and filter to just this package (same layout as
+# agenttools_config, agenttools_daemon, ...).
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["agenttools_taskref*"]
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]
