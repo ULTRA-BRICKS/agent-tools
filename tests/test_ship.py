@@ -5505,6 +5505,18 @@ esac
 _FAKE_REVIEW = """\
 #!/usr/bin/env bash
 sub="${1:-}"; shift || true
+if [ "$sub" = "capacity-check" ]; then
+  if [ -n "${SHIP_TEST_CAPACITY_JSON:-}" ]; then
+    printf '%s' "${SHIP_TEST_CAPACITY_JSON}"; exit 0
+  fi
+  [ "${SHIP_TEST_CAPACITY_SUPPORTED:-0}" = "1" ] || exit 0
+  if [ "${SHIP_TEST_CAPACITY_ALL_EXHAUSTED:-0}" = "1" ]; then
+    printf '{"models":["claude:claude-opus-4-8","codex","gemini"],"exhausted":[{"model":"claude:claude-opus-4-8","source":"harness-limits","evidence":"harness 5-hour window exhausted (100%%)"},{"model":"codex","source":"harness-limits","evidence":"harness weekly window exhausted (100%%)"},{"model":"gemini","source":"seat-cooldown:api","evidence":"rate limited"}],"available":[],"all_exhausted":true,"checked_at":"2026-09-09T00:00:00Z"}\n'
+  else
+    printf '{"models":["claude:claude-opus-4-8","gemini"],"exhausted":[{"model":"claude:claude-opus-4-8","source":"harness-limits","evidence":"harness 5-hour window exhausted (100%%)"}],"available":["gemini"],"all_exhausted":false,"checked_at":"2026-09-09T00:00:00Z"}\n'
+  fi
+  exit 0
+fi
 [ "$sub" = "task" ] || exit 0
 code="${1:-}"; shift || true
 flag=""
@@ -6668,6 +6680,88 @@ def test_review_quorum_audit_log_skipped_in_dry_run(tmp_path):
     assert "[dry-run] would append review-quorum audit" in r.stderr, r.stderr
     # ...but no persistent audit record was written.
     assert not audit.exists(), f"dry-run must not write the audit file, found: {audit.read_text()!r}"
+
+
+def test_review_quorum_auto_bypasses_on_confirmed_fleet_exhaustion(tmp_path):
+    """When review-cli's own capacity-check confirms EVERY configured provider is exhausted
+    right now, a bar-short ship auto-proceeds WITHOUT ever consulting the manual Telegram hatch
+    (RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM is deliberately left unset here, proving the hatch path
+    is never even reached) -- Alex's repeated complaint that every PR hits the same manual
+    prompt for one already-diagnosed fleet-wide outage."""
+    import json
+
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "ship-audit.jsonl"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-500",
+            "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_ROLES": "1",
+            "SHIP_TEST_CAPACITY_SUPPORTED": "1", "SHIP_TEST_CAPACITY_ALL_EXHAUSTED": "1",
+            "SHIP_AUDIT_FILE": str(audit),
+        },
+    )
+    assert r.returncode == 0, f"a confirmed fleet-wide outage must auto-proceed\n{r.stdout}\n{r.stderr}"
+    assert "auto-proceeding without a manual hatch prompt" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+    rec = json.loads(audit.read_text().strip().splitlines()[0])
+    assert rec["decision"] == "auto-proceed:capacity-outage", rec
+    assert rec["task_code"] == "HYP-500", rec
+
+
+def test_review_quorum_partial_exhaustion_still_blocks(tmp_path):
+    """A capacity-check that reports at least one AVAILABLE provider (not everything exhausted)
+    must change nothing: same bar-short refusal as without the capacity-check at all, proving
+    partial exhaustion never triggers the auto-bypass."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-501",
+            "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_ROLES": "1",
+            "SHIP_TEST_CAPACITY_SUPPORTED": "1",
+        },
+    )
+    assert r.returncode != 0, f"partial exhaustion must not auto-proceed\n{r.stdout}\n{r.stderr}"
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "HYP-501" in r.stderr, r.stderr
+    assert "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM" in r.stderr, r.stderr
+    assert "auto-proceeding" not in r.stdout, r.stdout
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_real_ci_failure_still_blocks_even_with_all_exhausted_capacity(
+    repo_with_pr_worktree, tmp_path
+):
+    """A genuine (non-outage-shaped) CI failure -- one check red, one green, 50% below the 80%
+    ci_appears_structurally_down threshold -- still refuses via the green-CI gate, even when
+    review-cli's capacity-check would report every provider exhausted. The green-CI gate runs
+    UNCONDITIONALLY earlier in ship.sh than the review-quorum gate, so this proves the new
+    capacity auto-bypass can never be used to sneak past a real test failure: the review-quorum
+    gate (and its capacity check) is never even reached."""
+    main, _wt = repo_with_pr_worktree
+    gh = _fake_gh_partial_fail_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    custom_path = f"{rv}{os.pathsep}{gh}{os.pathsep}{os.environ['PATH']}"
+    r = _run_ship_cidown(
+        main, gh,
+        env_extra={
+            "PATH": custom_path,
+            "SHIP_TEST_CAPACITY_SUPPORTED": "1", "SHIP_TEST_CAPACITY_ALL_EXHAUSTED": "1",
+        },
+    )
+    assert r.returncode != 0, (
+        f"a genuine CI failure must block regardless of capacity status\n{r.stdout}\n{r.stderr}"
+    )
+    assert "--known-flake" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+    assert "auto-proceed" not in r.stdout, (
+        "the capacity auto-bypass must never even be reached on a real CI failure\n" + r.stdout
+    )
 
 
 # --- #242: fail-closed against a hollow / forged / mis-floored quorum ----------------------
@@ -8123,6 +8217,66 @@ def test_external_review_deny_by_default_refuses_before_merge(repo_with_two_work
     rec = json.loads(audit.read_text().strip())
     assert rec["decision"] == "external-review:refused", rec
     assert rec["gate"] == "external-review", rec
+
+
+def test_external_review_auto_bypasses_on_confirmed_fleet_exhaustion(repo_with_two_worktrees, tmp_path):
+    """Zero GitHub reviews AND review-cli's own capacity-check confirms EVERY configured
+    provider is exhausted right now -> ship auto-proceeds WITHOUT ever consulting the manual
+    Telegram hatch (RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW is deliberately left unset here,
+    proving the hatch path is never even reached), and audits the dedicated capacity-outage
+    decision."""
+    import json
+
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    env = dict(os.environ)
+    env["PATH"] = f"{rv}{os.pathsep}{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env["SHIP_TEST_CAPACITY_SUPPORTED"] = "1"
+    env["SHIP_TEST_CAPACITY_ALL_EXHAUSTED"] = "1"
+    env.pop("RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW", None)
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode == 0, f"a confirmed fleet-wide outage must auto-proceed\n{r.stdout}\n{r.stderr}"
+    assert "auto-proceeding without a manual hatch prompt" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "external-review:auto-proceed:capacity-outage", rec
+    assert rec["gate"] == "external-review", rec
+
+
+def test_external_review_partial_exhaustion_still_blocks(repo_with_two_worktrees, tmp_path):
+    """A capacity-check that reports at least one AVAILABLE provider (not everything exhausted)
+    must change nothing: zero GitHub reviews still refuses exactly as today (deny-by-default,
+    no hatch consulted, no auto-bypass)."""
+    import json
+
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    env = dict(os.environ)
+    env["PATH"] = f"{rv}{os.pathsep}{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env["SHIP_TEST_CAPACITY_SUPPORTED"] = "1"
+    env.pop("RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW", None)
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"partial exhaustion must not auto-proceed\n{r.stdout}\n{r.stderr}"
+    assert "ZERO GitHub-side reviews" in r.stderr, r.stderr
+    assert "RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW" in r.stderr, r.stderr
+    assert "auto-proceeding" not in r.stdout, r.stdout
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "external-review:refused", rec
 
 
 def test_external_review_gh_query_failure_refuses_with_friendly_message_not_silent_abort(

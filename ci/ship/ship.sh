@@ -172,6 +172,12 @@
 #                          the PR's repo), then a trusted-paths allowlist. Neither the lib dir nor
 #                          tg-ctl is env- or repo-overridable, so nothing the shipper/PR controls
 #                          can redirect approval to a stub.
+#                          This hatch is for a bar not met for REVIEW-CONTENT reasons (too few
+#                          iterations/roles, an undiscoverable task code, review-cli
+#                          unreachable). A CONFIRMED fleet-wide review-cli capacity outage
+#                          (every configured provider's own capacity-check reads exhausted) is
+#                          now auto-detected instead — see _review_capacity_all_exhausted below
+#                          — and does NOT need this hatch at all.
 #   SHIP_EXTERNAL_REVIEW_ENABLED / SHIP_EXTERNAL_REVIEW  IGNORED as env vars (agent-tools#624).
 #                          A bare `SHIP_EXTERNAL_REVIEW=0` export no longer disables this gate
 #                          — that was the ambient-leak hole #528/#609 left open. Durable
@@ -183,6 +189,11 @@
 #   RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW  one-time bypass request for the external-review
 #                          gate, same shape/hardening as RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM
 #                          above — see ci/ship/external_review_hatch.py.
+#                          Same posture as the review-quorum hatch above: this is for a
+#                          zero-GitHub-reviews refusal for review-ACCESS reasons (nobody has
+#                          reviewed yet). A CONFIRMED fleet-wide review-cli capacity outage is
+#                          now auto-detected instead (_review_capacity_all_exhausted) and does
+#                          NOT need this hatch at all.
 #   SHIP_ACCEPTANCE_GATE   set to 0/false/no to disable the pre-merge ACCEPTANCE gate (default:
 #                          enabled) — the gate that runs `task gate <code> --json` (task-cli) and
 #                          refuses the merge while the ticket has unchecked criteria or checks
@@ -2436,12 +2447,54 @@ _review_quorum_hatch_check() {  # uses $TASK_CODE $QITER $QMODELS_N $PR
   python3 -I "$_SHIP_HATCH_PY"
 }
 
+# Consults review-cli's own capacity-check (reviewlib/capacity_check.py, review-cli's
+# `review capacity-check --json`) for "is EVERY configured review-board seat confirmed
+# exhausted right now" -- the SAME harness-limits/seat-cooldown evidence that command computes,
+# never a re-implementation here. Fails CLOSED on ANY problem: a missing `review`/`jq`, a
+# non-zero exit, empty/unparseable JSON, or a missing/non-true `all_exhausted` key all print
+# "0" -- "not confirmed" is always the safe default; only a positive machine-readable
+# confirmation ever short-circuits a manual hatch prompt. Stdout: "1<TAB><evidence text>" when
+# confirmed, "0" otherwise. Always returns 0 -- callers read stdout, never $?.
+_review_capacity_all_exhausted() {
+  command -v review >/dev/null 2>&1 || { echo "0"; return 0; }
+  command -v jq >/dev/null 2>&1 || { echo "0"; return 0; }
+  local json rc=0
+  json=$(review capacity-check --json 2>/dev/null) || rc=$?
+  if [ "$rc" != "0" ] || [ -z "$json" ]; then echo "0"; return 0; fi
+  local all_ex
+  all_ex=$(printf '%s' "$json" | jq -r 'if .all_exhausted == true then "true" else "false" end' 2>/dev/null) || { echo "0"; return 0; }
+  if [ "$all_ex" != "true" ]; then echo "0"; return 0; fi
+  local evidence
+  evidence=$(printf '%s' "$json" | jq -r '[.exhausted[]? | "\(.model): \(.evidence // .source // "exhausted")"] | join("; ")' 2>/dev/null) || evidence=""
+  printf '1\t%s\n' "$evidence"
+}
+
 # Terminal handler for a review-quorum refusal: either the hatch escalation approves a one-time
 # bypass (return 0 -> ship proceeds), or the ship is refused (exits 1). $1 is the human one-line
 # summary of WHY the bar wasn't met (or couldn't be verified). Uses $TASK_CODE / $QITER /
 # $QMODELS_N (set to safe defaults by the caller before any early refusal).
 _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
   local summary="$1"
+  # Auto-detect a confirmed fleet-wide review-cli capacity outage BEFORE ever considering the
+  # manual one-time hatch (Alex's repeated "stop asking me every time for the same known cause"
+  # ask). Fires ONLY when review-cli's own capacity-check confirms EVERY configured board seat
+  # is exhausted right now; an unmapped/never-dispatched seat always reads "not confirmed"
+  # there (see _review_capacity_all_exhausted above), so this never fires on missing data.
+  # Reaching this function at ALL already proves CI is not genuinely red on a real test
+  # failure: the green-CI gate (ci_appears_structurally_down / _empty_rollup_is_ci_outage /
+  # run_local_ci_gate, far above) runs UNCONDITIONALLY earlier in this script under
+  # `set -euo pipefail` and `exit 1`s before this point on any unresolved real failure, so no
+  # separate CI check is needed here -- only the review-capacity signal is new.
+  local cap_out cap_flag=0 cap_evidence=""
+  cap_out=$(_review_capacity_all_exhausted 2>/dev/null) || cap_out="0"
+  case "$cap_out" in
+    1*) cap_flag=1; cap_evidence="${cap_out#1$'\t'}" ;;
+  esac
+  if [ "$cap_flag" = "1" ]; then
+    echo "[ship] review-quorum gate — ${summary}; review-cli confirms EVERY configured provider is exhausted right now (${cap_evidence:-see \`review capacity-check --json\`}) — auto-proceeding without a manual hatch prompt. Recorded to \$SHIP_AUDIT_FILE."
+    _review_quorum_audit_log "auto-proceed:capacity-outage" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$cap_evidence" "${QROLES_N:-0}" "${MIN_ROLES:-0}" "${AUDIT_MIN_MODELS:-0}"
+    return 0
+  fi
   # Distinguish TRULY-UNSET (no bypass requested) from set-but-empty (an invalid request the lib
   # denies): `${var+x}` is empty only when the var is unset. Unset -> refuse with the how-to;
   # set (even blank) -> route through the helper, which denies blank/bare and asks on a real reason.
@@ -2956,38 +3009,51 @@ else
   esac
   if [ "$REVIEW_COUNT" -gt 0 ]; then
     echo "[ship] external-review gate OK — PR #$PR has $REVIEW_COUNT GitHub review(s)."
-  elif [ -n "${RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW+x}" ]; then
-    hrc=0; hout=$(_external_review_hatch_check 2>/dev/null) || hrc=$?
-    hverdict="${hout%% *}"; hreason=""
-    case "$hout" in *" "*) hreason="${hout#* }" ;; esac
-    if [ "$hrc" = "0" ] && [ "$hverdict" = "APPROVED" ]; then
-      if [ "$DRY_RUN" = "1" ]; then
-        echo "[ship] external-review --dry-run: justification present — a REAL run would request live Telegram approval before merging with zero reviews. (${hreason})"
+  else
+    # Auto-detect the SAME confirmed fleet-wide review-cli capacity outage as the review-quorum
+    # gate above (_review_capacity_all_exhausted): zero GitHub reviews AND every configured
+    # review-cli provider confirmed exhausted right now means NOBODY -- human or bot -- could
+    # have reviewed this PR through any currently-available channel, exactly the repeated,
+    # already-diagnosed outage case this auto-detection exists to stop re-escalating.
+    cap_out=$(_review_capacity_all_exhausted 2>/dev/null) || cap_out="0"
+    cap_flag=0; cap_evidence=""
+    case "$cap_out" in 1*) cap_flag=1; cap_evidence="${cap_out#1$'\t'}" ;; esac
+    if [ "$cap_flag" = "1" ]; then
+      echo "[ship] external-review gate — PR #$PR has zero GitHub reviews, but review-cli confirms EVERY configured provider is exhausted right now (${cap_evidence:-see \`review capacity-check --json\`}) — auto-proceeding without a manual hatch prompt. Recorded to \$SHIP_AUDIT_FILE."
+      _external_review_audit_log "external-review:auto-proceed:capacity-outage" "$cap_evidence"
+    elif [ -n "${RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW+x}" ]; then
+      hrc=0; hout=$(_external_review_hatch_check 2>/dev/null) || hrc=$?
+      hverdict="${hout%% *}"; hreason=""
+      case "$hout" in *" "*) hreason="${hout#* }" ;; esac
+      if [ "$hrc" = "0" ] && [ "$hverdict" = "APPROVED" ]; then
+        if [ "$DRY_RUN" = "1" ]; then
+          echo "[ship] external-review --dry-run: justification present — a REAL run would request live Telegram approval before merging with zero reviews. (${hreason})"
+        else
+          echo "[ship] external-review: a one-time Telegram hatch escalation was APPROVED by Alex — proceeding with zero GitHub reviews. (${hreason})"
+        fi
       else
-        echo "[ship] external-review: a one-time Telegram hatch escalation was APPROVED by Alex — proceeding with zero GitHub reviews. (${hreason})"
+        { echo "Refusing: external-review hatch escalation was requested but NOT approved: ${hreason:-no approval}."
+          echo "  Obtain live approval, or get an actual review posted on PR #$PR before shipping."; } >&2
+        # The helper logs its own bypass:denied only when it emitted DENIED during a REAL run. In
+        # dry-run it writes nothing (ship prints the would-be line); in every other non-DENIED case
+        # (fake/broken/absent interpreter, import-fail, unexpected verdict) it did NOT audit ->
+        # record fail-closed here.
+        case "$hverdict" in
+          DENIED) [ "$DRY_RUN" = "1" ] && _external_review_audit_log "external-review:bypass:denied" "$hreason" ;;
+          *) _external_review_audit_log "external-review:bypass:denied" "$hreason" ;;
+        esac
+        exit 1
       fi
     else
-      { echo "Refusing: external-review hatch escalation was requested but NOT approved: ${hreason:-no approval}."
-        echo "  Obtain live approval, or get an actual review posted on PR #$PR before shipping."; } >&2
-      # The helper logs its own bypass:denied only when it emitted DENIED during a REAL run. In
-      # dry-run it writes nothing (ship prints the would-be line); in every other non-DENIED case
-      # (fake/broken/absent interpreter, import-fail, unexpected verdict) it did NOT audit ->
-      # record fail-closed here.
-      case "$hverdict" in
-        DENIED) [ "$DRY_RUN" = "1" ] && _external_review_audit_log "external-review:bypass:denied" "$hreason" ;;
-        *) _external_review_audit_log "external-review:bypass:denied" "$hreason" ;;
-      esac
+      { echo "Refusing: PR #$PR has ZERO GitHub-side reviews. Guard-B (review-cli's own automated pass) and 0 unresolved review threads do NOT prove a review ever happened — see PR #764 (HYP-1380), which merged this exact way."
+        echo "  Get a real review posted (a human, or a review bot like Codex) before shipping."
+        echo "  There is NO self-service override. To request a ONE-TIME bypass, set:"
+        echo "    RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW=\"<justification>\""
+        echo "  which asks Alex live on Telegram and proceeds ONLY on his real-time approval."
+        echo "  A SHIP_EXTERNAL_REVIEW=0 .ship-config line already MERGED to the base branch disables this gate entirely (ops off-switch; env SHIP_EXTERNAL_REVIEW=0 is ignored; a .ship-config committed only on THIS PR's own branch does not count)."; } >&2
+      _external_review_audit_log "external-review:refused" ""
       exit 1
     fi
-  else
-    { echo "Refusing: PR #$PR has ZERO GitHub-side reviews. Guard-B (review-cli's own automated pass) and 0 unresolved review threads do NOT prove a review ever happened — see PR #764 (HYP-1380), which merged this exact way."
-      echo "  Get a real review posted (a human, or a review bot like Codex) before shipping."
-      echo "  There is NO self-service override. To request a ONE-TIME bypass, set:"
-      echo "    RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW=\"<justification>\""
-      echo "  which asks Alex live on Telegram and proceeds ONLY on his real-time approval."
-      echo "  A SHIP_EXTERNAL_REVIEW=0 .ship-config line already MERGED to the base branch disables this gate entirely (ops off-switch; env SHIP_EXTERNAL_REVIEW=0 is ignored; a .ship-config committed only on THIS PR's own branch does not count)."; } >&2
-    _external_review_audit_log "external-review:refused" ""
-    exit 1
   fi
 fi
 
