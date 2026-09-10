@@ -377,7 +377,7 @@ def test_omp_bridge_yield_empty_and_malformed_never_block(tmp_path):
     (d / "pending.jsonl").write_text("{{{ garbage\n")
     res = _run_omp_bridge(event, cfg=cfg, home=home)
     assert res.returncode == 0 and res.stdout == ""
-    assert "malformed" in res.stderr
+    assert "malformed" in (cfg / "hooks-debug.log").read_text(encoding="utf-8")
 
 
 def test_omp_bridge_ignores_inherited_claude_pid_and_keys_on_cwd(tmp_path):
