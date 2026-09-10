@@ -20,6 +20,8 @@ import sys
 import time
 from pathlib import Path
 
+import shlex
+
 import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -34,6 +36,7 @@ BLOCK_SECRETS_WRITE = _REPO / "agent-hooks" / "block-secrets-write" / "block_sec
 BACKGROUND_SUBAGENT_GATE = _REPO / "agent-hooks" / "background-subagent-gate" / "background_subagent_gate.py"
 WORKTREE_ONLY_WRITES = _REPO / "agent-hooks" / "worktree-only-writes" / "worktree_only_writes.py"
 NO_LONG_INLINE_PROCESS = _REPO / "agent-hooks" / "no-long-inline-process" / "no_long_inline_process.py"
+REQUIRE_REVIEW_BEFORE_COMMIT = _REPO / "agent-hooks" / "require-review-before-commit" / "require_review.py"
 
 _EXTENSION_TS = _REPO / "lib" / "omp_hook_bridge" / "extension.ts"
 
@@ -1610,6 +1613,126 @@ def test_omp_bridge_blocks_long_process_via_hub_start(tmp_path):
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout)
     assert out["decision"] == "block"
+
+
+def test_eval_shell_commands_scrapes_python_subprocess_git_argv():
+    """agent-tools#692: literal subprocess argv lists become shell-style commands."""
+    code = (
+        "import subprocess\n"
+        "subprocess.run(['git', 'add', '-A'], check=True)\n"
+        "subprocess.run(['git', 'commit', '-m', 'fix merge'], check=True)\n"
+    )
+    assert dispatch._eval_shell_commands({"language": "py", "code": code}) == [
+        shlex.join(["git", "add", "-A"]),
+        shlex.join(["git", "commit", "-m", "fix merge"]),
+    ]
+
+
+def test_eval_shell_commands_scrapes_python_os_system_and_js_bun_shell():
+    code_py = 'import os\nos.system("git commit -m \"ship\"")\n'
+    assert dispatch._eval_shell_commands({"language": "py", "code": code_py}) == [
+        'git commit -m "ship"',
+    ]
+    code_js = "await Bun.$`git push origin HEAD`.quiet()\n"
+    assert dispatch._eval_shell_commands({"language": "js", "code": code_js}) == [
+        "git push origin HEAD",
+    ]
+
+
+def test_v1_events_for_dispatch_eval_pre_bash_fans_out_commands():
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "eval",
+        "input": {
+            "language": "py",
+            "code": "import subprocess\nsubprocess.run(['git', 'add', '.'])\nsubprocess.run(['git', 'commit', '-m', 'x'])",
+        },
+        "cwd": "/repo",
+        "toolCallId": "c_eval_git",
+    }
+    events = dispatch._v1_events_for_dispatch(omp_event, point="pre-bash")
+    assert [e["command"] for e in events] == [shlex.join(["git", "add", "."]), shlex.join(["git", "commit", "-m", "x"])]
+    assert all(e["point"] == "pre-bash" for e in events)
+
+
+def _init_git_repo(repo: Path, rel: str = "src/change.py") -> None:
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "test"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath", "/dev/null"], check=True, capture_output=True)
+    target = repo / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("print('change')\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", rel], check=True, capture_output=True)
+
+
+def test_omp_bridge_blocks_eval_git_commit_via_require_review(tmp_path, monkeypatch):
+    """agent-tools#692: eval subprocess git commit must hit require-review-before-commit."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    marker = tmp_path / "review-marker"
+    monkeypatch.setenv("REVIEW_MARKER", str(marker))
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir,
+        hook_id="require-review-before-commit",
+        point="pre-bash",
+        cmd=REQUIRE_REVIEW_BEFORE_COMMIT,
+        on_error="open",
+    )
+    code = (
+        "import subprocess\n"
+        "subprocess.run(['git', 'commit', '-m', 'merge resolution'], check=True)\n"
+    )
+    event = {
+        "event": "tool_call",
+        "toolName": "eval",
+        "input": {"language": "py", "code": code},
+        "cwd": str(repo),
+    }
+
+    proc = _run_dispatch("tool_call", event, hooks_dir=hooks_dir)
+
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["decision"] == "block"
+
+
+def test_omp_bridge_bash_git_commit_and_eval_subprocess_equally_blocked(tmp_path, monkeypatch):
+    """Regression: bash and eval subprocess paths must both reach the same pre-bash gate."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    marker = tmp_path / "review-marker"
+    monkeypatch.setenv("REVIEW_MARKER", str(marker))
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir,
+        hook_id="require-review-before-commit",
+        point="pre-bash",
+        cmd=REQUIRE_REVIEW_BEFORE_COMMIT,
+        on_error="open",
+    )
+    bash_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m 'via bash'"},
+        "cwd": str(repo),
+    }
+    eval_event = {
+        "event": "tool_call",
+        "toolName": "eval",
+        "input": {
+            "language": "py",
+            "code": "import subprocess\nsubprocess.run(['git', 'commit', '-m', 'via eval'], check=True)",
+        },
+        "cwd": str(repo),
+    }
+
+    bash_proc = _run_dispatch("tool_call", bash_event, hooks_dir=hooks_dir)
+    eval_proc = _run_dispatch("tool_call", eval_event, hooks_dir=hooks_dir)
+
+    assert json.loads(bash_proc.stdout)["decision"] == "block"
+    assert json.loads(eval_proc.stdout)["decision"] == "block"
 
 
 def test_omp_bridge_dispatches_post_write_descriptor(tmp_path):

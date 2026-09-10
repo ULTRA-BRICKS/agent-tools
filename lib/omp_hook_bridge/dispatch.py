@@ -16,6 +16,7 @@ translated into a block; every other failure here (and in the extension) fails o
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -336,24 +337,47 @@ def _first_hook_block(event_name: str, omp_event: dict) -> str | None:
     (agent-tools#713) — the omp-visible decision is unaffected, since only the
     first block's reason is ever returned."""
     tool = _tool_name(omp_event)
-    point = point_for_event(event_name, tool)
-    if point is None:
+    primary_point = point_for_event(event_name, tool)
+    if primary_point is None:
         return None
     runner = _load_runner()
     if runner is None:
         return None
     load_descriptors, run_hook = runner
-    specs = load_descriptors(point, hooks_dir(), warn=_warn)
-    if not specs:
-        return None
-    v1_events = _v1_events_for_dispatch(omp_event, point=point)
     first_block_reason: str | None = None
-    for spec in specs:
-        for v1_event in v1_events:
-            outcome, reason = run_hook(spec, v1_event, warn=_warn)
-            if outcome == "block" and first_block_reason is None:
-                first_block_reason = reason
+    for point in _dispatch_points(event_name, tool, primary_point, _tool_args(omp_event)):
+        specs = load_descriptors(point, hooks_dir(), warn=_warn)
+        if not specs:
+            continue
+        v1_events = _v1_events_for_dispatch(omp_event, point=point)
+        for spec in specs:
+            for v1_event in v1_events:
+                outcome, reason = run_hook(spec, v1_event, warn=_warn)
+                if outcome == "block" and first_block_reason is None:
+                    first_block_reason = reason
     return first_block_reason
+
+
+def _dispatch_points(
+    event_name: str,
+    tool: str,
+    primary_point: str,
+    raw_args: dict,
+) -> list[str]:
+    """Hook points to run for one omp event, in order.
+
+    `eval` is write-shaped for file I/O (agent-tools#614) but can also launch shell/git
+    mutations via Python/JS subprocess helpers inside its `code` string (agent-tools#692).
+    When literal shell commands are recognized, run `pre-bash` hooks before `pre-write`.
+    """
+    if event_name != "tool_call" or tool != "eval":
+        return [primary_point]
+    points: list[str] = []
+    if _eval_shell_commands(raw_args):
+        points.append("pre-bash")
+    if primary_point == "pre-write":
+        points.append("pre-write")
+    return points or [primary_point]
 
 
 def _load_runner():
@@ -652,6 +676,113 @@ def _normalize_write_args(tool: str, raw_args: dict, args: dict, *, point: str) 
     if path:
         args["notebook_path"] = path
         _set_paths(args, path)
+
+
+# agent-tools#692: an eval cell can mutate git state via subprocess/os.system/Bun.$ the same way
+# a raw `bash` call would, bypassing every `pre-bash` hook (`require-review-before-commit`,
+# `orchestrator-stays-thin`, …) when the bridge only mapped `eval` to `pre-write`.
+# `_eval_shell_commands` is a best-effort literal scrape — same trust model as
+# `_eval_content_buckets`: only statically-known argv/string shapes are projected.
+_SUBPROCESS_RUN_METHODS = frozenset({"run", "call", "check_call", "check_output", "Popen"})
+_EVAL_BUN_SHELL = re.compile(r"(?<![.\w])Bun\.\$\s*`([^`]*)`", re.DOTALL)
+_EVAL_DOLLAR_SHELL = re.compile(r"(?<![.\w])\$\s*`([^`]*)`", re.DOTALL)
+_EVAL_EXEC_SYNC = re.compile(
+    r"(?<![.\w])(?:execSync|execFileSync|spawnSync)\s*\(\s*(['\"])(?:\\.|(?!\1).)*\1",
+    re.DOTALL,
+)
+
+
+def _eval_shell_commands(raw_args: dict) -> list[str]:
+    """Literal shell commands embedded in an eval cell, for `pre-bash` hook projection."""
+    code = _first_str(raw_args, "code", "content")
+    if not code:
+        return []
+    language = str(raw_args.get("language") or "").lower()
+    if language in ("py", "python", ""):
+        return _python_eval_shell_commands(code)
+    return _js_eval_shell_commands(code)
+
+
+def _python_eval_shell_commands(code: str) -> list[str]:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    commands: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        cmd = _python_call_to_shell_command(node)
+        if cmd:
+            commands.append(cmd)
+    return commands
+
+
+def _python_call_to_shell_command(node: ast.Call) -> str | None:
+    module, attr = _python_call_target(node.func)
+    if module == "os" and attr == "system":
+        return _literal_string_node(node.args[0]) if node.args else None
+    if module == "subprocess" and attr in _SUBPROCESS_RUN_METHODS:
+        if not node.args:
+            return None
+        argv = _literal_list_to_argv(node.args[0])
+        if argv is not None:
+            return shlex.join(argv)
+        shell_cmd = _literal_string_node(node.args[0])
+        if shell_cmd is not None and _python_call_uses_shell(node):
+            return shell_cmd
+    return None
+
+
+def _python_call_target(func: ast.AST) -> tuple[str | None, str | None]:
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return func.value.id, func.attr
+    if isinstance(func, ast.Name):
+        return None, func.id
+    return None, None
+
+
+def _python_call_uses_shell(node: ast.Call) -> bool:
+    for kw in node.keywords:
+        if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+            return True
+    return False
+
+
+def _literal_list_to_argv(node: ast.AST) -> list[str] | None:
+    if not isinstance(node, ast.List):
+        return None
+    argv: list[str] = []
+    for elt in node.elts:
+        val = _literal_string_node(elt)
+        if val is None:
+            return None
+        argv.append(val)
+    return argv
+
+
+def _literal_string_node(node: ast.AST) -> str | None:
+    return (
+        node.value
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        else None
+    )
+
+
+def _js_eval_shell_commands(code: str) -> list[str]:
+    commands: list[str] = []
+    for pattern in (_EVAL_BUN_SHELL, _EVAL_DOLLAR_SHELL):
+        for match in pattern.finditer(code):
+            body = match.group(1).strip()
+            if body:
+                commands.append(body)
+    for match in _EVAL_EXEC_SYNC.finditer(code):
+        quote = match.group(1)
+        start = match.end(1)
+        end = match.end() - 1
+        if end < len(code) and code[end] == quote:
+            commands.append(code[start:end])
+    return commands
 
 
 # `eval`'s written path/content live inside the `code` string itself (a Python/JS program the
@@ -1402,7 +1533,24 @@ def _v1_events_for_dispatch(omp_event: dict, *, point: str) -> list[dict]:
     """
     base = to_v1_event(omp_event, point=point)
     args = base.get("args")
-    if not isinstance(args, dict) or point not in ("pre-write", "post-write"):
+    if not isinstance(args, dict):
+        return [base]
+
+    if point == "pre-bash" and base.get("tool") == "eval":
+        commands = _eval_shell_commands(_tool_args(omp_event))
+        if not commands:
+            return [base]
+        events: list[dict] = []
+        for command in commands:
+            event = dict(base)
+            event_args = dict(args)
+            event_args["command"] = command
+            event["command"] = command
+            event["args"] = event_args
+            events.append(event)
+        return events
+
+    if point not in ("pre-write", "post-write"):
         return [base]
 
     if base.get("tool") == "eval":
