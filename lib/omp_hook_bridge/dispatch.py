@@ -686,9 +686,8 @@ def _normalize_write_args(tool: str, raw_args: dict, args: dict, *, point: str) 
 _SUBPROCESS_RUN_METHODS = frozenset({"run", "call", "check_call", "check_output", "Popen"})
 _EVAL_BUN_SHELL = re.compile(r"(?<![.\w])Bun\.\$\s*`([^`]*)`", re.DOTALL)
 _EVAL_DOLLAR_SHELL = re.compile(r"(?<![.\w])\$\s*`([^`]*)`", re.DOTALL)
-_EVAL_EXEC_SYNC = re.compile(
-    r"(?<![.\w])(?:execSync|execFileSync|spawnSync)\s*\(\s*(['\"])(?:\\.|(?!\1).)*\1",
-    re.DOTALL,
+_EVAL_EXEC_SYNC_OPENER = re.compile(
+    r"(?<![.\w])(?:execSync|execFileSync|spawnSync)\s*\(\s*(['\"])",
 )
 
 
@@ -769,6 +768,25 @@ def _literal_string_node(node: ast.AST) -> str | None:
     )
 
 
+def _js_quoted_literal(raw: str, start: int, quote: str) -> str | None:
+    """Scan a JS single/double-quoted literal from `start`; return content or None if unclosed."""
+    i = start
+    out: list[str] = []
+    while i < len(raw):
+        ch = raw[i]
+        if ch == "\\":
+            if i + 1 >= len(raw):
+                return None
+            out.append(raw[i + 1])
+            i += 2
+            continue
+        if ch == quote:
+            return "".join(out)
+        out.append(ch)
+        i += 1
+    return None
+
+
 def _js_eval_shell_commands(code: str) -> list[str]:
     commands: list[str] = []
     for pattern in (_EVAL_BUN_SHELL, _EVAL_DOLLAR_SHELL):
@@ -776,12 +794,11 @@ def _js_eval_shell_commands(code: str) -> list[str]:
             body = match.group(1).strip()
             if body:
                 commands.append(body)
-    for match in _EVAL_EXEC_SYNC.finditer(code):
+    for match in _EVAL_EXEC_SYNC_OPENER.finditer(code):
         quote = match.group(1)
-        start = match.end(1)
-        end = match.end() - 1
-        if end < len(code) and code[end] == quote:
-            commands.append(code[start:end])
+        body = _js_quoted_literal(code, match.end(), quote)
+        if body is not None and body.strip():
+            commands.append(body)
     return commands
 
 
