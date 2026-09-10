@@ -1,6 +1,6 @@
 ---
 name: worktree-isolation
-description: Use when running multiple agents or parallel tasks against the same repo. Give each its own git worktree (and its own scratch/output dir) so they don't collide on the working tree, and clean up on exit — even on signals.
+description: Use when running multiple agents or parallel tasks against the same repo, AND whenever a single subagent is about to Edit/Write in a repo whose committed rig.yaml sets agent_hooks.worktree_only — create the worktree before your first Edit/Write, before the reactive hook would otherwise catch you.
 ---
 
 # Worktree isolation for parallel work
@@ -8,6 +8,17 @@ description: Use when running multiple agents or parallel tasks against the same
 Two agents (or two parallel tasks) sharing one working tree will trample each other:
 one's edits, branch switches, and uncommitted changes corrupt the other's view. Give each
 its own **git worktree** so they have independent working trees over the same repo history.
+
+**This also applies to a single, solo subagent.** Before your first Edit/Write in any repo,
+check that repo's committed `rig.yaml` for `agent_hooks.worktree_only: true` (rig-provisioned
+repos use this). If it's set, create your worktree before editing anything — don't wait to be
+blocked by the `worktree-only-writes` hook and figure it out reactively from the error. A
+read-only session (answering a question, running a review) doesn't need one — the requirement
+is scoped to writing, not to every session.
+
+Prefer, in this order: `rig worktree create <name>` where `rig` is available (the validated,
+canonical convention — `<repo>/.worktrees/<name>`, auto-registered in `.git/info/exclude`);
+Claude Code's `EnterWorktree` tool; otherwise a raw `git worktree add` per the pattern below.
 
 ## Pattern
 
