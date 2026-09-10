@@ -993,6 +993,29 @@ def test_source_change_without_version_bump_is_blocked(repo_with_pyproject, tmp_
     assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
 
 
+def test_version_bump_already_on_base_tip_is_blocked(repo_with_pyproject, tmp_path):
+    """The PR diff (merge-base relative) shows 0.4.1 -> 0.4.2, but origin/main ALREADY moved
+    to 0.4.2 (a sibling PR released first). Merging would change no version, so the gate
+    must REFUSE and name both values (agent-tools#592: rig-cli #369/#370 shipped a feature
+    under a number main already had)."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "pyproject.toml").write_text(
+        '[project]\nname = "mytool"\nversion = "0.4.2"\n', encoding="utf-8"
+    )
+    _git("commit", "-qam", "release 0.4.2 (sibling PR)", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="src/a.py\npyproject.toml", patch=_PATCH_WITH_BUMP
+    )
+
+    assert r.returncode != 0, f"ship should refuse a bump the base tip already has\n{r.stdout}\n{r.stderr}"
+    assert "base branch tip ALREADY has version 0.4.2" in r.stderr, r.stderr
+    assert "bumps pyproject.toml to 0.4.2" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
 def test_source_change_with_version_bump_passes(repo_with_pyproject, tmp_path):
     """A PR that changes shippable source AND bumps the version passes the gate and merges."""
     main, _wt = repo_with_pyproject
