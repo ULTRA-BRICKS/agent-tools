@@ -307,9 +307,13 @@ def _has_control_char(text: str) -> bool:
 class ServiceStatus:
     """A snapshot a CLI prints for ``status``.
 
-    ``running`` mirrors ``agenttools_daemon``'s liveness probe (pidfile present + pid alive).
-    ``state`` is the underlying daemon state (``running`` / ``stale`` / ``stopped``).
-    ``enabled`` reflects whether OS autostart is installed.
+    ``running`` mirrors ``agenttools_daemon``'s liveness probe (pidfile present + pid alive),
+    OR'd with the OS-managed-autostart and legacy-listener fallbacks below. ``state`` is one
+    of: ``running`` / ``stale`` / ``stopped`` (the underlying daemon state), ``autostart``
+    (an OS-managed, manager-unspawned instance), or ``foreign`` (agent-tools#685 — a live
+    process on the port that neither the pidfile nor the installed-unit signal accounts for,
+    e.g. one running under a legacy/foreign OS-autostart label). ``enabled`` reflects whether
+    OS autostart is installed.
     """
 
     running: bool
@@ -1017,6 +1021,16 @@ class ServiceManager:
         report ``running=True`` while nothing is up. Probing the live OS process would need a
         ``launchctl list`` / ``systemctl is-active`` parse (a separate seam) — deliberately out
         of scope here; use the OS's own tools for authoritative OS-managed liveness.
+
+        FALLBACK (agent-tools#685): when neither of the two signals above shows a live
+        process, fall back to :meth:`probe_port`. A process genuinely serving this service's
+        port under a legacy/foreign launchd or systemd label (one that predates the current
+        ``com.agenttools.<tool>.<name>`` unit-naming convention) is invisible to both —
+        ``LaunchdBackend.is_installed``/``SystemdUserBackend.is_installed`` only check whether
+        the CURRENT label's unit file exists, never the actual set of running OS processes.
+        When the probe reports the port occupied, report ``running=True``/``state="foreign"``
+        with the probe's best-effort ``pid`` (``None`` when unresolvable) instead of a
+        permanent false "stopped".
         """
         sup = self._supervisor()
         st: DaemonStatus = sup.status()
@@ -1024,11 +1038,21 @@ class ServiceManager:
         # An OS-managed (enabled) service is "running" even though no pidfile names it — the OS
         # is the supervisor. Surface that so `status` after `enable` doesn't read "stopped".
         running = st.running or (enabled and self._backend.manages_process)
+        state = (
+            "autostart" if (enabled and self._backend.manages_process and not st.running)
+            else st.state
+        )
+        pid = st.pid
+        if not running:
+            probe = self.probe_port()
+            if probe is not None and probe.occupied:
+                running = True
+                state = "foreign"
+                pid = probe.pid
         return ServiceStatus(
             running=running,
-            state="autostart" if (enabled and self._backend.manages_process and not st.running)
-            else st.state,
-            pid=st.pid,
+            state=state,
+            pid=pid,
             port=self.service.port,
             url=self.service.url,
             enabled=enabled,
@@ -1128,6 +1152,15 @@ class ServiceManager:
         If the backend's ``uninstall`` reports failure (the OS unload/disable command returned
         nonzero — the unit may still be loaded and running), that is recorded so ``run_action``
         reports the failure instead of a false "disabled and stopped".
+
+        CAVEAT: the ``ServiceStatus`` this returns can transiently read
+        ``running=True``/``state="foreign"`` during the same launchd/systemd drain window
+        :func:`_run_action_disable`'s own settle-and-re-probe exists to mask (agent-tools#685's
+        ``status()`` fallback now probes here too) — it is naming this call's OWN
+        not-yet-fully-drained process, not a genuine foreign listener. ``run_action`` is
+        unaffected (it discards this return value and does its own settled probe via
+        :func:`_foreign_listener_fragment`); a direct API caller racing ``disable()`` should
+        expect this and re-check rather than trust the immediate return.
         """
         was_installed = self._backend.is_installed(self.service)
         uninstalled = self._backend.uninstall(self.service)
@@ -1261,8 +1294,16 @@ def run_action(manager: ServiceManager, action: str) -> int:
     if action == "status":
         st = manager.status()
         if st.running:
-            _print(f"{svc.name}: running{_pid_suffix(st)}{_url_suffix(st)}"
-                    f"{' [autostart on]' if st.enabled else ''}")
+            # agent-tools#685: a "foreign" state means something IS occupying the port, but
+            # it is not this manager's own pidfile/OS-managed instance (a legacy/foreign
+            # autostart label, or an unrelated process) — say so, rather than printing an
+            # indistinguishable "running" that reads as this service being healthy.
+            qualifier = (
+                " [foreign listener]" if st.state == "foreign"
+                else " [autostart on]" if st.enabled
+                else ""
+            )
+            _print(f"{svc.name}: running{_pid_suffix(st)}{_url_suffix(st)}{qualifier}")
             return 0
         _print(f"{svc.name}: {st.state}")
         return 3

@@ -412,6 +412,58 @@ def test_status_stopped_when_no_pidfile(home):
     assert st.enabled is False
 
 
+def test_status_running_when_port_probe_finds_a_legacy_listener(home):
+    # agent-tools#685: a process may genuinely be serving the service's port under a
+    # legacy/foreign launchd or systemd label that predates the current
+    # com.agenttools.<tool>.<name> unit-naming convention. LaunchdBackend.is_installed()/
+    # SystemdUserBackend.is_installed() only check the CURRENT label's unit file, so neither
+    # the pidfile signal nor the enabled-unit signal sees it. status() must fall back to
+    # probe_port() instead of reporting a permanent false "stopped".
+    svc = make_service(home)
+    fake_pid = 54321
+    mgr = ServiceManager(
+        svc,
+        platform=MACOS,
+        spawner=SpawnerSpy(),
+        runner=RunnerSpy(),
+        alive=lambda pid: False,  # no pidfile-tracked process
+        port_probe=lambda host, port: PortProbe(occupied=True, pid=fake_pid),
+    )
+
+    st = mgr.status()
+
+    assert st.running is True  # the regression assertion (False before the fix)
+    assert st.state == "foreign"
+    assert st.pid == fake_pid
+    assert st.enabled is False  # no plist/unit written — genuinely "not installed"
+
+
+def test_dispatch_status_subcommand_flags_a_foreign_listener(home, capsys):
+    # CLI-level regression guard (review round, agent-tools#685): a "foreign" state must be
+    # visible to a human/script reading `status`'s output, not printed identically to a
+    # genuinely managed "running" — the CLI-status branch keys off `st.running`, so this is
+    # the actual surface `run_action`/`dispatch` render, not just `ServiceManager.status()`.
+    svc = make_service(home)
+    mgr = ServiceManager(
+        svc,
+        platform=MACOS,
+        spawner=SpawnerSpy(),
+        runner=RunnerSpy(),
+        alive=lambda pid: False,
+        port_probe=lambda host, port: PortProbe(occupied=True, pid=54321),
+    )
+    parser = _build_parser(mgr)
+    args = parser.parse_args(["status"])
+
+    rc = dispatch(args, on_no_subcommand=lambda: 0)
+    out = capsys.readouterr().out
+
+    assert rc == 0  # something IS up on the port — not the "nothing running" exit
+    assert "foreign listener" in out
+    assert "running" in out
+    assert "(pid 54321)" in out
+
+
 def test_start_spawns_detached_and_writes_pidfile(home):
     spawner = SpawnerSpy()
     mgr = make_manager(home, spawner=spawner, alive=lambda pid: True)
@@ -1393,15 +1445,20 @@ def test_disable_warns_and_exits_4_when_stopped_but_port_still_occupied(home, ca
 
 def test_disable_settle_retry_clears_a_transient_launchd_drain_window(home, capsys):
     # THE launchd-drain scenario the settle window exists for: `launchctl unload` returns
-    # while the OS-managed process is still finishing its exit, so the FIRST probe (right
-    # after `manager.disable()`) reads occupied — but the port is actually free by the time
+    # while the OS-managed process is still finishing its exit, so the probes taken right
+    # after `manager.disable()` read occupied — but the port is actually free by the time
     # the settled re-probe runs. Must report a clean success, not a false failure.
+    #
+    # Two probes happen before the settle sleep, not one: `ServiceManager.disable()` itself
+    # ends with `self.status()`, which (agent-tools#685) now also consults `probe_port()` as
+    # its own not-running fallback — then `_run_action_disable`'s own foreign-listener check
+    # probes again right after. Both land inside the still-draining window here.
     svc = make_service(home)
     calls = {"n": 0}
 
     def draining_then_free(host, port):
         calls["n"] += 1
-        return PortProbe(occupied=(calls["n"] == 1), pid=4242 if calls["n"] == 1 else None)
+        return PortProbe(occupied=(calls["n"] <= 2), pid=4242 if calls["n"] <= 2 else None)
 
     sleeps: list[float] = []
     mgr = ServiceManager(
@@ -1418,7 +1475,8 @@ def test_disable_settle_retry_clears_a_transient_launchd_drain_window(home, caps
     assert captured.out.strip() == f"{svc.name}: autostart disabled and stopped"
     assert "still listening" not in captured.err
     assert sleeps == [0.5]
-    assert calls["n"] == 2  # probed once, settled once, re-probed once — no more
+    assert calls["n"] == 3  # disable()'s own status() probe, the first foreign-listener
+                            # check, and the settled re-probe — no more
 
 
 def test_disable_does_not_settle_retry_when_port_is_free_on_the_first_probe(home, capsys):
@@ -1442,7 +1500,9 @@ def test_disable_does_not_settle_retry_when_port_is_free_on_the_first_probe(home
     rc = run_action(mgr, "disable")
     assert rc == 0
     assert sleeps == []
-    assert calls["n"] == 1
+    # disable()'s own status() probes once (agent-tools#685's not-running fallback), then
+    # the foreign-listener check probes once more — both read free, so no settle retry.
+    assert calls["n"] == 2
 
 
 def test_stop_and_disable_unaffected_when_port_genuinely_free(home, capsys):
