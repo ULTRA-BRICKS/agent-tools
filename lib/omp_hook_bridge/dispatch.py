@@ -34,9 +34,13 @@ HOOK_API = "agents-hooks/v1"
 # `extension.ts`'s payload: `toolName`/`input`/`cwd`/`toolCallId` only — no session/task-spawn
 # marker distinguishing a dispatched child from the top-level session), so a forged
 # agent_id/agent_type is stripped below and restored ONLY from the launcher process
-# environment via `_detached_agent_id` — the same trust boundary
+# environment or a nested transcript path via `_detached_agent_id` — the same trust boundary
 # `opencode_hook_bridge._detached_agent_id` uses (agent-tools#476), ported here unchanged
-# (agent-tools#573).
+# (agent-tools#573). The nested path itself reaches this dispatcher from omp's extension ctx:
+# `ExtensionContext` carries no top-level `getSessionFile()`/`agentId` (oh-my-pi#11214), so
+# `extension.ts` reads `ctx.sessionManager.getSessionFile()` — for a Task/eval child that is
+# the CHILD's own session manager and returns the nested transcript
+# `.../<session-id>/<ChildName>.jsonl` (agent-tools#743).
 HARNESS = "omp"
 
 _KNOWN_EVENTS = frozenset({"tool_call", "tool_result"})
@@ -90,9 +94,11 @@ def _omp_nested_agent_id(omp_event: dict | None = None) -> str:
     Main:  .../<session-id>.jsonl          (not a child)
     Child: .../<session-id>/<agent>.jsonl  (stem is the worker id)
 
-    Prefer ``omp_event["sessionFile"]`` (extension.ts copies ctx.getSessionFile() —
-    agent-tools#647) over process env ``PI_SESSION_FILE``. The Node hook process
-    inherits the parent session env, so env alone never sees the nested child path.
+    Prefer ``omp_event["sessionFile"]`` (extension.ts sources it from
+    ``ctx.sessionManager.getSessionFile()`` — omp's ExtensionContext has no top-level
+    session getters, oh-my-pi#11214 / agent-tools#743) over process env
+    ``PI_SESSION_FILE``. The Node hook process inherits the parent session env,
+    so env alone never sees the nested child path.
     """
     if omp_event:
         nested = _nested_id_from_session_file(str(omp_event.get("sessionFile") or ""))
@@ -106,17 +112,20 @@ def _detached_agent_id(omp_event: dict | None = None) -> str:
 
     The forge-strip above removes any model/tool-supplied agent_id; omp's own `tool_call`/
     `tool_result` extension events carry no session/task-spawn marker to restore it from
-    (`extension.ts`'s payload is `toolName`/`input`/`cwd`/`toolCallId` only). Identity is
-    restored from the PROCESS ENVIRONMENT, in order:
-      1. ``RIG_AGENT_ID=<name>`` (rig-detached-omp launcher)
-      2. ``RIG_DETACHED_AGENT=1`` (anonymous ``detached``)
-      3. nested ``PI_SESSION_FILE`` (native omp Task/eval child — agent-tools#634)
+    (the event itself is `toolName`/`input`/`cwd`/`toolCallId` only; the payload's
+    `sessionFile` is extension.ts-sourced ctx session state, not event data). Identity is
+    restored, in order:
+      1. process env ``RIG_AGENT_ID=<name>`` (rig-detached-omp launcher)
+      2. process env ``RIG_DETACHED_AGENT=1`` (anonymous ``detached``)
+      3. a nested transcript path — payload ``sessionFile`` (``ctx.sessionManager``
+         of a native omp Task/eval child, agent-tools#743) or process env
+         ``PI_SESSION_FILE`` (agent-tools#634)
 
-    ``extension.ts`` spawns this dispatcher with ``{...process.env}``, so a marker set
-    when the child was launched (or omp's own nested session file) is visible here on
-    every tool call. A running orchestrator cannot retroactively mutate its process
-    environment. Cooperative-orchestrator threat model, on_error=open. A bare/whitespace
-    value is not a marker.
+    ``extension.ts`` spawns this dispatcher with ``{...process.env}`` plus the ctx-derived
+    session file, so a marker set when the child was launched (or omp's own nested session
+    file) is visible here on every tool call. A running orchestrator cannot retroactively
+    mutate its process environment. Cooperative-orchestrator threat model, on_error=open.
+    A bare/whitespace value is not a marker.
     """
     val = os.environ.get("RIG_AGENT_ID", "").strip()
     if val:

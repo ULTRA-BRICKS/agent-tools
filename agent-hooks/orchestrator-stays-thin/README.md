@@ -435,8 +435,24 @@ present) runs `task` freely regardless of this predicate.
 ## Tiering — WARN then BLOCK
 
 The **first** offense in the TTL window **WARNs** (allow + message); a **repeat** in the
-window **BLOCKs**. The tier is a marker file keyed by a hash of `(cwd, point)`, so `pre-write`
-and `pre-bash` tier **independently** — a write WARN does not prime a bash BLOCK (or vice versa).
+window **BLOCKs**. The tier is a marker file keyed by a hash of `(cwd, point)` plus — when
+one resolves — the harness **session id** (agent-tools#743): two sessions working in the same
+cwd tier independently, so one session's offenses no longer poison another's BLOCK state.
+The session id resolves from the hook process env first (`CLAUDE_SESSION_ID` /
+`CLAUDE_CODE_SESSION_ID` / `RIG_SESSION_ID` / `TMUX_PANE`, the same candidate list
+`lib/agenttools_hatch_escalation._SESSION_ID_ENV_VARS` uses — the omp bridge sets
+`RIG_SESSION_ID` from the ctx session manager), then from the bridge-sanitized
+`session_id` on the event itself (`cc_hook_bridge`'s T2 precedence makes it authoritative
+Claude Code harness state — the same trust tier as the sanitized `agent_id` the subagent
+exemption reads, and the source skills-read-gate's tier marker keys on). Deliberately NEVER
+a per-process pid: hooks run as fresh subprocesses per event, and a pid key would mint a
+fresh marker every event — warn forever, never block, a silent guard removal. With no
+session id from either source the key is byte-identical to the pre-#743
+`sha256(cwd\0point)` form, so anonymous sessions still share one state and blocking still
+works. Either way `pre-write` and `pre-bash` tier **independently** — a write WARN does not
+prime a bash BLOCK (or vice versa). Recording a WARN also runs a best-effort, capped sweep
+of markers older than the TTL (semantically dead already), keeping the per-session key
+space from growing without bound.
 A BLOCK does **not** refresh the marker mtime: the 900s window is measured from the original
 WARN, so a wedged retry loop cannot pin the orchestrator in BLOCK forever.
 

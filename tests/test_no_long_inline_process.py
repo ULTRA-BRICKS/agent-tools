@@ -22,6 +22,13 @@ from pathlib import Path
 
 import pytest
 
+_REPO = Path(__file__).resolve().parents[1]
+_LIB = _REPO / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+import omp_hook_bridge.dispatch as dispatch  # noqa: E402
+
 _HOOK = (
     Path(__file__).resolve().parents[1]
     / "agent-hooks"
@@ -764,3 +771,47 @@ def test_launcher_peel_is_bounded(monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# --- RC-9 regression (agent-tools#743) ------------------------------------------------------
+# ≥15 hatch-flood denies were a SANCTIONED subagent's synchronous pre-commit
+# `review diff --staged` tripping this guard: the omp task child had lost its identity
+# (oh-my-pi#11214) and was gated as the orchestrator. The RC-1 bridge fix (the extension
+# reads ctx.sessionManager.getSessionFile(), so the nested child transcript reaches the
+# dispatcher payload) restores subagent classification — and _is_subagent already allows a
+# subagent's long process outright. No new carve-out in this hook was needed; this test pins
+# that assessment end to end with a REAL bridge-produced event.
+
+def test_rc9_omp_task_child_runs_synchronous_review_diff_unblocked(monkeypatch):
+    # Identity must come from the PAYLOAD sessionFile alone — scrub every env marker BEFORE
+    # building the event so a host-carried value cannot smuggle the classification in.
+    for k in ("RIG_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE",
+              "ALLOW_INLINE_PROCESS", "ALLOW_INLINE_PROCESS_REASON",
+              "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS"):
+        monkeypatch.delenv(k, raising=False)
+    raw = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "review diff --staged"},
+        "cwd": "/repo",
+        "toolCallId": "call_1",
+        "sessionFile": (
+            "/tmp/omp-sessions/-xp-rig-cli/"
+            "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/ReviewChild.jsonl"
+        ),
+    }
+    v1 = dispatch.to_v1_event(raw, point="pre-bash")
+    assert v1["args"]["agent_id"] == "ReviewChild"
+    out, err = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(v1)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    code = nlip.main()
+    assert code == 0 and _decision(out.getvalue()) == "allow"
+
+
+def test_rc9_orchestrator_review_diff_still_blocked(monkeypatch):
+    """The other half of the RC-9 assessment: the SAME command with NO subagent identity
+    stays hard-blocked — the fix relaxes nothing for the main-thread orchestrator."""
+    out, _e, code = _run("review diff --staged", monkeypatch, harness="omp")
+    assert code == nlip.BLOCK_EXIT_CODE and _decision(out) == "block"
