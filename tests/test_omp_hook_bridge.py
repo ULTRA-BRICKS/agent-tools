@@ -1231,6 +1231,56 @@ def test_extension_forwards_getSessionFile_into_dispatcher_env(tmp_path):
     assert got["agentId"] == "ThinNotSub"
 
 
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_forwards_rig_agent_id_into_dispatcher_env(tmp_path):
+    """agent-tools#681: RIG_AGENT_ID must reach the dispatcher process env so hooks
+    that read process env (orchestrator-stays-thin tier 2) classify native subagents."""
+    nested = (
+        "/tmp/omp-sessions/-xp-rig-cli/"
+        "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/ThinNotSub.jsonl"
+    )
+    dump = tmp_path / "dump.json"
+    stub = tmp_path / "stub_dispatcher.py"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "payload = json.loads(sys.stdin.read() or '{}')\n"
+        f"path = {str(dump)!r}\n"
+        "open(path, 'w').write(json.dumps({"
+        "'env_rig': os.environ.get('RIG_AGENT_ID'), "
+        "'agentId': payload.get('agentId')"
+        "}))\n"
+        "print(json.dumps({'decision': 'allow'}))\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    driver = tmp_path / "driver.ts"
+    driver.write_text(
+        "const mod = await import(process.env.EXTENSION_PATH!);\n"
+        "const handlers: Record<string, Function> = {};\n"
+        "const pi = { on: (name: string, cb: Function) => { handlers[name] = cb; } };\n"
+        "mod.default(pi);\n"
+        "const nested = process.env.NESTED_SESSION!;\n"
+        "const ctx = {\n"
+        "  cwd: '/tmp', hasUI: false,\n"
+        "  getSessionFile: () => nested,\n"
+        "  getAgentId: () => 'ThinNotSub',\n"
+        "};\n"
+        "await handlers['tool_call']("
+        "{ toolName: 'bash', input: { command: 'git commit -m x' }, toolCallId: 'c1' }, ctx);\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["EXTENSION_PATH"] = str(_EXTENSION_TS)
+    env["OMP_HOOK_BRIDGE_PYTHON"] = str(stub)
+    env["NESTED_SESSION"] = nested
+    proc = subprocess.run(["bun", "run", str(driver)], capture_output=True, text=True, env=env, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    got = json.loads(dump.read_text())
+    assert got["env_rig"] == "ThinNotSub"
+    assert got["agentId"] == "ThinNotSub"
+
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
 def test_extension_ts_fails_open_when_dispatcher_python_is_missing(tmp_path):
     """The ONE deliberate divergence from opencode's plugin: a broken/missing dispatcher on
