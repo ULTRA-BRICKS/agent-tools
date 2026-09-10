@@ -1629,7 +1629,7 @@ def test_eval_shell_commands_scrapes_python_subprocess_git_argv():
 
 
 def test_eval_shell_commands_scrapes_python_os_system_and_js_bun_shell():
-    code_py = 'import os\nos.system("git commit -m \"ship\"")\n'
+    code_py = "import os\nos.system('git commit -m \"ship\"')\n"
     assert dispatch._eval_shell_commands({"language": "py", "code": code_py}) == [
         'git commit -m "ship"',
     ]
@@ -1656,6 +1656,7 @@ def test_v1_events_for_dispatch_eval_pre_bash_fans_out_commands():
 
 
 def _init_git_repo(repo: Path, rel: str = "src/change.py") -> None:
+    repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "test"], check=True, capture_output=True)
