@@ -62,13 +62,15 @@ JSON to the extension:
 | omp event + toolName | v1 point | Notes |
 | --- | --- | --- |
 | `tool_call` + `bash` | `pre-bash` | `input.command` becomes `event.command` and `args.command`. |
+| `tool_call` + `hub` | `pre-bash` | **(agent-tools#614)** omp's `hub` tool has no `command` field (its schema is `{op, application?, args?, name?, cwd?, env?, ready?, ...}`, inferred from the tool's own JSON-Schema description since no `docs/tools/hub.md` was found — same "no docs consulted" caveat as `notebook`/`apply_patch` below). Only `op: "start"` (launching `application` + `args` as a new background process) synthesizes an argv string via `shlex.join` onto `event.command`/`args.command`; every other op (`send`/`wait`/`inbox`/`list`/`jobs`/`cancel`/`ps`/`logs`/`stop`/`restart`/`describe`) manipulates an existing hub-managed process and synthesizes no command — see `_hub_command`. A `hub start` call's own `input.cwd` (defaulting to the session directory per `hub`'s own schema) overrides the session `cwd` on the synthesized v1 event — see `_cwd` — so a cwd-sensitive pre-bash hook judges the directory the process actually launches in, not wherever the session happens to be; a relative `input.cwd` resolves against the session cwd. |
 | `tool_call` + `edit` | `pre-write` | `input.input` (the hashline patch text) is parsed for every `[PATH#TAG]` section path → `args.file_path`/`path`/`file_paths`; a best-effort reconstruction of added body rows becomes `args.content` (same-path sections accumulate). No section found → the `replace`/`patch` fallback below. |
 | `tool_call` + `write` | `pre-write` | `input.path` / `input.content` normalize to `args.file_path`/`path`/`content` directly — same shape family as opencode's `write` tool. |
+| `tool_call` + `eval` | `pre-write` | **(agent-tools#614)** omp's `eval` tool has no `path`/`content` field — the whole program lives in `input.code` (observed alternate key: `content`), and `command` is FORCED to `""` regardless of any raw `command` key (a forged one could otherwise steer `block-secrets-write`'s `event.command` path fallback). `_eval_content_buckets` heuristically scrapes every write call by text-matching LITERAL arguments (single/double/triple-quoted OR backtick, escape-decoded) to `Path(<str>).write_text(<str>)`/`Path(<str>).write_bytes(<str>)` (Python), `Bun.write(<str>, <str>)` / `(fs.)?(write\|append)File(Sync)?(<str>, <str>)` (JS), `open(<str>, ...).write(<str>)` (Python), and a path-less `.write(<str>)`/`.write_text(<str>)` fallback (excluding a `Bun`/`fs` receiver, to avoid swapping a two-argument call's PATH in as content when its own second argument fails to parse) — aggregating EVERY match (not just …
 | `tool_call` + `apply_patch` | `pre-write` | The wire name omp uses for `edit` in apply_patch custom-tool mode (docs/tools/edit.md); the payload is the classic `*** Update File:` / `*** Add File:` / `*** Delete File:` / `*** Move to:` envelope, not hashline. Parsed with logic ported from the opencode bridge (see below). |
 | `tool_call` + `notebook` | `pre-write` | omp has no confirmed public tool schema for a dedicated notebook tool in the docs consulted while building this bridge. Best-effort passthrough only: whichever of `path`/`notebook_path`/`file_path` is present in `input` is normalized onto `args.notebook_path`/`file_path`/`path`. Kept as a mapped point (not dropped) on the assumption that IF omp ships one, its shape is path-like enough for this passthrough to still work; revisit once the real schema is confirmed. |
 | `tool_call` + `task` | `pre-agent` | omp's task item shape is `{name?, agent?, task, effort?, outputSchema?, schemaMode?, isolated?}` (flat) or `{context, tasks: item[]}` (batch, the default). Normalized onto the shared pre-agent contract the `background-subagent-gate` reads: `agent` → `args.subagent_type`, `task` → `args.prompt` (a batch joins every item's `task` with newlines), and `args.run_in_background: true` — see "omp `task` dispatches are background by contract" below. Raw `task`/`name`/`tasks`/`context` fields are kept alongside. |
 | `tool_call` + `yield` | `stop` | The hidden completion tool a helper must call (docs/tools/task.md). `tool_call` can return `{block: true, reason}` (docs/hooks.md); this is the omp Stop equivalent so `stop-completion-selfcheck` can block a premature yield, **and** so the tg-ctl Stop-hook inbox can deliver without tmux (agent-tools#656). The inbox key is the cwd hash (omp has no `--name`). |
-| `tool_result` + `edit`/`write`/`apply_patch` | `post-write` | Runs path-based hooks after the write; a block decision is logged only because omp cannot un-run a completed write. |
+| `tool_result` + `edit`/`write`/`apply_patch`/`eval` | `post-write` | Runs path-based hooks after the write; a block decision is logged only because omp cannot un-run a completed write. |
 
 omp's session-lifecycle events (`session_shutdown`, `agent_end`, etc.) have no documented
 blocking return contract in docs/hooks.md — this bridge does not map any of them to the v1
@@ -290,14 +292,22 @@ extensionHandlers:
 **Without that setting, any hook that holds a call longer than 30 s — i.e. every Telegram
 approval hatch — ends as an omp-generated block naming this extension's path, not as the
 hook's own decision.** That is the safe direction (a fail-closed hook still does not become an
-allow) but it is not the hook's verdict, and the human's later approval tap lands on a call omp
-has already refused. Do NOT "fix" it by lowering `OMP_HOOK_BRIDGE_TIMEOUT_MS` under 30 s: this
-bridge fails OPEN, so that turns a denied hatch into an allow — strictly worse. The extension
-prints a one-shot stderr line naming this setting once a dispatch passes 10 s, so a user who
-hits the ceiling is told why.
+⚠ 1 unresolved conflict detected
+- ours = HEAD
+- theirs = 0db8c6a (fix(omp-hook-bridge): map eval/hub tool calls to pre-write/pre-bash hook points)
+- base = parent of 0db8c6a (fix(omp-hook-bridge): map eval/hub tool calls to pre-write/pre-bash hook points)
+NOTICE: Inspect a block by reading `conflict://<N>` (add `/ours` / `/theirs` / `/base` to render a single side). Resolve with `write({ path: "conflict://<N>", content })`, or bulk-resolve every registered conflict with `write({ path: "conflict://*", content })`. Writes replace ONLY the marker block (markers + all sides) — never repeat the lines before/after it; they stay in place.
+`content` shorthand: a line that is exactly `@ours` / `@theirs` / `@base` / `@both` expands to that recorded section. `@both` is ours-then-theirs with no separator — only for additive conflicts where each side adds something different; NEVER for competing edits of the same lines (pick a side or write the combined text). Lines that are not a token pass through verbatim, so `"// keep both\n@ours\n@theirs"` literally writes the comment, then ours, then theirs.
+Per-id bulk: `write({ path: "conflict://*", content: "1: @ours\n2: @theirs\n…" })` resolves each listed id with that side in ONE call — the cheapest way through many pick-one conflicts; unlisted ids stay registered.
+Resolve each block faithfully: keep one side (`@ours`/`@theirs`), or combine them when both intents apply — never invent content beyond the recorded sides, and never stack both sides of competing edits. Resolve several conflicts in a single turn by issuing multiple `write` calls at once; ids stay valid as earlier blocks are resolved.
 
-On the Python side, `main()` keeps the same fail-open contract as the codex/opencode
-dispatchers: malformed stdin, a missing `agent_hooks_v1` import, or any dispatcher-internal
-exception logs to stderr and exits 0 with no result on stdout (equivalent to "allow"). A
-loaded descriptor still honors full v1 semantics: exit 10 blocks pre-tool calls, exit 0
-allows, and any other outcome resolves through the descriptor's own `on_error` policy.
+──── #1  L72-79 ────
+<<< ours
+| `tool_call` + `yield` | `stop` | The hidden completion tool a helper must call (docs/tools/task.md). `tool_call` can return `{block: true, reason}` (docs/hooks.md); this is the omp Stop equivalent so `stop-completion-selfcheck` can block a premature yield, **and** so the tg-ctl Stop-hook inbox can deliver without tmux (agent-tools#656). The inbox key is the cwd hash (omp has no `--name`). |
+| `tool_result` + `edit`/`write`/`apply_patch` | `post-write` | Runs path-based hooks after the write; a block decision is logged only because omp cannot un-run a completed write. |
+=== base
+| `tool_result` + `edit`/`write`/`apply_patch` | `post-write` | Runs path-based hooks after the write; a block decision is logged only because omp cannot un-run a completed write. |
+>>> theirs
+| `tool_result` + `edit`/`write`/`apply_patch`/`eval` | `post-write` | Runs path-based hooks after the write; a block decision is logged only because omp cannot un-run a completed write. |
+
+[Showing lines 1-300 of 312. Use :301 to continue]
