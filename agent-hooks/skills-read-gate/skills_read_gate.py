@@ -187,19 +187,74 @@ GIT_COMMIT = re.compile(r"(?:^|[|&;]\s*)git(?:[ \t]+[^\s;&|]+)*?[ \t]+commit\b")
 # a token that only appears in a shell COMMENT (`git commit -m x # --abort`) or in the commit
 # MESSAGE (`git commit -m 'support --skip'`) must NOT exempt a real commit from the skills gate.
 SKIP_FLAGS = frozenset({"--continue", "--abort", "--skip"})
-# A command starts at the line start or right after a &&/;/|/( separator. The build/test
-# runner must be at this command HEAD — not buried inside a string argument — so that
-# `git commit -m "fix: npm test was flaky"` and `echo "see npm test output"` are NOT
-# mis-classified as build/test work. Same anchoring the no-long-inline-process sibling uses (#4).
-_CMD_START = r"(?:^|&&|\|\||;|\||\()\s*"
-BUILD_OR_TEST = re.compile(
-    _CMD_START + r"(?:npm|pnpm|yarn|bun|deno)\b[^&;|]*\b(?:test|build)\b"
-    r"|" + _CMD_START + r"(?:pytest|vitest|jest)\b"
-    r"|" + _CMD_START + r"cargo\b[^&;|]*\b(?:test|build)\b"
-    r"|" + _CMD_START + r"go\b[^&;|]*\b(?:test|build)\b"
-    r"|" + _CMD_START + r"(?:make|rake|msbuild)\b[^&;|]*\b(?:test|build|all)\b"
-    r"|" + _CMD_START + r"(?:mvn|gradle)\b[^&;|]*\b(?:test|build|verify|package)\b"
+# The build/test runner must be the REAL invoked command of a segment — not a word buried in a
+# string argument — so that `git commit -m "fix: npm test was flaky"` and `echo "see npm test
+# output"` are NOT mis-classified as build/test work.
+#
+# This pattern is matched at the HEAD of an already-PARSED segment (see `_is_build_or_test`),
+# never against the raw command string. The raw-string form it replaces anchored each
+# alternative on a shell separator character (`|`, `&&`, `;`, `(`), and those characters appear
+# INSIDE quoted arguments too — so a read-only `rg -n 'storybook|vitest' package.json` had its
+# quoted alternation read as a pipe into a `vitest` command and was BLOCKED as build/test work
+# (agent-tools#578: 31 such refusals across four codex sessions, every one a read-only `rg`,
+# `sed` or `ps`). Deciding from the parsed argv is the same #59-doctrine correction the sibling
+# `no-long-inline-process` already made for its own copy of this problem (agent-tools#60).
+_BUILD_OR_TEST_HEAD = re.compile(
+    r"(?:npm|pnpm|yarn|bun|deno)\b[^&;|]*\b(?:test|build)\b"
+    r"|(?:pytest|vitest|jest)\b"
+    r"|cargo\b[^&;|]*\b(?:test|build)\b"
+    r"|go\b[^&;|]*\b(?:test|build)\b"
+    r"|(?:make|rake|msbuild)\b[^&;|]*\b(?:test|build|all)\b"
+    r"|(?:mvn|gradle)\b[^&;|]*\b(?:test|build|verify|package)\b"
 )
+
+# Leading no-op wrappers peeled off a segment head so the REAL runner beneath is what gets
+# matched (`timeout 600 npm test`, `env CI=1 pytest`). Only wrappers whose own operands we
+# model are listed — peeling one only partway would leave a non-command at the head. Mirrors
+# the sibling hook's `_strip_wrappers` set.
+_WRAPPERS = frozenset({"timeout", "env", "nice", "time", "stdbuf", "nohup", "setsid", "unbuffer"})
+# Per-WRAPPER option flags that consume a SEPARATE value token — keyed by wrapper because the
+# same short flag means different things (and takes a value or not) in different programs:
+# `stdbuf -o L cmd` must skip `L`, while an unkeyed set would leave `L` at the head and lose
+# the real runner behind it (a silent bypass, review finding on #578).
+_WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    # NOT `-S`/`--split-string`: its value IS the command (`env -S 'vitest run'`), so skipping it
+    # would hide the runner — left as a plain flag, its value lands at the head and is matched.
+    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+    "time": frozenset({"-f", "--format", "-o", "--output"}),
+}
+_MAX_WRAPPER_NESTING = 16
+# Shell separators between segments, and grouping/control tokens that precede a segment's real
+# command (`(npm test)`, `{ npm test; }`, `if npm test; then`). `punctuation_chars` tokenizing
+# emits `(`/`)` and fused `;`/`&&`/`|` as their own tokens, so a runner glued to a separator
+# (`git status;npm test`) is still found at a segment head — the raw-string matcher caught those
+# by substring, and dropping them would have been a regression (review finding on #578).
+_SEGMENT_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "|&", ";;", "(", ")"})
+_LEADING_SHELL_NOISE = frozenset({
+    "!", "{", "}", "if", "then", "do", "else", "elif", "while", "until", "exec", "command", "builtin",
+})
+# A heredoc BODY is data, not commands (`cat <<EOF` … `EOF`): its lines are cut out before
+# tokenizing, so a `;npm test` inside a note being written never starts a segment. Matches
+# `<<`, `<<-`, and a quoted/unquoted delimiter; the body runs from the line after the operator
+# to the line that is exactly the delimiter (a missing terminator swallows the rest — data anyway).
+# Only the BODY and terminator go; the rest of the opener line (`cat <<EOF | npm test`) is a
+# real pipeline and is kept (codex review on #587).
+_HEREDOC_RE = re.compile(
+    r"<<-?[ \t]*(?P<q>['\"]?)(?P<delim>[A-Za-z_][\w-]*)(?P=q)(?P<rest>[^\n]*)\n"
+    r"(?:.*?\n)*?[ \t]*(?P=delim)[ \t]*(?:\n|$)",
+    re.DOTALL,
+)
+# shlex's punctuation_chars mode coalesces ADJACENT punctuation into one token (`&&(`, `<(`,
+# `>&`), which would never equal a separator entry; such a token is decomposed into the shell
+# operators it is made of before segmenting (codex review on #587).
+_PUNCT_TOKEN_RE = re.compile(r"^[();<>|&]+$")
+_SHELL_OPERATOR_RE = re.compile(r"&&|\|\||;;|\|&|>&|<&|[();<>|&]")
+# A `VAR=value` token at a segment head is an inline env assignment, transparent to WHICH
+# command runs (`CI=1 vitest run` invokes `vitest`).
+_INLINE_ENV_TOKEN = re.compile(r"^[A-Za-z_]\w*=")
 
 # Canonical hook id for the shared Telegram hatch (RIG_HATCH_REQUEST_SKILLS_READ_GATE).
 HOOK_ID = "skills-read-gate"
@@ -387,6 +442,124 @@ def _strip_leading_inline_env(command: str) -> str:
     return _INLINE_ENV_PREFIX.sub(lambda m: m.group("sep"), command)
 
 
+def _basename(tok: str) -> str:
+    """`./node_modules/.bin/vitest` → `vitest`: a path-qualified runner is still the runner."""
+    return tok.rsplit("/", 1)[-1]
+
+
+def _strip_wrappers(argv: list[str]) -> list[str]:
+    """Peel leading no-op wrappers (`timeout 600`, `env CI=1`, `nice -n10`, `time`, …) so the REAL
+    command beneath is what head inspection sees. For a recognized wrapper its option flags (and
+    their separate values), `env`'s `VAR=value` operands and `timeout`'s DURATION positional are
+    skipped; a bare wrapper (`time make build`) is dropped to expose the next token. A non-wrapper
+    head is returned unchanged; a pathological chain stops at the nesting cap (→ no match, the
+    fail-open default of this discipline gate)."""
+    guard = 0
+    while argv and _basename(argv[0]) in _WRAPPERS and guard < _MAX_WRAPPER_NESTING:
+        guard += 1
+        wrapper, rest = _basename(argv[0]), argv[1:]
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok.startswith("-"):
+                if "=" not in tok and tok in _WRAPPER_VALUE_FLAGS.get(wrapper, frozenset()):
+                    i += 1  # `--signal SIGTERM` / `-k 5` / `stdbuf -o L` take a separate value
+                i += 1
+                continue
+            if wrapper == "env" and "=" in tok:
+                i += 1  # a NAME=VALUE assignment env consumes before the command
+                continue
+            if wrapper == "timeout":
+                i += 1  # the DURATION positional (the wrapped command follows)
+            break
+        if i:
+            argv = rest[i:]  # consumed the wrapper's own args → real command starts here
+        elif rest:
+            argv = rest  # bare wrapper with no args of its own
+        else:
+            break  # wrapper with nothing after it
+    return argv
+
+
+def _segment_head(segment: list[str]) -> list[str]:
+    """The argv a shell would actually EXEC for one segment: leading control keywords, inline
+    `VAR=value` assignments and no-op wrappers peeled, argv[0] reduced to its basename."""
+    i = 0
+    while i < len(segment) and (
+        segment[i] in _LEADING_SHELL_NOISE or _INLINE_ENV_TOKEN.match(segment[i])
+    ):
+        i += 1
+    argv = _strip_wrappers(segment[i:])
+    return [_basename(argv[0]), *argv[1:]] if argv else []
+
+
+def _decompose_punctuation(tok: str) -> list[str]:
+    """`&&(` → `&&`, `(`; `<(` → `<`, `(`; a non-punctuation token is returned as itself."""
+    if not _PUNCT_TOKEN_RE.match(tok):
+        return [tok]
+    return _SHELL_OPERATOR_RE.findall(tok)
+
+
+def _strip_function_bodies(tokens: list[str]) -> list[str]:
+    """Drop the body of a POSIX function DEFINITION (`f() { npm test; }`): defining `f` runs
+    nothing. The runner inside it is gated only when `f` is later called — which this hook
+    cannot see (pre-existing limit; the raw matcher never saw it either)."""
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        is_def = (
+            i + 3 < len(tokens) and tokens[i + 1] == "(" and tokens[i + 2] == ")" and tokens[i + 3] == "{"
+        )
+        if not is_def:
+            out.append(tokens[i])
+            i += 1
+            continue
+        depth, i = 0, i + 3
+        while i < len(tokens):  # skip to the matching `}`
+            depth += (tokens[i] == "{") - (tokens[i] == "}")
+            i += 1
+            if depth == 0:
+                break
+    return out
+
+
+def _shell_segments(command: str) -> list[list[str]]:
+    """Tokenize `command` with shell punctuation split out (`a;b`, `x&&y`, `(z)` become separate
+    tokens, quotes honoured, an unquoted `#` starts a comment), heredoc bodies and function
+    definitions removed, and split it into per-segment token lists. Raises ValueError on an
+    unbalanced quote."""
+    # The body is replaced by a `;` so the command AFTER the terminator starts its own segment
+    # (shlex reads a bare newline as whitespace, which would glue it onto `cat`).
+    lex = shlex.shlex(_HEREDOC_RE.sub(r"\g<rest> ; ", command), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    tokens = [op for tok in lex for op in _decompose_punctuation(tok)]
+    segments: list[list[str]] = [[]]
+    for tok in _strip_function_bodies(tokens):
+        if tok in _SEGMENT_SEPARATORS:
+            segments.append([])
+        else:
+            segments[-1].append(tok)
+    return segments
+
+
+def _is_build_or_test(command: str) -> bool:
+    """True when some segment's REAL invoked command is a build/test runner.
+
+    Decided from the PARSED argv, never the raw string: `shlex` keeps a quoted `'a|vitest'` as
+    ONE argument, so a runner name inside it can never be read as a command head (#578). A
+    tokenization failure (unbalanced quote) returns False — this gate is process discipline
+    (on_error=open), so a parse failure must never invent a work action."""
+    try:
+        segments = _shell_segments(command)
+    except ValueError:
+        return False
+    for segment in segments:
+        head = _segment_head(segment)
+        if head and _BUILD_OR_TEST_HEAD.match(" ".join(head)):
+            return True
+    return False
+
+
 def _is_work_action(command: str) -> bool:
     # Strip leading inline env first (so `RIG_HATCH_REQUEST_…="why" git commit` still trips the
     # gate), then detect the commit on the comment-stripped command and judge skip-ness from the
@@ -395,7 +568,7 @@ def _is_work_action(command: str) -> bool:
     stripped = _strip_shell_comment(env_free)
     if GIT_COMMIT.search(stripped) and not is_skip_commit(env_free):
         return True
-    return bool(BUILD_OR_TEST.search(stripped))
+    return _is_build_or_test(command)
 
 
 def _fresh(p: Path) -> bool:
