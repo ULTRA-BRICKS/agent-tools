@@ -323,6 +323,312 @@ def test_dash_F_stdin_fails_closed_with_hint(command):
     assert "REQUIRE_TICKET_SKIP" not in msg, "the removed inline-env escape must not be advertised"
 
 
+# ── HEREDOC-SOURCED COMMIT MESSAGES ───────────────────────────────────────────────────────────
+# This repo's own CLAUDE.md tells every agent to author a multi-line commit message via
+#   git commit -m "$(cat <<'EOF'
+#   …
+#   EOF
+#   )"
+# A heredoc BODY is not ordinary shell text — its `"`/`'`/`#` are literal, never real shell syntax
+# — but the tokenizer used to have zero heredoc awareness, so raw body characters corrupted its
+# quote/comment tracking. That went wrong BOTH ways: a real ticket reference past a stray embedded
+# quote in the body was mistaken for a shell comment and silently dropped (agent-tools#406 — a
+# false BLOCK on a correctly-ticketed commit), and an ODD embedded-quote count left the whole
+# command looking quote-unbalanced, so the on_error=open gate failed OPEN — silently ALLOWING a
+# genuinely ticketless commit (agent-tools#503/#430's same root cause, the other face of it). See
+# `_neutralize_heredocs` in the hook for the fix.
+
+
+def test_heredoc_m_with_ticket_allows():
+    # agent-tools#503's exact repro: a multi-line -m built via `$(cat <<'EOF' … EOF)`.
+    command = (
+        "git commit -m \"$(cat <<'EOF'\n"
+        "fix: some message\n\nCloses #502\n\nCo-Authored-By: Someone <x@example.com>\nEOF\n)\""
+    )
+    r = _run(command)
+    assert r["code"] == 0, f"a heredoc -m with a real ticket ref must allow ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_heredoc_m_unquoted_delimiter_with_embedded_quote_and_ticket_allows():
+    # agent-tools#406's repro shape: an UNQUOTED delimiter (`<<EOF`, an expanding body) whose body
+    # has an embedded double quote.
+    command = (
+        "git commit -m \"$(cat <<EOF\n"
+        'fix: handle "quoted" phrase correctly\n\nFixes #123\nEOF\n)"'
+    )
+    r = _run(command)
+    assert r["code"] == 0, f"an embedded quote must not swallow the real ticket ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_heredoc_m_paired_embedded_quote_before_ticket_allows():
+    # The concrete false-BLOCK reproduced live against the pre-fix hook: a PAIRED embedded quote
+    # ("note one") before the ticket reference desynced the naive quote-tracker's parity, so
+    # `#999` landed in a spot the (uncorrected) tracker thought was "outside quotes" and the
+    # comment-stripping step chopped the message there, losing "Closes #999" entirely.
+    command = (
+        "git commit -m \"$(cat <<'EOF'\n"
+        'fix: "note one" more text\n\nCloses #999\nEOF\n)"'
+    )
+    r = _run(command)
+    assert r["code"] == 0, f"the ticket after a paired embedded quote must survive ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_heredoc_m_odd_embedded_quote_no_ticket_still_blocks():
+    # The flip side of the same bug, also reproduced live: an ODD embedded-quote count made the
+    # WHOLE command look quote-unbalanced to the pre-fix tokenizer, so it failed to parse at all
+    # and the on_error=open gate silently ALLOWED — even with no ticket reference anywhere. That
+    # is a real gate bypass, not just a false block, and must not regress.
+    command = (
+        "git commit -m \"$(cat <<'EOF'\n"
+        'fix: handle "quoted phrase with no ticket at all, odd embedded quote\nEOF\n)"'
+    )
+    r = _run(command)
+    assert r["code"] == 10, f"a heredoc message with NO ticket must still block ({r['message']})"
+    assert r["decision"] == "block"
+
+
+def test_heredoc_m_closes_182_allows():
+    # agent-tools#430's exact repro.
+    command = (
+        "git commit -m \"$(cat <<'EOF'\n"
+        "fix: landing tg-cli PR 286\n\nCloses #182\nEOF\n)\""
+    )
+    r = _run(command)
+    assert r["code"] == 0, f"agent-tools#430's repro must allow ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_heredoc_m_without_ticket_blocks():
+    # Positive-path regression: a heredoc-authored message with NO ticket must still block — the
+    # fix must not make the hook permissive for the documented multi-line pattern.
+    command = "git commit -m \"$(cat <<'EOF'\nfix: some message with no ticket at all\nEOF\n)\""
+    r = _run(command)
+    assert r["code"] == 10, f"a ticketless heredoc commit must still block ({r['message']})"
+    assert r["decision"] == "block"
+
+
+def test_heredoc_m_chore_exemption_preserved():
+    # An exempt conventional-commit type authored via heredoc is still recognized as exempt — the
+    # heredoc unwrap must recover the REAL subject line, not a `$(cat …)`-prefixed one.
+    command = "git commit -m \"$(cat <<'EOF'\nchore: bump deps\nEOF\n)\""
+    r = _run(command)
+    assert r["code"] == 0, f"a heredoc chore: commit must be exempt ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_heredoc_m_second_commit_in_chain_without_ticket_blocks():
+    # A chain of two heredoc-authored commits: the first is exempt (chore:), the second is not and
+    # carries no ticket — the gate must still catch the SECOND segment, not just the first.
+    command = (
+        "git commit -m \"$(cat <<'EOF'\nchore: first one\nEOF\n)\" && "
+        "git commit -m \"$(cat <<'EOF'\nfix: second one no ticket\nEOF\n)\""
+    )
+    r = _run(command)
+    assert r["code"] == 10, f"the second, ticketless commit in the chain must block ({r['message']})"
+    assert r["decision"] == "block"
+
+
+def test_heredoc_written_file_dash_F_with_ticket_allows(tmp_path):
+    # agent-tools#570's primary repro: the message FILE is written by a heredoc in the SAME Bash
+    # command as the `git commit -F <file>` that reads it. A PreToolUse hook runs BEFORE the shell
+    # executes anything, so the file does not exist yet at hook time — a plain disk read always
+    # fails for this shape. The fix reads the heredoc body captured from the COMMAND TEXT instead.
+    msg = tmp_path / "commit-msg.txt"
+    command = (
+        f"cat > {msg} <<'EOF'\n"
+        "fix: reveal feature slides one at a time\n\nRefs #143\nEOF\n"
+        f"git commit -q -F {msg}"
+    )
+    r = _run(command)
+    assert r["code"] == 0, f"a -F file written by a same-command heredoc must allow ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_heredoc_written_file_dash_F_without_ticket_blocks(tmp_path):
+    # Positive-path regression for the #570 fix: the SAME shape but with no ticket in the body must
+    # still block — the heredoc-body fallback must not become a free bypass of the gate.
+    msg = tmp_path / "commit-msg.txt"
+    command = (
+        f"cat > {msg} <<'EOF'\n"
+        "fix: reveal feature slides one at a time, no ticket here\nEOF\n"
+        f"git commit -q -F {msg}"
+    )
+    r = _run(command)
+    assert r["code"] == 10, f"a heredoc-written -F file with no ticket must still block ({r['message']})"
+    assert r["decision"] == "block"
+
+
+def test_heredoc_body_mentioning_commit_flag_is_not_gated():
+    # agent-tools#570's "bonus repro": a heredoc body that merely MENTIONS `git commit -F …` as
+    # prose (inside an unrelated `gh issue create --body "$(cat <<'EOF' … EOF)"`) must never be
+    # mistaken for a real commit segment — the pre-fix tokenizer's line-by-line retry loop could
+    # treat an independently-parseable body LINE as its own command segment.
+    command = (
+        "gh issue create --body \"$(cat <<'EOF'\n"
+        "Repro: run `git commit -F msg.txt` and see it block.\nEOF\n)\""
+    )
+    r = _run(command)
+    assert r["code"] == 0, f"a non-commit command must never be gated ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+# ── review round 1 findings (codex) ───────────────────────────────────────────────────────────
+# Four real gaps found reviewing the heredoc-neutralization fix itself, before any of them shipped:
+#   1. `_heredoc_body_for_target` matched by TARGET PATH with no ordering check — a heredoc that
+#      writes its target file AFTER a commit already read it could retroactively "satisfy" that
+#      commit's ticket gate, even though the commit actually ran against whatever the file held
+#      BEFORE that later write. A real gate bypass.
+#   2. Backtick command substitution wasn't tracked as its own parsing frame, even though the
+#      `_BACKTICK_CAT_SUBST_RE` unwrap regex implied support — a heredoc inside backticks with a
+#      corrupting embedded quote could still fail to tokenize and fail OPEN.
+#   3. A COMPACT heredoc opener with no space before it (`cat<<'EOF'`) glued the sentinel directly
+#      onto `cat`, breaking the `$(cat SENTINEL)` unwrap's word boundary and false-blocking an
+#      otherwise-exempt commit.
+#   4. Multiple heredocs chained on one line (`cmd <<A <<B`) were modeled as only the first — a
+#      ticket hidden in an EARLIER, UNUSED heredoc could satisfy the gate while the command
+#      actually read a different, ticketless body (the LAST one wins in real shell redirection).
+
+
+def test_heredoc_target_ordering_rejects_a_later_write(tmp_path):
+    # Finding 1: `git commit -F msg` reads whatever `msg` holds RIGHT NOW; a heredoc that writes a
+    # ticket into `msg` AFTER this commit must not retroactively satisfy it. The pre-existing file
+    # on disk is genuinely ticketless, so the correct outcome is BLOCK.
+    msg = tmp_path / "msg"
+    msg.write_text("fix: no ticket\n", encoding="utf-8")
+    command = f"git commit -F {msg}; cat > {msg} <<'EOF'\nRefs #123\nEOF\n"
+    r = _run(command)
+    assert r["code"] == 10, f"a LATER heredoc write must not satisfy an earlier read ({r['message']})"
+    assert r["decision"] == "block"
+
+
+def test_heredoc_target_ordering_allows_an_earlier_write(tmp_path):
+    # Control for the above: when the heredoc write genuinely comes FIRST (the documented #570
+    # shape), it must still be honored.
+    msg = tmp_path / "msg"
+    command = f"cat > {msg} <<'EOF'\nRefs #123\nEOF\ngit commit -F {msg}"
+    r = _run(command)
+    assert r["code"] == 0, f"an EARLIER heredoc write must still satisfy the read ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_backtick_heredoc_with_embedded_quote_and_no_ticket_still_blocks():
+    # Finding 2: a heredoc inside a BACKTICK substitution (not `$()`), whose body has an unmatched
+    # embedded quote and NO ticket, must still block — not fail open via a tokenizer crash.
+    command = (
+        "git commit -m \"`cat <<'EOF'\n"
+        'fix: unmatched " quote, no ticket\nEOF\n`"'
+    )
+    r = _run(command)
+    assert r["code"] == 10, f"a ticketless backtick-heredoc commit must block ({r['message']})"
+    assert r["decision"] == "block"
+
+
+def test_backtick_heredoc_with_ticket_allows():
+    # Same shape, but the body DOES carry a ticket — must be recognized just like the `$()` form.
+    command = (
+        "git commit -m \"`cat <<'EOF'\n"
+        'fix: unmatched " quote, WITH ticket Refs #77\nEOF\n`"'
+    )
+    r = _run(command)
+    assert r["code"] == 0, f"a ticketed backtick-heredoc commit must allow ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_compact_heredoc_opener_no_space_chore_exemption_preserved():
+    # Finding 3: `cat<<'EOF'` (no space before the operator) must still neutralize to a
+    # word-boundary-safe `cat SENTINEL`, so the `chore:` exemption is still recognized.
+    command = "git commit -m \"$(cat<<'EOF'\nchore: compact redirection\nEOF\n)\""
+    r = _run(command)
+    assert r["code"] == 0, f"a compact heredoc opener must not break the exemption ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_chained_heredocs_use_the_last_ones_body_not_the_first():
+    # Finding 4: `cmd <<A <<B` — real shell redirects apply left-to-right, so `cat`'s stdin ends up
+    # wired to B, not A. A ticket hidden in the UNUSED first body (A) must NOT satisfy the gate.
+    command = (
+        "git commit -m \"$(cat <<A <<B\n"
+        "ignored Refs #99\nA\nfix: actual message without a ticket\nB\n)\""
+    )
+    r = _run(command)
+    assert r["code"] == 10, f"the ignored first heredoc's ticket must not count ({r['message']})"
+    assert r["decision"] == "block"
+
+
+def test_chained_heredocs_ticket_in_winning_body_allows():
+    # Control for the above: the ticket correctly placed in the WINNING (second) body must allow.
+    command = (
+        "git commit -m \"$(cat <<A <<B\n"
+        "ignored no ticket here\nA\nfix: actual message Refs #55\nB\n)\""
+    )
+    r = _run(command)
+    assert r["code"] == 0, f"a ticket in the winning heredoc body must allow ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+# ── review round 2 findings (codex) ───────────────────────────────────────────────────────────
+# Three more real gaps found reviewing round 1's own fix:
+#   P1 (critical — a real ALLOW bypass): `<<` inside a shell `#` COMMENT was still read as a real
+#      heredoc opener, so the neutralizer swallowed the next physical lines — including a REAL,
+#      ticketless `git commit` — as if they were the heredoc's body. `commit_segments` then found
+#      no commit at all and the hook silently ALLOWED it.
+#   P2a (a false BLOCK the round-1 ordering fix itself introduced): the ordering cutoff searched
+#      independently for a bare word "commit" in the rewritten text, which could match unrelated
+#      prose (`echo commit`) BEFORE the real commit segment and mis-anchor the cutoff, wrongly
+#      rejecting a genuinely earlier heredoc write.
+#   P2b (a false BLOCK on a plausible shape): the redirect-target regex was whitespace-delimited,
+#      so a quoted path containing an internal space (`cat > '/tmp/commit message' <<EOF`) was
+#      truncated at the first space and never matched the later `-F '/tmp/commit message'`.
+
+
+def test_comment_hiding_a_heredoc_opener_does_not_hide_the_real_commit():
+    # P1: a `#`-commented `<<EOF` must NOT be read as a real heredoc opener — the shell only
+    # comments out the FIRST line, so the ticketless `git commit` on the next line is a REAL,
+    # executed command and must be gated, not silently swallowed as "heredoc body".
+    command = "# <<EOF\ngit commit -m 'fix: no ticket'\nEOF\n"
+    r = _run(command)
+    assert r["code"] == 10, f"a commented-out heredoc opener must not hide the real commit ({r['message']})"
+    assert r["decision"] == "block"
+
+
+def test_leading_comment_does_not_break_a_legitimate_heredoc_commit():
+    # Control for P1: a harmless leading comment line must not interfere with a REAL heredoc
+    # commit that follows it.
+    command = (
+        "# a leading comment\n"
+        "git commit -m \"$(cat <<'EOF'\nfix: real change\n\nRefs #200\nEOF\n)\""
+    )
+    r = _run(command)
+    assert r["code"] == 0, f"a leading comment must not break a real heredoc commit ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_heredoc_ordering_not_confused_by_unrelated_commit_prose():
+    # P2a: `echo commit` (unrelated prose containing the word "commit") must not be mistaken for
+    # the anchor of the REAL commit segment — the genuinely earlier heredoc write must still count.
+    command = (
+        "echo commit\n"
+        "cat > /tmp/rtq-p2a-msg <<'EOF'\nRefs #123\nEOF\n"
+        "git commit -F /tmp/rtq-p2a-msg"
+    )
+    r = _run(command)
+    assert r["code"] == 0, f"unrelated 'commit' prose must not mis-anchor the ordering check ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_heredoc_target_quoted_path_with_space_allows(tmp_path):
+    # P2b: a quoted `-F` path containing an internal space must be read WHOLE by the redirect
+    # target parser, not truncated at the first space.
+    quoted = tmp_path / "commit message"
+    command = f"cat > '{quoted}' <<'EOF'\nRefs #123\nEOF\ngit commit -F '{quoted}'"
+    r = _run(command)
+    assert r["code"] == 0, f"a quoted path with a space must still match ({r['message']})"
+    assert r["decision"] == "allow"
+
+
 def test_dash_F_stdin_hatch_approved_allows(tmp_path, monkeypatch):
     # THE spec requirement: the hatch is consulted BEFORE the `-F -` stdin block, so an approved
     # hatch lets a genuinely ticketless `-F -` commit through (read from the command env + tg-ctl,
