@@ -50,7 +50,13 @@ def _entry(i: int, wrapped: str) -> str:
 def cfg(tmp_path, monkeypatch):
     monkeypatch.setenv("TG_CTL_CONFIG_DIR", str(tmp_path))
     monkeypatch.delenv("CLAUDE_PID", raising=False)
+    monkeypatch.setenv("HOOKS_DEBUG_LOG", str(tmp_path / "hooks-debug.log"))
     return tmp_path
+
+
+def _hooks_debug_log(cfg: Path) -> str:
+    path = Path(os.environ.get("HOOKS_DEBUG_LOG", str(cfg / "hooks-debug.log")))
+    return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
 # --- the shared key contract (mirror of ctl-unreachable.test.ts) ---
@@ -145,7 +151,7 @@ def test_consume_pending_missing_or_empty_never_blocks(cfg):
     assert not (d / "pending.jsonl").exists()
 
 
-def test_consume_pending_malformed_lines_are_archived_flagged_not_delivered(cfg, capsys):
+def test_consume_pending_malformed_lines_are_archived_flagged_not_delivered(cfg):
     d = inbox_dir("mixed")
     d.mkdir(parents=True)
     (d / "pending.jsonl").write_text("not json\n" + json.dumps({"nope": 1}) + "\n" + _entry(7, "ok") + "\n")
@@ -154,10 +160,10 @@ def test_consume_pending_malformed_lines_are_archived_flagged_not_delivered(cfg,
     (batch,) = d.glob("delivered-*.jsonl")
     delivered = [json.loads(line) for line in batch.read_text().splitlines()]
     assert [x.get("malformed", False) for x in delivered] == [True, True, False]
-    assert "2 malformed" in capsys.readouterr().err
+    assert "2 malformed" in _hooks_debug_log(cfg)
 
 
-def test_consume_pending_archive_failure_delivers_nothing_and_keeps_claim(cfg, monkeypatch, capsys):
+def test_consume_pending_archive_failure_delivers_nothing_and_keeps_claim(cfg, monkeypatch):
     d = inbox_dir("stuck")
     d.mkdir(parents=True)
     (d / "pending.jsonl").write_text(_entry(1, "x") + "\n")
@@ -165,7 +171,7 @@ def test_consume_pending_archive_failure_delivers_nothing_and_keeps_claim(cfg, m
     assert consume_pending("stuck") == []
     assert list(d.glob("claim-*"))  # records preserved for a human, not lost
     assert not list(d.glob("delivered-*"))
-    assert "could not publish" in capsys.readouterr().err
+    assert "could not publish" in _hooks_debug_log(cfg)
 
 
 def test_consume_pending_never_overwrites_a_stale_claim(cfg):
@@ -186,7 +192,7 @@ def test_consume_pending_never_overwrites_a_stale_claim(cfg):
 
 def _run_bridge(module: str, event: dict, *, cfg: Path, home: Path) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if not k.startswith("RIG_HATCH_REQUEST_")}
-    env.update({"HOME": str(home), "TG_CTL_CONFIG_DIR": str(cfg), "PYTHONPATH": str(_LIB)})
+    env.update({"HOME": str(home), "TG_CTL_CONFIG_DIR": str(cfg), "PYTHONPATH": str(_LIB), "HOOKS_DEBUG_LOG": str(cfg / "hooks-debug.log")})
     # Pin the "agent process" to pid 1 (launchd/init — never an agent binary) so the key
     # falls back to the cwd hash. Without this the ancestry walk would climb out of pytest
     # into the developer's OWN interactive `claude --name …` and key on that name.
@@ -211,6 +217,7 @@ def _run_omp_bridge(event: dict, *, cfg: Path, home: Path) -> subprocess.Complet
         "PYTHONPATH": str(_LIB),
         "OMP_HOOKS_DIR": str(hooks),
         "CLAUDE_PID": "1",
+        "HOOKS_DEBUG_LOG": str(cfg / "hooks-debug.log"),
     })
     return subprocess.run(
         [sys.executable, "-m", "omp_hook_bridge", "tool_call"],
@@ -233,7 +240,7 @@ def test_cc_bridge_stop_delivers_pending_inbox_as_block_reason(tmp_path):
     res = _run_bridge("cc_hook_bridge", {"hook_event_name": "Stop", "session_id": "s1", "cwd": cwd}, cfg=cfg, home=home)
     assert res.returncode == 0, res.stderr
     assert json.loads(res.stdout) == {"decision": "block", "reason": "[TG from Alex tg#42] deploy now"}
-    assert "delivering 1 queued" in res.stderr
+    assert "delivering 1 queued" in (cfg / "hooks-debug.log").read_text(encoding="utf-8")
     assert len(list(d.glob("delivered-*.jsonl"))) == 1
     # idempotent: the next Stop has nothing pending → no block
     res2 = _run_bridge("cc_hook_bridge", {"hook_event_name": "Stop", "session_id": "s1", "cwd": cwd}, cfg=cfg, home=home)
@@ -252,7 +259,7 @@ def test_cc_bridge_stop_empty_and_malformed_inbox_never_block(tmp_path):
     (d / "pending.jsonl").write_text("{{{ garbage\n")
     res = _run_bridge("cc_hook_bridge", {"hook_event_name": "Stop", "cwd": cwd}, cfg=cfg, home=home)
     assert res.returncode == 0 and res.stdout == ""
-    assert "malformed" in res.stderr
+    assert "malformed" in (cfg / "hooks-debug.log").read_text(encoding="utf-8")
 
 
 def test_codex_bridge_stop_delivers_pending_inbox(tmp_path):
@@ -370,7 +377,7 @@ def test_omp_bridge_yield_empty_and_malformed_never_block(tmp_path):
     (d / "pending.jsonl").write_text("{{{ garbage\n")
     res = _run_omp_bridge(event, cfg=cfg, home=home)
     assert res.returncode == 0 and res.stdout == ""
-    assert "malformed" in res.stderr
+    assert "malformed" in (cfg / "hooks-debug.log").read_text(encoding="utf-8")
 
 
 def test_omp_bridge_ignores_inherited_claude_pid_and_keys_on_cwd(tmp_path):
@@ -434,21 +441,21 @@ def test_omp_bridge_stop_hook_block_and_inbox_ride_in_one_block(tmp_path):
 # --- review-round hardening (PR #563, round 3) ---
 
 
-def test_consume_pending_invalid_utf8_keeps_claim_and_warns(cfg, capsys):
+def test_consume_pending_invalid_utf8_keeps_claim_and_warns(cfg):
     d = inbox_dir("landing")
     d.mkdir(parents=True)
     (d / "pending.jsonl").write_bytes(b'{"wrapped": "\xff\xfe broken"}\n')
     assert consume_pending("landing") == []
-    assert "could not read" in capsys.readouterr().err
+    assert "could not read" in _hooks_debug_log(cfg)
     assert len(list(d.glob("claim-*"))) == 1  # kept on disk for a human, not lost
 
 
-def test_consume_pending_blank_wrapped_is_malformed_not_silently_eaten(cfg, capsys):
+def test_consume_pending_blank_wrapped_is_malformed_not_silently_eaten(cfg):
     d = inbox_dir("landing")
     d.mkdir(parents=True)
     (d / "pending.jsonl").write_text(json.dumps({"id": 1, "wrapped": "   "}) + "\n")
     assert consume_pending("landing") == []
-    assert "1 malformed" in capsys.readouterr().err
+    assert "1 malformed" in _hooks_debug_log(cfg)
     batch = next(d.glob("delivered-*.jsonl"))
     assert json.loads(batch.read_text())["malformed"] is True
 
@@ -536,7 +543,7 @@ def test_combine_block_empty_hook_reason_still_blocks():
     assert omp_dispatch._combine_block("msg", "gate") == omp_dispatch.omp_block_output("msg\n\ngate")
 
 
-def test_consume_pending_requeues_a_record_appended_to_the_claim_mid_consume(cfg, monkeypatch, capsys):
+def test_consume_pending_requeues_a_record_appended_to_the_claim_mid_consume(cfg, monkeypatch):
     # The daemon appends with open-then-write; a claim rename between the two lands the
     # record on the CLAIMED inode after the reader's snapshot (round-1 finding). It must
     # come back as a fresh pending.jsonl, not die with the claim.
@@ -553,7 +560,7 @@ def test_consume_pending_requeues_a_record_appended_to_the_claim_mid_consume(cfg
 
     monkeypatch.setattr(inbox_core, "_write_private", late_append_then_write)
     assert [e["id"] for e in consume_pending("landing")] == [1]
-    assert "requeued to pending.jsonl" in capsys.readouterr().err
+    assert "requeued to pending.jsonl" in _hooks_debug_log(cfg)
     assert not list(d.glob("claim-*"))
     assert (d / "pending.jsonl").stat().st_mode & 0o777 == 0o600
     monkeypatch.setattr(inbox_core, "_write_private", real_write)

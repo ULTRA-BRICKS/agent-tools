@@ -29,8 +29,24 @@ FILE_MODE = 0o600
 _ANCESTRY_HOPS = 6
 
 
+def _debug_log_path() -> Path:
+    """File log for inbox diagnostics, overridable for tests."""
+    override = os.environ.get("HOOKS_DEBUG_LOG")
+    if override:
+        return Path(override)
+    return Path(os.path.expanduser("~/.cache/agent-tools/hooks-debug.log"))
+
+
 def _warn(msg: str) -> None:
-    sys.stderr.write(f"tg-inbox: {msg}\n")
+    """File-only diagnostics: bridges must never write to stderr (TUI noise in
+    every harness). Decisions travel via stdout JSON; this lands in the file log."""
+    try:
+        path = _debug_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"tg-inbox: {msg}\n")
+    except OSError:
+        pass
 
 
 # --- key derivation (the shared contract) ---
@@ -243,7 +259,7 @@ def consume_pending(key: str, *, session_id: str = "") -> list[dict]:
     as ONE complete ``delivered-<pid>-<ns>-<rnd>.jsonl`` (written to a ``tmp-…`` file, then
     renamed — the daemon only ever sees whole batches) and the claim is removed — all
     BEFORE the caller emits the block, so a message is never delivered twice.
-    Any problem → ``[]`` with a stderr line (fail-open: the stop proceeds normally).
+    Any problem → ``[]`` with a file-log line (fail-open: the stop proceeds normally).
     """
     directory = inbox_dir(key)
     pending = directory / PENDING_FILE
@@ -296,7 +312,7 @@ def consume_pending(key: str, *, session_id: str = "") -> list[dict]:
 def _finish_claim(claim: Path, pending: Path, consumed: int) -> None:
     """The batch is published, so the entries ARE delivered; the claim is now only a
     carrier for a late append. Requeue that, then drop the claim — or leave it on disk
-    (nothing lost, said on stderr) if either step fails."""
+    (nothing lost, said in the file log) if either step fails."""
     try:
         _requeue_late_appends(claim, pending, consumed)
         claim.unlink()
