@@ -1050,6 +1050,68 @@ def test_first_block_wins_collects_reason(tmp_path):
     assert "first-reason" in reason, out
 
 
+def test_multiple_hatch_vars_in_one_invocation_are_all_audited(tmp_path):
+    """Regression for agent-tools#713: overrides.log (the RIG_HATCH_REQUEST_* audit sink,
+    gap G-8) must record EVERY hatch attempt made during one dispatch, not just the first.
+
+    Two pre-bash descriptors each call the REAL `agenttools_hatch_escalation.request_hatch_approval`
+    with their own hook id. Both hatch env vars carry a blank value — a real "use" of the
+    mechanism (env_present=True) that is denied LOCALLY, without ever contacting tg-ctl (see
+    `_request_present_hatch_approval`'s blank-value early return), so this test cannot reach a
+    real Telegram approval regardless of what's on the host machine. The first descriptor
+    (lower priority number) denies and blocks the tool call; pre-fix, `_first_hook_block`
+    returned as soon as that happened, so the second descriptor's own hatch attempt never ran
+    and never got audited."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    checker = tmp_path / "hatch_checker.py"
+    checker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "sys.path.insert(0, os.environ['HATCH_LIB_DIR'])\n"
+        "import agenttools_hatch_escalation as hatch_escalation\n"
+        "json.load(sys.stdin)\n"
+        "hook_id = sys.argv[1]\n"
+        "result = hatch_escalation.request_hatch_approval(hook_id, {'hook': hook_id}, cwd=os.getcwd())\n"
+        "if result.approved:\n"
+        "    sys.exit(0)\n"
+        "print(json.dumps({'message': f'blocked by {hook_id}'}))\n"
+        "sys.exit(10)\n"
+    )
+    checker.chmod(0o755)
+    d1 = _install_descriptor(hooks, hook_id="hatch-alpha", point="pre-bash", cmd=checker, priority=5)
+    d2 = _install_descriptor(hooks, hook_id="hatch-beta", point="pre-bash", cmd=checker, priority=50)
+    for path, hook_id in ((d1, "hatch-alpha"), (d2, "hatch-beta")):
+        spec = json.loads(path.read_text())
+        spec["args"] = [hook_id]
+        path.write_text(json.dumps(spec))
+
+    overrides_log = home / ".config" / "agent-tools" / "overrides.log"
+    cc_event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "anything"}, "cwd": str(tmp_path)}
+    proc = _run_dispatch_with_env(
+        "PreToolUse", cc_event, home=home,
+        extra_env={
+            "HATCH_LIB_DIR": str(_LIB),
+            "AGENT_TOOLS_OVERRIDES_LOG": str(overrides_log),
+            # Blank values: a real hatch USE (env_present=True) that is denied without ever
+            # calling tg-ctl, so this can never fire a real Telegram approval on any machine.
+            "RIG_HATCH_REQUEST_HATCH_ALPHA": "",
+            "RIG_HATCH_REQUEST_HATCH_BETA": "",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", proc.stdout
+
+    assert overrides_log.is_file(), "expected overrides.log to be written at all"
+    entries = [json.loads(line) for line in overrides_log.read_text().splitlines() if line.strip()]
+    audited_hatches = {entry["hatch"] for entry in entries}
+    assert audited_hatches == {"hatch-alpha", "hatch-beta"}, (
+        f"expected BOTH simultaneous hatch attempts audited, got {audited_hatches} from {entries}"
+    )
+
+
 def _mk_lint_repo(tmp_path: Path, *, findings: bool) -> Path:
     """A throwaway repo with a fake local oxlint (findings or clean) and one .ts file."""
     repo = tmp_path / "repo"
