@@ -285,6 +285,54 @@ def test_worktree_path_with_space_is_collected(tmp_path):
     assert str(wt_spaced) not in remaining, f"spaced worktree still present:\n{remaining}"
 
 
+def test_ship_autodetect_main_survives_sigpipe_from_large_worktree_listing(
+    repo_with_pr_worktree, tmp_path
+):
+    """Auto-detecting the main checkout must not fail when its producer sees awk exit early."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    real_git = shutil.which("git")
+    assert real_git is not None
+
+    main_link = tmp_path / "main checkout"
+    main_link.symlink_to(main, target_is_directory=True)
+    listing = tmp_path / "large-worktree-list.txt"
+    head = _git("rev-parse", "HEAD", cwd=main).stdout.strip()
+    listing.write_text(
+        f"worktree {main_link}\nHEAD {head}\nbranch refs/heads/main\n"
+        + ("padding\n" * 500_000),
+        encoding="utf-8",
+    )
+    marker = tmp_path / "worktree-list-intercepted"
+    (bindir / "git").write_text(
+        f"""#!/usr/bin/env bash
+set -e
+if [ "$#" -eq 3 ] && [ "$1" = worktree ] && [ "$2" = list ] && [ "$3" = --porcelain ] && [ ! -e "{marker}" ]; then
+  touch "{marker}"
+  cat "{listing}"
+  exit $?
+fi
+exec "{real_git}" "$@"
+""",
+        encoding="utf-8",
+    )
+    (bindir / "git").chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env.pop("SHIP_MAIN_CHECKOUT", None)
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        cwd=main_link, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert marker.exists(), "fake git worktree-list interception was not observed"
+    assert "merged #1" in r.stdout, r.stdout
+
+
 @pytest.fixture
 def repo_with_pr_worktree(tmp_path):
     """A repo on `main` with branch `feat` checked out in ONE worktree, plus an `origin`
