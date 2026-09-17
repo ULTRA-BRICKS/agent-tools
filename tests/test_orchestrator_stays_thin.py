@@ -202,6 +202,20 @@ _OMP_MAIN_SESSION = (
     "/tmp/omp-sessions/-xp-rig-cli/"
     "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e.jsonl"
 )
+# A NESTED subagent — one dispatched via the `task` tool from WITHIN an already-dispatched
+# subagent (task depth >= 2), not directly by the top-level session. oh-my-pi derives each
+# level's own child `artifactsDir` from ITS OWN `session.getSessionFile().slice(0, -6)`
+# (packages/coding-agent/src/task/workpool.ts, src/vibe/runtime.ts) — i.e. one extra
+# directory level PER task-depth level, not a flat sibling directory shared by the whole
+# tree. So a depth-2 grandchild's transcript sits under its OWN parent's (the depth-1
+# child's) directory, `.../<session-id>/<child-agent-id>/<grandchild-agent-id>.jsonl` — the
+# grandchild's IMMEDIATE parent directory name is another AGENT id, never the root
+# session id.
+_OMP_GRANDCHILD_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/"
+    "ThinNotSub/GrandchildWorker.jsonl"
+)
 
 
 def test_subagent_git_commit_allowed_for_omp_nested_session(tmp_path, monkeypatch):
@@ -302,6 +316,121 @@ def test_single_level_nested_session_exempts_gh_and_multistep_bash_claude_code(
         assert c == 0 and _decision(out) == "allow", (
             f"call {attempt} for {command!r} was not allowed: {out}"
         )
+
+
+def test_subagent_git_commit_allowed_for_omp_grandchild_nested_session(tmp_path, monkeypatch):
+    """Live finding (2026-09-18): a NESTED omp Task-tool subagent — a grandchild spawned via
+    `task` from WITHIN an already-dispatched subagent, task depth >= 2 — was misclassified as
+    the orchestrator and hard-blocked on its own bash calls, despite #634/#676/#743 already
+    being merged. Root cause: `_is_omp_nested_session` only ever checked the file's IMMEDIATE
+    parent directory name against `_OMP_SESSION_DIR`. A depth-1 child's immediate parent is the
+    root session id (`_OMP_NESTED_SESSION` above) and matches; a depth-2+ grandchild's immediate
+    parent is instead ANOTHER AGENT id (`_OMP_GRANDCHILD_SESSION`'s parent is `ThinNotSub`, not
+    the session id) and never matched, so every nested dispatch below the first level fell
+    through to the orchestrator gate. Repeat `git commit` must ALLOW. Would FAIL pre-fix."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "omp",
+             "args": {"command": "git commit -m 'fix: x'"}}
+    env = {"PI_SESSION_FILE": _OMP_GRANDCHILD_SESSION}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_omp_bridge_nested_grandchild_pi_session_git_commit_is_allowed(tmp_path, monkeypatch):
+    """Same as `test_omp_bridge_nested_pi_session_git_commit_is_allowed` but through a REAL
+    `omp_hook_bridge.dispatch.to_v1_event` call for a depth-2 grandchild transcript: the
+    bridge-derived `args.agent_id` must resolve to the grandchild's OWN id (`GrandchildWorker`,
+    its `.jsonl` stem), not fall back empty, and the resulting event must ALLOW a repeat `git
+    commit`."""
+    import importlib
+    monkeypatch.setenv("PI_SESSION_FILE", _OMP_GRANDCHILD_SESSION)
+    dispatch = importlib.import_module("omp_hook_bridge.dispatch")
+    raw = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m 'fix: x'"},
+        "cwd": "/repo",
+        "toolCallId": "call_1",
+    }
+    v1 = dispatch.to_v1_event(raw, point="pre-bash")
+    assert v1["args"]["agent_id"] == "GrandchildWorker"
+    _run(v1, monkeypatch, tmp_path / "m")
+    out, _e, c = _run(v1, monkeypatch, tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_deeply_nested_great_grandchild_session_still_exempts(tmp_path, monkeypatch):
+    """The ancestor walk must not be hardcoded to exactly two levels: a THIRD-level nested
+    dispatch (`task.maxRecursionDepth` raised above the default of 2) still has the root
+    session id somewhere in its ancestry, just one directory deeper still. Must ALLOW."""
+    great_grandchild = (
+        "/tmp/omp-sessions/-xp-rig-cli/"
+        "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/"
+        "ThinNotSub/GrandchildWorker/GreatGrandchildWorker.jsonl"
+    )
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "omp",
+             "args": {"command": "git commit -m 'fix: x'"}}
+    env = {"PI_SESSION_FILE": great_grandchild}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_unrelated_nested_path_without_session_id_ancestor_still_blocks(tmp_path, monkeypatch):
+    """RC-2 guard: the ancestor walk must not become an unbounded "nested anywhere" grant.
+    A `.jsonl` path with NO session-id-shaped ancestor at ANY depth (e.g. an ordinary two-level
+    project directory that happens to hold a `.jsonl` file) is not an omp Task/eval transcript
+    at all and must NOT exempt the orchestrator — repeat `git commit` still BLOCKs."""
+    unrelated = "/repo/notes/archive/transcript.jsonl"
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "omp",
+             "args": {"command": "git commit -m 'fix: x'"}}
+    env = {"PI_SESSION_FILE": unrelated}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def _load_no_long_inline_process():
+    sib = (
+        Path(__file__).resolve().parents[1]
+        / "agent-hooks"
+        / "no-long-inline-process"
+        / "no_long_inline_process.py"
+    )
+    spec = importlib.util.spec_from_file_location("no_long_inline_process", sib)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_omp_session_dir_ancestor_check_stays_in_lockstep_across_all_three_copies():
+    """The session-id-ancestor-shaped path detector is duplicated three ways by design (each
+    hook is a standalone script with no shared import path; `dispatch.py` is a separate
+    package) — review finding from the nested-subagent-identity fix: nothing but a code
+    comment kept the three regexes/predicates aligned. Pin the regex text AND run every copy
+    over the SAME fixture battery (main / depth-1 / depth-2 / depth-3 / unrelated-deep) so a
+    future edit to any one copy that silently diverges from the other two fails HERE instead
+    of as a live misclassification."""
+    import importlib as _importlib
+    nlip = _load_no_long_inline_process()
+    dispatch = _importlib.import_module("omp_hook_bridge.dispatch")
+    assert ost._OMP_SESSION_DIR.pattern == nlip._OMP_SESSION_DIR.pattern == dispatch._OMP_SESSION_DIR.pattern
+
+    main_session = Path(_OMP_MAIN_SESSION)
+    depth1 = Path(_OMP_NESTED_SESSION)
+    depth2 = Path(_OMP_GRANDCHILD_SESSION)
+    depth3 = Path(
+        "/tmp/omp-sessions/-xp-rig-cli/"
+        "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/"
+        "ThinNotSub/GrandchildWorker/GreatGrandchildWorker.jsonl"
+    )
+    unrelated = Path("/repo/notes/archive/transcript.jsonl")
+    for path, expected in ((main_session, False), (depth1, True), (depth2, True),
+                            (depth3, True), (unrelated, False)):
+        assert ost._has_omp_session_ancestor(path) is expected, path
+        assert nlip._has_omp_session_ancestor(path) is expected, path
+        assert dispatch._has_omp_session_ancestor(path) is expected, path
 
 
 def test_orchestrator_git_commit_still_blocks_with_main_pi_session_file(tmp_path, monkeypatch):

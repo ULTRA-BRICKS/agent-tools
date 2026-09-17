@@ -669,11 +669,32 @@ _OMP_SESSION_DIR = re.compile(
 )
 
 
-def _is_omp_nested_session() -> bool:
-    """True when PI_SESSION_FILE is an omp Task/eval child transcript.
+def _has_omp_session_ancestor(path: Path) -> bool:
+    """True when ANY ancestor directory of ``path`` is session-id-shaped, not just the
+    immediate parent (live finding, 2026-09-18): a depth-1 Task/eval child's transcript is
+    ``.../<session-id>/<agent-id>.jsonl`` and its immediate parent matches directly. A NESTED
+    child — one dispatched via `task` from WITHIN an already-dispatched subagent, task depth
+    >= 2 — nests one MORE directory per additional level instead of staying flat: oh-my-pi
+    derives each level's own child `artifactsDir` from THAT session's own
+    ``sessionManager.getSessionFile().slice(0, -6)`` (packages/coding-agent/src/task/
+    workpool.ts, src/vibe/runtime.ts), so a depth-2 grandchild's transcript is
+    ``.../<session-id>/<child-agent-id>/<grandchild-agent-id>.jsonl`` — its IMMEDIATE parent
+    is another AGENT id, never the root session id. Checking only ``path.parent.name``
+    therefore misclassified every nested Task/eval subagent below the first dispatch level as
+    the orchestrator. Walking the full ancestor chain finds the root session-id directory at
+    whatever depth it actually sits, for any recursion depth. A bare top-level session file's
+    ancestors are the project-slug/`sessions` directory tree, never session-id-shaped, so a
+    non-nested main session still returns False here (RC-2: anonymous/main sessions keep
+    blocking)."""
+    return any(_OMP_SESSION_DIR.match(parent.name) for parent in path.parents)
 
-    Main:  .../<session-id>.jsonl
-    Child: .../<session-id>/<agent-id>.jsonl
+
+def _is_omp_nested_session() -> bool:
+    """True when PI_SESSION_FILE is an omp Task/eval child transcript, at any nesting depth.
+
+    Main:            .../<session-id>.jsonl
+    Direct child:     .../<session-id>/<agent-id>.jsonl
+    Nested (depth 2+): .../<session-id>/<agent-id>/<agent-id>/....jsonl
 
     NOT restricted to ``event["harness"] == "omp"`` (agent-tools#676): omp sets this var on
     every Task/eval child's process regardless of which model harness backs that omp
@@ -695,7 +716,7 @@ def _is_omp_nested_session() -> bool:
     path = Path(raw)
     if path.suffix.lower() != ".jsonl" or not path.stem.strip():
         return False
-    return bool(_OMP_SESSION_DIR.match(path.parent.name))
+    return _has_omp_session_ancestor(path)
 
 
 def _is_subagent(event: dict) -> bool:

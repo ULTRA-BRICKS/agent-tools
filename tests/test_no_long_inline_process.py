@@ -445,6 +445,29 @@ def test_subagent_review_allowed_via_omp_nested_session(monkeypatch):
     assert _decision(out) == "allow"
 
 
+_OMP_GRANDCHILD_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/"
+    "LongInlineFix/GrandchildWorker.jsonl"
+)
+
+
+def test_subagent_review_allowed_via_omp_grandchild_nested_session(monkeypatch):
+    """Live finding (2026-09-18), same root cause as orchestrator-stays-thin's identical
+    bug: a NESTED omp Task-tool subagent (a grandchild dispatched via `task` from WITHIN an
+    already-dispatched subagent, task depth >= 2) has its own transcript one directory
+    deeper than a direct child — `.../<session-id>/<child-id>/<grandchild-id>.jsonl` — so its
+    immediate parent directory is another agent id, never the root session id. No
+    args.agent_id, no RIG_AGENT_ID. review diff must still allow. Would FAIL if
+    `_is_omp_nested_session` still checked only the immediate parent."""
+    out, _e, code = _run(
+        "review diff", monkeypatch, harness="omp",
+        env={"PI_SESSION_FILE": _OMP_GRANDCHILD_SESSION},
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
 def test_omp_orchestrator_inline_review_still_blocks(monkeypatch):
     """Main thread, harness=omp, no subagent identity: inline review still
     blocks. Do not harness-allowlist omp. Recipe names hub start."""

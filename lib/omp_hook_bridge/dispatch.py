@@ -87,6 +87,22 @@ _OMP_SESSION_DIR = re.compile(
 )
 
 
+def _has_omp_session_ancestor(path: Path) -> bool:
+    """True when ANY ancestor directory of ``path`` is session-id-shaped, not just the
+    immediate parent (SYNC with orchestrator-stays-thin's / no-long-inline-process's copy of
+    this helper, same rationale, live finding 2026-09-18): a direct Task/eval child's
+    immediate parent is the root session-id directory, but a NESTED child — dispatched via
+    `task` from WITHIN an already-dispatched subagent, task depth >= 2 — nests one MORE
+    directory per additional level (oh-my-pi derives each level's own `artifactsDir` from
+    THAT session's own `sessionManager.getSessionFile().slice(0, -6)`, packages/coding-agent/
+    src/task/workpool.ts + src/vibe/runtime.ts), so its immediate parent is another agent id,
+    never the root session id. Checking only the immediate parent left `_omp_nested_agent_id`
+    empty for every dispatch below the first level, which in turn left `args.agent_id` empty
+    and fell through to `orchestrator-stays-thin`'s own (equally one-level) fallback — the
+    SAME bug, independently present in both places; both are fixed together."""
+    return any(_OMP_SESSION_DIR.match(parent.name) for parent in path.parents)
+
+
 def _nested_id_from_session_file(raw: str) -> str:
     """Agent id from a nested omp transcript path, or empty. Path shape only."""
     raw = (raw or "").strip()
@@ -95,7 +111,7 @@ def _nested_id_from_session_file(raw: str) -> str:
     path = Path(raw)
     if path.suffix.lower() != ".jsonl" or not path.stem.strip():
         return ""
-    if not _OMP_SESSION_DIR.match(path.parent.name):
+    if not _has_omp_session_ancestor(path):
         return ""
     return path.stem.strip()
 
