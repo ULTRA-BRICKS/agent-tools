@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -199,6 +200,82 @@ def test_real_justification_exit0_allows_and_includes_context(tmp_path):
     assert "Need to inspect the primary checkout before repairing it." in question
     assert "git checkout feat/x" in question
     assert result.tg_ctl_path == str(tg_ctl.resolve())
+
+
+def test_question_renders_title_agent_branch_path_up_top_and_collapses_rest(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "feature/redesign", str(repo)], check=True)
+    # `git rev-parse --abbrev-ref HEAD` (what `_git_branch` runs) needs a resolvable HEAD commit
+    # to succeed on this git version -- an empty repo with only a symbolic ref set by `init -b`
+    # fails with "ambiguous argument 'HEAD'" rather than reporting the branch name.
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t",
+         "commit", "--allow-empty", "-q", "-m", "init"],
+        check=True,
+    )
+    branch = agenttools_hatch_escalation._git_branch(str(repo))
+    question = agenttools_hatch_escalation._question(
+        "block-reset-hard",
+        "need to recover from a bad rebase",
+        {"command": "git reset --hard HEAD~3", "kind": "hard"},
+        str(repo),
+        branch=branch,
+        session_id="pid:1234",
+    )
+    assert question.startswith("<b>\U0001f513 Hatch approval request</b>")
+    assert "<blockquote expandable>" in question
+    head = question[: question.index("<blockquote expandable>")]
+    assert "<b>Branch:</b> <code>feature/redesign</code>" in head
+    assert "<b>Path:</b>" in head
+    assert "<b>Hook:</b> <code>block-reset-hard</code>" in head
+    assert "<b>Justification:</b> need to recover from a bad rebase" in head
+    # The raw command is NOT up top -- it's inside the collapsed block only.
+    assert "git reset --hard HEAD~3" not in head
+    assert "git reset --hard HEAD~3" in question
+
+
+def test_git_branch_falls_back_to_unknown_outside_a_repo(tmp_path):
+    outside = tmp_path / "not-a-repo"
+    outside.mkdir()
+    assert agenttools_hatch_escalation._git_branch(str(outside)) == "unknown"
+
+
+def test_git_branch_falls_back_to_unknown_on_detached_head(tmp_path):
+    """`rev-parse --abbrev-ref HEAD` prints the literal string "HEAD" for a detached HEAD
+    rather than erroring -- pin that `_git_branch` maps that case to "unknown" too, per its
+    own docstring, rather than leaking the literal string "HEAD" onto the approval card."""
+    repo = tmp_path / "detached-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t",
+         "commit", "--allow-empty", "-q", "-m", "init"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "--detach", "HEAD"], check=True)
+    assert agenttools_hatch_escalation._git_branch(str(repo)) == "unknown"
+
+
+def test_question_escapes_html_metacharacters_in_dynamic_values(tmp_path):
+    question = agenttools_hatch_escalation._question(
+        "no-shell-file-edit",
+        "the tag is <script> & needs review",
+        {},
+        str(tmp_path),
+        branch="unknown",
+        session_id="pid:1",
+    )
+    assert "<script>" not in question
+    assert "&lt;script&gt;" in question
+    assert "the tag is &lt;script&gt; &amp; needs review" in question
+
+
+def test_question_with_no_extra_context_has_no_collapsed_block(tmp_path):
+    question = agenttools_hatch_escalation._question(
+        "subagent-no-monitor", "one-off check", {}, str(tmp_path), branch="main", session_id="pid:1",
+    )
+    assert "<blockquote expandable>" not in question
 
 
 def test_real_justification_exit1_denies(tmp_path):
@@ -652,8 +729,8 @@ def test_process_env_takes_precedence_over_inline(tmp_path):
     # The chosen justification is the EXPORTED one, not the inline one. Assert on the specific
     # `Justification:` line (the raw command is echoed verbatim elsewhere in the question and
     # legitimately contains the inline text, so a bare `not in` would be a false negative).
-    assert "Justification: EXPORTED justification" in question
-    assert "Justification: INLINE justification" not in question
+    assert "<b>Justification:</b> EXPORTED justification" in question
+    assert "<b>Justification:</b> INLINE justification" not in question
 
 
 def test_inline_bare_flag_is_rejected_without_tg_ctl_contact(tmp_path):
@@ -867,7 +944,7 @@ def test_inline_whole_command_approval_from_earlier_segment(tmp_path):
     assert result.requested is True
     assert result.should_stop is True
     question = question_file.read_text()
-    assert "Justification: hand-verified" in question
+    assert "<b>Justification:</b> hand-verified" in question
     # The full command (including the later gated segment) is shown to the approver.
     assert "git commit -m x" in question
 
@@ -965,7 +1042,7 @@ def test_inline_quoted_separator_in_value_preserved(tmp_path):
 
     assert result.approved is True
     assert (
-        "Justification: ci & security both green; verified" in question_file.read_text()
+        "<b>Justification:</b> ci &amp; security both green; verified" in question_file.read_text()
     )
 
 
