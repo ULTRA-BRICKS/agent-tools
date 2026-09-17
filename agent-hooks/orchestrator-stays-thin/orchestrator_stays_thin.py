@@ -59,7 +59,10 @@ ONE script binds TWO points via two descriptors; it branches on ``event["point"]
                 hyphen-suffixed lookalike like `task-foo`) — see that predicate's own docstring.
 
 TIERED (warn → block): the FIRST offense in the TTL window WARNs (allow + message); a REPEAT
-in the window BLOCKs. The tier is tracked by a marker file keyed by a hash of cwd. This gives
+in the window BLOCKs. The tier is tracked by a marker file keyed by a hash of cwd, hook point,
+and — when one resolves from the hook process env or the bridge-sanitized event session id —
+the harness session id (so two sessions in the same cwd tier independently; anonymous
+sessions keep sharing one state). This gives
 the doctrine's "WARN then BLOCK" instead of a hard wall on the first inline edit.
 
 Subagent-exempt: a dispatched subagent does the actual work, so it is always allowed — this
@@ -124,6 +127,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import itertools
 import json
 import os
 import re
@@ -719,13 +723,71 @@ def _is_subagent(event: dict) -> bool:
     return _is_omp_nested_session()
 
 
+# Candidate process-env session ids folded into the marker key (agent-tools#743, RC-2) —
+# the SAME list `lib/agenttools_hatch_escalation/__init__.py::_SESSION_ID_ENV_VARS` uses
+# (keep in lockstep; a test pins the two literals together), but ABSOLUTELY NEVER that
+# module's ``pid:<getpid()>`` fallback: this hook runs as a FRESH SUBPROCESS per event, so
+# a pid component would mint a brand-new marker file every event and the guard would WARN
+# forever, never BLOCK — a silent guard removal. When NO session id resolves from env, the
+# event's bridge-sanitized ``session_id`` is used instead (cc_hook_bridge's T2 precedence
+# makes ``args.session_id`` authoritative CC-harness state — the same trust tier as the
+# sanitized ``args.agent_id`` `_is_subagent` already reads, and the source
+# skills-read-gate's `_tier_marker` keys on). Only when BOTH are absent does the key stay
+# exactly today's sha256(cwd\0point) (conservative: anonymous sessions still share state,
+# so blocking still works).
+_SESSION_ID_ENV_VARS = ("CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "RIG_SESSION_ID", "TMUX_PANE")
+
+
+def _session_id_for_marker(event: dict) -> str:
+    """A stable harness-session id from the hook process env, then the bridge-sanitized
+    event ``session_id``, else empty (see the block comment above)."""
+    for var in _SESSION_ID_ENV_VARS:
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    args = event.get("args")
+    val = str((args.get("session_id") if isinstance(args, dict) else "") or event.get("session_id") or "").strip()
+    return val
+
+
 def _marker(event: dict) -> Path:
     # Key by (cwd, point) so a pre-write WARN does not prime a pre-bash BLOCK (or vice versa):
-    # each point tiers independently (B5).
+    # each point tiers independently (B5). When a session id resolves, it joins the key so one
+    # session's offenses cannot poison a DIFFERENT session's BLOCK state in the same cwd
+    # (agent-tools#743); without one the key is byte-identical to the pre-#743 form.
     cwd = str(event.get("cwd") or "default")
     point = str(event.get("point") or "")
-    sid = hashlib.sha256(f"{cwd}\0{point}".encode()).hexdigest()[:16]
+    session = _session_id_for_marker(event)
+    key = f"{cwd}\0{point}\0{session}" if session else f"{cwd}\0{point}"
+    sid = hashlib.sha256(key.encode()).hexdigest()[:16]
     return MARKER_DIR / f"{sid}.warned"
+
+
+# Per-session keys multiply the marker population from O(cwd×point) to O(session×cwd×point),
+# so the WARN-write path also runs a best-effort sweep of markers older than the TTL (they
+# are semantically dead already — `_is_repeat` ignores them), keeping the per-session key
+# space from growing without bound. The sweep LAZILY caps ENUMERATION itself via islice —
+# never sorted(), which would materialize and sort the whole population (the WARN path is
+# warm: it gates a session's first inline edit, and long-lived installs start with a large
+# accumulated marker dir). The cap makes deletion hash-arbitrary rather than oldest-first,
+# which is fine: names are truncated sha256 hex, so ANY fixed window is an unbiased sample
+# and the population converges to the live set across sweeps. Runs only when an offense is
+# being recorded, never on the read path.
+_SWEEP_CAP = 256
+
+
+def _sweep_expired_markers() -> None:
+    try:
+        entries = itertools.islice(MARKER_DIR.glob("*.warned"), _SWEEP_CAP)
+        cutoff = time.time() - TTL_S
+        for path in entries:
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
+    except OSError:
+        return
 
 
 def _is_repeat(event: dict) -> bool:
@@ -740,6 +802,7 @@ def _is_repeat(event: dict) -> bool:
     try:
         MARKER_DIR.mkdir(parents=True, exist_ok=True)
         m.write_text(str(time.time()))
+        _sweep_expired_markers()
     except OSError as exc:
         warn(f"could not write warn marker {m}: {exc} — staying in WARN tier")
     return False

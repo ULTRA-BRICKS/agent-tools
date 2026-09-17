@@ -15,10 +15,13 @@ Run from the repo root::
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -640,6 +643,86 @@ def test_real_bridge_forged_agent_id_is_stripped_and_stays_governed(tmp_path, mo
     out2, _e, c2 = _run(v1_event, monkeypatch, tmp_path / "m")
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # repeat: BLOCK
 
+
+# ── regression: forged omp `input.session_id` must not defeat the per-session marker key ──
+# (agent-tools#743 RC-2 continuation, review finding on PR #745: the RC-2 fix folded a
+# per-session id into the warn->block marker key for cc_hook_bridge/codex_hook_bridge/
+# opencode_hook_bridge, each of which sanitizes every session-id spelling out of the raw
+# tool-call args before restoring a trusted value — but omp_hook_bridge.dispatch previously
+# restored a trusted `args.session_id` ONLY at the `stop` point, so a raw
+# `session_id`/`sessionId`/`sessionID` key sitting directly in a tool call's `input` (fully
+# model-controlled) rode untouched through `args = dict(raw_args)` into
+# `args["session_id"]` at pre-write/pre-bash/post-write, letting a model rotate this hook's
+# marker key on every call and keep it WARNing forever, never BLOCKing — the same "silent
+# guard removal" failure mode the RC-2 fix itself was written to close. Both tests below
+# build a REAL omp event and run it through the REAL `omp_hook_bridge.dispatch.to_v1_event`
+# (never a hand-built `{"args": {...}}` dict, which would not have caught this).
+
+
+@pytest.mark.parametrize("spelling", ["session_id", "sessionId", "sessionID"])
+def test_real_omp_bridge_forged_session_id_never_overrides_trusted_payload_session_id(tmp_path, monkeypatch, spelling):
+    """With a trusted `sessionId` present on the payload (`extension.ts`'s
+    `ctx.sessionManager`-derived chain — agent-tools#743 RC-1), a forged `input.session_id`
+    (in any of the three stripped spellings) must never override it: two calls carrying the
+    SAME real identity but DIFFERENT forged raw-args session ids still resolve
+    `args["session_id"]` to the trusted value, collapse to the SAME marker key, and the guard
+    still transitions WARN -> BLOCK."""
+    import omp_hook_bridge.dispatch as omp_dispatch
+
+    def raw_event(forged_session_id: str) -> dict:
+        return {
+            "event": "tool_call",
+            "toolName": "bash",
+            "input": {"command": _FALLBACK_CHAIN, spelling: forged_session_id},
+            "cwd": "/repo",
+            "toolCallId": "call_1",
+            # The extension's own trusted payload field — the SAME real identity both calls.
+            "sessionId": "real-session-xyz",
+        }
+
+    v1_a = omp_dispatch.to_v1_event(raw_event("attacker-controlled-1"), point="pre-bash")
+    v1_b = omp_dispatch.to_v1_event(raw_event("attacker-controlled-2"), point="pre-bash")
+    assert v1_a["args"]["session_id"] == "real-session-xyz"
+    assert v1_b["args"]["session_id"] == "real-session-xyz"
+    assert ost._marker(v1_a) == ost._marker(v1_b)
+
+    marker_dir = tmp_path / "m"
+    out1, _e, c1 = _run(v1_a, monkeypatch, marker_dir)
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
+    out2, _e, c2 = _run(v1_b, monkeypatch, marker_dir)  # different forged session_id
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # still BLOCKs: same key
+
+
+@pytest.mark.parametrize("spelling", ["session_id", "sessionId", "sessionID"])
+def test_real_omp_bridge_forged_session_id_does_not_leak_into_args_without_trusted_identity(tmp_path, monkeypatch, spelling):
+    """With NO trusted identity resolving at all (anonymous omp session, matching today's
+    conservative default), a forged `input.session_id` (in any of the three stripped
+    spellings) must be stripped and left ABSENT from `args` — never surviving through
+    unstripped the way it did before this fix. Two calls with different forged ids still
+    collapse to the anonymous cwd+point-only key and the guard still transitions
+    WARN -> BLOCK."""
+    import omp_hook_bridge.dispatch as omp_dispatch
+
+    def raw_event(forged_session_id: str) -> dict:
+        return {
+            "event": "tool_call",
+            "toolName": "bash",
+            "input": {"command": _FALLBACK_CHAIN, spelling: forged_session_id},
+            "cwd": "/repo",
+            "toolCallId": "call_1",
+        }
+
+    v1_a = omp_dispatch.to_v1_event(raw_event("attacker-controlled-1"), point="pre-bash")
+    v1_b = omp_dispatch.to_v1_event(raw_event("attacker-controlled-2"), point="pre-bash")
+    assert "session_id" not in v1_a["args"]
+    assert "session_id" not in v1_b["args"]
+    assert ost._marker(v1_a) == ost._marker(v1_b)
+
+    marker_dir = tmp_path / "m"
+    out1, _e, c1 = _run(v1_a, monkeypatch, marker_dir)
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
+    out2, _e, c2 = _run(v1_b, monkeypatch, marker_dir)  # different forged session_id
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # still BLOCKs: same key
 
 
 # ── regression: the OLD self-service escape hatch is DEAD (env AND inline) ──────────────────
@@ -3385,3 +3468,171 @@ def test_unparseable_sed_segment_is_not_granted(tmp_path, monkeypatch):
     """An unbalanced-quote `sed` segment cannot be classified → the GRANT-direction predicate
     refuses (the `_is_tg_command` precedent), never guesses read-only."""
     assert ost._is_read_only_sed("sed -n '1p f.txt") is False
+
+
+# --- per-session tier markers (agent-tools#743, RC-2) ---------------------------------------
+#
+# The warn→block tier state used to key on sha256(cwd\0point) only, shared across EVERY
+# session working in that cwd: one session's offenses poisoned another session's BLOCK state
+# inside the 900 s TTL. The marker now folds in a stable harness-session id — from the hook
+# process env first (the SAME candidate list as
+# lib/agenttools_hatch_escalation._SESSION_ID_ENV_VARS), then the bridge-sanitized
+# args.session_id the cc bridge puts on the event (T2 precedence — same trust tier as the
+# sanitized args.agent_id _is_subagent already reads) — and, critically, NEVER a per-process
+# pid (hooks are fresh subprocesses per event; a pid key would warn forever and never
+# block, silently removing the guard). With NEITHER source yielding a session id the key is
+# byte-identical to the pre-#743 form, so anonymous sessions keep sharing one state.
+#
+# These run the REAL hook script as a subprocess per event — the deployment shape — because
+# MARKER_DIR/TTL_S are read at module import and the pid-fallback failure mode only exists
+# across process boundaries.
+
+_SESSION_SCRUB_ENV = (
+    # Session-id candidates (host leakage: this pytest run may sit in tmux or under CC).
+    "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "RIG_SESSION_ID", "TMUX_PANE",
+    # Subagent exemptions that would allow everything outright.
+    "RIG_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE",
+    # Gate knobs that would short-circuit the warn/block path.
+    "RIG_ORCHESTRATOR_ONLY", "RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN",
+    "ALLOW_ORCHESTRATOR_WORK", "ALLOW_ORCHESTRATOR_WORK_REASON", "ORCH_THIN_TTL_S",
+)
+
+_OFFENSE_EVENT = {"point": "pre-write", "cwd": "/repo", "args": {"file_path": "/repo/src/a.ts"}}
+
+
+def _run_hook_subprocess(
+    marker_dir: Path, session_env: dict | None = None, event: dict | None = None
+) -> tuple[str, int]:
+    """One real hook-process invocation of the offense event; returns (stdout, exit code)."""
+    env = dict(os.environ)
+    for key in _SESSION_SCRUB_ENV:
+        env.pop(key, None)
+    env["ORCH_THIN_MARKER_DIR"] = str(marker_dir)
+    env.update(session_env or {})
+    proc = subprocess.run(
+        [sys.executable, str(_HOOK)],
+        input=json.dumps(event or _OFFENSE_EVENT), capture_output=True, text=True, timeout=30, env=env,
+    )
+    return proc.stdout, proc.returncode
+
+
+def _assert_warn(stdout: str, code: int) -> None:
+    assert code == 0 and json.loads(stdout)["decision"] == "allow"
+
+
+def _assert_block(stdout: str, code: int) -> None:
+    assert code == ost.BLOCK_EXIT_CODE and json.loads(stdout)["decision"] == "block"
+
+
+def test_session_env_var_list_lockstep_with_hatch_lib():
+    """The hook must stay a standalone script, so `_SESSION_ID_ENV_VARS` is a deliberate
+    duplicate of the hatch lib's list — this pin turns the comment-only "keep in lockstep"
+    into a drift alarm: editing one literal without the other fails here."""
+    import agenttools_hatch_escalation as ahe
+    assert ost._SESSION_ID_ENV_VARS == ahe._SESSION_ID_ENV_VARS
+
+
+def test_session_id_env_chain_candidates_and_no_pid_fallback(monkeypatch):
+    """Unit pin: the resolver consults exactly the hatch-escalation candidate list, in order,
+    then the bridge-sanitized event session_id, and with neither present returns EMPTY —
+    never a pid:<getpid()> value (a per-process key would mint a fresh marker every event
+    and the guard would warn forever, never BLOCK)."""
+    for var in ost._SESSION_ID_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    event = {"cwd": "/repo", "point": "pre-write", "args": {"session_id": "cc-sess-1"}}
+    assert ost._session_id_for_marker(event) == "cc-sess-1"  # event fallback (CC shape)
+    assert ost._session_id_for_marker({}) == ""
+    monkeypatch.setenv("RIG_SESSION_ID", "  ")  # blank is not an identity
+    assert ost._session_id_for_marker(event) == "cc-sess-1"
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    monkeypatch.setenv("RIG_SESSION_ID", "rig-sess")
+    assert ost._session_id_for_marker(event) == "rig-sess"  # env chain outranks the event
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "cc-sess")
+    assert ost._session_id_for_marker({}) == "cc-sess"  # first candidate wins
+
+
+def test_marker_key_without_session_env_is_byte_identical_to_legacy(monkeypatch, tmp_path):
+    """The anonymous-session key MUST stay exactly sha256(cwd\\0point) — conservative: state
+    is still shared (and blocking still works) when no session id resolves."""
+    for var in ost._SESSION_ID_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(ost, "MARKER_DIR", tmp_path)
+    event = {"cwd": "/repo", "point": "pre-write"}
+    legacy = hashlib.sha256("/repo\0pre-write".encode()).hexdigest()[:16]
+    assert ost._marker(event) == tmp_path / f"{legacy}.warned"
+    monkeypatch.setenv("RIG_SESSION_ID", "sess-A")
+    keyed = hashlib.sha256("/repo\0pre-write\0sess-A".encode()).hexdigest()[:16]
+    assert ost._marker(event) == tmp_path / f"{keyed}.warned"
+    monkeypatch.delenv("RIG_SESSION_ID")
+    keyed = hashlib.sha256("/repo\0pre-write\0cc-sess-1".encode()).hexdigest()[:16]
+    assert ost._marker({**event, "args": {"session_id": "cc-sess-1"}}) == tmp_path / f"{keyed}.warned"
+
+
+def test_subprocess_no_session_env_preserves_warn_then_block(tmp_path):
+    """RC-2 fallback semantics (a): two consecutive REAL hook-process invocations with NO
+    session env and the same cwd — first WARNs, second BLOCKs, exactly as before #743."""
+    marker_dir = tmp_path / "m"
+    _assert_warn(*_run_hook_subprocess(marker_dir))
+    _assert_block(*_run_hook_subprocess(marker_dir))
+
+
+def test_subprocess_same_session_id_shares_warn_block_state(tmp_path):
+    """RC-2 (c): the SAME session env value across two invocations shares one tier state —
+    warn on the first offense, block on the repeat."""
+    marker_dir = tmp_path / "m"
+    session = {"RIG_SESSION_ID": "sess-A"}
+    _assert_warn(*_run_hook_subprocess(marker_dir, session))
+    _assert_block(*_run_hook_subprocess(marker_dir, session))
+
+
+def test_subprocess_distinct_session_ids_have_independent_tiers(tmp_path):
+    """RC-2 (b) — the actual poisoning fix: session A reaches BLOCK in this cwd, yet session
+    B's FIRST offense in the same cwd still WARNs (allow), not inherits A's block."""
+    marker_dir = tmp_path / "m"
+    _assert_warn(*_run_hook_subprocess(marker_dir, {"RIG_SESSION_ID": "sess-A"}))
+    _assert_block(*_run_hook_subprocess(marker_dir, {"RIG_SESSION_ID": "sess-A"}))
+    _assert_warn(*_run_hook_subprocess(marker_dir, {"RIG_SESSION_ID": "sess-B"}))
+    _assert_block(*_run_hook_subprocess(marker_dir, {"RIG_SESSION_ID": "sess-B"}))
+    # And the anonymous tier is untouched by either keyed session.
+    _assert_warn(*_run_hook_subprocess(marker_dir))
+
+
+def test_subprocess_distinct_event_session_ids_have_independent_tiers(tmp_path):
+    """RC-2 (b) via the EVENT source (the Claude Code shape — no session id in the hook
+    process env, `args.session_id` put there by cc_hook_bridge's T2 precedence): two CC
+    sessions in the same cwd tier independently instead of poisoning each other."""
+    marker_dir = tmp_path / "m"
+
+    def cc_event(session_id: str) -> dict:
+        return {"point": "pre-write", "cwd": "/repo",
+                "args": {"file_path": "/repo/src/a.ts", "session_id": session_id}}
+
+    _assert_warn(*_run_hook_subprocess(marker_dir, event=cc_event("cc-A")))
+    _assert_block(*_run_hook_subprocess(marker_dir, event=cc_event("cc-A")))
+    _assert_warn(*_run_hook_subprocess(marker_dir, event=cc_event("cc-B")))
+    _assert_block(*_run_hook_subprocess(marker_dir, event=cc_event("cc-B")))
+    # And neither keyed tier primes the anonymous one.
+    _assert_warn(*_run_hook_subprocess(marker_dir))
+
+
+def test_sweep_expired_markers_removes_stale_keeps_fresh(tmp_path, monkeypatch):
+    """The per-session key space would otherwise grow without bound (one tiny file per
+    session×cwd×point, never deleted). Recording a WARN sweeps markers older than the TTL
+    (semantically dead — `_is_repeat` already ignores them) while fresh ones survive."""
+    import time as _time
+    for var in ost._SESSION_ID_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(ost, "MARKER_DIR", tmp_path)
+    stale = ost._marker({"cwd": "/old", "point": "pre-write"})
+    fresh = ost._marker({"cwd": "/repo", "point": "pre-write"})
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    stale.write_text("x")
+    fresh.write_text("x")
+    old_ts = _time.time() - ost.TTL_S - 60
+    os.utime(stale, (old_ts, old_ts))
+    ost._sweep_expired_markers()
+    assert not stale.exists()
+    assert fresh.exists()
+    # A missing marker dir must not raise (the hook must never die on housekeeping).
+    monkeypatch.setattr(ost, "MARKER_DIR", tmp_path / "does-not-exist")
+    ost._sweep_expired_markers()

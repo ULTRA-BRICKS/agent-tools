@@ -582,6 +582,24 @@ def test_to_v1_event_drops_forged_agent_identity_from_tool_args():
     assert "agent" not in v1["args"]
 
 
+def test_to_v1_event_nested_payload_session_file_beats_forged_args_agent_id(monkeypatch):
+    """agent-tools#743 (RC-1) trust boundary: with the sessionManager-sourced nested
+    sessionFile on the payload, the injected identity is the transcript's child stem — a
+    model/tool-supplied `agent_id` in the SAME call's raw args is still stripped first
+    (agent-tools#573) and can neither override nor shadow it."""
+    _clear_agent_env_markers(monkeypatch)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m x", "agent_id": "forged", "agentId": "forged-camel"},
+        "cwd": "/repo",
+        "sessionFile": _OMP_NESTED_SESSION,
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert v1["args"]["agent_id"] == "ThinNotSub"
+    assert "agentId" not in v1["args"]
+
+
 @pytest.fixture(autouse=True)
 def _no_host_agent_markers(monkeypatch):
     """Module-wide: a rig-dispatched test run (this process) may carry RIG_AGENT_ID /
@@ -1903,27 +1921,28 @@ def test_extension_ts_registers_tool_call_and_blocks_via_stub_dispatcher(tmp_pat
     assert result == {"block": True, "reason": "stub blocked it"}
 
 
-@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
-def test_extension_forwards_getSessionFile_into_dispatcher_env(tmp_path):
-    """agent-tools#647: omp tool ctx exposes getSessionFile()/getAgentId() methods, not
-    ctx.agentId. The extension must put the nested transcript on PI_SESSION_FILE for the
-    dispatcher AND on payload.sessionFile / payload.agentId."""
-    nested = (
-        "/tmp/omp-sessions/-xp-rig-cli/"
-        "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/ThinNotSub.jsonl"
-    )
+def _run_identity_driver(
+    tmp_path: Path,
+    ctx_ts: str,
+    dump_keys: str,
+    env_extra: dict[str, str] | None = None,
+    *,
+    dump_full_payload: bool = False,
+) -> dict:
+    """Common shape of the identity-forwarding tests below: load the real extension.ts
+    under bun with a stub `pi`, a caller-supplied ctx literal (`ctx_ts`), and a dump-style
+    stub dispatcher that records either the chosen env/payload fields (`dump_keys`, Python
+    dict-literal source reading `payload`/`os.environ`) or the whole payload, then allows
+    the call. Returns the recorded dict."""
     dump = tmp_path / "dump.json"
     stub = tmp_path / "stub_dispatcher.py"
+    recorded = "payload" if dump_full_payload else "{" + dump_keys + "}"
     stub.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, sys\n"
         "payload = json.loads(sys.stdin.read() or '{}')\n"
         f"path = {str(dump)!r}\n"
-        "open(path, 'w').write(json.dumps({"
-        "'env_pi': os.environ.get('PI_SESSION_FILE'), "
-        "'sessionFile': payload.get('sessionFile'), "
-        "'agentId': payload.get('agentId')"
-        "}))\n"
+        f"open(path, 'w').write(json.dumps({recorded}))\n"
         "print(json.dumps({'decision': 'allow'}))\n",
         encoding="utf-8",
     )
@@ -1934,26 +1953,41 @@ def test_extension_forwards_getSessionFile_into_dispatcher_env(tmp_path):
         "const handlers: Record<string, Function> = {};\n"
         "const pi = { on: (name: string, cb: Function) => { handlers[name] = cb; } };\n"
         "mod.default(pi);\n"
-        "const nested = process.env.NESTED_SESSION!;\n"
-        "const ctx = {\n"
-        "  cwd: '/tmp', hasUI: false,\n"
-        "  agentId: '', sessionFile: '   ',\n"
-        "  getSessionFile: () => nested,\n"
-        "  getAgentId: () => 'ThinNotSub',\n"
-        "};\n"
-        "await handlers['tool_call']("
+        + ctx_ts
+        + "await handlers['tool_call']("
         "{ toolName: 'bash', input: { command: 'git commit -m x' }, toolCallId: 'c1' }, ctx);\n",
         encoding="utf-8",
     )
     env = dict(os.environ)
     env["EXTENSION_PATH"] = str(_EXTENSION_TS)
     env["OMP_HOOK_BRIDGE_PYTHON"] = str(stub)
-    env["NESTED_SESSION"] = nested
+    env.update(env_extra or {})
     proc = subprocess.run(["bun", "run", str(driver)], capture_output=True, text=True, env=env, timeout=30)
     assert proc.returncode == 0, proc.stderr
-    got = json.loads(dump.read_text())
-    assert got["env_pi"] == nested
-    assert got["sessionFile"] == nested
+    return json.loads(dump.read_text())
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_forwards_getSessionFile_into_dispatcher_env(tmp_path):
+    """agent-tools#647: omp tool ctx exposes getSessionFile()/getAgentId() methods, not
+    ctx.agentId. The extension must put the nested transcript on PI_SESSION_FILE for the
+    dispatcher AND on payload.sessionFile / payload.agentId."""
+    got = _run_identity_driver(
+        tmp_path,
+        "const nested = process.env.NESTED_SESSION!;\n"
+        "const ctx = {\n"
+        "  cwd: '/tmp', hasUI: false,\n"
+        "  agentId: '', sessionFile: '   ',\n"
+        "  getSessionFile: () => nested,\n"
+        "  getAgentId: () => 'ThinNotSub',\n"
+        "};\n",
+        "'env_pi': os.environ.get('PI_SESSION_FILE'), "
+        "'sessionFile': payload.get('sessionFile'), "
+        "'agentId': payload.get('agentId')",
+        {"NESTED_SESSION": _OMP_NESTED_SESSION},
+    )
+    assert got["env_pi"] == _OMP_NESTED_SESSION
+    assert got["sessionFile"] == _OMP_NESTED_SESSION
     assert got["agentId"] == "ThinNotSub"
 
 
@@ -1962,50 +1996,81 @@ def test_extension_forwards_getSessionFile_into_dispatcher_env(tmp_path):
 def test_extension_forwards_rig_agent_id_into_dispatcher_env(tmp_path):
     """agent-tools#681: RIG_AGENT_ID must reach the dispatcher process env so hooks
     that read process env (orchestrator-stays-thin tier 2) classify native subagents."""
-    nested = (
-        "/tmp/omp-sessions/-xp-rig-cli/"
-        "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/ThinNotSub.jsonl"
-    )
-    dump = tmp_path / "dump.json"
-    stub = tmp_path / "stub_dispatcher.py"
-    stub.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, os, sys\n"
-        "payload = json.loads(sys.stdin.read() or '{}')\n"
-        f"path = {str(dump)!r}\n"
-        "open(path, 'w').write(json.dumps({"
-        "'env_rig': os.environ.get('RIG_AGENT_ID'), "
-        "'agentId': payload.get('agentId')"
-        "}))\n"
-        "print(json.dumps({'decision': 'allow'}))\n",
-        encoding="utf-8",
-    )
-    stub.chmod(0o755)
-    driver = tmp_path / "driver.ts"
-    driver.write_text(
-        "const mod = await import(process.env.EXTENSION_PATH!);\n"
-        "const handlers: Record<string, Function> = {};\n"
-        "const pi = { on: (name: string, cb: Function) => { handlers[name] = cb; } };\n"
-        "mod.default(pi);\n"
+    got = _run_identity_driver(
+        tmp_path,
         "const nested = process.env.NESTED_SESSION!;\n"
         "const ctx = {\n"
         "  cwd: '/tmp', hasUI: false,\n"
         "  getSessionFile: () => nested,\n"
         "  getAgentId: () => 'ThinNotSub',\n"
-        "};\n"
-        "await handlers['tool_call']("
-        "{ toolName: 'bash', input: { command: 'git commit -m x' }, toolCallId: 'c1' }, ctx);\n",
-        encoding="utf-8",
+        "};\n",
+        "'env_rig': os.environ.get('RIG_AGENT_ID'), "
+        "'agentId': payload.get('agentId')",
+        {"NESTED_SESSION": _OMP_NESTED_SESSION},
     )
-    env = dict(os.environ)
-    env["EXTENSION_PATH"] = str(_EXTENSION_TS)
-    env["OMP_HOOK_BRIDGE_PYTHON"] = str(stub)
-    env["NESTED_SESSION"] = nested
-    proc = subprocess.run(["bun", "run", str(driver)], capture_output=True, text=True, env=env, timeout=30)
-    assert proc.returncode == 0, proc.stderr
-    got = json.loads(dump.read_text())
     assert got["env_rig"] == "ThinNotSub"
     assert got["agentId"] == "ThinNotSub"
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_reads_session_manager_when_toplevel_ctx_identity_is_blank(tmp_path):
+    """agent-tools#743 (RC-1): omp's REAL ExtensionContext has NO top-level
+    getSessionFile()/getAgentId()/sessionFile/agentId at all (oh-my-pi#11214) — identity lives
+    on ctx.sessionManager. For a native Task/eval child that manager is the CHILD's own, so
+    getSessionFile() returns the nested transcript; the extension must forward it onto
+    payload.sessionFile AND the dispatcher env PI_SESSION_FILE so dispatch.py's
+    _OMP_SESSION_DIR classification sees the child. The resolved session id must ALSO reach
+    the dispatcher env as RIG_SESSION_ID (RC-2: orchestrator-stays-thin's per-session
+    warn/block markers read it from the hook process env chain)."""
+    got = _run_identity_driver(
+        tmp_path,
+        # The oh-my-pi#11214 shape: no top-level identity members AT ALL, only sessionManager.
+        "const nested = process.env.NESTED_SESSION!;\n"
+        "const ctx = {\n"
+        "  cwd: '/tmp', hasUI: false,\n"
+        "  sessionManager: {\n"
+        "    getSessionFile: () => nested,\n"
+        "    getSessionId: () => 'sess-child-1',\n"
+        "  },\n"
+        "};\n",
+        "'env_pi': os.environ.get('PI_SESSION_FILE'), "
+        "'env_rig_session': os.environ.get('RIG_SESSION_ID'), "
+        "'sessionFile': payload.get('sessionFile'), "
+        "'sessionId': payload.get('sessionId'), "
+        "'agentId': payload.get('agentId')",
+        {"NESTED_SESSION": _OMP_NESTED_SESSION},
+    )
+    assert got["env_pi"] == _OMP_NESTED_SESSION
+    assert got["sessionFile"] == _OMP_NESTED_SESSION
+    assert got["sessionId"] == "sess-child-1"
+    assert got["env_rig_session"] == "sess-child-1"  # RC-2: session-keyed hook state needs it in env
+    assert got["agentId"] == ""  # omp ctx has no agent id; the dispatcher derives it from the path
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_session_manager_main_session_file_stays_orchestrator(tmp_path, monkeypatch):
+    """agent-tools#743 (RC-1): the SAME sessionManager source on the MAIN session returns the
+    FLAT transcript (.../<session-id>.jsonl — parent is the project slug, not a session dir).
+    The extension forwards it, and the dispatcher's path-shape classification must yield NO
+    agent_id — the main thread stays governed as the orchestrator."""
+    payload = _run_identity_driver(
+        tmp_path,
+        "const mainFile = process.env.MAIN_SESSION!;\n"
+        "const ctx = {\n"
+        "  cwd: '/tmp', hasUI: false,\n"
+        "  sessionManager: { getSessionFile: () => mainFile, getSessionId: () => 'sess-main' },\n"
+        "};\n",
+        "",
+        {"MAIN_SESSION": _OMP_MAIN_SESSION},
+        dump_full_payload=True,
+    )
+    assert payload["sessionFile"] == _OMP_MAIN_SESSION
+    # The dispatcher's own classification of that payload: flat main path → no agent_id.
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("PI_SESSION_FILE", _OMP_MAIN_SESSION)  # mirror the dispatcher's spawned env
+    v1 = dispatch.to_v1_event(payload, point="pre-bash")
+    assert "agent_id" not in v1["args"]
+
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
 def test_extension_ts_fails_open_when_dispatcher_python_is_missing(tmp_path):
