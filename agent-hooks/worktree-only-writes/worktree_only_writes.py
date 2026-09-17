@@ -319,6 +319,22 @@ def _target_dir(cwd: str, args: dict) -> str:
     (and vice-versa). A relative path is judged against `cwd`. The file may not exist yet (a
     create) → walk up to the nearest existing ancestor for the git query.
 
+    The target is `.parent`ed ONLY when it does not already resolve to an existing directory
+    (agent-tools#616 follow-up). A naive unconditional `.parent` is wrong whenever the raw
+    path itself denotes a directory rather than a not-yet-created file: a bare "." collapses
+    (pathlib drops single-dot components) to exactly `cwd`, and `cwd.parent` then climbs ONE
+    LEVEL ABOVE it; a relative path that happens to name an existing directory (e.g. another
+    worktree reached via `.worktrees/<name>`, no file component beneath it) has the same
+    problem. In a sibling-worktree layout that overshoot is harmless (the directory above a
+    sibling worktree is not a git repo, so the check fails open) — but in the REALISTIC
+    nested `rig worktree create` layout (`<repo>/.worktrees/<name>`), the directory one level
+    above a worktree root (`<repo>/.worktrees`) sits squarely inside the PRIMARY checkout's
+    own git boundary, so the overshoot silently swapped in main's branch for a write that was
+    genuinely happening on a feature branch, in the correct place. Treating an existing
+    directory as its OWN target (not its parent's) fixes both directions without touching the
+    documented not-yet-created-file walk (`_existing_ancestor`) or the still-intentional
+    behavior of a genuine `..` that escapes `cwd` into a different real checkout.
+
     DELIBERATE fallback to `cwd` when NO file_path/path/notebook_path key is usable at all —
     whether a key is missing entirely or present but blank/wrong-typed, both are "no path
     signal" and get the identical, tested outcome (agent-tools#615, replacing the prior
@@ -342,7 +358,8 @@ def _target_dir(cwd: str, args: dict) -> str:
             target = Path(raw).expanduser()
             if not target.is_absolute():
                 target = Path(base) / target
-            return _existing_ancestor(target.parent, base)
+            start = target if target.is_dir() else target.parent
+            return _existing_ancestor(start, base)
     return base
 
 

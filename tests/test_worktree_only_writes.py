@@ -372,6 +372,45 @@ def test_relative_path_absent_from_cwd_still_blocks_despite_a_sibling_worktree_m
     assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+# ── a relative path that RESOLVES TO cwd's own directory must not climb ABOVE it in a nested
+# `rig worktree create` layout (`<repo>/.worktrees/<name>`) — distinct from #613/#615/#616,
+# which are about a relative path judged against the wrong SIBLING checkout ──────────────────
+
+def test_relative_dot_path_in_nested_worktree_allows_not_primary_checkout(tmp_path, monkeypatch):
+    """`_target_dir` used to unconditionally take ``target.parent`` — for a relative path that
+    pathlib normalizes to exactly `cwd` itself (a bare "."), that climbed ONE LEVEL ABOVE the
+    nested worktree root into `.worktrees`, whose nearest git boundary is the PRIMARY checkout.
+    In the sibling-directory layout the older tests use this is harmless (the level above a
+    sibling worktree is not a git repo at all, so the check fails open); in a REALISTIC nested
+    `<repo>/.worktrees/<name>` layout it lands squarely inside the primary checkout's OWN
+    boundary — main — falsely BLOCKing a write that is genuinely happening on a feature
+    branch, in the correct place."""
+    main_repo = _make_repo(tmp_path, branch="main")
+    wtdir = main_repo / ".worktrees" / "feat"
+    _git(main_repo, "worktree", "add", "-b", "feat/x", str(wtdir))
+    out, code = _run(wtdir, monkeypatch, {"RIG_WORKTREE_ONLY": "1"}, target=".")
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_relative_path_naming_nested_worktree_root_allows_not_primary_checkout(tmp_path, monkeypatch):
+    """The same off-by-one from the other direction: a relative path that names the nested
+    worktree's OWN root directory (no file component beneath it) must be judged against THAT
+    worktree's branch, not one level up. `_target_dir` used to take `.parent` unconditionally
+    even when the resolved target is already an existing DIRECTORY, landing on `.worktrees`
+    (primary checkout boundary) instead of the worktree root itself."""
+    main_repo = _make_repo(tmp_path, branch="main")
+    wtdir = main_repo / ".worktrees" / "feat"
+    _git(main_repo, "worktree", "add", "-b", "feat/x", str(wtdir))
+    out, code = _run(main_repo, monkeypatch, {"RIG_WORKTREE_ONLY": "1"}, target=".worktrees/feat")
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_target_dir_dot_path_stays_at_cwd_not_its_parent():
+    """Unit-level pin: `_target_dir("/some/dir", {"file_path": "."})` must return `/some/dir`
+    itself (an existing directory), never `/some/dir`'s parent."""
+    assert wow._target_dir("/tmp", {"file_path": "."}) == "/tmp"
+
+
 # ── unit: the minimal rig.yaml boolean parse ──────────────────────────────────────────────
 
 @pytest.mark.parametrize("text,expected", [
