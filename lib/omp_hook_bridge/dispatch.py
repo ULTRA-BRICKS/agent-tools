@@ -67,6 +67,18 @@ _FORGED_AGENT_KEYS = (
     "agent",
 )
 
+# Session-id spellings a model can put directly in a tool call's `input` dict — kept
+# separate from `_FORGED_AGENT_KEYS` (that tuple's name and its one call site are
+# agent-id-specific) rather than folded in, matching `opencode_hook_bridge.dispatch`'s own
+# separate inline strip for the same reason (agent-tools#743 RC-2 continuation): a raw
+# `session_id`/`sessionId`/`sessionID` key surviving `args = dict(raw_args)` into
+# `args["session_id"]` unstripped is exactly what let a model rotate
+# `orchestrator-stays-thin`'s per-session marker key on every call (warn forever, never
+# block) on THIS bridge specifically — `_FORGED_AGENT_KEYS` never covered it, and unlike
+# `cc_hook_bridge`/`codex_hook_bridge`/`opencode_hook_bridge`, this bridge never restored a
+# trusted value at any point other than `stop`.
+_FORGED_SESSION_KEYS = ("session_id", "sessionId", "sessionID")
+
 
 # omp Task/eval child transcript: .../<session-id>/<agent-id>.jsonl
 # (same shape orchestrator-stays-thin._OMP_SESSION_DIR matches; keep in lockstep).
@@ -163,16 +175,30 @@ def point_for_event(event_name: str, tool_name: str | None) -> str | None:
 
 
 
-def _stop_session_id(omp_event: dict) -> str:
-    """Stable per-agent id for v1 stop events (yield retries must share one cooldown)."""
-    detached = _detached_agent_id()
-    if detached:
-        return detached
+def _trusted_session_id(omp_event: dict, detached_id: str | None = None) -> str:
+    """Per-session id from harness-trusted sources ONLY — never `args`/raw tool input,
+    which a model fully controls. Prefers a detached-launcher identity (pass an
+    already-computed one via `detached_id` to avoid re-deriving it; `None` computes it here),
+    then the extension's own trusted `sessionId`/`agentId` payload fields
+    (`ctx.sessionManager`-derived, see extension.ts's `sessionManagerString`/`ctxString`
+    chain), else "" — callers that need a non-empty fallback add their own
+    (`_stop_session_id` below falls back to cwd; `to_v1_event` leaves `args["session_id"]`
+    unset, which collapses `orchestrator-stays-thin`'s marker key to cwd+point alone, the
+    same conservative default an anonymous session already got)."""
+    if detached_id is None:
+        detached_id = _detached_agent_id(omp_event)
+    if detached_id:
+        return detached_id
     for key in ("sessionId", "session_id", "agentId", "agent_id"):
         val = omp_event.get(key)
         if val:
             return str(val)
-    return _cwd(omp_event)
+    return ""
+
+
+def _stop_session_id(omp_event: dict, detached_id: str | None = None) -> str:
+    """Stable per-agent id for v1 stop events (yield retries must share one cooldown)."""
+    return _trusted_session_id(omp_event, detached_id) or _cwd(omp_event)
 
 
 def to_v1_event(omp_event: dict, *, point: str) -> dict:
@@ -188,11 +214,18 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
         _normalize_task_args(args)
     for key in _FORGED_AGENT_KEYS:
         args.pop(key, None)
+    # T2 hardening (agent-tools#743 RC-2 continuation): a raw `session_id`/`sessionId`/
+    # `sessionID` key in the model-controlled tool input must never survive into
+    # `args["session_id"]` — `orchestrator-stays-thin` keys its warn->block marker on this
+    # field at pre-write/pre-bash, and this bridge previously restored a trusted value only
+    # for `stop`, leaving those two points to leak the raw one through unstripped.
+    for key in _FORGED_SESSION_KEYS:
+        args.pop(key, None)
     detached_id = _detached_agent_id(omp_event)
     ctx_id = str(omp_event.get("agentId") or omp_event.get("agent_id") or "")
-    trusted_id = detached_id or ctx_id
-    if trusted_id:
-        args["agent_id"] = trusted_id
+    trusted_agent_id = detached_id or ctx_id
+    if trusted_agent_id:
+        args["agent_id"] = trusted_agent_id
 
     command = _tool_command(tool, raw_args)
     if command:
@@ -207,9 +240,18 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
         # omp yield retries are new tool_call ids, so a per-call event_id would block
         # forever. Prefer a trusted agent id, then a top-level omp session/agent field,
         # then cwd — never a value from tool args (forgeable).
-        sid = _stop_session_id(omp_event)
+        sid = _stop_session_id(omp_event, detached_id)
         args["session_id"] = sid
         event_id = sid
+    else:
+        # Every OTHER point (pre-write/pre-bash/post-write/pre-agent): restore the same
+        # trusted value if one resolves, so `orchestrator-stays-thin`'s marker key is stable
+        # per real session there too — never leave the stripped key silently absent while a
+        # trusted identity IS available. No trusted value resolves -> stays absent, and the
+        # marker key falls back to cwd+point alone, the existing conservative default.
+        trusted_sid = _trusted_session_id(omp_event, detached_id)
+        if trusted_sid:
+            args["session_id"] = trusted_sid
 
     return {
         "hook_api": HOOK_API,

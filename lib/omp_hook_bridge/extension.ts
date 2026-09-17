@@ -217,11 +217,15 @@ function ctxString(ctx: any, event: any, prop: string, getter: string): string {
 }
 
 interface SessionManagerIdentity {
-  getSessionFile?: () => unknown;
-  getSessionId?: () => unknown;
+  getSessionFile?: () => string | undefined;
+  getSessionId?: () => string | undefined;
 }
 
-function sessionManagerString(ctx: unknown, getter: keyof SessionManagerIdentity): string {
+interface SessionManagerHost {
+  sessionManager?: SessionManagerIdentity;
+}
+
+function sessionManagerString(ctx: SessionManagerHost | null | undefined, getter: keyof SessionManagerIdentity): string {
   // The REAL identity source on omp's ExtensionContext (agent-tools#743): for a native
   // Task/eval child, ctx.sessionManager is the CHILD's own session manager, so its
   // getSessionFile() returns the nested transcript .../<session-id>/<ChildName>.jsonl —
@@ -231,10 +235,11 @@ function sessionManagerString(ctx: unknown, getter: keyof SessionManagerIdentity
   // .../<session-id>.jsonl here, which the dispatcher correctly does NOT classify as a
   // child. Returns "" for an in-memory session (getSessionFile() → undefined) or any
   // ctx without a sessionManager — the dispatcher then keeps its conservative default.
+  // SAFETY: ctx is typed as SessionManagerHost so no runtime cast is needed here; the
+  // actual caller still passes an untyped `any` extension ctx, so the getter is still
+  // runtime-guarded (typeof === "function") before it is invoked.
   try {
-    // One structural cast: omp's ctx is untyped at this boundary; the getter call below
-    // is still runtime-guarded (typeof === "function") before it is invoked.
-    const sm = (ctx as { sessionManager?: SessionManagerIdentity } | null)?.sessionManager;
+    const sm = ctx?.sessionManager;
     const fn = sm?.[getter];
     return firstNonBlank(typeof fn === "function" ? fn.call(sm) : undefined);
   } catch {

@@ -644,6 +644,86 @@ def test_real_bridge_forged_agent_id_is_stripped_and_stays_governed(tmp_path, mo
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # repeat: BLOCK
 
 
+# ── regression: forged omp `input.session_id` must not defeat the per-session marker key ──
+# (agent-tools#743 RC-2 continuation, review finding on PR #745: the RC-2 fix folded a
+# per-session id into the warn->block marker key for cc_hook_bridge/codex_hook_bridge/
+# opencode_hook_bridge, each of which sanitizes every session-id spelling out of the raw
+# tool-call args before restoring a trusted value — but omp_hook_bridge.dispatch previously
+# restored a trusted `args.session_id` ONLY at the `stop` point, so a raw
+# `session_id`/`sessionId`/`sessionID` key sitting directly in a tool call's `input` (fully
+# model-controlled) rode untouched through `args = dict(raw_args)` into
+# `args["session_id"]` at pre-write/pre-bash/post-write, letting a model rotate this hook's
+# marker key on every call and keep it WARNing forever, never BLOCKing — the same "silent
+# guard removal" failure mode the RC-2 fix itself was written to close. Both tests below
+# build a REAL omp event and run it through the REAL `omp_hook_bridge.dispatch.to_v1_event`
+# (never a hand-built `{"args": {...}}` dict, which would not have caught this).
+
+
+@pytest.mark.parametrize("spelling", ["session_id", "sessionId", "sessionID"])
+def test_real_omp_bridge_forged_session_id_never_overrides_trusted_payload_session_id(tmp_path, monkeypatch, spelling):
+    """With a trusted `sessionId` present on the payload (`extension.ts`'s
+    `ctx.sessionManager`-derived chain — agent-tools#743 RC-1), a forged `input.session_id`
+    (in any of the three stripped spellings) must never override it: two calls carrying the
+    SAME real identity but DIFFERENT forged raw-args session ids still resolve
+    `args["session_id"]` to the trusted value, collapse to the SAME marker key, and the guard
+    still transitions WARN -> BLOCK."""
+    import omp_hook_bridge.dispatch as omp_dispatch
+
+    def raw_event(forged_session_id: str) -> dict:
+        return {
+            "event": "tool_call",
+            "toolName": "bash",
+            "input": {"command": _FALLBACK_CHAIN, spelling: forged_session_id},
+            "cwd": "/repo",
+            "toolCallId": "call_1",
+            # The extension's own trusted payload field — the SAME real identity both calls.
+            "sessionId": "real-session-xyz",
+        }
+
+    v1_a = omp_dispatch.to_v1_event(raw_event("attacker-controlled-1"), point="pre-bash")
+    v1_b = omp_dispatch.to_v1_event(raw_event("attacker-controlled-2"), point="pre-bash")
+    assert v1_a["args"]["session_id"] == "real-session-xyz"
+    assert v1_b["args"]["session_id"] == "real-session-xyz"
+    assert ost._marker(v1_a) == ost._marker(v1_b)
+
+    marker_dir = tmp_path / "m"
+    out1, _e, c1 = _run(v1_a, monkeypatch, marker_dir)
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
+    out2, _e, c2 = _run(v1_b, monkeypatch, marker_dir)  # different forged session_id
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # still BLOCKs: same key
+
+
+@pytest.mark.parametrize("spelling", ["session_id", "sessionId", "sessionID"])
+def test_real_omp_bridge_forged_session_id_does_not_leak_into_args_without_trusted_identity(tmp_path, monkeypatch, spelling):
+    """With NO trusted identity resolving at all (anonymous omp session, matching today's
+    conservative default), a forged `input.session_id` (in any of the three stripped
+    spellings) must be stripped and left ABSENT from `args` — never surviving through
+    unstripped the way it did before this fix. Two calls with different forged ids still
+    collapse to the anonymous cwd+point-only key and the guard still transitions
+    WARN -> BLOCK."""
+    import omp_hook_bridge.dispatch as omp_dispatch
+
+    def raw_event(forged_session_id: str) -> dict:
+        return {
+            "event": "tool_call",
+            "toolName": "bash",
+            "input": {"command": _FALLBACK_CHAIN, spelling: forged_session_id},
+            "cwd": "/repo",
+            "toolCallId": "call_1",
+        }
+
+    v1_a = omp_dispatch.to_v1_event(raw_event("attacker-controlled-1"), point="pre-bash")
+    v1_b = omp_dispatch.to_v1_event(raw_event("attacker-controlled-2"), point="pre-bash")
+    assert "session_id" not in v1_a["args"]
+    assert "session_id" not in v1_b["args"]
+    assert ost._marker(v1_a) == ost._marker(v1_b)
+
+    marker_dir = tmp_path / "m"
+    out1, _e, c1 = _run(v1_a, monkeypatch, marker_dir)
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
+    out2, _e, c2 = _run(v1_b, monkeypatch, marker_dir)  # different forged session_id
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # still BLOCKs: same key
+
 
 # ── regression: the OLD self-service escape hatch is DEAD (env AND inline) ──────────────────
 
