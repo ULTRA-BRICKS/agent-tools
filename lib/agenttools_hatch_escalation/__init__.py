@@ -846,7 +846,7 @@ def _question(
     details: list[str] = []
     command = context.get("command")
     if command:
-        details.append(f"<b>Command:</b>\n<pre>{_html_escape(_context_value(command))}</pre>")
+        details.append(f"<b>Command:</b>\n{_html_escape(_context_value(command))}")
     extra_lines: list[str] = []
     for key in sorted(context):
         if key in ("command", "hook"):
