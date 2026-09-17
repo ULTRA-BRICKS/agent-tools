@@ -12,6 +12,7 @@ hatches have no audit sink"). See `_append_overrides_log` for the record shape a
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import pwd
@@ -384,7 +385,9 @@ def _request_present_hatch_approval(
         effective_timeout = _bounded_timeout(timeout_s)
         proc_timeout = effective_timeout + max(process_margin_s, 0.0)
 
-    question = _question(hook_id, justification, context, cwd)
+    branch = _git_branch(cwd)
+    session_id = _resolve_session_id(context, env_map)
+    question = _question(hook_id, justification, context, cwd, branch=branch, session_id=session_id)
     # `tg-ctl ask` is the internal hook client documented in its own usage text as
     # "reads a ButtonRequest JSON from stdin" — it is NOT a generic "ask a plain-text
     # question" CLI. It takes no positional question argument and no `--timeout` flag
@@ -864,24 +867,90 @@ def _agent_hooks_raw(rig_yaml_text: str, key: str) -> str | None:
     return None
 
 
+def _git_branch(cwd: str) -> str:
+    """The current git branch at `cwd`, for the human-facing "Branch:" line -- informational
+    only, never a security decision (unlike the trusted absolute `tg-ctl` path used elsewhere in
+    this module, this intentionally consults ambient PATH `git`; worst case it reports "unknown",
+    and nothing in the hatch approval decision path ever reads this value). Falls back to
+    "unknown" when `cwd` is not inside a git repo, `git` is unavailable, HEAD is detached
+    (`rev-parse --abbrev-ref HEAD` prints the literal string "HEAD" rather than erroring for a
+    detached HEAD), or the call otherwise fails for any reason -- never raises.
+    """
+    try:
+        result = subprocess.run(  # noqa: S603, S607 - informational display only, never gates approval
+            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return "unknown"
+    branch = result.stdout.strip()
+    if result.returncode != 0 or not branch or branch == "HEAD":
+        return "unknown"
+    return branch
+
+
+def _html_escape(value: object) -> str:
+    """Escape a dynamic value for Telegram HTML (`<`, `>`, `&`) -- see
+    https://core.telegram.org/bots/api#html-style. Telegram does not require escaping quotes
+    outside an attribute value, so quotes are left untouched (`quote=False`) rather than turned
+    into `&quot;`/`&#x27;` noise inside a justification or command that legitimately quotes
+    something."""
+    return html.escape(str(value), quote=False)
+
+
 def _question(
     hook_id: str,
     justification: str,
     context: Mapping[str, object],
     cwd: str,
+    *,
+    branch: str,
+    session_id: str,
 ) -> str:
-    lines = [
-        "Approve this one-time agent-hook hatch request?",
-        f"Hook: {hook_id}",
-        f"Justification: {justification}",
-        f"CWD: {cwd}",
+    """The human-facing hatch approval prompt, sent verbatim as `ButtonRequest.question` with
+    `parse_mode=HTML` -- tg-cli's `buildQuestionText` renders a hatch permission's `question`
+    AS-IS instead of wrapping it in the generic heading/source concatenation it uses for every
+    other permission/question (see `isHatchPermissionRequest`), because this string already IS
+    the whole card. Ordered so the facts a human needs to decide render without scrolling or
+    expanding anything: a bold title, then the requesting agent/session and its path/branch,
+    then the hook id and the written justification. Everything else (the raw command and any
+    remaining context fields) goes inside a collapsed `<blockquote expandable>` so it stays one
+    tap away without crowding out the part that matters.
+    """
+    top = [
+        "<b>\U0001f513 Hatch approval request</b>",
+        "",
+        f"<b>Agent:</b> {_html_escape(_ASK_AGENT)} (session {_html_escape(session_id)})",
+        f"<b>Path:</b> <code>{_html_escape(cwd)}</code>",
+        f"<b>Branch:</b> <code>{_html_escape(branch)}</code>",
+        "",
+        f"<b>Hook:</b> <code>{_html_escape(hook_id)}</code>",
+        f"<b>Justification:</b> {_html_escape(justification)}",
     ]
+
+    details: list[str] = []
+    command = context.get("command")
+    if command:
+        details.append(f"<b>Command:</b>\n{_html_escape(_context_value(command))}")
+    extra_lines: list[str] = []
     for key in sorted(context):
+        if key in ("command", "hook"):
+            continue
         value = context[key]
         if value is None or value == "":
             continue
-        lines.append(f"{key}: {_context_value(value)}")
-    return "\n".join(lines)
+        extra_lines.append(f"<b>{_html_escape(str(key))}:</b> {_html_escape(_context_value(value))}")
+    if extra_lines:
+        details.append("\n".join(extra_lines))
+
+    if details:
+        detail_block = "\n\n".join(details)
+        top.append("")
+        top.append(f"<blockquote expandable>{detail_block}</blockquote>")
+
+    return "\n".join(top)
 
 
 def _context_value(value: object) -> str:
