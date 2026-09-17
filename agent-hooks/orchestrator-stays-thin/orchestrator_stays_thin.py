@@ -2092,7 +2092,10 @@ def _target_dir(cwd: str, args: dict) -> str:
 
     Mirrors worktree-only-writes._target_dir (SYNC): a pre-write's opt-out must follow the checkout
     the FILE lives in, not the shell cwd (they can differ — an absolute write into another repo).
-    The file may not exist yet (a create) → walk up to the nearest existing ancestor.
+    The file may not exist yet (a create) → walk up to the nearest existing ancestor. `.parent`
+    is taken ONLY when the target does not already resolve to an existing directory — a bare
+    "." (or any relative path naming an existing directory, e.g. a nested worktree's own root)
+    must not climb one level ABOVE it into a different git boundary (SYNC, agent-tools#616 follow-up).
     """
     base = cwd or os.getcwd()
     if not isinstance(args, dict):
@@ -2103,7 +2106,8 @@ def _target_dir(cwd: str, args: dict) -> str:
             target = Path(raw).expanduser()
             if not target.is_absolute():
                 target = Path(base) / target
-            for cand in (target.parent, *target.parent.parents):
+            start = target if target.is_dir() else target.parent
+            for cand in (start, *start.parents):
                 if cand.exists():
                     return str(cand)
             return base

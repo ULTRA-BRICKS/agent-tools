@@ -84,6 +84,12 @@ def test_target_dir_expands_tilde_before_absolute_check(monkeypatch, tmp_path):
     assert "/some/other/cwd" not in result
 
 
+def test_target_dir_dot_path_stays_at_cwd_not_its_parent():
+    """SYNC with worktree-only-writes' identical pin: `_target_dir` must not climb one level
+    ABOVE `cwd` for a relative path that pathlib normalizes to `cwd` itself (a bare ".")."""
+    assert ost._target_dir("/tmp", {"file_path": "."}) == "/tmp"
+
+
 
 # ── BLOCK (warn first, then block on repeat) ───────────────────────────────────────────
 
