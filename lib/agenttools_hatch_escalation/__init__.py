@@ -102,6 +102,13 @@ class HatchApprovalResult:
     env_var: str
     env_present: bool = False
     tg_ctl_path: str | None = None
+    # Echoes the `critical=` kwarg the caller passed to `request_hatch_approval` (agent-tools#754
+    # / tg-cli#403). Purely for caller introspection/logging — the daemon round-trip only needs
+    # `critical` on the OUTBOUND ButtonRequest JSON (set in `_request_present_hatch_approval`
+    # below), never on this inbound result, so nothing reads this field today. Defaults to `False`
+    # so every pre-existing construction of this frozen dataclass (positional or keyword) stays
+    # valid with zero call-site changes.
+    critical: bool = False
 
     @property
     def should_stop(self) -> bool:
@@ -206,6 +213,7 @@ def request_hatch_approval(
     timeout_s: float = DEFAULT_TG_CTL_TIMEOUT_S,
     process_margin_s: float = DEFAULT_PROCESS_MARGIN_S,
     overrides_log_path: Path | str | None = None,
+    critical: bool = False,
 ) -> HatchApprovalResult:
     """Request Telegram approval when this hook's hatch env var carries a real justification.
 
@@ -236,6 +244,23 @@ def request_hatch_approval(
     invalid request: no Telegram call is made and the hook should deny rather than falling
     through to `approval_cmd`.
 
+    `critical` (agent-tools#754, companion to tg-cli#403's daemon-side "critical/no-timeout hatch
+    approval mode"): opt-in, defaults `False`. When `True`, this call is for a decision Alex
+    genuinely cannot lose to a client-side clock — the live incident that motivated this ticket
+    was a hatch approval tapped AFTER the calling process had already given up waiting on its own
+    bounded budget, so the tap landed on a process that no longer existed. Setting `critical=True`:
+
+      - Removes the LOCAL (this-process) wait bound entirely — see `_request_present_hatch_
+        approval` for the `_bounded_timeout`/`MAX_TG_CTL_TIMEOUT_S` bypass detail.
+      - Adds `"critical": true` to the outbound `tg-ctl ask` ButtonRequest JSON, which is what
+        tells the tg-ctl daemon (tg-cli#403) to also drop ITS OWN `ASK_TOTAL_TIMEOUT_MS` bound for
+        this specific ask, schedule quiet-hours-aware reminder pings while it stays pending, and
+        proactively push a late decision into the caller's live agent session instead of leaving
+        it only passively retry-discoverable.
+
+    Every existing call site that does not pass `critical=` is completely unaffected: default
+    `False` keeps `_bounded_timeout`/`MAX_TG_CTL_TIMEOUT_S`/the padded subprocess wait exactly as
+    they were before this kwarg existed — this is a strictly additive, opt-in mode.
 
     Every attempt where the env var carries ANY value (blank, bare-flag, or a real justification —
     i.e. `env_present` ends up `True`) is a hatch USE and is appended, best-effort, to the
@@ -267,6 +292,7 @@ def request_hatch_approval(
             tg_ctl_candidates=tg_ctl_candidates,
             timeout_s=timeout_s,
             process_margin_s=process_margin_s,
+            critical=critical,
             env_map=env_map,
         )
     except Exception as exc:  # noqa: BLE001 - a hatch request must never fail open.
@@ -276,6 +302,7 @@ def request_hatch_approval(
             reason=f"Telegram hatch escalation errored: {exc}",
             env_var=env_var,
             env_present=True,
+            critical=critical,
         )
     _append_overrides_log(
         hook_id,
@@ -302,6 +329,7 @@ def _request_present_hatch_approval(
     timeout_s: float,
     process_margin_s: float,
     env_map: Mapping[str, str],
+    critical: bool = False,
 ) -> HatchApprovalResult:
     justification = raw.strip()
     if not justification:
@@ -311,6 +339,7 @@ def _request_present_hatch_approval(
             reason=f"{env_var} is blank; Telegram hatch escalation denied",
             env_var=env_var,
             env_present=True,
+            critical=critical,
         )
     if not _is_written_justification(justification):
         return HatchApprovalResult(
@@ -321,6 +350,7 @@ def _request_present_hatch_approval(
             ),
             env_var=env_var,
             env_present=True,
+            critical=critical,
         )
 
 
@@ -332,9 +362,29 @@ def _request_present_hatch_approval(
             reason="tg-ctl is not available at a trusted executable path",
             env_var=env_var,
             env_present=True,
+            critical=critical,
         )
 
-    effective_timeout = _bounded_timeout(timeout_s)
+    # SECURITY / agent-tools#754: a `critical=True` caller gets NO local timeout at all — not a
+    # very large one, an ACTUAL unbounded wait, because a real critical decision (Alex reviewing
+    # something while away from his phone) may take hours, and any finite number here would just
+    # relocate the exact bug this ticket exists to fix (a client-side clock outliving the human's
+    # attention, then discarding a tap that arrives after it). `_bounded_timeout` is deliberately
+    # NEVER called on this path — feeding a caller-supplied `timeout_s` through it and then
+    # overriding the result would leave a foot-gun for a future refactor to accidentally re-cap
+    # the critical path. `proc_timeout=None` reaches `subprocess.Popen.communicate` unmodified,
+    # whose own contract is to block until the child exits with no deadline at all. This does NOT
+    # weaken the approval boundary itself: `tg_ctl` is still resolved exclusively from the trusted
+    # absolute-path allowlist above (never from `cwd`), and the reply is still parsed by the same
+    # fail-closed `_parse_ask_decision` check below — critical mode changes how long we wait for a
+    # trustworthy answer, never what counts as one.
+    if critical:
+        effective_timeout: float | None = None
+        proc_timeout: float | None = None
+    else:
+        effective_timeout = _bounded_timeout(timeout_s)
+        proc_timeout = effective_timeout + max(process_margin_s, 0.0)
+
     branch = _git_branch(cwd)
     session_id = _resolve_session_id(context, env_map)
     question = _question(hook_id, justification, context, cwd, branch=branch, session_id=session_id)
@@ -350,8 +400,10 @@ def _request_present_hatch_approval(
     # caller like this one, not synthesizing a fake harness hook_event payload.
     #
     # The daemon's own per-ask deadline is a hard-coded 115s (ASK_TOTAL_TIMEOUT_MS in
-    # tg-ctl) regardless of what is requested here; `effective_timeout` still bounds
-    # how long THIS process waits for tg-ctl to give up and exit.
+    # tg-ctl) regardless of what is requested here UNLESS `critical` is set below — a
+    # critical ButtonRequest tells the daemon itself (tg-cli#403) to also drop that
+    # bound; `effective_timeout` only ever bounds how long THIS process waits for
+    # tg-ctl to give up and exit, never the daemon's own deadline.
     request_id = f"hatch-{hook_id}-{uuid.uuid4().hex[:12]}"
     button_request = {
         "requestId": request_id,
@@ -360,9 +412,31 @@ def _request_present_hatch_approval(
         "question": question,
         "title": f"Hatch: {hook_id}",
         "decisionLabels": {"allow": "Approve", "deny": "Deny"},
+        # Structural `cwd` (agent-tools#754 / tg-cli#403): previously `cwd` only ever reached the
+        # daemon embedded inside the free-text `question` body (the "CWD: …" line above), which is
+        # unparseable as an identity key. A late critical decision is proactively pushed into the
+        # requesting agent's live session by matching THIS field against `listLiveOmpAgents()` on
+        # the tg-cli side — reusing that existing live-session lookup, not a new identity scheme.
+        "cwd": cwd,
     }
+    # Best-effort tie-breaker alongside `cwd` for the same proactive-delivery match (tg-cli#403
+    # design decision 4): mirrors exactly how tg-ctl's own `askDaemon()` captures `env.paneId`
+    # from `TMUX_PANE` for its non-hatch asks. Read from `env_map` (the same resolved environment
+    # `request_hatch_approval` already uses for the hatch env var and `_resolve_session_id`), not
+    # bare `os.environ`, so a caller that passes an explicit `env=` mapping (every existing test in
+    # this suite) gets deterministic, hermetic behavior instead of leaking the real test-runner's
+    # own tmux pane. Omitted entirely when unset — tg-ctl's `normalizeButtonRequest` already
+    # treats a missing field as "no pane", so there is nothing to default it to.
+    pane_id = env_map.get("TMUX_PANE")
+    if pane_id:
+        button_request["paneId"] = pane_id
+    # Only set when True — see `HatchApprovalResult.critical`'s docstring and AC #4 of
+    # agent-tools#754: a non-critical caller's JSON payload must be byte-identical to today's
+    # (no `critical` key at all), not merely `"critical": false`, so an old tg-ctl build (or a
+    # test asserting the exact payload shape) sees no observable difference whatsoever.
+    if critical:
+        button_request["critical"] = True
     argv = [str(tg_ctl), "ask", "--agent", _ASK_AGENT]
-    proc_timeout = effective_timeout + max(process_margin_s, 0.0)
 
     def _deny(reason: str) -> HatchApprovalResult:
         # Every deny below differs ONLY in its reason; one constructor keeps the
@@ -374,6 +448,7 @@ def _request_present_hatch_approval(
             env_var=env_var,
             env_present=True,
             tg_ctl_path=str(tg_ctl),
+            critical=critical,
         )
 
     outcome = _run_tg_ctl_ask(
@@ -426,6 +501,7 @@ def _request_present_hatch_approval(
         env_var=env_var,
         env_present=True,
         tg_ctl_path=str(tg_ctl),
+        critical=critical,
     )
 
 
@@ -446,13 +522,24 @@ def _ask_forward_verdict(stderr_text: str) -> str | None:
 
 
 def _run_tg_ctl_ask(
-    argv: list[str], stdin_payload: str, proc_timeout: float, *, requested_timeout: float
+    argv: list[str],
+    stdin_payload: str,
+    proc_timeout: float | None,
+    *,
+    requested_timeout: float | None,
 ) -> tuple[int, str, str] | str:
     """Run `tg-ctl ask` with the ButtonRequest on stdin. Returns (returncode, stdout,
     stderr) on completion, or a deny REASON string when the process could not be run
     to completion (launch failure, timeout, I/O error) — the caller treats either as
     untrusted input, never as approval. `proc_timeout` is the padded wait actually
-    enforced; `requested_timeout` is the unpadded budget quoted in the timeout reason."""
+    enforced; `requested_timeout` is the unpadded budget quoted in the timeout reason.
+
+    `proc_timeout=None` (agent-tools#754 critical mode) reaches `Popen.communicate` unmodified:
+    per its own documented contract, passing `timeout=None` blocks until the child exits with NO
+    deadline — `subprocess.TimeoutExpired` can never be raised on this path, so `requested_timeout`
+    is also `None` and the `except subprocess.TimeoutExpired` branch below is simply unreachable
+    for a critical call, not merely never expected to fire.
+    """
     try:
         proc = subprocess.Popen(  # noqa: S603 - argv[0] is an absolute, executable tg-ctl path
             argv,

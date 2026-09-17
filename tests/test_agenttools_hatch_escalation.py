@@ -354,6 +354,57 @@ def test_real_justification_timeout_denies(tmp_path):
     assert "timed out" in result.reason
 
 
+def test_critical_mode_ignores_max_tg_ctl_timeout_cap(tmp_path, monkeypatch):
+    """agent-tools#754 AC#5: a `critical=True` call must not be capped by MAX_TG_CTL_TIMEOUT_S at
+    all — not merely bounded to a bigger number. Patching the cap down to 0.2s and having the fake
+    tg-ctl sleep past it (0.6s) before replying `allow` proves the cap is never consulted on the
+    critical path: if `_bounded_timeout` were still in the loop anywhere, this call would time out
+    exactly like the non-critical sibling test below does against the identical fake subprocess."""
+    monkeypatch.setattr(agenttools_hatch_escalation, "MAX_TG_CTL_TIMEOUT_S", 0.2)
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", "sleep 0.6\n" + _ALLOW_REPLY_SH)
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-reset-hard")
+
+    result = request_hatch_approval(
+        "block-reset-hard",
+        {"command": "git reset --hard"},
+        cwd=str(repo),
+        env={env_var: "Need to discard a disposable failed experiment."},
+        tg_ctl_candidates=[tg_ctl],
+        critical=True,
+    )
+
+    assert result.requested is True
+    assert result.approved is True
+    assert result.critical is True
+
+
+def test_non_critical_mode_still_respects_max_tg_ctl_timeout_cap(tmp_path, monkeypatch):
+    """Sibling to the test above, same fake subprocess and same patched cap: a NON-critical call
+    (the default, every existing call site) must still deny at the (now tiny) MAX_TG_CTL_TIMEOUT_S
+    bound — proving `critical=True` is what changed, not some accidental global relaxation of the
+    cap for everyone."""
+    monkeypatch.setattr(agenttools_hatch_escalation, "MAX_TG_CTL_TIMEOUT_S", 0.2)
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", "sleep 0.6\n" + _ALLOW_REPLY_SH)
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-reset-hard")
+
+    result = request_hatch_approval(
+        "block-reset-hard",
+        {"command": "git reset --hard"},
+        cwd=str(repo),
+        env={env_var: "Need to discard a disposable failed experiment."},
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+        process_margin_s=0.1,
+    )
+
+    assert result.requested is True
+    assert result.approved is False
+    assert "timed out" in result.reason
+    assert result.critical is False
+
+
 def _ask(tmp_path: Path, tg_ctl_body: str):
     """Run one hatch request against a fake tg-ctl with the given shell body."""
     tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", tg_ctl_body)
