@@ -204,6 +204,34 @@ def test_checkout_dot_allows(tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
 
 
+# ── BLOCK: a detach defeats the branch-name signal exactly like a real checkout ─────────────
+# agent-tools: `_switch_target` used to skip `--detach` as "just an unrecognized flag", so a
+# BARE `git checkout --detach` (no positional branch arg) returned None = "not a checkout at
+# all" and was never evaluated — permanently defeating worktree-only-writes' branch-name
+# detection with zero warning. Any detach (bare, or with an explicit target — even the default
+# branch itself) must be gated the same way a real branch switch is.
+
+def test_bare_checkout_detach_denies(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "git checkout --detach", monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_checkout_detach_explicit_default_target_denies(tmp_path, monkeypatch):
+    """`--detach main` still disables the branch-name signal even though the STATED target is
+    the default branch — the sentinel target must win over the literal argument."""
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "git checkout --detach main", monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_switch_dash_d_detach_denies(tmp_path, monkeypatch):
+    """`switch`'s short `-d` form for `--detach` is recognized too."""
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "git switch -d main", monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
 def test_read_only_git_commands_allow(tmp_path, monkeypatch):
     repo = _make_repo(tmp_path)
     for cmd in ("git status", "git log --oneline -5", "git worktree list", "git branch"):

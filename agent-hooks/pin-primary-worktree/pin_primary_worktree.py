@@ -599,12 +599,25 @@ def _classify_git_segment(
     return toks[i], toks[i + 1:], cwd_override
 
 
+# A detach (`--detach` for either subcommand, or `switch`'s short `-d`) leaves the default
+# branch exactly as effectively as switching to another branch name does — it defeats
+# worktree-only-writes' branch-name detection (its `current_branch()` returns None once HEAD is
+# detached) regardless of which commit it lands on, so it must be gated the same way. This
+# sentinel can never collide with a real git ref name (parentheses and spaces are invalid in
+# ref syntax), so `target == default` in `_evaluate_checkout_segment` is always False for it and
+# the segment always proceeds to the primary-worktree gate.
+_DETACHED_TARGET = "(detached)"
+
+
 def _switch_target(subcommand: str, toks: list[str]) -> str | None:
     """The branch/ref a `checkout`/`switch` segment would move HEAD to, or None if it isn't a
-    branch switch at all (a path-restore, a bare detach, or a `.`/no-arg form)."""
+    branch switch at all (a path-restore or a `.`/no-arg form). A detach flag (with or without
+    an explicit target — `--detach`, `--detach main`, `-d`) returns `_DETACHED_TARGET`."""
     if "--" in toks:
         return None  # `checkout <ref> -- <path>` / `checkout -- <path>` — restores a path only
     create_flags = {"-b", "-B"} if subcommand == "checkout" else {"-c", "-C"}
+    detach_flags = {"--detach", "-d"} if subcommand == "switch" else {"--detach"}
+    detach_requested = False
     positional: list[str] = []
     i = 0
     while i < len(toks):
@@ -615,11 +628,17 @@ def _switch_target(subcommand: str, toks: list[str]) -> str | None:
             positional.append(t)  # "previous branch" — a real target, NOT a flag despite the dash
             i += 1
             continue
+        if t in detach_flags:
+            detach_requested = True
+            i += 1
+            continue
         if t.startswith("-"):
             i += 1
             continue
         positional.append(t)
         i += 1
+    if detach_requested:
+        return _DETACHED_TARGET  # any detach defeats the branch-name signal, regardless of target
     if not positional or positional[0] == ".":
         return None  # `checkout .` (bulk path-restore) / no target at all
     return positional[0]

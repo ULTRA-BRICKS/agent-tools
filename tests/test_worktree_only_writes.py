@@ -70,6 +70,14 @@ def _git(repo: Path, *args: str) -> None:
     )
 
 
+def _git_out(repo: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True, capture_output=True, text=True, env=_GIT_ENV,
+    )
+    return proc.stdout.strip()
+
+
 def _make_repo(tmp_path: Path, *, branch: str, default_via: str | None = None) -> Path:
     """A real git repo checked out on ``branch`` with one commit.
 
@@ -258,13 +266,31 @@ def test_hatch_justification_exit1_blocks_citing_denial(tmp_path, monkeypatch):
     assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
-# ── fail-OPEN: detached HEAD / not a git repo ─────────────────────────────────────────────
+# ── fail-OPEN: detached HEAD at a genuinely divergent commit ──────────────────────────────
 
-def test_detached_head_allows(tmp_path, monkeypatch):
+def test_detached_head_at_divergent_commit_allows(tmp_path, monkeypatch):
+    """Detaching at an OLD commit — genuinely different content from the default branch's
+    current tip — stays fail-open: this hook cannot tell what that commit represents."""
+    repo = _make_repo(tmp_path, branch="main")
+    old_sha = _git_out(repo, "rev-parse", "HEAD")
+    (repo / "seed.txt").write_text("y")
+    _git(repo, "commit", "-am", "advance main")
+    _git(repo, "checkout", "--detach", old_sha)
+    out, code = _run(repo, monkeypatch, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == 0 and _decision(out) == "allow"
+
+
+# ── same-content bypass closed: detaching AT the default branch's own tip still blocks ────
+
+def test_detached_head_at_default_still_blocks(tmp_path, monkeypatch):
+    """agent-tools: `git checkout --detach` (no divergence — same commit as main's tip) used to
+    read as "detached, unknown branch → fail-open allow", permanently defeating this gate with
+    zero warning. It must be judged exactly like sitting on the default branch, since it IS that
+    content."""
     repo = _make_repo(tmp_path, branch="main")
     _git(repo, "checkout", "--detach", "HEAD")
     out, code = _run(repo, monkeypatch, {"RIG_WORKTREE_ONLY": "1"})
-    assert code == 0 and _decision(out) == "allow"
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
 def test_non_git_dir_allows(tmp_path, monkeypatch):

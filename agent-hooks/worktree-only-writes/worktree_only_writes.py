@@ -179,6 +179,27 @@ def current_branch(cwd: str) -> str | None:
     return name
 
 
+def _detached_head_matches_default(cwd: str, default: str) -> bool:
+    """True iff a DETACHED HEAD in ``cwd`` points at the same commit as ``default``.
+
+    Closes a known gap: ``current_branch`` returns None for ANY detached HEAD, and the naive
+    reading of that ("can't determine the branch → fail open") let a bare `git checkout
+    --detach` on the default branch's own tip permanently defeat this gate with zero warning —
+    the working tree is byte-identical to the default branch, only the branch-name label is
+    gone. A detach at some OTHER (genuinely divergent) commit — an old tag, a different SHA —
+    stays fail-open; this only recognizes the same-content case.
+    """
+    head = _git(cwd, "rev-parse", "HEAD")
+    if not head:
+        return False
+    target = _git(cwd, "rev-parse", "--verify", "--quiet", default)
+    if not target:
+        target = _git(cwd, "rev-parse", "--verify", "--quiet", f"origin/{default}")
+    if not target:
+        return False
+    return head == target
+
+
 def default_branch(cwd: str) -> str:
     """The repo's default branch — detected repo-locally, never hardcoded and never machine-derived.
 
@@ -365,11 +386,20 @@ def main() -> int:
         return 0
 
     # 2. Only enforce when actually sitting on the default branch.
+    default = default_branch(where)
     branch = current_branch(where)
     if branch is None:
-        emit("allow")  # detached / not a git repo / git error → fail-open
+        # Detached HEAD: usually fail-open (can't compare a branch name), UNLESS the detached
+        # commit is byte-identical to the default branch's own tip — e.g. a bare `git checkout
+        # --detach` run while sitting on `main`. That is not a genuinely different commit, it's
+        # the same content with the branch-name label removed, and treating it as "unknown"
+        # let it defeat this gate with zero warning (see `_detached_head_matches_default`).
+        # Any OTHER detached commit (an old tag, a real divergent SHA) still fails open below.
+        if _detached_head_matches_default(where, default):
+            return _decide_block(where, default)
+        emit("allow")  # detached at an unrelated commit / not a git repo / git error → fail-open
         return 0
-    if branch != default_branch(where):
+    if branch != default:
         emit("allow")  # on a feature branch → exactly where authoring belongs
         return 0
 
