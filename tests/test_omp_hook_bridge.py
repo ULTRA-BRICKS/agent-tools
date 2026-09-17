@@ -657,6 +657,16 @@ _OMP_MAIN_SESSION = (
     "/tmp/omp-sessions/-xp-rig-cli/"
     "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e.jsonl"
 )
+_OMP_GRANDCHILD_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/"
+    "ThinNotSub/ThinNotSub.NestedRepro.jsonl"
+)
+_OMP_GREAT_GRANDCHILD_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/"
+    "A/A.B/A.B.C.jsonl"
+)
 
 
 def test_to_v1_event_injects_agent_id_from_nested_pi_session_file(monkeypatch):
@@ -687,6 +697,40 @@ def test_to_v1_event_main_pi_session_file_has_no_agent_id(monkeypatch):
     }
     v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
     assert "agent_id" not in v1["args"]
+
+
+def test_to_v1_event_injects_agent_id_from_nested_great_grandchild_pi_session_file(monkeypatch):
+    """review finding: depth-3 coverage was previously uneven across the three
+    duplicated implementations (only test_orchestrator_stays_thin.py covered it). The
+    any-depth ancestor walk must keep injecting agent_id at depth 3 here too."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("PI_SESSION_FILE", _OMP_GREAT_GRANDCHILD_SESSION)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m test-commit"},
+        "cwd": "/repo",
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert v1["args"]["agent_id"] == "A.B.C"
+
+
+def test_to_v1_event_injects_agent_id_from_nested_grandchild_pi_session_file(monkeypatch):
+    """agent-tools#634-followup: a depth-2 GRANDCHILD omp Task/eval transcript must inject
+    args.agent_id exactly like a depth-1 child. A prior version of
+    _nested_id_from_session_file matched only the IMMEDIATE parent directory against the
+    session-id shape, which a grandchild path never satisfies. Would FAIL on the pre-fix
+    immediate-parent-only check."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("PI_SESSION_FILE", _OMP_GRANDCHILD_SESSION)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m test-commit"},
+        "cwd": "/repo",
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert v1["args"]["agent_id"] == "ThinNotSub.NestedRepro"
 
 
 def test_to_v1_event_injects_agent_id_from_payload_session_file(monkeypatch):

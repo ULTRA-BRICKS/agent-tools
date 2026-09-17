@@ -421,6 +421,16 @@ _OMP_MAIN_SESSION = (
     "/tmp/omp-sessions/-xp-rig-cli/"
     "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e.jsonl"
 )
+_OMP_GRANDCHILD_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/"
+    "LongInlineFix/LongInlineFix.NestedRepro.jsonl"
+)
+_OMP_GREAT_GRANDCHILD_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/"
+    "A/A.B/A.B.C.jsonl"
+)
 
 
 def test_subagent_review_allowed_via_rig_agent_id(monkeypatch):
@@ -440,6 +450,32 @@ def test_subagent_review_allowed_via_omp_nested_session(monkeypatch):
     out, _e, code = _run(
         "review diff", monkeypatch, harness="omp",
         env={"PI_SESSION_FILE": _OMP_NESTED_SESSION},
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_subagent_review_allowed_via_omp_grandchild_session(monkeypatch):
+    """agent-tools#634-followup: a depth-2 GRANDCHILD omp Task/eval transcript must
+    exempt exactly like a depth-1 child. A prior version of _is_omp_nested_session
+    matched only the IMMEDIATE parent directory against the session-id shape, which a
+    grandchild path never satisfies. Would FAIL on the pre-fix immediate-parent-only
+    check."""
+    out, _e, code = _run(
+        "review diff", monkeypatch, harness="omp",
+        env={"PI_SESSION_FILE": _OMP_GRANDCHILD_SESSION},
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_subagent_review_allowed_via_omp_great_grandchild_session(monkeypatch):
+    """review finding: depth-3 coverage was previously uneven across the three
+    duplicated implementations (only test_orchestrator_stays_thin.py covered it). The
+    any-depth ancestor walk must keep working at depth 3 here too, not only depth 2."""
+    out, _e, code = _run(
+        "review diff", monkeypatch, harness="omp",
+        env={"PI_SESSION_FILE": _OMP_GREAT_GRANDCHILD_SESSION},
     )
     assert code == 0
     assert _decision(out) == "allow"

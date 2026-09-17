@@ -662,18 +662,46 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"orchestrator-stays-thin: {msg}\n")
 
 
-# omp Task/eval child transcript: .../<session-id>/<agent-id>.jsonl
-# Main session file is .../<session-id>.jsonl (parent dir is the project slug, not the id).
+# omp Task/eval NESTED transcript, at ANY dispatch depth: .../<session-id>/<agent-id>.jsonl
+# (child), .../<session-id>/<agent-id>/<agent-id>.<child>.jsonl (grandchild), etc. — see
+# `_is_omp_nested_session` below for the any-depth walk. Main session file is
+# .../<session-id>.jsonl (parent dir is the project slug, not the id).
 _OMP_SESSION_DIR = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-fA-F-]+$"
 )
 
 
 def _is_omp_nested_session() -> bool:
-    """True when PI_SESSION_FILE is an omp Task/eval child transcript.
+    """True when PI_SESSION_FILE is a NESTED omp Task/eval transcript, at ANY dispatch depth —
+    not only a DIRECT child of the top-level session.
 
-    Main:  .../<session-id>.jsonl
-    Child: .../<session-id>/<agent-id>.jsonl
+    Main:         .../<session-id>.jsonl
+    Child:        .../<session-id>/<agent-id>.jsonl
+    Grandchild:   .../<session-id>/<agent-id>/<agent-id>.<child-agent-id>.jsonl
+
+    Confirmed against REAL omp session trees on disk (not merely inferred): a `task`-tool
+    dispatch fired FROM WITHIN an already-dispatched subagent nests one directory level
+    deeper per hop, e.g. `RestoreMissingFusionBatch/RestoreMissingFusionBatch.
+    VerifyRestoreBranch.jsonl` and `RepoCleanupCore/RepoCleanupCore.GrandGerbil.jsonl`.
+
+    A prior version checked ONLY the immediate parent directory name against
+    `_OMP_SESSION_DIR` — correct for a depth-1 child (whose parent IS the session-id
+    directory) but wrong for a depth-2+ grandchild, whose immediate parent is an
+    AGENT-NAME-shaped directory (`RestoreMissingFusionBatch`, never ISO-timestamp-shaped),
+    so it never matched. Every grandchild — a `task`-tool child spawned from inside
+    another dispatched subagent, exactly the shape a fanned-out subagent tree produces —
+    was misclassified as the orchestrator despite #634/#676/#743 already landing: a live,
+    reproduced regression in the identity-forwarding chain, distinct from #673 (which is
+    Codex-specific and unrelated to omp `task`-tool nesting).
+
+    The fix walks every ANCESTOR directory (`Path.parents`, which terminates at the
+    filesystem root — no unbounded loop; bounded by the path's own segment count) looking
+    for one matching the top-level session-id shape. A match at ANY depth means this
+    transcript sits somewhere inside that session's dispatch tree, however many `task`
+    hops deep. The MAIN session's flat `.../<session-id>.jsonl` has NO such ancestor (its
+    own parent is the project-slug directory, never ISO-timestamp-shaped), so it is still
+    correctly NOT classified as nested — RC-2's anonymous-orchestrator-still-blocks policy
+    is unweakened.
 
     NOT restricted to ``event["harness"] == "omp"`` (agent-tools#676): omp sets this var on
     every Task/eval child's process regardless of which model harness backs that omp
@@ -684,8 +712,9 @@ def _is_omp_nested_session() -> bool:
     unreachable for exactly that default configuration, misclassifying every nested
     Claude-Code-backed omp subagent as the orchestrator (live incident: CommitReconcile /
     ThinNotSub, agent-tools#676). `no_long_inline_process._is_omp_nested_session` (the
-    sibling hook with the identical trust tier) never had this restriction; this brings the
-    two back into lockstep. omp sets PI_SESSION_FILE on the process; a running orchestrator
+    sibling hook with the identical trust tier) and `omp_hook_bridge.dispatch.
+    _nested_id_from_session_file` MUST stay in the SAME any-depth walk — a test pins the
+    three copies together. omp sets PI_SESSION_FILE on the process; a running orchestrator
     cannot retroactively mutate its own process environment (same trust model as
     RIG_AGENT_ID — cooperative-orchestrator threat model, on_error=open). Path shape only —
     no filesystem probe, so tests stay hermetic."""
@@ -695,7 +724,7 @@ def _is_omp_nested_session() -> bool:
     path = Path(raw)
     if path.suffix.lower() != ".jsonl" or not path.stem.strip():
         return False
-    return bool(_OMP_SESSION_DIR.match(path.parent.name))
+    return any(_OMP_SESSION_DIR.match(parent.name) for parent in path.parents)
 
 
 def _is_subagent(event: dict) -> bool:

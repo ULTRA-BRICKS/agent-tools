@@ -204,6 +204,23 @@ _OMP_MAIN_SESSION = (
 )
 
 
+# agent-tools#634-followup: a task-tool dispatch fired FROM WITHIN an already-dispatched
+# subagent nests one directory level deeper per hop. Confirmed against a REAL omp session
+# tree on disk (not merely inferred): RestoreMissingFusionBatch/RestoreMissingFusionBatch.
+# VerifyRestoreBranch.jsonl and RepoCleanupCore/RepoCleanupCore.GrandGerbil.jsonl are
+# genuine depth-2 grandchild transcripts a live fleet produced.
+_OMP_GRANDCHILD_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/"
+    "RestoreMissingFusionBatch/RestoreMissingFusionBatch.VerifyRestoreBranch.jsonl"
+)
+_OMP_GREAT_GRANDCHILD_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/"
+    "A/A.B/A.B.C.jsonl"
+)
+
+
 def test_subagent_git_commit_allowed_for_omp_nested_session(tmp_path, monkeypatch):
     """omp Task/eval child: `PI_SESSION_FILE` is nested `.../<session-id>/<agent>.jsonl`.
     No `args.agent_id`, no `RIG_AGENT_ID`. Repeat `git commit` must allow — the
@@ -271,6 +288,64 @@ def test_nested_pi_session_exempts_with_no_harness_tag(tmp_path, monkeypatch):
     _run(event, monkeypatch, tmp_path / "m", env=env)
     out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
     assert c == 0 and _decision(out) == "allow"
+
+
+def test_subagent_git_commit_allowed_for_omp_grandchild_session(tmp_path, monkeypatch):
+    """agent-tools#634-followup: a depth-2 GRANDCHILD omp Task/eval transcript
+
+    (`_OMP_GRANDCHILD_SESSION`, matching a REAL on-disk grandchild path a live fleet
+    produced) must exempt exactly like a depth-1 child. A prior version of
+    `_is_omp_nested_session` matched only the IMMEDIATE parent directory against the
+    session-id shape, which a grandchild `..../<agent-id>/<agent-id>.<child>.jsonl` never
+    satisfies (its immediate parent is an agent-name directory, not the session-id
+    directory) — so this exact fixture was misclassified as the orchestrator and a repeat
+    `git commit` BLOCKED. Would FAIL on the pre-fix immediate-parent-only check."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "omp",
+             "args": {"command": "git commit -m test-commit"}}
+    env = {"PI_SESSION_FILE": _OMP_GRANDCHILD_SESSION}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_subagent_git_commit_allowed_for_omp_great_grandchild_session(tmp_path, monkeypatch):
+    """The any-depth ancestor walk must keep working at depth 3 (great-grandchild), not
+    only depth 2 — proving the fix is a genuine ANY-depth walk, not merely a widened
+    depth-1-or-2 special case."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "omp",
+             "args": {"command": "git commit -m test-commit"}}
+    env = {"PI_SESSION_FILE": _OMP_GREAT_GRANDCHILD_SESSION}
+    _run(event, monkeypatch, tmp_path / "m", env=env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env=env)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_omp_session_dir_pattern_matches_across_all_three_copies():
+    """review finding: the docstring above claims a test pins the three _OMP_SESSION_DIR
+
+    copies (this hook, no_long_inline_process, and omp_hook_bridge.dispatch) together, but
+    no such test existed. This is that test, matching the established idiom at
+    tests/test_subagent_no_bg_longproc.py test_long_process_detection_constants_match_sibling.
+    If any one copy regresses to a depth-limited special case while the others keep the
+    any-depth walk, this FAILS instead of silently diverging."""
+    import importlib
+    import importlib.util
+
+    sib_path = (
+        Path(__file__).resolve().parents[1]
+        / "agent-hooks"
+        / "no-long-inline-process"
+        / "no_long_inline_process.py"
+    )
+    spec = importlib.util.spec_from_file_location("no_long_inline_process", sib_path)
+    assert spec and spec.loader
+    nlip = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(nlip)
+
+    dispatch = importlib.import_module("omp_hook_bridge.dispatch")
+
+    assert ost._OMP_SESSION_DIR.pattern == nlip._OMP_SESSION_DIR.pattern
+    assert ost._OMP_SESSION_DIR.pattern == dispatch._OMP_SESSION_DIR.pattern
 
 
 # agent-tools#679: a live same-day report (post-#637-merge, pre-#676-fix) that a PLAIN

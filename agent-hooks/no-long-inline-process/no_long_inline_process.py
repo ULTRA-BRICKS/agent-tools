@@ -318,8 +318,10 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"no-long-inline-process: {msg}\n")
 
 
-# omp Task/eval child transcript: .../<session-id>/<agent-id>.jsonl
-# Main session file is .../<session-id>.jsonl (parent dir is the project slug, not the id).
+# omp Task/eval NESTED transcript, at ANY dispatch depth: .../<session-id>/<agent-id>.jsonl
+# (child), .../<session-id>/<agent-id>/<agent-id>.<child>.jsonl (grandchild), etc. — see
+# `_is_omp_nested_session` below for the any-depth walk. Main session file is
+# .../<session-id>.jsonl (parent dir is the project slug, not the id).
 # Same path-shape detector as the #634 identity work on orchestrator-stays-thin
 # (duplicated: each hook is a standalone script; agent-tools#635).
 _OMP_SESSION_DIR = re.compile(
@@ -328,10 +330,18 @@ _OMP_SESSION_DIR = re.compile(
 
 
 def _is_omp_nested_session() -> bool:
-    """True when PI_SESSION_FILE is an omp Task/eval child transcript.
+    """True when PI_SESSION_FILE is a NESTED omp Task/eval transcript, at ANY dispatch depth.
 
-    Main:  .../<session-id>.jsonl
-    Child: .../<session-id>/<agent-id>.jsonl
+    Main:         .../<session-id>.jsonl
+    Child:        .../<session-id>/<agent-id>.jsonl
+    Grandchild:   .../<session-id>/<agent-id>/<agent-id>.<child-agent-id>.jsonl
+
+    See `orchestrator_stays_thin._is_omp_nested_session`'s own docstring for the full
+    rationale (real on-disk evidence, agent-tools#634 lockstep note) — this is the SAME
+    any-depth `Path.parents` walk, kept identical across both copies deliberately
+    (duplicated: each hook is a standalone script; agent-tools#635). A prior version
+    checked only the immediate parent directory, which missed every depth-2+ grandchild
+    (a `task`-tool child spawned from inside another already-dispatched subagent).
 
     omp sets PI_SESSION_FILE on the process; a running orchestrator cannot retroactively
     mutate its own process environment (same trust model as RIG_AGENT_ID). Path shape
@@ -342,7 +352,7 @@ def _is_omp_nested_session() -> bool:
     path = Path(raw)
     if path.suffix.lower() != ".jsonl" or not path.stem.strip():
         return False
-    return bool(_OMP_SESSION_DIR.match(path.parent.name))
+    return any(_OMP_SESSION_DIR.match(parent.name) for parent in path.parents)
 
 
 def _is_subagent(event: dict) -> bool:

@@ -88,14 +88,28 @@ _OMP_SESSION_DIR = re.compile(
 
 
 def _nested_id_from_session_file(raw: str) -> str:
-    """Agent id from a nested omp transcript path, or empty. Path shape only."""
+    """Agent id from a NESTED omp transcript path, at ANY dispatch depth, or empty.
+
+    Main:         .../<session-id>.jsonl                                    (not nested)
+    Child:        .../<session-id>/<agent-id>.jsonl
+    Grandchild:   .../<session-id>/<agent-id>/<agent-id>.<child-agent-id>.jsonl
+
+    A prior version matched only the IMMEDIATE parent directory against
+    `_OMP_SESSION_DIR` — correct for a depth-1 child but not a depth-2+ grandchild (a
+    `task`-tool child spawned from inside another already-dispatched subagent), whose
+    immediate parent is an agent-name-shaped directory, never the ISO-timestamp-shaped
+    session-id directory. Walking every ancestor (`Path.parents`, bounded by the path's own
+    segment count) finds the session-id directory at ANY depth — see
+    `orchestrator_stays_thin._is_omp_nested_session` docstring for the full rationale
+    and real on-disk evidence; keep the three copies (this one, that hook, and
+    `no_long_inline_process._is_omp_nested_session`) in lockstep. Path shape only."""
     raw = (raw or "").strip()
     if not raw:
         return ""
     path = Path(raw)
     if path.suffix.lower() != ".jsonl" or not path.stem.strip():
         return ""
-    if not _OMP_SESSION_DIR.match(path.parent.name):
+    if not any(_OMP_SESSION_DIR.match(parent.name) for parent in path.parents):
         return ""
     return path.stem.strip()
 
