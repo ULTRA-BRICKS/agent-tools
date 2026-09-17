@@ -327,11 +327,25 @@ _OMP_SESSION_DIR = re.compile(
 )
 
 
-def _is_omp_nested_session() -> bool:
-    """True when PI_SESSION_FILE is an omp Task/eval child transcript.
+def _has_omp_session_ancestor(path: Path) -> bool:
+    """True when ANY ancestor directory of ``path`` is session-id-shaped, not just the
+    immediate parent (live finding, 2026-09-18; SYNC with orchestrator-stays-thin's copy of
+    this helper, same rationale): a NESTED Task/eval child — dispatched via `task` from
+    WITHIN an already-dispatched subagent, depth >= 2 — nests one directory per additional
+    level (oh-my-pi derives each level's own `artifactsDir` from THAT session's own
+    `sessionManager.getSessionFile().slice(0, -6)`), so its IMMEDIATE parent is another agent
+    id, never the root session id. Walking the full ancestor chain finds the root session-id
+    directory at whatever depth it sits. A bare main session file's ancestors are the
+    project-slug/`sessions` tree and never session-id-shaped, so this stays False for it."""
+    return any(_OMP_SESSION_DIR.match(parent.name) for parent in path.parents)
 
-    Main:  .../<session-id>.jsonl
-    Child: .../<session-id>/<agent-id>.jsonl
+
+def _is_omp_nested_session() -> bool:
+    """True when PI_SESSION_FILE is an omp Task/eval child transcript, at any nesting depth.
+
+    Main:            .../<session-id>.jsonl
+    Direct child:     .../<session-id>/<agent-id>.jsonl
+    Nested (depth 2+): .../<session-id>/<agent-id>/<agent-id>/....jsonl
 
     omp sets PI_SESSION_FILE on the process; a running orchestrator cannot retroactively
     mutate its own process environment (same trust model as RIG_AGENT_ID). Path shape
@@ -342,7 +356,7 @@ def _is_omp_nested_session() -> bool:
     path = Path(raw)
     if path.suffix.lower() != ".jsonl" or not path.stem.strip():
         return False
-    return bool(_OMP_SESSION_DIR.match(path.parent.name))
+    return _has_omp_session_ancestor(path)
 
 
 def _is_subagent(event: dict) -> bool:
