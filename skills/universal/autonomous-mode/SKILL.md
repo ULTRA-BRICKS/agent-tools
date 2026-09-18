@@ -20,6 +20,12 @@ In **autonomous** mode (harness mode autonomous, or the user says autonomous):
 - Do **not** invent a "gate-behavior hold for a human" class (including a
   "hold for Alex"). That class does not exist.
 - Autonomous agents send key status via `tg --tag report`, not chat-only.
+- There is no `/result-report` slash command in tg-cli or agent-tools, despite being
+  referenced that way in some session notes — that name means this same convention:
+  `tg --tag report` (formalized as tg-cli's `tg report` subcommand — ticket/PR link, user
+  impact, and verification proof as required fields). A separate, unrelated artifact exists
+  at `~/.claude/commands/result-report.md` (a Claude Code slash command that shows a report in
+  chat + writes an HTML file via `rig report`) — it does not send to Telegram.
 - If extra-approval is wrongly ON, **fix that knob** —
   `github.ruleset.require_extra_approval_for_unattributed_changes`, mode-gated
   by [rig-cli#404](https://github.com/alex-mextner/rig-cli/pull/404). A red test
