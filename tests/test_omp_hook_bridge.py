@@ -706,6 +706,98 @@ def test_to_v1_event_injects_agent_id_from_payload_session_file(monkeypatch):
     assert v1["args"]["agent_id"] == "ThinNotSub"
 
 
+def test_to_v1_event_injects_agent_id_from_is_main_session_false_with_no_session_file(monkeypatch):
+    """Live finding (2026-09-18): a genuinely nested Task/eval child's OWN session can still
+    be in-memory — not yet persisted to disk — for its first few tool calls (SessionManager
+    mints getSessionId() synchronously at creation, but getSessionFile() stays undefined
+    until the session is actually written to disk). With no session file at all, the
+    path-shape check has nothing to walk, and the child was silently classified as the
+    orchestrator. extension.ts's `isMainSession` (a per-process "first session seen is root"
+    latch on the always-available getSessionId()) is a second, file-independent signal for
+    exactly this gap: with isMainSession=False and no sessionFile, args.agent_id must still
+    be injected."""
+    _clear_agent_env_markers(monkeypatch)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m 'fix: x'"},
+        "cwd": "/repo",
+        "sessionId": "child-session-id-2",
+        "isMainSession": False,
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert v1["args"]["agent_id"] == "omp-nested:child-session-id-2"
+
+
+def test_to_v1_event_is_main_session_true_has_no_agent_id(monkeypatch):
+    """The genuine root/orchestrator session — even one still in-memory with no session file
+    yet — must NOT be exempted: isMainSession=True must not inject an agent_id."""
+    _clear_agent_env_markers(monkeypatch)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m 'fix: x'"},
+        "cwd": "/repo",
+        "sessionId": "root-session-id",
+        "isMainSession": True,
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert "agent_id" not in v1["args"]
+
+
+def test_to_v1_event_without_is_main_session_key_has_no_agent_id_when_no_session_file(monkeypatch):
+    """Backward compatibility: an event with no `isMainSession` key at all (an older bridge
+    build, or an existing test fixture) falls through to the pre-fix behavior exactly — no
+    agent_id when there is no session file to walk, even with a sessionId present."""
+    _clear_agent_env_markers(monkeypatch)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m 'fix: x'"},
+        "cwd": "/repo",
+        "sessionId": "some-session-id",
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert "agent_id" not in v1["args"]
+
+
+def test_to_v1_event_is_main_session_never_overrides_positive_nested_file_check(monkeypatch):
+    """A positive file-shape nested result always wins — isMainSession is consulted ONLY
+    when the file-based check found nothing, never used to second-guess a real hit."""
+    _clear_agent_env_markers(monkeypatch)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m 'fix: x'"},
+        "cwd": "/repo",
+        "sessionFile": _OMP_NESTED_SESSION,
+        "sessionId": "whatever",
+        "isMainSession": True,  # would (wrongly) say "root" if it were consulted first
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert v1["args"]["agent_id"] == "ThinNotSub"
+
+
+def test_to_v1_event_is_main_session_false_never_overrides_present_main_shaped_file(monkeypatch):
+    """Review finding (2026-09-18): a PRESENT-but-flat (main-shaped) `sessionFile` is real,
+    positive file evidence that this is NOT a child — just as authoritative as a present
+    NESTED file, and must not be second-guessed by a contradictory `isMainSession: false`
+    (e.g. a stale root latch in a reused process). Only the complete ABSENCE of file evidence
+    (no `sessionFile`, no env `PI_SESSION_FILE`) reaches the `isMainSession` fallback."""
+    _clear_agent_env_markers(monkeypatch)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m 'fix: x'"},
+        "cwd": "/repo",
+        "sessionFile": _OMP_MAIN_SESSION,
+        "sessionId": "sess-main",
+        "isMainSession": False,  # contradicts the file evidence — must be ignored
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert "agent_id" not in v1["args"]
+
+
 def test_to_v1_event_env_marker_wins_over_forged_agent_id(monkeypatch):
     """Strip-then-inject order: a forged args.agent_id is dropped FIRST, then the env
     marker (the only authority) supplies the identity — never the payload."""
@@ -2070,6 +2162,153 @@ def test_extension_session_manager_main_session_file_stays_orchestrator(tmp_path
     monkeypatch.setenv("PI_SESSION_FILE", _OMP_MAIN_SESSION)  # mirror the dispatcher's spawned env
     v1 = dispatch.to_v1_event(payload, point="pre-bash")
     assert "agent_id" not in v1["args"]
+
+
+def _run_sequential_identity_driver(tmp_path: Path, steps: list[str]) -> list[dict]:
+    """Drive MULTIPLE sequential `tool_call`/`session_shutdown` handler invocations against
+    the SAME extension.ts module instance in one bun process — proving `latchRootSessionId`'s
+    cross-call, cross-session statefulness (agent-tools review finding, 2026-09-18): a single
+    `_run_identity_driver` call can only ever exercise ONE `tool_call`, which can never
+    observe a per-process latch. Each string in `steps` is a JS statement invoking the
+    driver-provided `await dumpToolCall(ctxLiteral)` (records that call's payload, in order)
+    or `await shutdown(ctxLiteral)` (fires `session_shutdown` for that ctx, no payload).
+    Returns the dumped `tool_call` payloads in call order."""
+    dump_dir = tmp_path / "dumps"
+    dump_dir.mkdir()
+    stub = tmp_path / "stub_dispatcher.py"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys, pathlib\n"
+        "payload = json.loads(sys.stdin.read() or '{}')\n"
+        f"d = pathlib.Path({str(dump_dir)!r})\n"
+        "(d / f\"{payload.get('toolCallId', 'x')}.json\").write_text(json.dumps(payload))\n"
+        "print(json.dumps({'decision': 'allow'}))\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    driver = tmp_path / "driver.ts"
+    driver.write_text(
+        "const mod = await import(process.env.EXTENSION_PATH!);\n"
+        "const handlers: Record<string, Function> = {};\n"
+        "const pi = { on: (name: string, cb: Function) => { handlers[name] = cb; } };\n"
+        "mod.default(pi);\n"
+        "let callSeq = 0;\n"
+        "const dumpToolCall = async (ctx: unknown) => {\n"
+        "  const n = ++callSeq;\n"
+        "  await handlers['tool_call'](\n"
+        "    { toolName: 'bash', input: { command: 'git commit -m x' }, toolCallId: `c${n}` }, ctx);\n"
+        "};\n"
+        "const shutdown = async (ctx: unknown) => { await handlers['session_shutdown']({}, ctx); };\n"
+        + "\n".join(steps),
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["EXTENSION_PATH"] = str(_EXTENSION_TS)
+    env["OMP_HOOK_BRIDGE_PYTHON"] = str(stub)
+    proc = subprocess.run(["bun", "run", str(driver)], capture_output=True, text=True, env=env, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    calls = sorted(dump_dir.glob("c*.json"), key=lambda p: int(p.stem[1:]))
+    return [json.loads(f.read_text()) for f in calls]
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_is_main_session_true_across_repeat_calls_from_same_session(tmp_path):
+    """The root latch must not just fire once: the SAME session calling a SECOND time must
+    still compare equal to the id it latched on its own first call."""
+    payloads = _run_sequential_identity_driver(
+        tmp_path,
+        [
+            "const ctx = { cwd: '/tmp', hasUI: false,"
+            " sessionManager: { getSessionId: () => 'root-sess' } };\n"
+            "await dumpToolCall(ctx);\n"
+            "await dumpToolCall(ctx);\n"
+            "await dumpToolCall(ctx);\n",
+        ],
+    )
+    assert [p.get("isMainSession") for p in payloads] == [True, True, True]
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_is_main_session_false_for_later_different_session_same_process(tmp_path):
+    """Live finding (2026-09-18): a Task/eval child dispatched from an already-running
+    orchestrator shares the SAME Node process. The orchestrator's OWN first tool_call latches
+    the root; the child's differently-id'd session, calling afterward in the SAME process,
+    must compare false against it — the exact signal `dispatch.py` uses to exempt an
+    in-memory (no session file yet) child. Would FAIL (both `true`, or the child's session
+    wrongly becoming root) if the latch didn't persist across calls or compared the wrong way."""
+    payloads = _run_sequential_identity_driver(
+        tmp_path,
+        [
+            "const parent = { cwd: '/tmp', hasUI: false,"
+            " sessionManager: { getSessionId: () => 'root-sess' } };\n"
+            "const child = { cwd: '/tmp', hasUI: false,"
+            " sessionManager: { getSessionId: () => 'child-sess' } };\n"
+            "await dumpToolCall(parent);\n"
+            "await dumpToolCall(child);\n"
+            "await dumpToolCall(child);\n",
+        ],
+    )
+    assert [p.get("isMainSession") for p in payloads] == [True, False, False]
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_is_main_session_absent_when_session_id_is_blank(tmp_path):
+    """No `sessionManager`/blank `getSessionId()` at all — stay silent (no key on the
+    payload) rather than guess either way; dispatch.py's file-shape check alone governs."""
+    payloads = _run_sequential_identity_driver(
+        tmp_path,
+        [
+            "const ctx = { cwd: '/tmp', hasUI: false };\n"
+            "await dumpToolCall(ctx);\n",
+        ],
+    )
+    assert "isMainSession" not in payloads[0]
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_session_shutdown_of_root_lets_next_session_relatch(tmp_path):
+    """Self-healing (agent-tools review finding, 2026-09-18): a process that goes on to host a
+    genuinely SECOND, unrelated top-level session (session reuse, an ACP host, a future
+    same-process `/new`-style flow) must not keep comparing that new session against a root
+    that has already ended. `session_shutdown` for the CURRENT root clears the latch, so the
+    NEXT session's first call correctly becomes the new root instead of scoring `false`
+    forever against a session that no longer exists — the exact wrong-direction failure mode
+    (exempting the wrong session) an independent review flagged against a latch with no
+    clearing path at all."""
+    payloads = _run_sequential_identity_driver(
+        tmp_path,
+        [
+            "const first = { cwd: '/tmp', hasUI: false,"
+            " sessionManager: { getSessionId: () => 'first-root' } };\n"
+            "const second = { cwd: '/tmp', hasUI: false,"
+            " sessionManager: { getSessionId: () => 'second-root' } };\n"
+            "await dumpToolCall(first);\n"
+            "await shutdown(first);\n"
+            "await dumpToolCall(second);\n",
+        ],
+    )
+    assert [p.get("isMainSession") for p in payloads] == [True, True]
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_session_shutdown_of_non_root_child_does_not_clear_latch(tmp_path):
+    """Only the ROOT's own shutdown may clear the latch: a CHILD ending mid-session (its task
+    finished, its own `session_shutdown` fires) must not reset root identity out from under
+    the still-running orchestrator or its other siblings."""
+    payloads = _run_sequential_identity_driver(
+        tmp_path,
+        [
+            "const root = { cwd: '/tmp', hasUI: false,"
+            " sessionManager: { getSessionId: () => 'root-sess' } };\n"
+            "const child = { cwd: '/tmp', hasUI: false,"
+            " sessionManager: { getSessionId: () => 'child-sess' } };\n"
+            "await dumpToolCall(root);\n"
+            "await dumpToolCall(child);\n"
+            "await shutdown(child);\n"
+            "await dumpToolCall(root);\n",
+        ],
+    )
+    assert [p.get("isMainSession") for p in payloads] == [True, False, True]
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")

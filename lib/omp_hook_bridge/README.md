@@ -94,7 +94,8 @@ never derived from the omp event, so it can't be forged the way the identity fie
 must be actively stripped. The bridge restores a TRUSTED `args.agent_id` from, in order: `RIG_AGENT_ID` /
 `RIG_DETACHED_AGENT` (rig-detached-omp, agent-tools#573); a nested transcript path
 (`.../<session-id>/<agent>.jsonl` → stem) from **payload `sessionFile`** or process env
-`PI_SESSION_FILE` (agent-tools#634); then payload `agentId`. omp's `ExtensionContext`
+`PI_SESSION_FILE` (agent-tools#634); a synthetic id from **payload `isMainSession`**
+(live finding, 2026-09-18, see below); then payload `agentId`. omp's `ExtensionContext`
 exposes NO top-level `getSessionFile()`/`getAgentId()`/`agentId` (oh-my-pi#11214), so
 `extension.ts` sources the session file from `ctx.sessionManager.getSessionFile()`
 (agent-tools#743) — for a native Task/eval child that is the CHILD's own session manager
@@ -103,6 +104,23 @@ session env, so env `PI_SESSION_FILE` alone is the main session file — the nes
 child path has to be forwarded. The main session file is not a child and does
 not inject. omp's `tool_call` payload still has no per-call spawn marker of its
 own; identity comes from ctx session state and launcher env.
+
+**`isMainSession` (live finding, 2026-09-18)**: a nested child's own session can still be
+in-memory — not yet persisted to disk — for its first few tool calls (`SessionManager`
+mints `getSessionId()` synchronously at creation, but `getSessionFile()` stays undefined
+until the session is actually written). With no session file at all, the path-shape check
+above has nothing to walk, and the child was silently classified as the orchestrator —
+misfiring `orchestrator-stays-thin`'s warn-then-block tier on its own first couple of
+pre-write/pre-bash calls despite being a genuine subagent throughout. `extension.ts` latches
+the FIRST `getSessionId()` it ever sees in this process (on `globalThis`, reload-safe like
+the in-flight dispatcher registry above) as the root/orchestrator session — sound because a
+child cannot exist before its own parent's `task` tool_call has already fired through this
+same handler — and forwards `isMainSession: sessionId === thatRoot` on the payload whenever
+both are known. `dispatch.py` consults it ONLY when the file-based nested check above found
+nothing: `isMainSession === false` synthesizes `args.agent_id = "omp-nested:<sessionId>"`
+(a marker, not a real transcript stem) so `_is_subagent` still exempts the call; a positive
+file-based result is never second-guessed, and an event with no `isMainSession` key at all
+(an older bridge build, or an existing test fixture) falls through unchanged.
 
 ## Hashline content extraction is an approximation
 
