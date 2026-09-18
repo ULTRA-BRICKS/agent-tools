@@ -657,6 +657,16 @@ _OMP_MAIN_SESSION = (
     "/tmp/omp-sessions/-xp-rig-cli/"
     "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e.jsonl"
 )
+_OMP_GRANDCHILD_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/"
+    "ThinNotSub/GrandchildWorker.jsonl"
+)
+_OMP_GREAT_GRANDCHILD_SESSION = (
+    "/tmp/omp-sessions/-xp-rig-cli/"
+    "2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e/"
+    "ThinNotSub/GrandchildWorker/GreatGrandchildWorker.jsonl"
+)
 
 
 def test_to_v1_event_injects_agent_id_from_nested_pi_session_file(monkeypatch):
@@ -687,6 +697,38 @@ def test_to_v1_event_main_pi_session_file_has_no_agent_id(monkeypatch):
     }
     v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
     assert "agent_id" not in v1["args"]
+
+
+def test_to_v1_event_injects_agent_id_from_nested_grandchild_pi_session_file(monkeypatch):
+    """agent-tools#760 follow-up: this bridge own test file had no direct coverage of the
+    any-depth ancestor walk at the to_v1_event level (only tests/test_orchestrator_stays_thin.py
+    exercised dispatch.to_v1_event for a grandchild). A depth-2 GRANDCHILD transcript must
+    inject args.agent_id from its own .jsonl stem exactly like a depth-1 child."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("PI_SESSION_FILE", _OMP_GRANDCHILD_SESSION)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m test-commit"},
+        "cwd": "/repo",
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert v1["args"]["agent_id"] == "GrandchildWorker"
+
+
+def test_to_v1_event_injects_agent_id_from_nested_great_grandchild_pi_session_file(monkeypatch):
+    """The any-depth ancestor walk must keep injecting agent_id at depth 3, not only depth 2 -
+    proving a genuine any-depth walk, not a widened depth-1-or-2 special case."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("PI_SESSION_FILE", _OMP_GREAT_GRANDCHILD_SESSION)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "git commit -m test-commit"},
+        "cwd": "/repo",
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert v1["args"]["agent_id"] == "GreatGrandchildWorker"
 
 
 def test_to_v1_event_injects_agent_id_from_payload_session_file(monkeypatch):
