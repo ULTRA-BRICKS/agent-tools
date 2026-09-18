@@ -27,7 +27,9 @@ or >5 commits is a reasonable trigger).
 ## Step 1 — Gather the data
 
 ```bash
-MERGE_BASE=$(git merge-base main HEAD)
+BASE_BRANCH=$(gh pr view --json baseRefName -q .baseRefName)
+MERGE_BASE=$(git merge-base "origin/$BASE_BRANCH" HEAD)
+# BASE_BRANCH may be main, master, trunk, or a release branch depending on the repo/PR.
 
 # Commits on this branch
 git log --format='{"sha": "%H", "short": "%h", "message": "%s", "date": "%ci"}' $MERGE_BASE..HEAD
@@ -50,7 +52,28 @@ gh pr view --json title,url,number,state
   entries, find the real line numbers with Grep/Read so file links can carry
   `#L<N>-L<M>` anchors — GitHub renders those as a highlighted range.
 
-## Step 2 — UI screenshots (skip if no UI changes)
+## Step 2 — Prepare the reports repo + scaffold the report
+
+```bash
+if [ -d /tmp/<reports-repo> ]; then
+  cd /tmp/<reports-repo> && git pull
+else
+  cd /tmp && git clone https://github.com/<org>/<reports-repo>.git
+fi
+```
+
+If the repo ships `scripts/new-report.sh` (HyperIDE's does), use it instead of
+hand-copying the template — it stamps `_template/report.html` into
+`reports/<TASK-ID>/index.html` with the task ID/title/date already substituted:
+
+```bash
+./scripts/new-report.sh HYP-XXX "Task Title"
+```
+
+If there's no scaffold script yet, copy `_template/report.html` (or the plain
+`<!DOCTYPE html>` skeleton below) to `reports/<TASK-ID>/index.html` by hand.
+
+## Step 3 — UI screenshots (skip if no UI changes)
 
 Use the **`agent-browser`** CLI — not a Playwright/browser MCP tool. (The original
 version of this workflow called `playwright_screenshot(selector=...)` via an MCP
@@ -73,7 +96,7 @@ Poll the app URL until it responds (max ~30s) before touching the browser.
 **Capture element-level screenshots:**
 
 ```bash
-agent-browser open https://local.hyperi.de/
+agent-browser open <app-url>          # e.g. https://local.hyperi.de/ for HyperIDE
 agent-browser set viewport 1280 800
 
 # Navigate to the changed UI area (open the relevant panel/tab first)
@@ -107,27 +130,6 @@ agent-browser screenshot '#logs-panel' 03-logs-panel.png
 ```bash
 dev stop   # or: kill $DEV_PID / pkill -f 'bun scripts/dev.ts'
 ```
-
-## Step 3 — Prepare the reports repo + scaffold the report
-
-```bash
-if [ -d /tmp/<reports-repo> ]; then
-  cd /tmp/<reports-repo> && git pull
-else
-  cd /tmp && git clone https://github.com/<org>/<reports-repo>.git
-fi
-```
-
-If the repo ships `scripts/new-report.sh` (HyperIDE's does), use it instead of
-hand-copying the template — it stamps `_template/report.html` into
-`reports/<TASK-ID>/index.html` with the task ID/title/date already substituted:
-
-```bash
-./scripts/new-report.sh HYP-XXX "Task Title"
-```
-
-If there's no scaffold script yet, copy `_template/report.html` (or the plain
-`<!DOCTYPE html>` skeleton below) to `reports/<TASK-ID>/index.html` by hand.
 
 ## Step 4 — Populate the report
 
@@ -413,22 +415,34 @@ gh ship <PR_NUMBER>
 
 If the reports repo has a CI validation script (HyperIDE's is
 `scripts/ci/validate-reports.mjs` — structural HTML checks, local asset paths, a
-headless-browser smoke render of `Report.init`, internal link resolution) it will run on
-the push; treat a red run as a real defect in the page, not noise.
+headless-browser smoke render of `Report.init`, internal link resolution) it runs on
+the PR; treat a red run as a real defect in the page, not noise.
 
 ## Step 7 — Post links (mandatory, do not skip)
 
 Post the report link to **both** the ticket and the PR immediately after publishing —
 before verification, not as an afterthought.
 
+**Resolve the actual Pages base URL first — don't assume the org-root shape.** GitHub
+Pages serves a repo differently depending on its name and settings:
+
+- A reports repo literally named `<org>.github.io` publishes at the org root:
+  `https://<org>.github.io/`.
+- Any other repo name is a project Pages site, published beneath the repo name:
+  `https://<org>.github.io/<reports-repo>/`.
+- A custom domain (check the repo's `CNAME` file or its Pages settings) replaces
+  `<org>.github.io` with that domain entirely.
+
 ```bash
+PAGES_BASE_URL="https://<org>.github.io/"   # or .../<reports-repo>/ for a project Pages site — see above
+
 # Ticket tracker (Linear CLI, not MCP)
-linear issue comment HYP-XXX --body "📊 [Result Report](https://<org>.github.io/reports/HYP-XXX/)"
+linear issue comment HYP-XXX --body "📊 [Result Report](${PAGES_BASE_URL}reports/HYP-XXX/)"
 # or, if this project uses task-cli:
-task change HYP-XXX --comment "📊 [Result Report](https://<org>.github.io/reports/HYP-XXX/)"
+task change HYP-XXX --comment "📊 [Result Report](${PAGES_BASE_URL}reports/HYP-XXX/)"
 
 # GitHub PR
-gh pr comment <PR_NUMBER> --body "📊 [Result Report](https://<org>.github.io/reports/HYP-XXX/)"
+gh pr comment <PR_NUMBER> --body "📊 [Result Report](${PAGES_BASE_URL}reports/HYP-XXX/)"
 ```
 
 If either fails — retry once, then report the failure to the user. Do NOT silently skip.
