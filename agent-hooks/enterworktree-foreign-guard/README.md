@@ -114,17 +114,18 @@ but blank/bare (`1`/`true`/`yes`), the hook denies without contacting Telegram.
 > `hook_bridge_entries` matcher registration (or the live `settings.json` entry), tracked as
 > catalog-wide follow-up, not something to patch ad hoc for one matcher here.
 
-## Registration gap (read before assuming this fires)
+## Registration status
 
-Mapping `EnterWorktree` → `pre-worktree-enter` in `lib/cc_hook_bridge/dispatch.py` is **not**,
-on its own, enough for CC to ever invoke the bridge for an `EnterWorktree` tool call — Claude
+Mapping `EnterWorktree` → `pre-worktree-enter` in `lib/cc_hook_bridge/dispatch.py` is not, on
+its own, enough for CC to ever invoke the bridge for an `EnterWorktree` tool call — Claude
 Code only runs `PreToolUse` hooks it has an explicit **matcher** for in `settings.json`, and
 matchers are written by **rig-cli**'s `hook_bridge_entries` (a separate repo), not by this
 dispatcher. This is the identical two-repo split `pre-agent`/`pre-skill`/`pre-monitor` went
-through. Until rig-cli's `EnterWorktree` matcher change ships **and** `rig apply` (or an
-equivalent manual `settings.json` edit) runs on a given machine, this descriptor is installed
-but inert — CC never calls the bridge for `EnterWorktree` at all, so
-`enterworktree_foreign_guard.py` never runs.
+through — and, same as those, it has now shipped: rig-cli#298 registered the `EnterWorktree`
+matcher. This descriptor fires once **`rig apply`** (or an equivalent manual `settings.json`
+edit) has run on a given machine to pick that matcher up — a machine that hasn't re-run
+`rig apply` since the matcher shipped won't have it wired yet, and this script stays
+installed but inert there.
 
 ## What's unaffected
 
