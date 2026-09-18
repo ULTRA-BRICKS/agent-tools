@@ -97,8 +97,16 @@ const inFlight = registry.children;
 // — see `sessionManagerString`'s "in-memory session" case and README.md's "isMainSession"
 // section for the full gap this closes). Cleared on the ROOT session's own `session_shutdown`
 // below (agent-tools review finding, 2026-09-18) so a process that goes on to host a
-// genuinely different top-level session next re-latches onto THAT session instead of
-// comparing forever against one that no longer exists.
+// genuinely different top-level session NEXT (sequentially, after the old root's shutdown
+// has already run) re-latches onto that new session instead of comparing forever against one
+// that no longer exists. Accepted residual (review finding, same date): TWO top-level
+// sessions genuinely CONCURRENT in one unrestarted process — both alive at once, neither's
+// shutdown having run yet — would each still compare against whichever latched first, same
+// as any single-root system. Not a plausible shape for omp's own CLI process model (one
+// interactive top-level session per process; everything else it spawns is a Task/eval CHILD
+// of that one root), but this bridge cannot independently verify that from agent-tools —
+// flagged here rather than silently assumed away, the same "accepted imprecision in the safe
+// direction" doctrine this file's other trust-boundary comments already use.
 const ROOT_SESSION_KEY = Symbol.for("agent-tools.omp-hook-bridge.root-session-id");
 
 // First non-blank `sessionId` seen wins and sticks until `clearRootSessionIfShuttingDown`
