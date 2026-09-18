@@ -392,12 +392,24 @@ New entries go at the TOP of the list (newest first).
 
 ## Step 6 — Publish
 
+This ecosystem's global `protect-main` git hook blocks a direct push to the reports
+repo's default branch — push a feature branch and land it through a PR instead (`gh
+ship` merges once CI/required checks are green; see `git-hooks/global-dispatcher`'s
+`protect-main` fragment):
+
 ```bash
 cd /tmp/<reports-repo>
+git checkout -b report/HYP-XXX
 git add .
 git commit -m "report: HYP-XXX — Task Title"
-git push
+git push origin HEAD:refs/heads/report/HYP-XXX
+gh pr create --fill
+gh ship <PR_NUMBER>
 ```
+
+(Legitimate exception with no PR available, e.g. an unattended release script —
+`PUSH_MAIN_OK=1 PUSH_MAIN_REASON="<why>" git push` overrides `protect-main`, audited to
+`overrides.log`. Not the default path for this skill.)
 
 If the reports repo has a CI validation script (HyperIDE's is
 `scripts/ci/validate-reports.mjs` — structural HTML checks, local asset paths, a
