@@ -287,6 +287,24 @@ READ_ONLY_BASH = re.compile(
 # no PR number, `gh pr merge`, `gh run`, `gh pr checks/view`, `gh api`, AND `gh ship <PR#>` chained
 # with anything else at all, even a trailing `| tail` — still delegates.
 #
+# A SECOND, narrower exception (Alex, 2026-09-18, session-authorized relaxation of tg#5743/
+# tg#7103's blanket gh gate — read-only CI/PR *inspection* specifically, not a reversal of the
+# gate itself): a fixed, explicit ALLOWLIST of known-read-only gh shapes — `gh issue list/view`,
+# `gh pr list/view/checks/diff`, `gh run list/view/watch`, `gh repo view`, and `gh api` invoked
+# with no method flag other than GET and no `-f`/`-F`/`--input` data-payload flag — is likewise
+# sanctioned for the orchestrator to run inline. Named `_is_gh_readonly_command` (table
+# `_GH_READONLY_SUBCOMMANDS`), consulted directly by `_seg_is_allowed`, per-segment (the SAME
+# tier `tg`/`task` get, NOT `gh ship`'s narrower per-LINE-only grant): `_is_gh_command` (and
+# therefore `_seg_is_impl_signal`) is DELIBERATELY left unchanged and still trips on EVERY gh
+# invocation, allowlisted read-only shapes included — so a chain that is not ENTIRELY composed of
+# allowed segments still treats a gh-readonly segment as its own implementation signal, closing
+# off the exact "recognized-but-also-exempted-from-impl-signal" laundering hole agent-tools#363
+# fixed for `gh ship`; this grant only ever matters via `_is_all_inline_allowed`'s "ALL segments
+# allowed" fast path. Every OTHER gh shape — `gh pr merge/create/close/edit`, `gh issue
+# create/close/edit`, `gh release`, `gh workflow`, `gh secret`, `gh pr checkout`, a `gh api` call
+# with any non-GET method or any `-f`/`-F`/`--input` payload flag, and any gh shape not in the
+# table above — stays delegated exactly as before, warn-then-block, same as `git commit`.
+#
 # `tg` is DELIBERATELY ABSENT from THIS head-only regex (moved out, tg-carveout-159, Fable review
 # round 3): it used to live here as a plain `tg\b` since agent-tools#164, but a plain regex has no
 # argument-position awareness and — worse — its `\b` boundary also matches a hyphen-suffixed
@@ -1308,10 +1326,12 @@ def _seg_is_allowed(segment: str) -> bool:
 
     Head-anchored, so a build/edit token appearing only as an ARGUMENT/needle (`cat tee.log`,
     `git log | rg gh`) stays allowed on its real head, not the needle (the anchor invariant, #5/#80).
-    `gh` (ANY subcommand, INCLUDING `ship`) is NOT allowed here — it is delegated (`_is_gh_command`);
-    this predicate covers `review`/`git worktree list` (via `ORCH_ALLOW`), `tg` (via its own
-    shlex-based `_is_tg_command`), `task` (via its own shlex-based `_is_task_command`), read-only
-    inspection, and the `cd` companion.
+    `gh` is NOT blanket-allowed here — most subcommands (including `ship`) are delegated
+    (`_is_gh_command`); a fixed ALLOWLIST of read-only gh shapes IS granted directly
+    (`_is_gh_readonly_command`, table `_GH_READONLY_SUBCOMMANDS`), the same tier as `review`/
+    `git worktree list` (via `ORCH_ALLOW`), `tg` (via its own shlex-based `_is_tg_command`), and
+    `task` (via its own shlex-based `_is_task_command`); plus read-only inspection and the `cd`
+    companion.
 
     `gh ship <PR#>` is DELIBERATELY ABSENT from this per-segment allow-list (agent-tools#363,
     reverting a #159/#162 regression): the ship carve-out is granted ONLY by
@@ -1359,6 +1379,7 @@ def _seg_is_allowed(segment: str) -> bool:
         or CD_HEAD.match(segment)
         or _is_tg_command(segment)
         or _is_task_command(segment)
+        or _is_gh_readonly_command(segment)
     ):
         return True
     return _git_subcommand(segment) in _GIT_READ_SUBS  # `git -C d status`, `/usr/bin/git log`, …
@@ -1412,6 +1433,116 @@ def _is_gh_command(segment: str) -> bool:
     except ValueError:
         return bool(_GH_HEAD_RE.match(segment))  # unbalanced quotes → conservative head match
     return _gh_argv_after_env(toks) is not None
+
+
+# ── read-only gh allowlist (Alex, 2026-09-18) ───────────────────────────────────────────────────
+# A fixed, explicit TABLE of gh (subcommand, sub-subcommand) pairs that are pure inspection — no
+# state anywhere is ever mutated by running them. Deliberately a closed enumeration, not a
+# heuristic: gh growing a new subcommand in the future must NOT silently widen this grant.
+_GH_READONLY_SUBCOMMANDS = frozenset({
+    ("issue", "list"),
+    ("issue", "view"),
+    ("pr", "list"),
+    ("pr", "view"),
+    ("pr", "checks"),
+    ("pr", "diff"),
+    ("run", "list"),
+    ("run", "view"),
+    ("run", "watch"),
+    ("repo", "view"),
+})
+
+# `gh api` flags that mark a REST/GraphQL call as carrying a WRITE, independent of the method
+# verb: `-f`/`--raw-field` and `-F`/`--field` attach a request parameter (the standard shape of a
+# gh api mutation, e.g. `-f title=x`, `-F draft=true`, or a GraphQL `-f query='mutation{…}'`), and
+# `--input` reads a request body from a file/stdin. Presence of ANY of these disqualifies the
+# read-only grant regardless of `-X`/`--method` — a GET request should never carry a data payload
+# in the first place, so this errs toward "still delegated" whenever a payload flag is present.
+_GH_API_PAYLOAD_LONG_FLAGS = ("--field", "--raw-field", "--input")
+
+
+def _is_gh_api_write_flag(tok: str) -> bool:
+    """True when `tok` is (or glues, pflag-style, a value onto) a gh api data-payload flag:
+    `-f`/`-F` short form (bare, or with an attached value like `-ftitle=x` — pflag's shorthand
+    flags accept a glued value with no separating space or `=`), or a long `--field`/
+    `--raw-field`/`--input` (bare, or `=`-glued). A conservative, GRANT-WITHHOLDING predicate: any
+    token merely STARTING with `-f`/`-F` counts, even one this file cannot fully validate as the
+    real gh flag (e.g. an unrecognized cluster) — the safe default for a predicate that decides
+    whether to WITHHOLD a grant is to withhold it on anything it cannot confidently rule out."""
+    if tok in _GH_API_PAYLOAD_LONG_FLAGS:
+        return True
+    if any(tok.startswith(f"{flag}=") for flag in _GH_API_PAYLOAD_LONG_FLAGS):
+        return True
+    return tok.startswith("-f") or tok.startswith("-F")
+
+
+def _is_gh_api_readonly(argv: list[str]) -> bool:
+    """`argv` is the gh argv AFTER the literal `api` token. Read-only iff NO `-f`/`-F`/`--input`
+    payload flag appears anywhere, AND every `-X`/`--method` value present is `GET`
+    (case-insensitive) — including gh's own glued short-flag form `-XPOST`. The method flag's
+    ABSENCE also counts as GET, matching gh's own documented default. A `-X`/`--method` whose
+    value this scan cannot determine (e.g. a bare trailing `-X`/`--method` with nothing after it)
+    is treated as NOT GET — the safe direction for a GRANT-direction predicate facing uncertain
+    input (the same "deny on ambiguity" precedent `_is_gh_ship_command`'s own unparseable-fallback
+    sets elsewhere in this file)."""
+    i = 0
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        if tok == "--":
+            break
+        if _is_gh_api_write_flag(tok):
+            return False
+        if tok == "-X" or tok == "--method":
+            if i + 1 >= n or argv[i + 1].strip().upper() != "GET":
+                return False
+            i += 2
+            continue
+        if tok.startswith("--method="):
+            if tok[len("--method="):].strip().upper() != "GET":
+                return False
+            i += 1
+            continue
+        if tok.startswith("-X") and len(tok) > 2:
+            if tok[2:].strip().upper() != "GET":
+                return False
+            i += 1
+            continue
+        i += 1
+    return True
+
+
+def _is_gh_readonly_command(segment: str) -> bool:
+    """True when a segment's COMMAND is one of the fixed READ-ONLY gh shapes sanctioned for the
+    orchestrator to run inline (Alex, 2026-09-18, session-authorized relaxation of tg#5743/
+    tg#7103's blanket gh gate to exempt read-only inspection): `gh issue list/view`, `gh pr
+    list/view/checks/diff`, `gh run list/view/watch`, `gh repo view` (exact (subcommand,
+    sub-subcommand) pairs, table `_GH_READONLY_SUBCOMMANDS`), or `gh api` carrying no non-GET
+    method and no `-f`/`-F`/`--input` data payload (`_is_gh_api_readonly`).
+
+    shlex + basename/env-prefix normalized exactly like `_is_gh_command`/`_is_gh_ship_command`
+    (via the shared `_gh_argv_after_env`). Consulted DIRECTLY by `_seg_is_allowed`, per-segment —
+    the SAME tier `tg`/`task` are granted at, NOT `gh ship`'s narrower whole-LINE-only grant —
+    because, unlike the old `gh ship` design, `_is_gh_command`/`_seg_is_impl_signal` are left
+    UNCHANGED here: they still classify EVERY gh invocation, including one this predicate grants,
+    as an impl-signal. That means a chain that is not entirely composed of allowed segments still
+    trips on a gh-readonly segment exactly as before, so this grant cannot reopen the
+    `gh ship 205; rm -rf /`-shaped laundering hole agent-tools#363 closed — the grant only ever
+    matters via `_is_all_inline_allowed`'s "ALL segments allowed" fast path.
+
+    On an UNPARSEABLE (unbalanced-quote) segment, shlex raises — return `False` (deny-by-default;
+    a GRANT-direction predicate facing uncertain input must not grant, the same direction
+    `_is_gh_ship_command`/`_is_tg_command` take)."""
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return False
+    argv = _gh_argv_after_env(toks)
+    if not argv:
+        return False
+    if argv[0] == "api":
+        return _is_gh_api_readonly(argv[1:])
+    return len(argv) >= 2 and (argv[0], argv[1]) in _GH_READONLY_SUBCOMMANDS
 
 
 # A bare PR number: ASCII digits only (never a unicode digit look-alike, never a URL/branch name).
