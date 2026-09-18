@@ -1,6 +1,6 @@
 ---
 name: model-fallback
-description: 'Use when your model keeps erroring — repeated rate-limits, "temporarily limiting requests", overloaded, 429, or API 5xx — instead of stalling, dying, or burning the whole session on retries. Defines the cross-harness fallback chain and the discipline: retry a few times, then drop to the next executor; surface which model is now active; return to the top when the preferred one recovers. Triggers on a model throttle/overload/outage during any task.'
+description: 'Use when your model keeps erroring — rate-limits, "temporarily limiting requests", overloaded, 429, API 5xx — instead of stalling or burning the session on retries. Defines the cross-harness fallback chain: retry briefly, drop to the next executor, surface which model is active, return to the top once it recovers.'
 ---
 
 # Fall down a model chain on repeated errors; don't stall on a throttle

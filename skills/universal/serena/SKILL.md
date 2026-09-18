@@ -1,6 +1,6 @@
 ---
 name: serena
-description: Use as an OPT-IN exception to grep when you need LSP-precise code navigation or structured edits in a sizeable codebase — "where is symbol X defined / who calls it / rename it across the repo", or edit a function/class by symbol instead of by line. Serena is an LSP-backed code-intelligence MCP (symbol search/references/overview, symbol-precise edits, diagnostics). NOT a memory system — agent memory lives in agent-tools MEMORY.md.
+description: 'Use as an OPT-IN exception to grep for LSP-precise navigation/edits in a sizeable codebase — "where is symbol X defined/who calls it/rename it repo-wide", or edit by symbol not line. Serena is an LSP-backed code-intelligence MCP. NOT a memory system — memory lives in agent-tools MEMORY.md.'
 ---
 
 # Serena — LSP-backed code intelligence (opt-in)

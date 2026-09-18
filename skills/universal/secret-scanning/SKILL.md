@@ -1,6 +1,6 @@
 ---
 name: secret-scanning
-description: Use whenever you set up secret-leak protection for a repo — a pre-commit guard, a CI check, or both — or when deciding how to stop credentials reaching git history. The standard engine is gitleaks; this skill says how to wire it as a git-hook (local) and as CI (backstop), with block-vs-warn tiers and how to extend rules / allowlist false positives.
+description: 'Use when setting up secret-leak protection for a repo — a pre-commit guard, a CI check, or both — or deciding how to stop credentials reaching git history. Standard engine: gitleaks. Covers wiring it as a git-hook (local) and CI (backstop), block-vs-warn tiers, and extending rules/allowlisting false positives.'
 ---
 
 # Secret scanning: gitleaks, as a git-hook AND in CI

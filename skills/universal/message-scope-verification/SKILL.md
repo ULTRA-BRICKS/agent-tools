@@ -1,6 +1,6 @@
 ---
 name: message-scope-verification
-description: Use whenever a NEW inbound message arrives — a chat reply, an injected wrapper like "[TG from ...]"/"[from ...]", a pasted tmux/pane message, a fresh dispatch — while your current work is unfinished (uncommitted changes, an open ticket, a running background task). Check whether the message reads as a continuation of what you're doing, or as something from an unrelated project/repo/ticket/topic that never came up in this session. If it looks misdirected, ask the user to confirm it's actually for you before you drop your current work and switch.
+description: 'Use when a NEW inbound message arrives — a chat reply, an injected "[TG from ...]"/"[from ...]" wrapper, a pasted tmux/pane message — while your work is unfinished (uncommitted changes, an open ticket). Check if it continues your work or is from an unrelated project/topic; if misdirected, confirm with the user first.'
 ---
 
 # Confirm a message is actually yours before you drop unfinished work for it

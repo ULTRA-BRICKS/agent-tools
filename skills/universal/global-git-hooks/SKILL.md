@@ -1,6 +1,6 @@
 ---
 name: global-git-hooks
-description: Use when you want a git hook to run in EVERY repo on the machine — not just the one in front of you — or when a repo with a local hook manager (lefthook/husky) or raw .git/hooks is bypassing the global core.hooksPath. Explains the dispatcher model (one entry point, a drop-in global-hooks.d/ directory), how to add a hook once and have it run everywhere, how to wire a single repo, and the passive layers (templateDir + manager templates + a MANUAL sweep, never cron) that keep new repos covered.
+description: 'Use to make a git hook run in EVERY repo, or when a local hook manager (lefthook/husky) or raw .git/hooks bypasses global core.hooksPath. Covers the dispatcher model (one entry point, a global-hooks.d/ drop-in dir), wiring a single repo, and the passive layers that keep new repos covered.'
 ---
 
 # Global git hooks: one dispatcher, runs everywhere

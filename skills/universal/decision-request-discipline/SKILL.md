@@ -1,6 +1,6 @@
 ---
 name: decision-request-discipline
-description: 'Use before escalating any product or architecture decision to a human (the project owner / CTO) — any "should we A or B", "open the PR or drop it", "which approach", or any mention of an open PR awaiting review. Also fires when a code review raises findings on a PR and you''re deciding whether to ship, hold, or fold them in — see "Decisions you must NOT escalate" below for the fixed on-scope-vs-off-scope rule and the P1/security sign-off carve-out. Brainstorm across models first; escalate only on genuine model disagreement or an irreversible high-blast-radius call (a repo''s own required human sign-off gate on a merge is separate and still applies). Never relabel a product feature as a "risk/vuln/hazard". When you do escalate, send it as `tg --tag decision` in the strict decision-request format so the decision takes 30 seconds without reading code — there is no separate question tag; an open question IS a decision request.'
+description: 'Use before escalating a product/architecture decision to a human — "should we A or B", "open the PR or drop it", "which approach", or ship/hold/fold on review findings. Escalate only on genuine model disagreement or an irreversible call; send via `tg --tag decision` in the strict format.'
 ---
 
 # Decide what you can; escalate only what you can't — and only in the strict format

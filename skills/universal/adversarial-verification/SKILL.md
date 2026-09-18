@@ -1,6 +1,6 @@
 ---
 name: adversarial-verification
-description: Use when verifying a fix or a finding — before claiming "works", "no longer happens", or "always works". Don't confirm the happy path; try to break it. Build the case where it MUST fail, hunt the counterexample, name the real boundaries, and prove with an artifact (rendered output, test run, screenshot), not "the helper returns empty" or "correct by construction".
+description: 'Use when verifying a fix or finding — before claiming "works", "no longer happens", or "always works". Don''t confirm the happy path; try to break it. Build the case where it MUST fail, hunt the counterexample, and prove it with an artifact (output, test run, screenshot) — not "correct by construction".'
 ---
 
 # Prove it from the opposite side
