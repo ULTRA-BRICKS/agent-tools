@@ -8,11 +8,20 @@ See `reap_tgctl_omp_acp.py`'s module docstring for the 2026-09-09 OOM incident
 writeup and the safety rationale (ppid == 1 + tgctl temp-dir marker + age
 threshold + 0% CPU + token-boundary `omp acp` match).
 
-## Status: manually installed, NOT yet wired into `rig apply`
+## Status: manually installed; superseded by rig's `tgctl_reaper` provisioning
 
-Same honest scope as ops/vscode-orphan-reaper and ops/zombie-parent-reaper:
-`rig apply`'s agenttools_service only knows RunAtLoad+KeepAlive daemons, not
-StartInterval periodic jobs.
+`rig-cli` now provisions this reaper declaratively via `rig apply` (the `tgctl_reaper:` config
+block, GLOBAL layer, default ON on macOS) — see `riglib/tgctl_reaper.py` +
+`riglib/tgctl_reaper_daemon.py` in the `rig-cli` repo. It reuses this script's exact launchd
+Label (`com.hyperide.tgctl-omp-acp-reaper`) so a machine that ran `./install.sh` by hand
+converges onto the rig-managed version on the next `rig apply commit` (backup-on-conflict,
+same as every other rig-managed artifact) instead of running a second, colliding LaunchAgent.
+`install.sh` below remains for a machine not yet running `rig apply`, or for manual testing.
+
+Same honest scope note applies to the STILL-unwired siblings ops/vscode-orphan-reaper and
+ops/zombie-parent-reaper: `rig apply`'s agenttools_service only knows RunAtLoad+KeepAlive
+daemons, not StartInterval periodic jobs — THIS reaper is the first of the three to get a
+dedicated `StartInterval` provisioning module in rig-cli, not a fix to that shared limitation.
 
 ```
 ./install.sh              # renders the plist, installs to ~/Library/LaunchAgents, loads it
