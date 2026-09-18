@@ -87,6 +87,38 @@ const IN_FLIGHT_KEY = Symbol.for("agent-tools.omp-hook-bridge.in-flight");
 const registry: InFlightRegistry = ((globalThis as any)[IN_FLIGHT_KEY] ??= registerExitReaper());
 const inFlight = registry.children;
 
+// The FIRST omp session (main or a Task/eval child) to reach THIS module instance in this
+// process is, by construction, the top-level/orchestrator session: a child cannot exist
+// before its own parent's "task" tool_call has already fired through this same handler (the
+// parent must already be running to dispatch it, and `runBridge` — including this latch —
+// completes before that "task" call is allowed to execute and spawn anything). Latched on
+// `globalThis` for the same reload-safety reason as `IN_FLIGHT_KEY` above, keyed on
+// `getSessionId()` (always set the instant a SessionManager exists, unlike `getSessionFile()`
+// — see `sessionManagerString`'s "in-memory session" case and README.md's "isMainSession"
+// section for the full gap this closes). Cleared on the ROOT session's own `session_shutdown`
+// below (agent-tools review finding, 2026-09-18) so a process that goes on to host a
+// genuinely different top-level session next re-latches onto THAT session instead of
+// comparing forever against one that no longer exists.
+const ROOT_SESSION_KEY = Symbol.for("agent-tools.omp-hook-bridge.root-session-id");
+
+// First non-blank `sessionId` seen wins and sticks until `clearRootSessionIfShuttingDown`
+// clears it; every later call just reads it back. Returns undefined only when no session in
+// this process has ever reported one yet — stay silent rather than guess, so `runBridge`
+// leaves `isMainSession` unset and dispatch.py keeps today's file-shape-only behavior.
+function latchRootSessionId(sessionId: string): string | undefined {
+  const root = globalThis as Record<symbol, string | undefined>;
+  if (sessionId) root[ROOT_SESSION_KEY] ??= sessionId;
+  return root[ROOT_SESSION_KEY];
+}
+
+// Only the ROOT session's own shutdown clears the latch: a CHILD ending mid-session must not
+// reset it out from under still-running siblings, but once the root itself is gone the
+// process is ready to correctly re-latch whatever top-level session starts next.
+function clearRootSessionIfShuttingDown(sessionId: string): void {
+  const root = globalThis as Record<symbol, string | undefined>;
+  if (sessionId && root[ROOT_SESSION_KEY] === sessionId) delete root[ROOT_SESSION_KEY];
+}
+
 function registerExitReaper(): InFlightRegistry {
   const created: InFlightRegistry = { children: new Set(), stopping: new WeakSet() };
   process.on("exit", () => {
@@ -266,6 +298,14 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
       sessionManagerString(ctx, "getSessionFile"),
       ctxString(ctx, event, "sessionFile", "getSessionFile"),
     );
+    // File-independent nested signal (see the block comment on `latchRootSessionId` above):
+    // narrows dispatch.py's fallback ONLY when the file-shape check above found nothing
+    // (blank `sessionFile`) — a positive file-based nested result is never second-guessed.
+    // `undefined` (no root latched yet, or this call's own sessionId is blank) means "stay
+    // silent", which JSON.stringify drops from the payload entirely, matching the pre-this-
+    // change wire shape exactly for that case.
+    const rootSessionId = latchRootSessionId(sessionId);
+    const isMainSession = rootSessionId && sessionId ? sessionId === rootSessionId : undefined;
     const payload = JSON.stringify({
       event: eventName,
       toolName: event?.toolName,
@@ -278,6 +318,7 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
       agentId,
       sessionId,
       sessionFile,
+      isMainSession,
     });
     outcome = await spawnDispatcher(eventName, payload, event?.toolCallId, {
       sessionFile,
@@ -495,9 +536,19 @@ function interpretDispatcherResult(eventName: BridgeEvent, outcome: DispatcherOu
 }
 
 export default function (pi: any): void {
-  // omp's own teardown: end any dispatcher still waiting (see `inFlight`).
-  pi.on("session_shutdown", async () => {
+  // omp's own teardown: end any dispatcher still waiting (see `inFlight`), and — only when
+  // THIS session is the currently-latched root — clear `ROOT_SESSION_KEY` so a process that
+  // goes on to host a different top-level session next re-latches correctly instead of
+  // comparing forever against a session that no longer exists (see the block comment on
+  // `clearRootSessionIfShuttingDown` above).
+  pi.on("session_shutdown", async (_event: unknown, ctx: SessionManagerHost | null | undefined) => {
     reapInFlight("session shutdown");
+    try {
+      clearRootSessionIfShuttingDown(sessionManagerString(ctx, "getSessionId"));
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logToDebugFile(`omp-hook-bridge: root-session clear on shutdown failed (ignored): ${message}`);
+    }
   });
 
   pi.on("tool_call", async (event: any, ctx: any) => {

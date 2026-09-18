@@ -116,6 +116,12 @@ def _nested_id_from_session_file(raw: str) -> str:
     return path.stem.strip()
 
 
+# Marker prefix for `_omp_nested_agent_id`'s file-independent fallback (see its docstring and
+# README.md's "isMainSession" section for the full rationale) — a single source of truth so
+# the marker format never drifts between the producer here and any consumer/test asserting it.
+_NESTED_SESSION_MARKER_PREFIX = "omp-nested:"
+
+
 def _omp_nested_agent_id(omp_event: dict | None = None) -> str:
     """Agent id from a nested omp Task/eval transcript, or empty.
 
@@ -126,13 +132,29 @@ def _omp_nested_agent_id(omp_event: dict | None = None) -> str:
     ``ctx.sessionManager.getSessionFile()`` — omp's ExtensionContext has no top-level
     session getters, oh-my-pi#11214 / agent-tools#743) over process env
     ``PI_SESSION_FILE``. The Node hook process inherits the parent session env,
-    so env alone never sees the nested child path.
+    so env alone never sees the nested child path. Either source, once PRESENT, is
+    authoritative on its own path shape — a present-but-flat (main-shaped) file is real
+    evidence this is NOT a child, and short-circuits here without falling through further.
+
+    FALLBACK (live finding 2026-09-18, see README.md "isMainSession"): a genuinely nested
+    child's OWN session can still be in-memory — no session file at all yet, not even a
+    main-shaped one — for its first few tool calls. Only in that no-file-evidence-at-all
+    state does ``omp_event["isMainSession"] is False`` synthesize a marker id from the
+    bridge-trusted ``sessionId`` (never model/tool-controlled input), so `_is_subagent`
+    still exempts the call. An event with no ``isMainSession`` key (an older bridge, or an
+    existing test fixture) falls through unchanged.
     """
-    if omp_event:
-        nested = _nested_id_from_session_file(str(omp_event.get("sessionFile") or ""))
-        if nested:
-            return nested
-    return _nested_id_from_session_file(os.environ.get("PI_SESSION_FILE", ""))
+    session_file = str((omp_event or {}).get("sessionFile") or "").strip()
+    if session_file:
+        return _nested_id_from_session_file(session_file)
+    env_file = os.environ.get("PI_SESSION_FILE", "").strip()
+    if env_file:
+        return _nested_id_from_session_file(env_file)
+    if omp_event and omp_event.get("isMainSession") is False:
+        session_id = str(omp_event.get("sessionId") or "").strip()
+        if session_id:
+            return f"{_NESTED_SESSION_MARKER_PREFIX}{session_id}"
+    return ""
 
 
 def _detached_agent_id(omp_event: dict | None = None) -> str:

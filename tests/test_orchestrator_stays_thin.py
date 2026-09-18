@@ -359,6 +359,39 @@ def test_omp_bridge_nested_grandchild_pi_session_git_commit_is_allowed(tmp_path,
     assert c == 0 and _decision(out) == "allow"
 
 
+def test_in_memory_nested_child_pre_write_stays_exempt_across_repeat_calls(tmp_path, monkeypatch):
+    """Live finding (2026-09-18): a genuinely nested Task/eval child's OWN session can still
+    be in-memory — no session file persisted to disk yet — for its first few tool calls
+    (SessionManager mints getSessionId() synchronously at creation, but getSessionFile()
+    stays undefined until the session is actually written). With no session file at all, the
+    path-shape ancestor walk (#743/#760) has nothing to walk, args.agent_id was never
+    injected, and the child was silently gated as the orchestrator: its FIRST offending
+    pre-write WARNed (allowed, but recorded a marker), and its SECOND — and every further —
+    offending pre-write in the same cwd within the TTL window then BLOCKed, despite being a
+    genuine subagent throughout. `isMainSession=False` (extension.ts's file-independent,
+    always-available getSessionId()-based signal) must exempt this child on every call, not
+    just transiently: this drives THREE consecutive pre-write events for the SAME in-memory
+    child through the real bridge and the real hook, asserting the first, second, AND third
+    all ALLOW. Would FAIL pre-fix on call 2 (BLOCK, exit code ost.BLOCK_EXIT_CODE)."""
+    import importlib
+    dispatch = importlib.import_module("omp_hook_bridge.dispatch")
+    raw = {
+        "event": "tool_call",
+        "toolName": "edit",
+        "input": {"path": "/repo/src/a.ts"},
+        "cwd": "/repo",
+        "toolCallId": "call_1",
+        "sessionId": "in-memory-child-session",
+        "isMainSession": False,
+        # No sessionFile at all — the in-memory case this fix targets.
+    }
+    v1 = dispatch.to_v1_event(raw, point="pre-write")
+    assert v1["args"]["agent_id"] == "omp-nested:in-memory-child-session"
+    for attempt in (1, 2, 3):
+        out, _e, c = _run(v1, monkeypatch, tmp_path / "m")
+        assert c == 0 and _decision(out) == "allow", f"call {attempt} was not allowed: {out}"
+
+
 def test_deeply_nested_great_grandchild_session_still_exempts(tmp_path, monkeypatch):
     """The ancestor walk must not be hardcoded to exactly two levels: a THIRD-level nested
     dispatch (`task.maxRecursionDepth` raised above the default of 2) still has the root
