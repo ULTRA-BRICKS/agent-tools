@@ -1,6 +1,6 @@
 ---
 name: strict-ticket-discipline
-description: 'Use before starting any non-trivial change — a feature, a bugfix, a refactor — and whenever you file a ticket or tracked task, and before closing a ticket or checking off an acceptance criterion. Every change starts from a ticket (task-cli / GitHub Issue / Linear) written before work and referenced from the commit. The ticket must be self-explanatory cold: what is concretely wrong, evidence captured FIRST (a Playwright/Docker screenshot of the broken state, never screencapture; a failing run; a repro), where it came from, the user-facing consequence of not fixing it, provable acceptance criteria, and pseudocode when the fix is non-obvious. Plus five documentation rules: links-not-bare-ids, no close with unchecked acceptance boxes, no checked box without a visual proof, at least 2 criteria, and a plain-language user-impact.'
+description: 'Use before any non-trivial change, filing a ticket, or closing one. Every change starts from a ticket (task-cli/GitHub Issue/Linear) written before work: concrete problem, evidence FIRST (screenshot/failing run/repro), user impact, acceptance criteria. Enforces no unchecked-box closes; checked boxes need visual proof.'
 ---
 
 # Every non-trivial change starts from a ticket

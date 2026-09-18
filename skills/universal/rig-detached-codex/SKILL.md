@@ -1,13 +1,6 @@
 ---
 name: rig-detached-codex
-description: >-
-  Use when a codex orchestrator must dispatch a NON-TRIVIAL subagent in the background.
-  Codex CLI has no first-class "run this in the background and notify me" tool the way
-  Claude Code's Agent `fork`/`isolation: "remote"` does, and the background-subagent-gate /
-  orchestrator-stays-thin / no-long-inline-process hooks block a foreground dispatch or
-  inline long-running work. Run the bundled rig-detached-codex launcher - it detaches a
-  `codex exec` child carrying RIG_AGENT_ID/RIG_DETACHED_AGENT so the hook bridge classifies
-  every tool call in the child session as a dispatched subagent.
+description: 'Use when a codex orchestrator must dispatch a NON-TRIVIAL subagent in the background — Codex has no fork/isolation:"remote"; background-subagent-gate hooks block foreground dispatch. Run rig-detached-codex — it detaches a `codex exec` child so the hook bridge treats its calls as a subagent.'
 ---
 
 # rig-detached-codex — canonical detached-agent launcher for Codex CLI

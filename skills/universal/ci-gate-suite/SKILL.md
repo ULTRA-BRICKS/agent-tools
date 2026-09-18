@@ -1,6 +1,6 @@
 ---
 name: ci-gate-suite
-description: Use when setting up or extending CI / PR-merge gates for a repo — security scanning, an AI-review step, "block merge until X" rules (unresolved comments, unchecked checkboxes, missing screenshots), dependency/license review, conventional-commit title lint, leftover-marker grep, or a green-CI-gated merge command. Points at the ready-made, parameterized drop-ins in `ci/` instead of hand-rolling each gate.
+description: 'Use when setting up or extending CI/PR-merge gates — security scanning, an AI-review step, "block merge until X" rules, dependency/license review, commit-title lint, or a green-CI-gated merge command. Points at ready-made drop-ins in `ci/` instead of hand-rolling each gate.'
 ---
 
 # CI gate suite: adopt the drop-ins, don't hand-roll

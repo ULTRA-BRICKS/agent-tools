@@ -1,6 +1,6 @@
 ---
 name: learn-from-feedback
-description: Use the moment a user complains, corrects you, or expresses frustration ("again", "third time", "I keep telling you", "stop doing this", "every single time"), OR the moment you notice yourself repeating a process mistake you've made before. Triggers on any rebuke, correction, "you always/never", repeated rework on the same point, or a self-noticed recurring failure.
+description: 'Use the moment a user complains, corrects you, or expresses frustration ("again", "third time", "I keep telling you", "every single time"), or you notice yourself repeating a past process mistake. Triggers on any rebuke, "you always/never", repeated rework on the same point, or a self-noticed recurring failure.'
 ---
 
 # Extract the lesson from a complaint, don't just apologize and move on

@@ -1,6 +1,6 @@
 ---
 name: web-page-reading-agent-browser
-description: Use when reading a web page, documentation, or an API reference — ESPECIALLY a long page or JS-rendered content. Prefer the `agent-browser` CLI (`open` + `get text body` / `eval`) over a fetch-and-summarize tool, which truncates long pages and silently drops content. Also covers DOM inspection, extracting one section, screenshots, and browser automation.
+description: 'Use when reading a web page, docs, or an API reference — especially long or JS-rendered content. Prefer the `agent-browser` CLI (`open` + `get text body`/`eval`) over fetch-and-summarize, which truncates long pages and drops content. Also covers DOM inspection, extracting one section, screenshots, and browser automation.'
 ---
 
 # Read web pages with agent-browser, not a truncating fetch tool

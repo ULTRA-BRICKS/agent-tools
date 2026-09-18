@@ -1,12 +1,6 @@
 ---
 name: rig-detached-omp
-description: >-
-  Use when an omp (oh-my-pi) orchestrator must dispatch a NON-TRIVIAL subagent in the
-  background and cannot use the native `task` tool's async job for it (e.g. it needs to
-  survive the current session ending, or run outside a task-tool call entirely). Run the
-  bundled rig-detached-omp launcher - it detaches an `omp -p` child carrying
-  RIG_AGENT_ID/RIG_DETACHED_AGENT so the hook bridge classifies every tool call in the child
-  session as a dispatched subagent.
+description: 'Use when an omp (oh-my-pi) orchestrator must dispatch a NON-TRIVIAL subagent in the background and can''t use the native `task` tool''s async job (must outlive the session, or run outside a task-tool call). Run rig-detached-omp — it detaches an `omp -p` child carrying RIG_AGENT_ID so the hook bridge treats its calls as a subagent.'
 ---
 
 # rig-detached-omp — canonical detached-agent launcher for omp (oh-my-pi)

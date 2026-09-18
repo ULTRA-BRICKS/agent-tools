@@ -1,6 +1,6 @@
 ---
 name: git-merge-syntax-aware
-description: Use when a git merge, rebase, or cherry-pick produces conflicts that are purely structural — reordered imports or methods, formatting-only collisions, moved code — in a supported language (TS/TSX/JS/JSX/JSON/PY/RS/GO/YAML/TOML and more). A tree-sitter merge driver (mergiraf) resolves these by merging the AST instead of lines, where line-based git fails. Covers wiring it as the driver, manual single-file resolution, and the caveats that mean you must still typecheck after.
+description: 'Use when a git merge/rebase/cherry-pick conflict is purely structural — reordered imports/methods, formatting-only, moved code — in TS/JS/JSON/PY/RS/GO/YAML/TOML and more. The mergiraf tree-sitter driver merges the AST instead of lines. Covers wiring it as the driver, manual resolution, and that you must still typecheck after.'
 ---
 
 # Syntax-aware git merge with a tree-sitter driver
