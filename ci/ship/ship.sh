@@ -2945,6 +2945,7 @@ fi
 # reviewed PR"). A `--repo`/foreign-target ship never reads this checkout's file for a DIFFERENT
 # repo's PR either (same reasoning _acceptance_gate already applies to its own foreign-repo skip)
 # — and with the env path gone, a foreign invoke has no off-switch at all (hatch only).
+# Rig machine policy is additionally checked below; legacy base-only lookup is retained.
 EXTREV_ENABLED=1
 if [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ]; then
   EXTREV_PR_BASE=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null) || EXTREV_PR_BASE=""
@@ -3036,8 +3037,28 @@ _external_review_hatch_check() {  # uses $PR $BRANCH $DRY_RUN
   python3 -I "$_SHIP_EXTERNAL_REVIEW_HATCH_PY"
 }
 
+# BEGIN RIG MACHINE EXTERNAL REVIEW POLICY
+# Resolve the actual gh target (including --repo/GH_REPO), never assume CWD's owner.
+# This user-owned YAML policy is independent of the PR branch and only affects
+# this gate. All local/CI/review-quorum checks above remain in force.
+EXTREV_RIG_SOURCE=0
+if [ "$EXTREV_ENABLED" = "1" ]; then
+  EXTREV_RIG_TARGET=$(gh repo view "${_EFFECTIVE_TARGET:-${_CWD_ORIGIN_REPO:-}}" --json nameWithOwner,url -q 'select(.url | startswith("https://github.com/")) | .nameWithOwner' 2>/dev/null) || EXTREV_RIG_TARGET=""
+  EXTREV_RIG_DECISION=$(python3 -I "$_SHIP_SELF_DIR/rig_external_review_policy.py" "$EXTREV_RIG_TARGET" "$ROOT" 2>/dev/null) || EXTREV_RIG_DECISION=enabled
+  if [ "$EXTREV_RIG_DECISION" = "disabled" ]; then
+    EXTREV_ENABLED=0
+    EXTREV_RIG_SOURCE=1
+  fi
+fi
+# END RIG MACHINE EXTERNAL REVIEW POLICY
+
 if [ "$EXTREV_ENABLED" = "0" ]; then
-  echo "[ship] external-review gate disabled by the committed .ship-config on origin/${EXTREV_BASE} (SHIP_EXTERNAL_REVIEW=${EXTREV_CFG_VALUE})."
+  if [ "$EXTREV_RIG_SOURCE" = "1" ]; then
+    echo "[ship] external-review gate disabled by Rig machine policy for $EXTREV_RIG_TARGET. Other gates remain enabled."
+    _external_review_audit_log "external-review:disabled:rig-policy" "$EXTREV_RIG_TARGET"
+  else
+    echo "[ship] external-review gate disabled by the committed .ship-config on origin/${EXTREV_BASE} (SHIP_EXTERNAL_REVIEW=${EXTREV_CFG_VALUE})."
+  fi
 else
   # Guarded like every other `$(gh ...)` in this file (see the dwell/threads gates above) --
   # under `set -euo pipefail`, an UNGUARDED substitution would abort the whole script the

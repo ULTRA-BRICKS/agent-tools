@@ -310,3 +310,39 @@ its threads resolved, a review-dwell window elapsed (so review questions had tim
 (for UI) its screenshot present, its ticket accepted with proofs, and no magic-close keyword
 waiting to close that ticket behind the gates — without trusting yourself to remember. The CI
 workflows in this directory are the server-side backstop; `ship` is the client-side gate.
+
+## Rig machine policy for external PR review
+
+An explicit machine-owner policy can disable **only** the extra GitHub-side
+external-review gate across selected repository owners, without modifying every
+repository or authorizing each PR separately. Configure the Rig machine file
+`~/.config/rig/config.yaml` (or `$XDG_CONFIG_HOME/rig/config.yaml`):
+
+```yaml
+ci:
+  items:
+    ship:
+      require_external_review: false
+      external_review_owners:
+        - alex-mextner
+```
+
+`rig_external_review_policy.py` reads only this trusted machine file. The gate
+resolves the actual `gh repo view` target, including `--repo`/`GH_REPO`, and checks
+its exact owner against this list. A foreign owner's PR is not opted out merely
+because the current checkout is owned by the operator. Empty scope, wrong types,
+duplicate YAML keys, missing dependencies/files, unsafe permissions, symlinks and
+repository-local policy files never authorize the opt-out. The bounded parser
+runs with `python3 -I`; arbitrary project modules and ambient `SHIP_*` variables
+cannot replace this configuration. Rig registers these keys as Global-only.
+
+A successful machine decision is audited as
+`external-review:disabled:rig-policy` with the actual repository. It takes effect
+immediately on the next canonical `gh ship`; no CI/review-quorum/test/secret or
+permission gate is changed. Legacy `.ship-config` opt-outs from the trusted base
+remain supported. The earlier documentation's "only .ship-config or one-time
+hatch" statement applies when no explicit Rig machine policy is configured.
+
+The reader uses Rig's supported Python 3.10+ runtime and PyYAML. Parent Rig and
+XDG configuration directories must also be user-owned and not group/world writable.
+When the trusted base already opts out, no extra repository query is performed.
