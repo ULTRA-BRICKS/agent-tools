@@ -51,6 +51,18 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   subagent (`agent_id` present) is exempt and runs gh/ship freely — the gate governs the
   orchestrator only.
 
+  **UPDATE (Alex, 2026-09-18): a second, narrower exception — a fixed READ-ONLY gh allowlist.**
+  Unlike the `gh ship <PR#>` carve-out below (a per-LINE-only grant), this one is granted
+  per-segment, the SAME tier `tg`/`task` get: `gh issue list`/`view`, `gh pr list`/`view`/`checks`/
+  `diff`, `gh run list`/`view`/`watch`, `gh repo view`, and `gh api` carrying no non-GET method and
+  no `-f`/`-F`/`--input` data-payload flag (`_is_gh_readonly_command`, table
+  `_GH_READONLY_SUBCOMMANDS`) are sanctioned CI/PR *inspection* the orchestrator may run inline.
+  `_is_gh_command`/`_seg_is_impl_signal` are DELIBERATELY left unchanged — every gh invocation,
+  allowlisted shapes included, still trips them — so a chain that is not entirely composed of
+  allowed segments still treats a gh-readonly segment as its own implementation signal; this
+  grant only ever matters via the "ALL segments allowed" fast path. See "Read-only `gh`
+  allowlist" below for the full matrix.
+
   **UPDATE (Alex tg#9977, agent-tools#159): one narrow exception restored — a genuinely UNCHAINED
   `gh ship <PR#>`.** The orchestrator may run the gated merge itself inline again, matched only on
   the literal shape `gh ship <bare-PR-number>` (head `gh`, next token exactly `ship`, next token
@@ -109,6 +121,11 @@ orchestrator, single or chained, with or without `cd`/read-only plumbing (`gh sh
 substring/needle (`grep 'gh ship' log`, `git log | rg gh`) is **not** a gh command and exempts
 nothing. The **dispatched subagent** (`agent_id` present) is the one meant to verify and is
 exempt for everything.
+
+**UPDATE (Alex, 2026-09-18): a second, narrower exception — a fixed read-only gh allowlist.**
+`gh issue list`/`view`, `gh pr list`/`view`/`checks`/`diff`, `gh run list`/`view`/`watch`, `gh repo
+view`, and a payload-free-GET `gh api` are sanctioned for the orchestrator to run inline, granted
+per-segment (like `tg`/`task`), not per-line like `gh ship`. See "Read-only `gh` allowlist" below.
 
 **UPDATE (Alex tg#9977, agent-tools#159; narrowed by agent-tools#363):** a genuinely UNCHAINED
 `gh ship <PR#>` — the gated merge itself, matched narrowly on a bare PR-number argument, as the
@@ -286,6 +303,69 @@ DELEGATED (a 2-segment chain), not sanctioned — each merge still gets its own 
 `ci/ship/ship.sh` pipeline (green CI, review quorum, screenshot, etc.) if run separately as two
 unchained `gh ship <PR#>` calls; running several ships as ONE chained line is no longer a shortcut
 this gate grants inline.
+
+## Read-only `gh` allowlist (Alex, 2026-09-18)
+
+A SECOND, narrower exception to "ALL `gh` is delegated" (tg#7103): a fixed, explicit ALLOWLIST of
+gh shapes that are pure inspection — no state anywhere is ever mutated by running them — is
+sanctioned for the orchestrator to run inline. Session-authorized as a relaxation of the blanket
+gh gate specifically for read-only CI/PR *inspection*, not a reversal of the gate itself:
+«разрешить да, через rig это надо закрепить в хуке и белом списке» — "allow it, but codify
+it via the hook + an explicit allowlist."
+
+**Granted per-segment, the SAME tier `tg`/`task` get — NOT `gh ship`'s narrower per-LINE-only
+grant.** `_is_gh_readonly_command` is consulted directly by `_seg_is_allowed`, alongside
+`_is_tg_command`/`_is_task_command`/`ORCH_ALLOW`. This is a deliberately different design from
+`gh ship <PR#>`: `_is_gh_command` (and therefore `_seg_is_impl_signal`) is left UNCHANGED here —
+every gh invocation, allowlisted shapes included, still trips it — so a chain that is not
+*entirely* composed of allowed segments still treats a gh-readonly segment as its own
+implementation signal, closing off the exact "recognized-but-also-exempted-from-impl-signal"
+laundering hole agent-tools#363 fixed for `gh ship`. This grant only ever matters via the
+"ALL segments allowed" fast path in `_is_all_inline_allowed`.
+
+**The fixed table (`_GH_READONLY_SUBCOMMANDS`), a closed enumeration, not a heuristic — gh growing
+a new subcommand must NOT silently widen this grant:**
+- `gh issue list`, `gh issue view`
+- `gh pr list`, `gh pr view`, `gh pr checks`, `gh pr diff`
+- `gh run list`, `gh run view`, `gh run watch`
+- `gh repo view`
+
+**`gh api`, evaluated separately (`_is_gh_api_readonly`):** read-only iff NO `-f`/`-F`/`--input`
+data-payload flag appears anywhere (`_is_gh_api_write_flag` — bare or glued `-f`/`-F`, bare or
+`=`-glued `--field`/`--raw-field`/`--input`), AND every `-X`/`--method` value present is `GET`
+(case-insensitive, including gh's own glued short-flag form `-XGET`) — the method flag's ABSENCE
+also counts as GET, matching gh's own documented default. A `-X`/`--method` whose value cannot be
+determined (a bare trailing `-X`/`--method` with nothing after it) is treated as NOT GET — the safe
+direction for a GRANT-direction predicate facing uncertain input.
+
+**What matches (never warns, never blocks, at any chain length when the WHOLE chain is
+allowlisted-gh/`tg`/read-only):**
+- `gh issue list`, `gh issue view 42`, `gh pr list`, `gh pr view 5`, `gh pr checks 5`, `gh pr diff 5`
+- `gh run list`, `gh run view 9`, `gh run watch 123`, `gh repo view`
+- `gh api repos/o/r/pulls` (bare — no method flag counts as GET)
+- `gh api repos/o/r/pulls -X GET` / `--method GET` / `--method=GET`
+- `/usr/bin/gh pr view 5` (path-qualified), `GH_PAGER=cat gh pr view 5` (env-prefixed)
+- `gh pr list && gh pr view 5`, `gh run list && gh run view 9 && tg 'done'` (chained allowlisted reads)
+
+**What does NOT match — falls through to the general `gh` deny, still warn-then-blocks:**
+- `gh pr merge`/`create`/`close`/`edit`/`checkout`, `gh issue create`/`close`/`edit`, `gh release`,
+  `gh workflow`, `gh secret` — every mutating subcommand outside the fixed table
+- `gh ship` (bare or with a PR#) — deliberately absent from this table; it keeps its OWN, narrower,
+  per-LINE-only carve-out (see above) and is unaffected by this change
+- `gh api` with any non-GET method (`-X POST`, `--method POST`, `--method=POST`, glued `-XPOST`)
+- `gh api` carrying a payload flag REGARDLESS of method — `-f`/`-F`/`--field`/`--raw-field`/
+  `--input`, including a GET carrying one (`gh api … --method GET -f state=open`)
+
+**Does not launder a mutation elsewhere on the line — by design, via the UNCHANGED impl-signal:**
+`gh pr view 5; rm -rf /tmp/x` still delegates (warn-then-blocks): `_seg_is_allowed('gh pr view 5')`
+is `True`, but `_seg_is_impl_signal('gh pr view 5')` is ALSO `True` (unchanged), so the chain is
+never "ALL segments allowed" and falls through to the ordinary judgement of its full content —
+the same protection agent-tools#363 relies on for `gh ship`, achieved here structurally rather
+than by a per-line-only grant.
+
+**Subagent-exempt, same as everything else in this gate:** a dispatched subagent (`agent_id`
+present) runs every gh shape — allowlisted or not — freely regardless of this predicate; this
+grant only ever matters for the orchestrator.
 
 ## `tg` — formalized carve-out (tg-carveout-159, Alex direct Telegram authorization)
 
@@ -531,6 +611,8 @@ rc=$?; echo "exit=$rc"   # CHAINED gh ship <PR#> → exit=0 (first offense, WARN
                           # the carve-out is per-LINE, not per-segment; any companion delegates)
 echo '{"point":"pre-bash","cwd":"/r","args":{"command":"gh pr merge 605"}}' | ./orchestrator_stays_thin.py
 rc=$?; echo "exit=$rc"   # every OTHER gh subcommand → exit=0 (first offense, WARN)
+echo '{"point":"pre-bash","cwd":"/r","args":{"command":"gh pr view 605"}}' | ./orchestrator_stays_thin.py
+rc=$?; echo "exit=$rc"   # allowlisted gh read → exit=0 (allow, never warns — Alex, 2026-09-18)
 
 echo '{"point":"pre-bash","cwd":"/r","args":{"command":"TG_BOT_TOKEN=x tg --format html x"}}' \
   | ./orchestrator_stays_thin.py

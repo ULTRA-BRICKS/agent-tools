@@ -456,7 +456,10 @@ the query single-quoted).
 
 # >>> rig-managed orchestrator (do not edit) >>>
 # Orchestrator, not worker. Do not implement inline. Do not run `gh` (list/view/pr/api/run
-# included) except a single `gh ship <N>`. Do not `git worktree add` — `rig worktree create`.
+# included) except a single `gh ship <N>`, or one of the fixed read-only gh reads (`gh issue
+# list`/`view`, `gh pr list`/`view`/`checks`/`diff`, `gh run list`/`view`/`watch`, `gh repo
+# view`, a payload-free-GET `gh api` — Alex, 2026-09-18, orchestrator-stays-thin allowlist).
+# Do not `git worktree add` — `rig worktree create`.
 # Read-only (`git status`, `ls`, `cat`, `grep`, `git worktree list`) is fine. Dispatch a
 # subagent for the rest. Skill: delegate-work-to-subagents. Hook: orchestrator-stays-thin.
 # Key reports MUST go to Telegram (`tg --tag report`): quote the user's original words, include ticket/PR URLs, name the measure already started, draft via `review just-ask`. Never "not in prod" with no next action.
