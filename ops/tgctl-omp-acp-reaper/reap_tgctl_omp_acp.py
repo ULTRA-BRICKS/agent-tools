@@ -20,8 +20,10 @@ Reap ONLY when ALL of the following hold (positive match, never absence):
   - elapsed >= REPARENTED_MIN_AGE_S (15 min grace)
   - %cpu == 0.0 (idle — a live wedge-simulation child still being driven
     shows non-zero CPU occasionally; leaked fixtures are fully stuck)
-  - argv carries a structurally valid `/tgctl-omp-(acp|reply)-<suffix>`
-    temp-dir path token (tg-cli's mkdtemp prefix convention)
+  - argv carries a structurally valid `/tgctl-<prefix>-<suffix>` temp-dir path
+    token, where `<prefix>` is one of tg-cli's mkdtemp prefixes — see
+    `_TGCTL_MKDTEMP_PREFIXES` below for the current list and the source test
+    each one comes from (grown over time as new integration tests were added)
   - argv is an `omp acp` invocation (token-boundary `omp` + `acp` subcommand)
 
 A live `omp acp` child still owned by the running tg-ctl daemon has
@@ -50,8 +52,22 @@ from typing import Callable, Optional
 
 REPARENTED_MIN_AGE_S = 15 * 60  # 15 min, only when ppid == 1
 
-# tg-cli tests: mkdtempSync(join(tmpdir(), 'tgctl-omp-acp-')) / 'tgctl-omp-reply-'
-_TGCTL_TEMP_DIR_RE = re.compile(r"/tgctl-omp-(?:acp|reply)-[A-Za-z0-9]+")
+# Each entry is a tg-cli mkdtemp fixture prefix: mkdtempSync(join(tmpdir(), <prefix> + '-')).
+# Single source of truth — append new prefixes here ONLY (the module docstring and
+# README point back at this tuple instead of re-enumerating, after agent-tools#775
+# found the README drifting out of sync with a hand-duplicated list).
+_TGCTL_MKDTEMP_PREFIXES = (
+    "omp-acp",  # tests/ctl-omp-acp-integration.test.ts
+    "omp-reply",  # tests/ctl-omp-reply-no-tmux-integration.test.ts
+    "omp-anchor",  # tests/ctl-omp-anchor-multicandidate.test.ts
+    "hatch-proactive-live",  # observed variant of the prefix below; listed first (more specific)
+    "hatch-proactive",  # tests/ctl-hatch-critical-proactive-integration.test.ts
+    "headless-omp",  # tests/ctl-omp-acp-headless-discovery-integration.test.ts
+    "ff-omp",  # tests/ctl-persist-before-ack.test.ts
+)
+_TGCTL_TEMP_DIR_RE = re.compile(
+    r"/tgctl-(?:" + "|".join(re.escape(p) + "-" for p in _TGCTL_MKDTEMP_PREFIXES) + r")[A-Za-z0-9]+"
+)
 
 # Token-boundary `omp` executable + `acp` subcommand (not `omp --print`, not bare `omp`).
 _OMP_EXE_RE = re.compile(r"(?:^|\s)(?:/[^\s]+/)?omp(?:\s|$)")
@@ -123,7 +139,7 @@ class ReapReport:
 
 
 def has_tgctl_temp_dir_marker(args: str) -> bool:
-    """True when argv carries a tg-cli mkdtemp `tgctl-omp-(acp|reply)-*` path."""
+    """True when argv carries a recognized tg-cli mkdtemp `tgctl-<prefix>-*` path."""
     return _TGCTL_TEMP_DIR_RE.search(args) is not None
 
 
