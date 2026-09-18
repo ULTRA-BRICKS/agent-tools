@@ -18,7 +18,7 @@ ViewModels, Router navigation, constructor injection, `ViewState` enum, and
 Repository-based networking. Adopts a **production-first iterative refactoring** approach —
 every pattern is chosen for testability, reviewability, and safe incremental adoption in
 large teams. For non-architectural SwiftUI API guidance (animations, modern API
-replacements, Liquid Glass), use a general SwiftUI skill instead.
+replacements, Liquid Glass, view composition, code review), use the `swiftui-views` skill instead.
 
 ## What goes where
 

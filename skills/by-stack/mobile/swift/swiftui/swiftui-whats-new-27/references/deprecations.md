@@ -1,7 +1,7 @@
 # Deprecations
 **SDK Version:** 27.0 and later
 
-APIs hard-deprecated in SDK 27.0. Soft-deprecated APIs are covered by the `swiftui-specialist` skill's `soft-deprecated-apis.md` reference.
+APIs hard-deprecated in SDK 27.0. Soft-deprecated APIs are covered by the `swiftui-views` skill's `soft-deprecated-apis.md` reference.
 
 ## `View.statusBarHidden(_:)` on visionOS → remove
 
