@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import time
 from pathlib import Path
 
 _SCRIPT = (
@@ -35,6 +36,16 @@ HELPER_PATH_ARGS = (
 )
 RAYCAST_APP_ARGS = "/Applications/Raycast.app/Contents/MacOS/Raycast"
 CHROME_HELPER_ARGS = "Google Chrome Helper (Extensions)"
+
+
+# Fixed reference "now" for sweep()'s birth-token check. Tests monkeypatch
+# reaper.time.time to this value rather than relying on the real clock.
+FIXED_NOW = 1_800_000_000.0
+
+
+def _lstart_for(epoch: float) -> str:
+    """Render an epoch as the `ps -o lstart=` string the reaper parses."""
+    return time.strftime(reaper._LSTART_FORMAT, time.localtime(epoch))
 
 
 def _proc(pid, ppid, *, stat="S", age_s=None, args=HELPER_ARGS):
@@ -139,8 +150,13 @@ def test_sweep_signals_only_the_helper_pid(monkeypatch):
     ]
     killed = []
 
+    monkeypatch.setattr(reaper.time, "time", lambda: FIXED_NOW)
     monkeypatch.setattr(reaper, "_reread_args", lambda pid, run=None: HELPER_ARGS)
-    monkeypatch.setattr(reaper, "_process_start_time", lambda pid, run=None: "start-1")
+    monkeypatch.setattr(
+        reaper,
+        "_process_start_time",
+        lambda pid, run=None: _lstart_for(FIXED_NOW - reaper.MIN_ZOMBIE_AGE_S),
+    )
     report = reaper.sweep(
         list_processes=lambda: procs,
         kill=lambda pid, sig: killed.append((pid, sig)),
@@ -200,8 +216,13 @@ def test_sweep_escalates_to_sigkill_if_helper_survives_sigterm(monkeypatch):
     helper = _proc(49954, 49498, args=HELPER_ARGS)
     procs = [helper, _zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S)]
     killed = []
+    monkeypatch.setattr(reaper.time, "time", lambda: FIXED_NOW)
     monkeypatch.setattr(reaper, "_reread_args", lambda pid, run=None: HELPER_ARGS)
-    monkeypatch.setattr(reaper, "_process_start_time", lambda pid, run=None: "start-1")
+    monkeypatch.setattr(
+        reaper,
+        "_process_start_time",
+        lambda pid, run=None: _lstart_for(FIXED_NOW - reaper.MIN_ZOMBIE_AGE_S),
+    )
     report = reaper.sweep(
         list_processes=lambda: procs,
         kill=lambda pid, sig: killed.append((pid, sig)),
@@ -226,8 +247,13 @@ def test_sweep_no_sigkill_when_pid_is_reused_during_grace(monkeypatch):
         calls["n"] += 1
         return HELPER_ARGS if calls["n"] == 1 else RAYCAST_APP_ARGS
 
+    monkeypatch.setattr(reaper.time, "time", lambda: FIXED_NOW)
     monkeypatch.setattr(reaper, "_reread_args", fake_reread)
-    monkeypatch.setattr(reaper, "_process_start_time", lambda pid, run=None: "start-1")
+    monkeypatch.setattr(
+        reaper,
+        "_process_start_time",
+        lambda pid, run=None: _lstart_for(FIXED_NOW - reaper.MIN_ZOMBIE_AGE_S),
+    )
     report = reaper.sweep(
         list_processes=lambda: procs,
         kill=lambda pid, sig: killed.append((pid, sig)),
@@ -244,8 +270,13 @@ def test_sweep_no_sigkill_when_helper_dies_on_sigterm(monkeypatch):
     helper = _proc(49954, 49498, args=HELPER_ARGS)
     procs = [helper, _zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S)]
     killed = []
+    monkeypatch.setattr(reaper.time, "time", lambda: FIXED_NOW)
     monkeypatch.setattr(reaper, "_reread_args", lambda pid, run=None: HELPER_ARGS)
-    monkeypatch.setattr(reaper, "_process_start_time", lambda pid, run=None: "start-1")
+    monkeypatch.setattr(
+        reaper,
+        "_process_start_time",
+        lambda pid, run=None: _lstart_for(FIXED_NOW - reaper.MIN_ZOMBIE_AGE_S),
+    )
     report = reaper.sweep(
         list_processes=lambda: procs,
         kill=lambda pid, sig: killed.append((pid, sig)),
@@ -267,11 +298,13 @@ def test_sweep_no_sigkill_when_pid_reused_by_identical_argv_process(monkeypatch)
     procs = [helper, _zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S)]
     killed = []
     calls = {"n": 0}
+    first_start = _lstart_for(FIXED_NOW - reaper.MIN_ZOMBIE_AGE_S)
 
     def fake_start_time(pid, run=None):
         calls["n"] += 1
-        return "start-1" if calls["n"] == 1 else "start-2"
+        return first_start if calls["n"] == 1 else "start-2"
 
+    monkeypatch.setattr(reaper.time, "time", lambda: FIXED_NOW)
     monkeypatch.setattr(reaper, "_reread_args", lambda pid, run=None: HELPER_ARGS)
     monkeypatch.setattr(reaper, "_process_start_time", fake_start_time)
     report = reaper.sweep(
@@ -300,6 +333,92 @@ def test_sweep_skips_when_start_time_unavailable(monkeypatch):
     )
     assert killed == []
     assert report.reaped == []
+
+
+def test_sweep_refuses_pid_reused_by_fresh_respawn_before_first_sigterm(monkeypatch):
+    """Review follow-up #683 (race 1, birth-token check): the process-list
+    snapshot that decided to reap this ppid and the pre-SIGTERM identity
+    reread are two separate `ps` calls. If the original helper pid exits
+    and a brand-new same-argv Helper reuses it in between, `_reread_args`/
+    `_process_start_time` describe the NEW process. Its real lstart reads
+    ~now, but the snapshot's inferred birth epoch (now - parent.age_s) is
+    >= MIN_ZOMBIE_AGE_S in the past, since a zombie can never be older
+    than its own parent — sweep() must refuse rather than signal it."""
+    helper = _proc(49954, 49498, args=HELPER_ARGS)
+    procs = [helper, _zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S)]
+    killed = []
+    monkeypatch.setattr(reaper.time, "time", lambda: FIXED_NOW)
+    monkeypatch.setattr(reaper, "_reread_args", lambda pid, run=None: HELPER_ARGS)
+    # Fresh respawn: real lstart is ~now, not FIXED_NOW - MIN_ZOMBIE_AGE_S.
+    monkeypatch.setattr(
+        reaper, "_process_start_time", lambda pid, run=None: _lstart_for(FIXED_NOW)
+    )
+    report = reaper.sweep(
+        list_processes=lambda: procs,
+        kill=lambda pid, sig: killed.append((pid, sig)),
+        sleeper=lambda _s: None,
+        pid_alive=lambda _pid: True,
+    )
+    assert killed == []
+    assert report.reaped == []
+    assert report.killed_pids == []
+
+
+def test_sweep_allows_small_timing_slop_in_birth_token(monkeypatch):
+    """The genuine, unchanged helper's lstart won't line up to the
+    microsecond with `now0 - parent.age_s` (etime/lstart both round to
+    whole seconds, plus the small gap between the two `ps` calls). A few
+    seconds of drift must not trip the birth-token check."""
+    helper = _proc(49954, 49498, args=HELPER_ARGS)
+    procs = [helper, _zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S)]
+    killed = []
+    monkeypatch.setattr(reaper.time, "time", lambda: FIXED_NOW)
+    monkeypatch.setattr(reaper, "_reread_args", lambda pid, run=None: HELPER_ARGS)
+    monkeypatch.setattr(
+        reaper,
+        "_process_start_time",
+        lambda pid, run=None: _lstart_for(FIXED_NOW - reaper.MIN_ZOMBIE_AGE_S + 2),
+    )
+    report = reaper.sweep(
+        list_processes=lambda: procs,
+        kill=lambda pid, sig: killed.append((pid, sig)),
+        sleeper=lambda _s: None,
+        pid_alive=lambda _pid: False,
+    )
+    assert report.killed_pids == [49954]
+
+
+def test_sweep_refuses_when_start_time_unparseable(monkeypatch):
+    """An lstart string in an unexpected shape can't be turned into an
+    epoch for the birth-token check — refuse rather than guess."""
+    helper = _proc(49954, 49498, args=HELPER_ARGS)
+    procs = [helper, _zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S)]
+    killed = []
+    monkeypatch.setattr(reaper.time, "time", lambda: FIXED_NOW)
+    monkeypatch.setattr(reaper, "_reread_args", lambda pid, run=None: HELPER_ARGS)
+    monkeypatch.setattr(
+        reaper, "_process_start_time", lambda pid, run=None: "not a real lstart"
+    )
+    report = reaper.sweep(
+        list_processes=lambda: procs,
+        kill=lambda pid, sig: killed.append((pid, sig)),
+        sleeper=lambda _s: None,
+        pid_alive=lambda _pid: True,
+    )
+    assert killed == []
+    assert report.reaped == []
+
+
+def test_parse_lstart_epoch_roundtrips_with_lstart_format():
+    epoch = 1_800_000_000.0
+    rendered = _lstart_for(epoch)
+    assert reaper._parse_lstart_epoch(rendered) == time.mktime(
+        time.strptime(rendered, reaper._LSTART_FORMAT)
+    )
+
+
+def test_parse_lstart_epoch_returns_none_for_garbage():
+    assert reaper._parse_lstart_epoch("not a timestamp") is None
 
 
 def test_sweep_empty_process_list():
