@@ -12,6 +12,7 @@ hatches have no audit sink"). See `_append_overrides_log` for the record shape a
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import os
@@ -318,6 +319,24 @@ def request_hatch_approval(
     return result
 
 
+def _operation_fingerprint(hook_id: str, context: Mapping[str, object]) -> str:
+    """Deterministic identity for the OPERATION a hatch ask is about (tg-cli#398's late-approval
+    grant protocol): `hookId` + this fingerprint is what `tg-ctl`'s `isGrantableRequest` needs to
+    mint a grant when a human taps Approve after the request itself has already expired.
+
+    Deliberately excludes the free-text justification: two asks for the SAME operation (a retry
+    with a differently-worded reason) must fingerprint identically, or a late approval could never
+    match the retried request. `context` is dumped with `sort_keys=True` so the same `hook_id` +
+    `context` always hashes the same across separate Python process invocations (each hook run is
+    a fresh interpreter — there is no in-memory state to carry this identity another way).
+    """
+    return hashlib.sha256(
+        "\x00".join([hook_id, json.dumps(context, sort_keys=True, default=str)]).encode(
+            "utf-8", "surrogatepass"
+        )
+    ).hexdigest()
+
+
 def _request_present_hatch_approval(
     hook_id: str,
     context: Mapping[str, object],
@@ -405,6 +424,14 @@ def _request_present_hatch_approval(
     # bound; `effective_timeout` only ever bounds how long THIS process waits for
     # tg-ctl to give up and exit, never the daemon's own deadline.
     request_id = f"hatch-{hook_id}-{uuid.uuid4().hex[:12]}"
+    # tg-cli#398/PR#400 shipped the daemon-side "late-approval grant" protocol: a Telegram
+    # Approve tap that arrives after this request has already expired can still mint a grant
+    # for a plain retry of the SAME operation, but only if `isGrantableRequest` on the tg-ctl
+    # side finds `hookId` + `operation.fingerprint` + `operation.cwd` all present below. This
+    # fingerprint is what identifies "the same operation" across the two separate `tg-ctl ask`
+    # invocations (the original, now-expired ask and the later retry) — see
+    # `_operation_fingerprint`'s docstring for why the justification text is excluded.
+    operation_fingerprint = _operation_fingerprint(hook_id, context)
     button_request = {
         "requestId": request_id,
         "agent": _ASK_AGENT,
@@ -418,6 +445,16 @@ def _request_present_hatch_approval(
         # requesting agent's live session by matching THIS field against `listLiveOmpAgents()` on
         # the tg-cli side — reusing that existing live-session lookup, not a new identity scheme.
         "cwd": cwd,
+        # `hookId` + `operation`: required by tg-ctl's `isGrantableRequest` to mint a
+        # late-approval grant (tg-cli#398/PR#400). Without these, EVERY hatch ask —
+        # however recent — was silently ungrantable on a late Approve tap; see
+        # `_operation_fingerprint` for the identity scheme.
+        "hookId": hook_id,
+        "operation": {
+            "kind": hook_id,
+            "fingerprint": operation_fingerprint,
+            "cwd": cwd,
+        },
     }
     # Best-effort tie-breaker alongside `cwd` for the same proactive-delivery match (tg-cli#403
     # design decision 4): mirrors exactly how tg-ctl's own `askDaemon()` captures `env.paneId`

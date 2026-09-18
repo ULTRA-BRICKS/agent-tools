@@ -202,6 +202,70 @@ def test_real_justification_exit0_allows_and_includes_context(tmp_path):
     assert result.tg_ctl_path == str(tg_ctl.resolve())
 
 
+# --- hookId/operation grant fields (tg-cli#398/PR#400 late-approval grant protocol) ----------
+#
+# `tg-ctl`'s `isGrantableRequest` refuses to mint a late-approval grant unless the original
+# ButtonRequest carried `hookId` plus a non-empty `operation.fingerprint`/`operation.cwd`. Every
+# hatch ask sent by this library must include them, or a Telegram Approve tap arriving after the
+# request's own window has already expired can never be bound back to it.
+
+
+def test_button_request_carries_hook_id_and_operation_fields(tmp_path):
+    capture_file = tmp_path / "captured.json"
+    tg_ctl = _write_tg_ctl(
+        tmp_path / "trusted" / "tg-ctl",
+        f'cat > "{capture_file}"\n' + _ALLOW_REPLY_SH,
+    )
+    repo = _repo_with_tg_ctl(tmp_path)
+    hook_id = "pin-primary-worktree"
+    env_var = hatch_env_var(hook_id)
+
+    result = request_hatch_approval(
+        hook_id,
+        {"repo": str(repo), "command": "git checkout feat/x"},
+        cwd=str(repo),
+        env={env_var: "Need to inspect the primary checkout before repairing it."},
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+    assert result.approved is True
+    payload = json.loads(capture_file.read_text())
+    assert payload["hookId"] == hook_id
+    assert payload["operation"]["kind"] == hook_id
+    assert payload["operation"]["cwd"] == str(repo)
+    assert isinstance(payload["operation"]["fingerprint"], str)
+    assert payload["operation"]["fingerprint"] != ""
+
+
+def test_operation_fingerprint_is_deterministic_across_calls(tmp_path):
+    """The SAME hook_id + context must fingerprint identically on two separate calls -- each
+    hook invocation is a fresh Python process, so nothing but the inputs themselves can carry
+    this identity between the original ask and a later retry of the same operation."""
+    context = {"repo": "/tmp/repo", "command": "git checkout feat/x"}
+
+    first = agenttools_hatch_escalation._operation_fingerprint("pin-primary-worktree", context)
+    second = agenttools_hatch_escalation._operation_fingerprint(
+        "pin-primary-worktree", {"command": "git checkout feat/x", "repo": "/tmp/repo"}
+    )
+
+    assert first == second
+
+
+def test_operation_fingerprint_differs_for_different_context(tmp_path):
+    """Two asks for the SAME hook at the SAME cwd but a DIFFERENT operation (a different `command`
+    in context) must fingerprint differently -- this is what stops a late approval from ever
+    being bound to the wrong operation once a pull/redemption flow consumes the fingerprint."""
+    fp_a = agenttools_hatch_escalation._operation_fingerprint(
+        "pin-primary-worktree", {"repo": "/tmp/repo", "command": "git checkout feat/x"}
+    )
+    fp_b = agenttools_hatch_escalation._operation_fingerprint(
+        "pin-primary-worktree", {"repo": "/tmp/repo", "command": "git checkout feat/y"}
+    )
+
+    assert fp_a != fp_b
+
+
 def test_question_renders_title_agent_branch_path_up_top_and_collapses_rest(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
