@@ -19,8 +19,29 @@ is scoped to writing, not to every session.
 Prefer, in this order: `rig worktree create <name>` where `rig` is available (the validated,
 canonical convention — `<repo>/.worktrees/<name>`, auto-registered in `.git/info/exclude`);
 Claude Code's `EnterWorktree` tool; otherwise a raw `git worktree add` per the pattern below.
+`commandcode` has its own native equivalent — a `-w`/`--worktree` launch flag, an in-session
+`/worktree` slash command, and model-driven `enter_worktree`/`exit_worktree` tools — though it
+manages worktrees outside the repo, under `~/.commandcode/worktrees/`, not this convention's
+`<repo>/.worktrees/<name>`. `pi` has no native worktree tooling of its own; it relies entirely
+on `rig worktree create` or a raw `git worktree add`.
 
 ## Pattern
+
+Preferred — `rig worktree create`/`rig worktree remove` (idempotently ignores `.worktrees/`
+in `.git/info/exclude`, never touches the committed `.gitignore`, and `remove` also deletes
+the branch `create` made, so a same-name retry doesn't collide):
+
+```bash
+run_id="$(date +%s)-$$"
+rig worktree create "agent-$run_id"   # -> <repo>/.worktrees/agent-$run_id, branch agent-$run_id
+trap 'rig worktree remove "agent-$run_id" 2>/dev/null' EXIT INT TERM
+cd ".worktrees/agent-$run_id"
+
+# ... do the work here — fully isolated from other runs ...
+```
+
+Fallback — only when `rig` isn't available on that machine/repo, a raw `git worktree add`
+with the same signal-safe cleanup:
 
 ```bash
 # Each parallel run gets a uniquely-named, isolated worktree.
