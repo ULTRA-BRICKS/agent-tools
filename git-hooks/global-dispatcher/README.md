@@ -27,7 +27,7 @@ automatically takes effect everywhere, with zero per-repo changes.
 │   │   └── 10-secret-scan           # gitleaks tiered staged-diff gate (block + warn)
 │   ├── commit-msg/
 │   └── pre-push/
-│       └── 10-protect-main          # block direct pushes to main/master (audited PUSH_MAIN_OK escape)
+│       └── 10-protect-main          # block direct main/master pushes after empty-repo bootstrap (audited PUSH_MAIN_OK escape)
 ├── hooks/                           # the GLOBAL composers (core.hooksPath target)
 │   ├── pre-commit                   # repo-local hook → dispatcher → review-gate
 │   ├── commit-msg                   # repo-local hook → dispatcher

@@ -843,10 +843,39 @@ git -C "$RPM" remote add origin "$TMP/rpm-origin.git"
 git -C "$RPM" config core.hooksPath "$HERE/hooks"
 pp_push() { ( cd "$RPM" && GLOBAL_HOOKS_DIR="$GHD_PP" git push "$@" >/dev/null 2>&1 ); }
 
-LABEL="protect-main blocks a direct push to main"
+LABEL="protect-main allows the first root commit to an empty remote main"
+assert pp_push origin main
+( cd "$RPM" && echo second >> seed.txt && git add seed.txt \
+    && git -c core.hooksPath= commit -q --no-verify -m second )
+LABEL="protect-main blocks a second direct push to main"
 assert_not pp_push origin main
 LABEL="protect-main allows a feature-branch push"
 assert pp_push origin main:feat-x
+
+# A missing main branch is not enough: bootstrap is allowed only when the ENTIRE remote is empty.
+# Seed another branch, then prove creating main directly is still blocked.
+RPM_NONEMPTY="$TMP/rpm-nonempty"; mk_repo "$RPM_NONEMPTY"
+git -C "$RPM_NONEMPTY" branch -M main
+git init -q --bare "$TMP/rpm-nonempty-origin.git"
+git -C "$RPM_NONEMPTY" remote add origin "$TMP/rpm-nonempty-origin.git"
+git -C "$RPM_NONEMPTY" push -q origin main:seed
+git -C "$RPM_NONEMPTY" config core.hooksPath "$HERE/hooks"
+ne_push() { ( cd "$RPM_NONEMPTY" && GLOBAL_HOOKS_DIR="$GHD_PP" git push "$@" >/dev/null 2>&1 ); }
+LABEL="protect-main blocks creating main when remote already has another ref"
+assert_not ne_push origin main
+
+# Likewise, an empty remote does not waive history: only a single root commit is bootstrap.
+RPM_HISTORY="$TMP/rpm-history"; mk_repo "$RPM_HISTORY"
+git -C "$RPM_HISTORY" branch -M main
+( cd "$RPM_HISTORY" && echo second >> seed.txt && git add seed.txt \
+    && git -c core.hooksPath= commit -q --no-verify -m second )
+git init -q --bare "$TMP/rpm-history-origin.git"
+git -C "$RPM_HISTORY" remote add origin "$TMP/rpm-history-origin.git"
+git -C "$RPM_HISTORY" config core.hooksPath "$HERE/hooks"
+hist_push() { ( cd "$RPM_HISTORY" && GLOBAL_HOOKS_DIR="$GHD_PP" git push "$@" >/dev/null 2>&1 ); }
+LABEL="protect-main blocks multi-commit first push to an empty remote main"
+assert_not hist_push origin main
+
 rm -f "$OVLOG"
 LABEL="PUSH_MAIN_OK=1 allows the push to main"
 assert env PUSH_MAIN_OK=1 PUSH_MAIN_REASON=selfcheck sh -c \
@@ -947,7 +976,11 @@ GLOBAL_HOOKS_DIR="$GHD_PP" "$INSTALLER" "$RHPP" >/dev/null
 git init -q --bare "$TMP/rhuskypp-origin.git"
 git -C "$RHPP" remote add origin "$TMP/rhuskypp-origin.git"
 hpp_push() { ( cd "$RHPP" && GLOBAL_HOOKS_DIR="$GHD_PP" git push "$@" >/dev/null 2>&1 ); }
-LABEL="husky repo: direct push to main is BLOCKED (refs reach protect-main via stdin)"
+LABEL="husky repo: first root commit to empty remote main passes through protect-main"
+assert hpp_push origin main
+( cd "$RHPP" && echo second >> seed.txt && git add seed.txt \
+    && git -c core.hooksPath= commit -q --no-verify -m second )
+LABEL="husky repo: second direct push to main is BLOCKED (refs reach protect-main via stdin)"
 assert_not hpp_push origin main
 LABEL="husky repo: feature-branch push passes"
 assert hpp_push origin main:feat-h
