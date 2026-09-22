@@ -200,6 +200,22 @@ stays enabled). Role coverage is the predicate; `distinct_models_passed` is tele
   untouched. Under `--dry-run` the edit is printed, not made.
 - `--screenshot <path> [desc]` — upload (via `SHIP_IMAGE_UPLOAD_CMD`) and post a screenshot
   as a PR comment; repeatable.
+- `--task-config <path>` — an explicit task-cli config file for this ship's ticket, for a
+  ticket whose tracker differs from the repository's own task routing (e.g. a Tasks-app ticket
+  such as `UB-25` shipped from a Forgejo repository). ship passes it as task-cli's standard
+  `--config <path>` to the acceptance gate (`task gate`) and to the post-merge `task
+  mark-shipped` / auto-close `task done`; task-cli always runs in the repository root, never with
+  `-C`. A missing or unreadable file refuses before any gate runs. With `--task-config`, every
+  acceptance outcome that is a logged skip without it (task-cli missing, unparseable output,
+  `task gate` exit ≥ 2 such as an invalid config) refuses instead. It never disables or waives the
+  gate: the ticket must still be accepted (or carry a recorded post-merge-acceptance reason).
+  The file must be **routing-only** — `backend` (`tasks` or `forgejo`) plus that backend's block
+  (`tasks: {url, team}` / `forgejo: {repo, url}`); any other key (enforcement or policy settings
+  such as switching the acceptance gate off), duplicate keys, or non-plain YAML refuses before any
+  gate runs ([`task_config_guard.py`](task_config_guard.py)). And with `--task-config`, as on the
+  Forgejo provider, a `task gate` exit 0 counts only when its JSON says `ok: true`,
+  `gate_enabled: true` and the ticket is not cancelled — a disabled acceptance gate is not
+  evidence.
 - `--known-flake <check-name>` — assert that the FAILED check named `<check-name>` (exactly as
   printed by the green-CI gate's own `x <name> -> <conclusion>` refusal lines) is a pre-existing
   failure unrelated to this diff, not the "CI is structurally down" case above. Repeatable — one
@@ -310,6 +326,76 @@ its threads resolved, a review-dwell window elapsed (so review questions had tim
 (for UI) its screenshot present, its ticket accepted with proofs, and no magic-close keyword
 waiting to close that ticket behind the gates — without trusting yourself to remember. The CI
 workflows in this directory are the server-side backstop; `ship` is the client-side gate.
+
+## Forgejo provider
+
+`gh ship <PR>` (and `ship.sh <PR>`) also ship a pull request from a checkout whose `origin` is a
+**Forgejo** host. There is no separate command, and `fj` gains no `ship` subcommand; the
+sanctioned entrypoint dispatches by origin:
+
+| `origin` | Provider |
+| --- | --- |
+| `github.com` (any URL form), a local path, `file://`, or no origin | GitHub — the unchanged `gh` path |
+| any other host | probed with the Forgejo-only `GET /api/forgejo/v1/version`; confirmed → Forgejo, otherwise **refuse** |
+
+`SHIP_PROVIDER=github|forgejo|auto` (default `auto`) pins the choice, e.g. `github` for a GitHub
+Enterprise origin. Before this, a Forgejo checkout's `gh` silently resolved a different remote
+(an archived GitHub mirror), so every gate read the wrong repository.
+
+**How it works.** For a Forgejo origin, ship binds a shell function named `gh` to
+[`forgejo_provider.py`](forgejo_provider.py) (stdlib Python). Every gate in `ship.sh` runs
+**unchanged** against Forgejo evidence; child processes (`task`, `review`, the hatch helpers)
+never see the function. Only the `gh` invocations ship makes are mapped; anything else exits
+non-zero with a reason, which every call site treats as refuse or as "no extra evidence".
+
+| Gate | Forgejo evidence (API v1, Swagger 16.0.3) |
+| --- | --- |
+| open / not draft / mergeable | `PullRequest.state`, `draft`, `merged`, `mergeable` (`false`, including "not computed yet", is reported as CONFLICTING) |
+| exact base (BEHIND) | `PullRequest.merge_base` vs `Branch.commit.id` of the base — **strict**: any base movement refuses |
+| green CI | `CombinedStatus.statuses` for the **pinned** head sha; required contexts from `Branch.enable_status_check` / `status_check_contexts` (globs) that never reported are added as pending, so ship waits and then refuses |
+| CI outage → local fallback gate | same rule as GitHub, reading the first non-empty of `.forgejo/workflows`, `.gitea/workflows`, `.github/workflows` on `origin/<base>` |
+| unresolved review threads | every review's comments are read (never skipped on `comments_count`); a conversation is keyed by `pull_request_review_id` + `original_commit_id` + `path` + line (`position`/`original_position`), a line-less comment is its own conversation, and it is resolved only when its **first** comment has `resolver` (Forgejo resolves through the first comment) — an older resolved conversation on the same line never hides a newer one |
+| review dwell | `created_at`, head commit `committer.date`, latest `pull_push` timeline event |
+| external review (≥1 review) | `PullReview` entries with state APPROVED / REQUEST_CHANGES / COMMENT (PENDING drafts and REQUEST_REVIEW rows are not reviews) |
+| acceptance (task-cli) | `task gate <code> --json` exactly as on GitHub — the ticket is resolved by task-cli, never through the Forgejo issues API. **Difference:** every "could not evaluate" case that is a logged skip on GitHub (task-cli missing, a foreign `task`, unparseable output, `task gate` exit ≥ 2 such as an unroutable ticket) **refuses** on Forgejo. A ticket that lives in another tracker is routed with `--task-config <path>` (see Flags) |
+| magic-close, review-quorum, screenshot, version bump, clean pushed tree | unchanged; they read title / body / commits / files / diff through the adapter, or local git |
+| merge | `POST /pulls/{index}/merge` with `Do` and `head_commit_id` = the head pinned at the first read (Forgejo answers 409 if the head moved); `--skip-ci` maps to `force_merge` after its hatch approval; audited to `SHIP_AUDIT_FILE` as `gate:"merge", provider:"forgejo"` |
+| post-merge | `task mark-shipped` notify as on GitHub (never closes the ticket); remote branch delete via `git push origin --delete` |
+
+**Evidence ledger.** Some `ship.sh` call sites tolerate a failed `gh` (`|| true`, a fallback
+value) because on GitHub that failure only means "no extra evidence". On Forgejo ship creates a
+per-run ledger at start (refusing if it cannot), and the `gh` wrapper logs `start` before and
+`ok` after every adapter call and appends every failure — unsupported call, HTTP error, moved
+head, crash, even a SIGKILL — to `fatal.log`. The final pre-merge check (after re-reading the PR
+head) refuses the ship, dry-run included, unless the ledger is intact, every started call
+completed, and `fatal.log` is empty; it prints each recorded reason.
+
+**Head pinning.** The first PR read pins the head sha in a per-run state directory. Every later
+read refuses if the head moved, CI statuses are read for the pinned sha, and the merge sends that
+sha as `head_commit_id`.
+
+**Credentials** are bound to the origin host: fj's key store entry for exactly that host
+(`fj auth login` / `fj auth add-token`), or `SHIP_FORGEJO_TOKEN` only together with
+`SHIP_FORGEJO_TOKEN_HOST` naming the same host. `GH_TOKEN`/`GITHUB_TOKEN` are never read. HTTP
+redirects are refused, so a token never reaches another host. Plain `http://` is accepted only
+for a loopback origin (tests). Without a credential, reads are anonymous (public repositories
+only); every write (merge, comment, edit) refuses.
+
+**Fails closed on Forgejo (no evidence source):**
+
+- `--resolve-addressed-threads`: Forgejo has no `isOutdated` or GraphQL resolve mutation, so the
+  auto-resolve query is unsupported and the run refuses (see the evidence ledger below). Resolve
+  conversations in the web UI and ship without the flag.
+- `--known-flake` and the "CI structurally down" re-classification of failed checks: both rely on
+  GitHub Actions run history / githubstatus.com, so a failing Forgejo check always refuses.
+- `--repo` / `GH_SHIP_REPO` / `GH_REPO`: GitHub-only; run ship from the Forgejo checkout.
+- The Rig machine external-review policy (below) is read for the Forgejo origin's own
+  `owner/repo`; the owner list carries no host, so an owner listed there is opted out on both
+  GitHub and Forgejo. An owner that is not listed still needs a real review, the base-branch
+  `.ship-config` opt-out, or the one-time hatch.
+- Warning statuses count as failures; an unknown status value counts as an error.
+- PRs migrated from GitHub lost their conversation resolution, so their migrated review comments
+  read as unresolved.
 
 ## Rig machine policy for external PR review
 
