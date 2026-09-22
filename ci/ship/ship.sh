@@ -3180,7 +3180,7 @@ _external_review_hatch_check() {  # uses $PR $BRANCH $DRY_RUN
 # this gate. All local/CI/review-quorum checks above remain in force.
 EXTREV_RIG_SOURCE=0
 if [ "$EXTREV_ENABLED" = "1" ]; then
-  if [ "$SHIP_PROVIDER_RESOLVED" = "forgejo" ]; then
+  if [ "${SHIP_PROVIDER_RESOLVED:-github}" = "forgejo" ]; then
     # The same trusted machine policy, checked against the Forgejo origin's own owner/repo.
     EXTREV_RIG_TARGET=$(gh repo view "" --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || EXTREV_RIG_TARGET=""
   else
@@ -3903,7 +3903,7 @@ _acceptance_gate
 # receipt; re-read the PR once more (a moved head is recorded too), then refuse on ANY entry.
 # The merge itself still sends the pinned head as head_commit_id (server-side race check).
 _ship_forgejo_final_preflight() {
-  [ "$SHIP_PROVIDER_RESOLVED" = "forgejo" ] || return 0
+  [ "${SHIP_PROVIDER_RESOLVED:-github}" = "forgejo" ] || return 0
   gh pr view "$PR" --json headRefOid -q '.headRefOid' >/dev/null 2>&1 || true
   local dir="$_SHIP_FORGEJO_STATE_DIR" starts oks problem=""
   if [ ! -f "$dir/ready" ] || [ ! -f "$dir/fatal.log" ] || [ ! -f "$dir/calls.log" ] || [ -e "$dir/broken" ]; then
