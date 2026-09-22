@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- `cc-hook-bridge`: one hard wall-clock budget (1100s) for all agent-hooks run on a single
+  Claude Code tool call. Two hatch approval waits (960s each) in one pre-bash call used to
+  exceed Claude Code's outer 1200s hook timeout, and a killed command hook fails OPEN. Each
+  hook's timeout is now clamped to the remaining budget (fail-closed when clamped); once the
+  budget is spent the remaining hooks are skipped and the call is blocked, overriding any
+  earlier grant.
 - `omp-hook-bridge`: round-3 hardening of the `eval` tool's write-call secret-scan heuristic
   (agent-tools#614). Four further security-review findings closed:
   - A JS `\u{HEX}` Unicode code-point escape that widens to a literal backslash (e.g. `\u{5c}`)
