@@ -368,7 +368,10 @@ per-run ledger at start (refusing if it cannot), and the `gh` wrapper logs `star
 `ok` after every adapter call and appends every failure — unsupported call, HTTP error, moved
 head, crash, even a SIGKILL — to `fatal.log`. The final pre-merge check (after re-reading the PR
 head) refuses the ship, dry-run included, unless the ledger is intact, every started call
-completed, and `fatal.log` is empty; it prints each recorded reason.
+completed, and `fatal.log` is empty; it prints each recorded reason. The wrapper records a call's
+outcome before releasing its output, and the exit trap lets in-flight calls finish (bounded)
+before it removes the ledger; on a refusal it first prints a one-line ledger summary (calls
+started / completed / failed, plus each recorded reason) to stderr.
 
 **Head pinning.** The first PR read pins the head sha in a per-run state directory. Every later
 read refuses if the head moved, CI statuses are read for the pinned sha, and the merge sends that

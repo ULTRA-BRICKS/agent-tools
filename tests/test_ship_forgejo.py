@@ -995,3 +995,30 @@ def test_task_config_guard_accepts_routing_files(text):
 def test_task_config_guard_refuses_everything_else(text):
     with pytest.raises(tcg.ConfigRefused):
         tcg.parse_routing(text)
+
+
+# --- evidence ledger vs. the EXIT trap (process-substitution race) ----------------------------
+
+
+def test_refusal_with_a_slow_background_gh_call_keeps_the_evidence_and_prints_no_stray_errors(forge):
+    # `read ... < <(gh pr view ...)` runs the wrapper in a background subshell. The provider here
+    # prints its answer and then lingers, so ship refuses (BEHIND) while that call is still in
+    # flight. Its ledger outcome must be captured before the trap removes the ledger.
+    _fake_python(forge, "headRefName", '"$REAL_PY" "$@"; rc=$?; sleep 1; exit $rc')
+    forge["fake"].state["main_sha"] = "c" * 40
+    import shutil
+    r = _ship(forge, "--dry-run", REAL_PY=shutil.which("python3"))
+    out = r.stdout + r.stderr
+    assert r.returncode != 0 and "BEHIND" in r.stderr, out
+    assert "No such file" not in out, out
+    assert "evidence ledger: 1 call(s) started, 1 completed, 0 failed" in r.stderr, out
+
+
+def test_call_still_in_flight_at_the_final_preflight_refuses(forge):
+    # A provider call that started but never recorded completion (simulated by an extra `start`
+    # line written from inside an otherwise-successful call) must fail the pre-merge check.
+    _fake_python(forge, "statusCheckRollup", 'echo start >> "$SHIP_FORGEJO_STATE_DIR/calls.log"')
+    r = _ship(forge)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "did not complete" in r.stderr, r.stdout + r.stderr
+    assert forge["fake"].merges() == []

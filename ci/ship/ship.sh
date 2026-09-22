@@ -596,18 +596,42 @@ _ship_forgejo_init_state() {
     echo "Refusing: could not create the Forgejo provider's per-run evidence ledger under ${TMPDIR:-/tmp} — without it a swallowed provider failure would be invisible." >&2
     exit 1
   fi
-  trap 'rm -rf "$_SHIP_FORGEJO_STATE_DIR"' EXIT
+  trap '_ship_forgejo_cleanup "$?"' EXIT
+}
+# EXIT trap. A `read … < <(gh …)` call runs the wrapper in a background subshell that can still
+# be finishing when ship refuses and exits, so first let every started call record its outcome
+# (bounded), then — on a refusal — summarize the ledger on stderr, and only then remove it.
+_ship_forgejo_cleanup() {  # $1 = ship's exit status
+  local dir="$_SHIP_FORGEJO_STATE_DIR" i=0 started finished failed
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  while :; do
+    started=$(grep -c '^start$' "$dir/calls.log" 2>/dev/null) || started=0
+    finished=$(grep -cE '^(ok|fail)$' "$dir/calls.log" 2>/dev/null) || finished=0
+    { [ "$started" -le "$finished" ] || [ "$i" -ge 100 ]; } && break
+    sleep 0.1; i=$((i+1))
+  done
+  if [ "$1" != "0" ]; then
+    failed=$(grep -c '^fail$' "$dir/calls.log" 2>/dev/null) || failed=0
+    echo "[ship] forgejo evidence ledger: ${started} call(s) started, $((finished - failed)) completed, ${failed} failed$([ "$started" -gt "$finished" ] && echo ", $((started - finished)) still running at exit")." >&2
+    [ -s "$dir/fatal.log" ] && sed 's/^/[ship]   - /' "$dir/fatal.log" >&2
+  fi
+  rm -rf "$dir"
 }
 _ship_forgejo_gh() {
-  local dir="$_SHIP_FORGEJO_STATE_DIR" rc=0 before after
+  local dir="$_SHIP_FORGEJO_STATE_DIR" rc=0 before after out
   if ! echo start >> "$dir/calls.log"; then
     echo broken > "$dir/broken" 2>/dev/null || true
     echo "[ship] forgejo provider: cannot write the evidence ledger — refusing this gh call." >&2
     return 1
   fi
   before=$(wc -c < "$dir/fatal.log" 2>/dev/null) || before=-1
-  python3 -I "$_SHIP_FORGEJO_PY" gh "$@" || rc=$?
+  # The provider's stdout is held until its outcome is in the ledger: a caller reading from a
+  # process substitution can react (and ship can exit) the moment output appears, so recording
+  # afterwards could race the EXIT trap. The trailing `x` keeps trailing newlines intact.
+  out=$(python3 -I "$_SHIP_FORGEJO_PY" gh "$@"; rc=$?; printf x; exit "$rc") || rc=$?
+  out=${out%x}
   if [ "$rc" -ne 0 ]; then
+    echo fail >> "$dir/calls.log" 2>/dev/null || echo broken > "$dir/broken" 2>/dev/null || true
     # The provider records its own detailed reason; write a line only when it could not
     # (a signal, a crash before main(), an unwritable ledger) so no failure goes unrecorded.
     after=$(wc -c < "$dir/fatal.log" 2>/dev/null) || after=-1
@@ -615,9 +639,11 @@ _ship_forgejo_gh() {
       printf 'gh %s: exit %s (no reason recorded by the provider)\n' "$(printf '%s ' "${@:1:3}" | LC_ALL=C tr '\n' ' ')" "$rc" \
         >> "$dir/fatal.log" 2>/dev/null || echo broken > "$dir/broken" 2>/dev/null || true
     fi
+    printf '%s' "$out"
     return "$rc"
   fi
   echo ok >> "$dir/calls.log" || { echo broken > "$dir/broken" 2>/dev/null || true; }
+  printf '%s' "$out"
   return 0
 }
 if _ship_provider_wants_forgejo_probe; then
