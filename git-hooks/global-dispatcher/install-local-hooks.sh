@@ -46,7 +46,7 @@ set -eu
 
 MARKER="global-git-hooks-dispatcher"          # idempotency marker (in injected text)
 DISPATCHER='"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks"'
-EVENTS="pre-commit commit-msg pre-push"
+EVENTS="pre-commit commit-msg post-commit pre-push"
 
 # --- option parsing (flags may appear before the optional REPO_DIR) ---------------
 DO_COMMIT=0
@@ -193,17 +193,19 @@ inject_lefthook() {
   awk -v keyline="$keyline" \
       -v run_pc="      run: '$rgh pre-commit'" \
       -v run_cm="      run: '$rgh commit-msg {1}'" \
+      -v run_post="      run: '$rgh post-commit </dev/null || true'" \
       -v run_pp="      run: '$rgh pre-push'" \
       -v stdin_pp="      use_stdin: true" '
     function emit(ev) {
       print keyline
       if (ev == "pre-commit") print run_pc
       else if (ev == "commit-msg") print run_cm
+      else if (ev == "post-commit") print run_post
       else if (ev == "pre-push") { print run_pp; print stdin_pp }
     }
     BEGIN {
-      split("pre-commit commit-msg pre-push", order, " ")
-      for (k = 1; k <= 3; k++) { e = order[k]; hdr[e] = 0; cmds[e] = 0 }
+      split("pre-commit commit-msg post-commit pre-push", order, " ")
+      for (k = 1; k <= 4; k++) { e = order[k]; hdr[e] = 0; cmds[e] = 0 }
     }
     # Record, per event: the header line index (hdr) and its `commands:` line index
     # (cmds, 0 if the block has no commands: key — e.g. a scripts:-only block).
@@ -212,7 +214,7 @@ inject_lefthook() {
       # Event header: `pre-commit:` optionally followed by whitespace and/or a `# comment`.
       # (A trailing comment like `pre-commit: # gate` is valid YAML; without allowing it we
       # would treat the block as absent and append a DUPLICATE top-level key.)
-      if ($0 ~ /^(pre-commit|commit-msg|pre-push):[ \t]*(#.*)?$/) {
+      if ($0 ~ /^(pre-commit|commit-msg|post-commit|pre-push):[ \t]*(#.*)?$/) {
         ev = $0; sub(/:.*/, "", ev); cur_event = ev; hdr[ev] = NR
       } else if ($0 ~ /^[^ \t#]/) {
         cur_event = ""   # left the block (some other top-level key)
@@ -225,7 +227,7 @@ inject_lefthook() {
       # Decide the injection point for each present event.
       #  - has commands:  -> inject right AFTER the commands: line.
       #  - block but no commands: -> inject right AFTER the header, prefixing a commands: line.
-      for (k = 1; k <= 3; k++) {
+      for (k = 1; k <= 4; k++) {
         e = order[k]
         if (cmds[e] > 0)      { after_cmds[cmds[e]] = e }
         else if (hdr[e] > 0)  { after_hdr[hdr[e]]  = e }
@@ -236,7 +238,7 @@ inject_lefthook() {
         if (i in after_hdr)  { print "  commands:"; emit(after_hdr[i]) }
       }
       # Events with no block at all -> append a fresh one.
-      for (k = 1; k <= 3; k++) {
+      for (k = 1; k <= 4; k++) {
         e = order[k]
         if (hdr[e] == 0) { print e ":"; print "  commands:"; emit(e) }
       }
@@ -262,7 +264,7 @@ inject_husky() {
     # husky repo with no .husky/pre-push would never dispatch the protected protect-main
     # fragment — direct pushes to main would fail open.
     case "$ev" in
-      pre-commit|pre-push) ;;
+      pre-commit|post-commit|pre-push) ;;
       *) [ -f "$f" ] || continue ;;
     esac
     if [ -f "$f" ] && grep -q "$MARKER" "$f"; then
@@ -271,6 +273,8 @@ inject_husky() {
     cmt="# $MARKER — runs every global hook for this event (see agent-tools git-hooks/global-dispatcher)"
     if [ "$ev" = "commit-msg" ]; then
       call="$DISPATCHER commit-msg \"\$1\" || exit \$?"
+    elif [ "$ev" = "post-commit" ]; then
+      call="$DISPATCHER post-commit \"\$@\" < /dev/null || true"
     else
       call="$DISPATCHER $ev \"\$@\" || exit \$?"
     fi
@@ -312,6 +316,8 @@ inject_raw() {
     cmt="# $MARKER — runs every global hook for this event (agent-tools git-hooks/global-dispatcher)"
     if [ "$ev" = "commit-msg" ]; then
       call="$DISPATCHER commit-msg \"\$1\" || exit \$?"
+    elif [ "$ev" = "post-commit" ]; then
+      call="$DISPATCHER post-commit \"\$@\" < /dev/null || true"
     else
       call="$DISPATCHER $ev \"\$@\" || exit \$?"
     fi

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Template post-commit hook. Advisory only: post-commit must never turn a successful
+# commit into a failed command merely because an awareness hook has a problem.
+DISP="${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks"
+[ -x "$DISP" ] && "$DISP" post-commit "$@" < /dev/null || true
+exit 0
