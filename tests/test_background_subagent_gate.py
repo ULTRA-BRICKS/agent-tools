@@ -265,7 +265,7 @@ def test_allow_opencode_task_general_explore_without_background(kind, monkeypatc
     default-build dispatch is foreground — tolerated because opencode has no in-tool
     background path at all, so general/explore must pass without a fake flag. The
     carrier discriminator is the exact lowercase tool name ``task`` (CC uses ``Agent``
-    / ``Task``). https://github.com/alex-mextner/agent-tools/issues/495."""
+    / ``Task``). https://git.hyperide.ai/ultrabricks/agent-tools/issues/495."""
     out, _err, code = _run(
         {"tool": "task", "args": {"subagent_type": kind, "prompt": _LONG}},
         monkeypatch,

@@ -8,7 +8,7 @@ codes (bare placeholders like `CODE`/`TEST-1`, free-text slugs) recorded as if t
 real ticket references (agent-tools#607).
 
 A repo's own `task.yaml` (or `rig.yaml`'s `task:` block) already declares this — read the
-same way [task-cli](https://github.com/alex-mextner/task-cli)'s own `tasklib/config.py`
+same way [task-cli](https://git.hyperide.ai/ultrabricks/task-cli)'s own `tasklib/config.py`
 reads it:
 
 - `backend: github-issues` (the default) — only a real, resolvable issue/PR number in the

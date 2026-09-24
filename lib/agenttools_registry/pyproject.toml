@@ -22,7 +22,7 @@ dependencies = []
 test = ["pytest"]
 
 [project.urls]
-Homepage = "https://github.com/alex-mextner/agent-tools"
+Homepage = "https://git.hyperide.ai/ultrabricks/agent-tools"
 
 # This pyproject lives INSIDE the package dir (lib/agenttools_registry/), so the package
 # is discovered from the parent (lib/). The `include` filter scopes discovery strictly to

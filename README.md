@@ -4,7 +4,7 @@
 agent-hooks, git-hooks, CI gates, and MCP slots, distilled from practice and generalized so
 they apply to **any** project, language, or team. It is a *library*, not an installer: you
 don't cherry-pick 36 skills, 8 hooks, and 12 CI gates by hand. You install the whole catalog
-through one front door — [`rig`](https://github.com/alex-mextner/rig-cli) — which reads a
+through one front door — [`rig`](https://git.hyperide.ai/ultrabricks/rig-cli) — which reads a
 committed `rig.yaml` and wires it in. agent-tools is the **what**; rig is the **how**.
 
 ## Quick start — the single front door (`rig init`)
@@ -26,7 +26,7 @@ alias of `rig init`.) rig scans this catalog live and installs what `rig.yaml` e
 — skills to your harness's skills dir, agent-hooks to its hook dir, the global git-hook
 dispatcher, CI workflows, MCP registrations. Update agent-tools, re-run `rig apply`, and the
 new items flow in with no code change in rig. See
-[rig-cli](https://github.com/alex-mextner/rig-cli) for install and the full `rig.yaml`
+[rig-cli](https://git.hyperide.ai/ultrabricks/rig-cli) for install and the full `rig.yaml`
 schema.
 
 ## Why this exists: autonomous, observable, controllable — and safe
@@ -206,7 +206,7 @@ the gates were all present and red, but advisory, so the merge went through anyw
 artifact (declared in `rig.yaml`, applied by `rig apply`) the same way skills/hooks/CI are —
 so the required-checks set is provisioned, not hand-toggled. agent-tools is the **what**
 (the gates + this policy); the reconciler that flips the server-side switches lives in
-[rig-cli](https://github.com/alex-mextner/rig-cli) (#5).
+[rig-cli](https://git.hyperide.ai/ultrabricks/rig-cli) (#5).
 
 ### The `github:` block in `rig.yaml` (provisioned by rig-cli#5)
 
@@ -216,7 +216,7 @@ reconciles them via `gh api` (branch-protection / rulesets) — secure defaults 
 **classic branch-protection** model (`required_status_checks.contexts`, `enforce_admins`,
 `required_pull_request_reviews`); the newer *rulesets* API expresses the same intent with a
 different field layout. Either way the authoritative schema and the chosen backend live in
-[rig-cli](https://github.com/alex-mextner/rig-cli) (#5) — this is the concept, not the wire
+[rig-cli](https://git.hyperide.ai/ultrabricks/rig-cli) (#5) — this is the concept, not the wire
 format:
 
 ```yaml
@@ -323,21 +323,21 @@ Claude-Code-specific, with no enforcement at all.
 but cannot stop a `--no-verify` bypass or a secret being written *mid-session* — that needs
 an agent-hook. Skill lists supply ideas but no mechanism. `agent-tools` is the only one here
 that carries advice, mid-session enforcement, and the commit/CI backstop together, and is
-consumed declaratively by [`rig`](https://github.com/alex-mextner/rig-cli).
+consumed declaratively by [`rig`](https://git.hyperide.ai/ultrabricks/rig-cli).
 
 ## Ecosystem
 
 Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 
-- **[tg-cli](https://github.com/alex-mextner/tg-cli)** — simple Telegram CLI to send messages, photos & files, and a two-way agent bridge (reports, Q→buttons, voice/rich)
-- **[review-cli](https://github.com/alex-mextner/review-cli)** — multi-model read-only code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. Read-only, CLI-first, harness-agnostic.
-- **[research-cli](https://github.com/alex-mextner/research-cli)** — multi-provider research/panel CLI on the shared providers engine: ask a question, get a synthesized answer from a panel of models. A distinct tool from review-cli — research, not code review. Spun out of this umbrella ([#125](https://github.com/alex-mextner/agent-tools/issues/125)); it vendors `agenttools_providers` + `agenttools_errors` + `models.yaml` with a drift-guard sync-check (strategy B), kept single-source against this repo's `lib/` canonical.
-- **[rig-cli](https://github.com/alex-mextner/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
-- **[task-cli](https://github.com/alex-mextner/task-cli)** — the enforced ticket interface: every request becomes a well-formed ticket, with acceptance criteria, motivation, user-impact & screenshots enforced by the tool. Backends: GitHub Issues (default) and Linear.
-- **[pm-cli](https://github.com/alex-mextner/pm-cli)** — autonomous project-manager coordinator over the task/tg/rig ecosystem: an event-sourced work queue projected from an append-only JSONL log. Release 1 observes and reconciles on unforgeable evidence; it does not dispatch or edit code.
+- **[tg-cli](https://git.hyperide.ai/ultrabricks/tg-cli)** — simple Telegram CLI to send messages, photos & files, and a two-way agent bridge (reports, Q→buttons, voice/rich)
+- **[review-cli](https://git.hyperide.ai/ultrabricks/review-cli)** — multi-model read-only code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. Read-only, CLI-first, harness-agnostic.
+- **[research-cli](https://git.hyperide.ai/ultrabricks/research-cli)** — multi-provider research/panel CLI on the shared providers engine: ask a question, get a synthesized answer from a panel of models. A distinct tool from review-cli — research, not code review. Spun out of this umbrella ([#125](https://git.hyperide.ai/ultrabricks/agent-tools/issues/125)); it vendors `agenttools_providers` + `agenttools_errors` + `models.yaml` with a drift-guard sync-check (strategy B), kept single-source against this repo's `lib/` canonical.
+- **[rig-cli](https://git.hyperide.ai/ultrabricks/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
+- **[task-cli](https://git.hyperide.ai/ultrabricks/task-cli)** — the enforced ticket interface: every request becomes a well-formed ticket, with acceptance criteria, motivation, user-impact & screenshots enforced by the tool. Backends: GitHub Issues (default) and Linear.
+- **[pm-cli](https://git.hyperide.ai/ultrabricks/pm-cli)** — autonomous project-manager coordinator over the task/tg/rig ecosystem: an event-sourced work queue projected from an append-only JSONL log. Release 1 observes and reconciles on unforgeable evidence; it does not dispatch or edit code.
 - **`dev`** (`lib/agenttools_dev/`) — project-scoped dev/e2e process runner shipped in this repo: runs a repo's `rig.yaml` scripts and manages background dev servers / e2e jobs, with a safe-by-default `dev stop` that only kills runners scoped to the current repo. See [`lib/agenttools_dev/README.md`](lib/agenttools_dev/README.md).
-- **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
-- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
+- **[draw-cli](https://git.hyperide.ai/ultrabricks/draw-cli)** — text-to-image via Hugging Face
+- **[3d-cli](https://git.hyperide.ai/ultrabricks/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
 - **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
 Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.

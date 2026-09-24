@@ -20,7 +20,7 @@ dependencies = []
 test = ["pytest"]
 
 [project.urls]
-Homepage = "https://github.com/alex-mextner/agent-tools"
+Homepage = "https://git.hyperide.ai/ultrabricks/agent-tools"
 
 # The packages live directly under lib/ (this file's directory). Scope discovery to the
 # Python packages so setuptools never wanders into the umbrella repo's non-Python content

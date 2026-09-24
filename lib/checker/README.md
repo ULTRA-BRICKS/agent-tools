@@ -133,7 +133,7 @@ python3 lib/checker/model_freshness.py --json      # machine-readable summary
 
 The daily cron rig provisions runs exactly `python3 <checkout>/lib/checker/model_freshness.py`
 at **12:00 (noon)** — launchd on macOS, crontab on Linux. See
-[rig-cli](https://github.com/alex-mextner/rig-cli) (`models:` block / `rig status`).
+[rig-cli](https://git.hyperide.ai/ultrabricks/rig-cli) (`models:` block / `rig status`).
 
 #### Exit codes (the cron / a wrapper script branches on these)
 
