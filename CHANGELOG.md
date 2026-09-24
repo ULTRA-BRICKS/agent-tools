@@ -2,8 +2,30 @@
 
 ## Unreleased
 
+### Added
+
+- `block-raw-ticket`: Forgejo/Gitea and raw-API coverage (UB-25). With task-cli armed, the
+  guard now also blocks `fj issue` / `fj repo labels` writes, `tea issues` / `tea comment` /
+  `tea label` writes, REST writes to `repos/<o>/<r>/(issues|labels)` via curl, wget, HTTPie
+  or `gh api` on any host (github.com included), `gh api graphql` issue/label mutations, and
+  inline Python/Node programs making those writes — through `bash -c`, `eval`, heredocs,
+  `sudo`/`doas`/`xargs` and `uv run`-style runners. Explicit GET/HEAD stays a read; an
+  unresolvable method counts as a write. New deny-by-default
+  `RIG_HATCH_REQUEST_BLOCK_RAW_TICKET` hatch (one ask per command, `timeout_ms` 960000);
+  unparseable writes and junk-title creates are never hatchable. Pre-tool text guard, not a
+  firewall — residuals are listed in the hook README.
+- `agenttools_hatch_escalation`: display-only `redact_for_display` masks credential values in
+  the Telegram approval preview and the `overrides.log` audit line (redacted before
+  truncation). Approval identity stays bound to the original command and cwd.
+
 ### Fixed
 
+- `cc-hook-bridge`: one hard wall-clock budget (1100s) for all agent-hooks run on a single
+  Claude Code tool call. Two hatch approval waits (960s each) in one pre-bash call used to
+  exceed Claude Code's outer 1200s hook timeout, and a killed command hook fails OPEN. Each
+  hook's timeout is now clamped to the remaining budget (fail-closed when clamped); once the
+  budget is spent the remaining hooks are skipped and the call is blocked, overriding any
+  earlier grant.
 - `omp-hook-bridge`: round-3 hardening of the `eval` tool's write-call secret-scan heuristic
   (agent-tools#614). Four further security-review findings closed:
   - A JS `\u{HEX}` Unicode code-point escape that widens to a literal backslash (e.g. `\u{5c}`)

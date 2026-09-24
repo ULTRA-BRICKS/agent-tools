@@ -54,7 +54,16 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
+
+# Claude Code kills this command at its outer settings.json timeout (1200s) and a killed
+# command hook fails OPEN, so the sequential descriptor run must finish well inside it.
+HOOK_BUDGET_S = 1100
+_monotonic = time.monotonic  # indirection so tests can inject a fake clock
+# Mirrors agent_hooks_v1.runner.DEFAULT_TIMEOUT_MS; the runner is imported lazily (fail-open).
+_DEFAULT_TIMEOUT_MS = 5000
+_MAX_SKIPPED_IDS = 10
 
 HOOK_API = "agents-hooks/v1"
 # The v1 event's `harness` tag for every event this bridge produces. A MODULE LITERAL, not
@@ -443,6 +452,10 @@ def _evaluate_point(hook_event_name: str, cc_event: dict) -> tuple[str, str] | N
     A BLOCK from ANY hook wins, unconditionally — even one that runs AFTER a grant
     already seen, and regardless of priority. Absent any block, the FIRST grant seen
     wins (grants are not expected to disagree with each other).
+
+    The whole run shares one wall-clock budget (``HOOK_BUDGET_S``): each hook's timeout is
+    clamped to what remains (fail-closed when clamped), and once it is spent the remaining
+    hooks are skipped and the call is BLOCKED, overriding any earlier grant.
     """
     tool_name = cc_event.get("tool_name")
     point = point_for_event(hook_event_name, tool_name)
@@ -458,8 +471,12 @@ def _evaluate_point(hook_event_name: str, cc_event: dict) -> tuple[str, str] | N
     v1_event = to_v1_event(cc_event, point=point)
     first_block_reason: str | None = None
     grant_reason: str | None = None
-    for spec in specs:
-        outcome, reason = run_hook(spec, v1_event, warn=_warn)
+    deadline = _monotonic() + HOOK_BUDGET_S
+    for index, spec in enumerate(specs):
+        remaining_ms = int((deadline - _monotonic()) * 1000)
+        if remaining_ms < 1:
+            return "block", _budget_exhausted(specs[index:], first_block_reason)
+        outcome, reason = run_hook(_budgeted_spec(spec, remaining_ms), v1_event, warn=_warn)
         if outcome == "block" and first_block_reason is None:
             first_block_reason = reason
         if outcome == "grant" and grant_reason is None:
@@ -469,6 +486,49 @@ def _evaluate_point(hook_event_name: str, cc_event: dict) -> tuple[str, str] | N
     if grant_reason is not None:
         return "grant", grant_reason
     return None
+
+
+def _effective_timeout_ms(spec: dict) -> int | None:
+    """The timeout ``run_hook`` would apply, or ``None`` for a value it rejects via on_error."""
+    raw = spec.get("timeout_ms", _DEFAULT_TIMEOUT_MS)
+    if raw is None:
+        return _DEFAULT_TIMEOUT_MS
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if value == 0:
+        return _DEFAULT_TIMEOUT_MS
+    return value if value > 0 else None
+
+
+def _budgeted_spec(spec: dict, remaining_ms: int) -> dict:
+    """A copy of ``spec`` whose timeout fits the remaining budget; a hook the budget cuts
+    short must deny rather than let CC's outer kill turn into a fail-open."""
+    original = _effective_timeout_ms(spec)
+    # None: run_hook rejects this timeout via on_error before starting anything, so no wait.
+    if original is None or original <= remaining_ms:
+        return spec
+    clamped = dict(spec)
+    clamped["timeout_ms"] = max(1, remaining_ms)
+    clamped["on_error"] = "closed"
+    return clamped
+
+
+def _budget_exhausted(skipped: list, first_block_reason: str | None) -> str:
+    ids = [str(s.get("id", "?")) for s in skipped[:_MAX_SKIPPED_IDS]]
+    more = len(skipped) - len(ids)
+    listed = ", ".join(ids) + (f" (+{more} more)" if more > 0 else "")
+    _warn(f"hook budget {HOOK_BUDGET_S}s exhausted; skipped {len(skipped)} hook(s): {listed}")
+    if first_block_reason is not None:
+        return first_block_reason
+    return (
+        f"Agent-hook budget of {HOOK_BUDGET_S}s for this tool call is exhausted; "
+        f"{len(skipped)} remaining check(s) could not run ({listed}). Denying rather than "
+        "letting the action through unchecked."
+    )
 
 
 def _load_runner():
