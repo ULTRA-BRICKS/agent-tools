@@ -26,11 +26,14 @@ automatically takes effect everywhere, with zero per-repo changes.
 │   ├── pre-commit/
 │   │   └── 10-secret-scan           # gitleaks tiered staged-diff gate (block + warn)
 │   ├── commit-msg/
+│   ├── post-commit/
+│   │   └── 10-bootstrap-next-steps  # one-time root-main notice: task → worktree/branch → PR
 │   └── pre-push/
 │       └── 10-protect-main          # block direct main/master pushes after empty-repo bootstrap (audited PUSH_MAIN_OK escape)
 ├── hooks/                           # the GLOBAL composers (core.hooksPath target)
 │   ├── pre-commit                   # repo-local hook → dispatcher → review-gate
 │   ├── commit-msg                   # repo-local hook → dispatcher
+│   ├── post-commit                  # advisory bootstrap-complete notice; never blocks
 │   ├── pre-push                     # repo-local hook → dispatcher
 │   └── review-gate                  # review-before-commit gate
 ├── template/hooks/                  # init.templateDir → new repos get dispatcher hooks
@@ -62,6 +65,15 @@ chmod +x ~/.config/git/global-hooks.d/pre-commit/20-no-todo-in-prod
 That's it. It now runs in EVERY wired repo. No installer, no sweep, no per-repo edit. The
 number prefix controls order (`10-` before `20-`). Mirror the file into this dir in
 agent-tools and commit it to keep the shipped twin current.
+
+### Empty-repository bootstrap
+
+`post-commit/10-bootstrap-next-steps` is deliberately advisory and fires only for the root
+commit created on `main`/`master`. That commit is the one bootstrap exception: it may be made
+directly before a task/worktree/PR can exist. The notice then tells the operator that every
+subsequent change returns to the normal guarded workflow: task first, separate worktree +
+feature branch, Forgejo PR, guarded ship. The matching `pre-push/10-protect-main` exception is
+even narrower: it allows that root commit to `main` only while the entire remote has no refs.
 
 ## Per-repo injection — `install-local-hooks.sh`
 

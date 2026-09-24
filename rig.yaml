@@ -39,3 +39,10 @@ linters:
   enabled: true
   preview: true
   rules: {}
+
+task:
+  backend: forgejo
+  forgejo:
+    host: git.hyperide.ai
+    repo: ultrabricks/agent-tools
+    attachment_mode: link

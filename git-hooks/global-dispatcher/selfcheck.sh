@@ -824,6 +824,66 @@ LABEL="no-local-scan repo with read-only .githooks-skip => install succeeds (no 
 assert test "$rc_c" = 0
 chmod 0644 "$RON/.githooks-skip" 2>/dev/null || true
 
+# --- 34b. bootstrap post-commit: first-root-main notice + every wiring path -------
+POST_SRC="$HERE/global-hooks.d/post-commit/10-bootstrap-next-steps"
+LABEL="bootstrap post-commit fragment is shipped"
+assert test -x "$POST_SRC"
+LABEL="global core.hooksPath ships a post-commit composer"
+assert test -x "$HERE/hooks/post-commit"
+LABEL="init.templateDir ships a post-commit dispatcher hook"
+assert test -x "$HERE/template/hooks/post-commit"
+
+# Raw repo: installer must wire post-commit even when no local post-commit existed.
+RPC="$TMP/rpc"; mk_repo "$RPC"
+GLOBAL_HOOKS_DIR="$GHD" "$INSTALLER" "$RPC" >/dev/null
+LABEL="raw repo gets post-commit dispatcher wiring"
+assert grep -q "global-git-hooks-dispatcher" "$RPC/.git/hooks/post-commit"
+
+# Lefthook: post-commit must be a generated event block.
+RLP="$TMP/rlp"; mk_repo "$RLP"
+cat > "$RLP/lefthook.yml" <<'EOF'
+pre-commit:
+  commands:
+    existing:
+      run: 'true'
+EOF
+GLOBAL_HOOKS_DIR="$GHD" "$INSTALLER" "$RLP" >/dev/null
+LABEL="lefthook gets post-commit dispatcher event"
+assert sh -c 'grep -q "^post-commit:" "$1" && grep -q "run-global-hooks.*post-commit" "$1"' _ "$RLP/lefthook.yml"
+
+# Husky owns core.hooksPath, so post-commit must be created even when absent.
+RHP="$TMP/rhp"; mk_repo "$RHP"
+mkdir -p "$RHP/.husky/_"
+git -C "$RHP" config core.hooksPath .husky/_
+GLOBAL_HOOKS_DIR="$GHD" "$INSTALLER" "$RHP" >/dev/null
+LABEL="husky repo gets post-commit dispatcher wiring"
+assert grep -q "global-git-hooks-dispatcher" "$RHP/.husky/post-commit"
+
+# Behavior: only the root commit on main/master emits the workflow transition notice.
+if [ -x "$POST_SRC" ]; then
+  GHD_PC="$TMP/ghd-postcommit"
+  mkdir -p "$GHD_PC/post-commit"
+  cp "$POST_SRC" "$GHD_PC/post-commit/"
+  chmod +x "$GHD_PC/post-commit/10-bootstrap-next-steps"
+
+  RBPC="$TMP/rbpc"; mk_repo "$RBPC"
+  git -C "$RBPC" branch -M main
+  FIRST_NOTICE="$(cd "$RBPC" && GLOBAL_HOOKS_DIR="$GHD_PC" "$DISPATCHER" post-commit < /dev/null 2>&1)"
+  LABEL="root commit on main emits bootstrap-complete workflow notice"
+  assert sh -c 'printf %s "$1" | grep -qi "bootstrap.*complete" && printf %s "$1" | grep -qi "task" && printf %s "$1" | grep -qi "worktree" && printf %s "$1" | grep -qi "PR"' _ "$FIRST_NOTICE"
+
+  ( cd "$RBPC" && echo next >> seed.txt && git add seed.txt && git -c core.hooksPath= commit -q --no-verify -m next )
+  SECOND_NOTICE="$(cd "$RBPC" && GLOBAL_HOOKS_DIR="$GHD_PC" "$DISPATCHER" post-commit < /dev/null 2>&1)"
+  LABEL="second commit on main emits no bootstrap notice"
+  have "$SECOND_NOTICE" "" "$LABEL"
+
+  RBF="$TMP/rbf"; mk_repo "$RBF"
+  git -C "$RBF" branch -M feat/bootstrap
+  FEATURE_NOTICE="$(cd "$RBF" && GLOBAL_HOOKS_DIR="$GHD_PC" "$DISPATCHER" post-commit < /dev/null 2>&1)"
+  LABEL="root commit on feature branch emits no bootstrap notice"
+  have "$FEATURE_NOTICE" "" "$LABEL"
+fi
+
 # --- 35. protect-main: the SHIPPED pre-push fragment blocks direct pushes to main ---
 # Uses the real fragment + the real composers (core.hooksPath) end-to-end through a
 # real `git push` to a local bare origin, so the stdin ref-forwarding chain

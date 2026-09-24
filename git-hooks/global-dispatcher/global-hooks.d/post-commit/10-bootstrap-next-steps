@@ -1,0 +1,25 @@
+#!/bin/sh
+# global-hook-id: bootstrap-next-steps
+# global-hook-protected: true
+# Advisory only: after the repository's root commit lands on main/master, tell the
+# user that the one-time bootstrap exception is over and normal Rig workflow starts.
+
+branch="$(git branch --show-current 2>/dev/null || true)"
+case "$branch" in main|master) ;; *) exit 0 ;; esac
+
+line="$(git rev-list --parents -n 1 HEAD 2>/dev/null || true)"
+[ -n "$line" ] || exit 0
+case "$line" in
+  *" "*) exit 0 ;;
+esac
+
+cat >&2 <<'EOF'
+
+rig: bootstrap complete — the first commit created the default branch.
+From now on, use the normal guarded workflow for every change:
+  1. Create or select a task first (`task create ...`).
+  2. Work in a separate worktree + feature branch (`rig worktree create ... --branch ...`).
+  3. Open a Forgejo PR (`fj pr create`).
+  4. Merge only through the guarded ship flow after tests/review/acceptance pass.
+EOF
+exit 0
