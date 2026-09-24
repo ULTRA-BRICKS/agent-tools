@@ -56,17 +56,30 @@ done
 echo "[sast] semgrep $(semgrep --version 2>/dev/null || echo '?') — config: $SEMGREP_CONFIG, target: $SEMGREP_TARGET" >&2
 
 # --error makes semgrep exit non-zero on findings; we own the exit policy below.
-# shellcheck disable=SC2086
-if semgrep scan "$@" --error $SEMGREP_EXTRA "$SEMGREP_TARGET"; then
+# Capture semgrep's OWN exit code. We must NOT gate on `if semgrep …; then … exit 0; fi` and
+# read `rc=$?` in the fall-through: after an `if` whose condition is false (and no else), POSIX
+# `$?` is the `if` statement's status — which is 0 — so the runner would print FAIL but
+# `exit 0`, leaving CI green on a real finding or a scanner failure (the whole point of block
+# tier). Disable errexit only around the scanner so a non-zero result is captured, not
+# fatal-on-the-spot.
+set +e
+# shellcheck disable=SC2086  # SEMGREP_EXTRA is an intentional word-split of pass-through flags
+semgrep scan "$@" --error $SEMGREP_EXTRA "$SEMGREP_TARGET"
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ]; then
   echo "[sast] PASS — no findings." >&2
   exit 0
 fi
 
-rc=$?
+# Warn tier honors "never fails the build" UNCONDITIONALLY — not just for findings, but for an
+# operational semgrep error too (bad flag, unreadable ruleset, network failure). So warn tier
+# exits 0 regardless of `rc`, after surfacing whatever semgrep printed.
 if [ "$SAST_WARN" = "1" ]; then
-  echo "[sast] WARN tier — findings reported above, NOT failing the build (SAST_WARN=1)." >&2
+  echo "[sast] WARN tier — semgrep exited $rc (findings and/or a scanner error), NOT failing the build (SAST_WARN=1)." >&2
   exit 0
 fi
-echo "[sast] FAIL — semgrep reported findings (exit $rc). Fix them, or use an inline" >&2
+echo "[sast] FAIL — semgrep exited $rc (findings, or a scanner error). Fix them, or use an inline" >&2
 echo "       // nosemgrep comment / .semgrepignore for justified false positives." >&2
 exit "$rc"
