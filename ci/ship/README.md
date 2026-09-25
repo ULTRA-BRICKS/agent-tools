@@ -330,8 +330,9 @@ workflows in this directory are the server-side backstop; `ship` is the client-s
 ## Forgejo provider
 
 `gh ship <PR>` (and `ship.sh <PR>`) also ship a pull request from a checkout whose `origin` is a
-**Forgejo** host. There is no separate command, and `fj` gains no `ship` subcommand; the
-sanctioned entrypoint dispatches by origin:
+**Forgejo** host. `fj ship <PR>` is the same command: rig's `fj:` block installs an `fj` wrapper
+whose `ship` subcommand runs exactly the `gh ship` dispatch (rig-cli#601). One `ship.sh` serves
+both and dispatches by origin:
 
 | `origin` | Provider |
 | --- | --- |
