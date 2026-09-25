@@ -21,6 +21,12 @@ def policy():
 def config_path(tmp_path):
     root = tmp_path / 'machine' / 'rig'
     root.mkdir(parents=True, mode=0o700)
+    # The policy refuses a group/other-writable config dir or parent. mkdir's mode is masked by
+    # the process umask and `parents=True` creates `machine/` with the default mode, so under a
+    # umask of 0002 (Ubuntu's user-private-group default, e.g. a Forgejo runner user) the tree
+    # came out group-writable and every "policy applies" test read `unsafe_parent`. Pin it.
+    for directory in (root.parent, root):
+        directory.chmod(0o700)
     return root / 'config.yaml'
 
 def write(path, required=False, owners=None):
