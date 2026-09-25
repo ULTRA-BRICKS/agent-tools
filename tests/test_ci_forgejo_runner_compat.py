@@ -145,3 +145,65 @@ def test_pr_title_lint_fails_closed_without_a_title(tmp_path: Path):
     res = _lint(tmp_path, {"pull_request": {}})
     assert res.returncode == 1
     assert "failing closed" in res.stdout
+
+
+# --- codeql self-gate ----------------------------------------------------------------------
+
+CODEQL_WF = REPO_ROOT / "ci" / "codeql" / "workflow-selfgate.yml"
+
+
+def test_codeql_selfgate_drives_the_cli_not_the_action():
+    """github/codeql-action calls GitHub's code-scanning API on init ("404 page not found" on
+    Forgejo). The self-gate never uploads, so it runs the pinned CodeQL CLI bundle instead."""
+    yaml = pytest.importorskip("yaml")
+    wf = yaml.safe_load(CODEQL_WF.read_text(encoding="utf-8"))
+    steps = wf["jobs"]["analyze"]["steps"]
+    assert not any("codeql-action" in str(s.get("uses", "")) for s in steps)
+    assert re.fullmatch(r"\d+\.\d+\.\d+", wf["env"]["CODEQL_VERSION"]), "pin the CodeQL bundle"
+    runs = "\n".join(str(s.get("run", "")) for s in steps)
+    assert "codeql database create" in runs and "codeql database analyze" in runs
+    assert "sarif-results/" in runs
+
+
+def test_codeql_selfgate_artifact_upload_cannot_fail_the_gate():
+    """upload-artifact@v4 refuses a non-github.com server (treats it as GHES)."""
+    steps = _steps(CODEQL_WF, "analyze")
+    upload = next(s for s in steps if "upload-artifact" in str(s.get("uses", "")))
+    assert upload.get("continue-on-error") is True
+
+
+def test_codeql_selfgate_parses_sarif_without_jq(tmp_path: Path):
+    """jq is not on every runner image; the gate parses SARIF with python3. Rule levels come
+    from the query-pack extensions (where the CodeQL CLI puts them), so a note is not gated
+    as a warning, and an in-source `codeql[<id>]` marker still suppresses."""
+    if shutil.which("bash") is None or shutil.which("python3") is None:
+        pytest.skip("needs bash + python3")
+    gate = next(s for s in _steps(CODEQL_WF, "analyze") if s.get("name") == "Gate on SARIF findings")
+    assert re.search(r"(?m)^\s*jq\b", gate["run"]) is None
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "x.js").write_text("a();\n// codeql[js/suppressed]\nb();\nc();\n", encoding="utf-8")
+    (tmp_path / "sarif-results").mkdir()
+    sarif = {"runs": [{
+        "tool": {"driver": {"name": "CodeQL", "rules": []}, "extensions": [{"name": "codeql/javascript-queries", "rules": [
+            {"id": "js/note", "defaultConfiguration": {"level": "note"}},
+            {"id": "js/suppressed", "defaultConfiguration": {"level": "warning"}},
+            {"id": "js/bad", "defaultConfiguration": {"level": "error"}}]}]},
+        "results": [
+            {"ruleId": "js/note", "message": {"text": "n"}, "locations": [{"physicalLocation": {"artifactLocation": {"uri": "src/x.js"}, "region": {"startLine": 1}}}]},
+            {"ruleId": "js/suppressed", "message": {"text": "s"}, "locations": [{"physicalLocation": {"artifactLocation": {"uri": "src/x.js"}, "region": {"startLine": 3}}}]},
+        ]}]}
+    (tmp_path / "sarif-results" / "js.sarif").write_text(json.dumps(sarif), encoding="utf-8")
+    script = tmp_path / "gate.sh"
+    script.write_text(gate["run"], encoding="utf-8")
+    env = dict(os.environ, LANGUAGE="javascript-typescript", GATE_LEVELS="error warning",
+               GITHUB_STEP_SUMMARY=str(tmp_path / "summary.md"))
+    ok = subprocess.run(["bash", str(script)], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert "gated=0, suppressed=1, notes=1" in ok.stdout
+
+    sarif["runs"][0]["results"].append(
+        {"ruleId": "js/bad", "message": {"text": "b"}, "locations": [{"physicalLocation": {"artifactLocation": {"uri": "src/x.js"}, "region": {"startLine": 4}}}]})
+    (tmp_path / "sarif-results" / "js.sarif").write_text(json.dumps(sarif), encoding="utf-8")
+    bad = subprocess.run(["bash", str(script)], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    assert bad.returncode == 1, bad.stdout + bad.stderr
+    assert "[error] js/bad" in bad.stdout
