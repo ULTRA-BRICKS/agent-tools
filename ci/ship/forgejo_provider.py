@@ -622,19 +622,27 @@ def merge_pr(pr: PullRequest, method_flag: str, admin: bool) -> str:
     status, body = api.request("POST", api.repo_path(f"/pulls/{pr.number}/merge"), payload, "application/json")
     if status != 200:
         raise ProviderError(_http_error_text("POST", f"merge of PR #{pr.number}", status, body, api.credential))
-    after = api.call("GET", api.repo_path(f"/pulls/{pr.number}"))
+    # The 200 means the merge happened server-side: a failed confirmation read must not leave
+    # it unaudited, so that path writes an `unconfirmed` line before refusing.
+    try:
+        after = api.call("GET", api.repo_path(f"/pulls/{pr.number}"))
+    except ProviderError:
+        _audit_merge(pr, do, admin, "", confirmed=False)
+        raise
     if not isinstance(after, dict) or not after.get("merged"):
+        _audit_merge(pr, do, admin, "", confirmed=False)
         raise ProviderError(f"Forgejo accepted the merge of PR #{pr.number} but does not report it merged — check the PR")
     merge_sha = str(after.get("merge_commit_sha") or "")
     _audit_merge(pr, do, admin, merge_sha)
     return merge_sha
 
 
-def _audit_merge(pr: PullRequest, do: str, admin: bool, merge_sha: str) -> None:
+def _audit_merge(pr: PullRequest, do: str, admin: bool, merge_sha: str, confirmed: bool = True) -> None:
     path = Path(os.environ.get("SHIP_AUDIT_FILE") or Path.home() / ".config/agent-tools/ship-audit.jsonl")
+    decision = "merged:admin" if admin else "merged"
     line = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "gate": "merge", "provider": "forgejo",
-        "decision": "merged:admin" if admin else "merged", "host": pr.api.origin.host_key,
+        "decision": decision if confirmed else f"{decision}:unconfirmed", "host": pr.api.origin.host_key,
         "repo": pr.api.origin.slug, "pr": pr.number, "head": pr.pinned_sha, "method": do,
         "merge_commit": merge_sha,
     }

@@ -57,7 +57,7 @@ class FakeForgejo:
             "version_status": 200, "pr": {}, "main_sha": "", "statuses": {}, "reviews": [],
             "review_comments": {}, "timeline": [], "files": ["docs/x.md"], "commits": [],
             "branch_protection": {"enable_status_check": False, "status_check_contexts": []},
-            "merge_head_override": None, "redirect_to": None,
+            "merge_head_override": None, "redirect_to": None, "pr_get_status_after_merge": None,
         }
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.port = self.server.server_address[1]
@@ -128,6 +128,8 @@ class FakeForgejo:
             return 200, (items if page == 1 else []), "application/json"
 
         if sub == "/pulls/1" and method == "GET":
+            if s["pr"].get("merged") and s["pr_get_status_after_merge"]:
+                return s["pr_get_status_after_merge"], {"message": "bad gateway"}, "application/json"
             return 200, s["pr"], "application/json"
         if sub == "/pulls/1" and method == "PATCH":
             s["pr"].update(body)
@@ -440,6 +442,19 @@ def test_merge_sends_head_commit_id_and_audits(api_fake, tmp_path):
     assert m["auth"] == f"token {PLACEHOLDER}"
     audit = [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text().splitlines()]
     assert audit[-1]["provider"] == "forgejo" and audit[-1]["head"] == head
+
+
+def test_merge_is_audited_even_when_the_confirmation_read_fails(api_fake, tmp_path):
+    """The merge already happened server-side once the POST answers 200: the audit line must be
+    written before the confirmation read, and a failed read still refuses (never claims merged)."""
+    head = _seed(api_fake)
+    api_fake.state["pr_get_status_after_merge"] = 502
+    with pytest.raises(fp.ProviderError, match="502"):
+        fp.run_gh(_ctx_for(api_fake, tmp_path), ["pr", "merge", "1", "--squash"])
+    assert len(api_fake.merges()) == 1
+    audit = [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    assert audit[-1]["gate"] == "merge" and audit[-1]["head"] == head
+    assert audit[-1]["decision"] == "merged:unconfirmed" and audit[-1]["merge_commit"] == ""
 
 
 def test_merge_without_credential_or_with_raced_head_fails(api_fake, tmp_path, monkeypatch):
