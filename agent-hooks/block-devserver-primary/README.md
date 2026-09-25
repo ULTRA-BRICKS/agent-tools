@@ -128,7 +128,7 @@ need requests a one-time Telegram approval with a written justification in
   sibling `no-shell-file-edit` hook already unwraps `bash -c`/`sh -c` and peels `VAR=` prefixes
   for its own detection — this hook only does the `VAR=` peel (`_strip_leading_assignments`),
   not the wrapper unwrapping. Tracked as a follow-up
-  ([agent-tools#463](https://github.com/alex-mextner/agent-tools/issues/463)) rather than folded
+  ([agent-tools#463](https://git.hyperide.ai/ultrabricks/agent-tools/issues/463)) rather than folded
   into this PR: unwrapping needs its own care (recursion depth cap, `bash -c` re-tokenizing the
   inner script, `env`'s own `VAR=val` args vs. its target command) and deserves review on its
   own rather than inflating this PR further; the RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY

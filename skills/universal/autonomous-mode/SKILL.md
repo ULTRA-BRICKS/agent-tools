@@ -22,7 +22,7 @@ In **autonomous** mode (harness mode autonomous, or the user says autonomous):
 - Autonomous agents send key status via `tg --tag report`, not chat-only.
 - If extra-approval is wrongly ON, **fix that knob** —
   `github.ruleset.require_extra_approval_for_unattributed_changes`, mode-gated
-  by [rig-cli#404](https://github.com/alex-mextner/rig-cli/pull/404). A red test
+  by [rig-cli#404](https://git.hyperide.ai/ultrabricks/rig-cli/pull/404). A red test
   is not a broken gate: fix the work. Do not stall, and do not weaken a
   legitimate check.
 

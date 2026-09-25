@@ -26,7 +26,7 @@ yaml = ["pyyaml"]
 test = ["pytest", "pyyaml"]
 
 [project.urls]
-Homepage = "https://github.com/alex-mextner/agent-tools"
+Homepage = "https://git.hyperide.ai/ultrabricks/agent-tools"
 
 # The package source lives one directory up (lib/agenttools_providers, this file's
 # directory IS the package). Point discovery at the parent so setuptools finds the package

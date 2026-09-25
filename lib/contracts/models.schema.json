@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/alex-mextner/agent-tools/lib/contracts/models.schema.json",
+  "$id": "https://git.hyperide.ai/ultrabricks/agent-tools/lib/contracts/models.schema.json",
   "title": "agent-tools model manifest",
   "description": "Shape of lib/contracts/models.yaml — the ecosystem's single source of truth for the current-best concrete model per provider, each tagged with capabilities (esp. `vision`), plus a symbolic roles/aliases map. The `vision` role/alias resolving only to vision-capable entries is a CROSS-REFERENCE the JSON-Schema cannot express; the checker's --validate enforces it.",
   "type": "object",

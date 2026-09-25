@@ -1,6 +1,6 @@
 """End-to-end proof that ``agenttools-stall-watchdog watch`` fires under a REAL stall.
 
-Ticket: https://github.com/alex-mextner/agent-tools/issues/209
+Ticket: https://git.hyperide.ai/ultrabricks/agent-tools/issues/209
 
 Why this file exists (separate from ``test_agenttools_stall_watchdog.py``): every test in
 that suite drives either ``Watchdog`` directly with a fake clock, or ``cli.run_watch`` with

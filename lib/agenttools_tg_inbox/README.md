@@ -2,7 +2,7 @@
 
 The tmux-free delivery channel for Telegram messages to an agent that `tg-ctl` cannot reach
 with `tmux send-keys` (agent-tools#526, tg-cli#306). `tg-ctl` (the Telegram bridge in
-[tg-cli](https://github.com/alex-mextner/tg-cli)) discovers agents via `tmux list-panes` and
+[tg-cli](https://git.hyperide.ai/ultrabricks/tg-cli)) discovers agents via `tmux list-panes` and
 delivers by typing into the pane. An interactive `claude` / `codex` started from a plain
 terminal tab has no pane; `tg-ctl status` now lists it as `unreachable: not in tmux (tty …,
 cwd …, name …)` and a `/agent <name> <text>` addressed to it is **queued to an inbox file**.

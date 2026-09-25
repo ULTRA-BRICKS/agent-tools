@@ -20,7 +20,7 @@ dependencies = ["pyyaml>=6"]
 test = ["pytest"]
 
 [project.urls]
-Homepage = "https://github.com/alex-mextner/agent-tools"
+Homepage = "https://git.hyperide.ai/ultrabricks/agent-tools"
 
 # This pyproject lives INSIDE the package dir; the package source is this same directory.
 # Point discovery one level up and filter to just this package so setuptools never bundles
