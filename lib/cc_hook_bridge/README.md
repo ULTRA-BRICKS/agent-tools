@@ -71,6 +71,13 @@ installed `rtk-rewrite.sh` PreToolUse hook's style.
   (any other non-zero exit, a timeout, an unrunnable `cmd`) is resolved by its descriptor's
   `on_error`: `closed` → **block** ("I couldn't check" means "don't do it", for security
   gates); `open` (default) → allow (advisory hooks stay out of the way).
+- **One wall-clock budget per call (`HOOK_BUDGET_S`, 1100s).** Claude Code kills the bridge
+  at its outer `settings.json` timeout (1200s), and a killed command hook fails OPEN. Hooks
+  run sequentially (every hook runs even after a block, so each hatch attempt is audited), and
+  hatch hooks may wait up to 960s each, so the bridge caps the whole run below that outer wall:
+  each hook's `timeout_ms` is clamped to the remaining budget (and made `on_error: closed` when
+  clamped), and once the budget is spent the remaining hooks are skipped (logged) and the call
+  is **blocked**, even if an earlier hook granted it.
 
 ## The tg-ctl inbox on `Stop` (agent-tools#526 / tg-cli#306)
 
