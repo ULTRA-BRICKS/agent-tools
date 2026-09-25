@@ -678,6 +678,161 @@ def diff_pr(pr: PullRequest, name_only: bool) -> str:
 # --- gh-shaped CLI --------------------------------------------------------------------------
 
 
+# --- read-only Actions evidence for ship's --known-flake gate ------------------------------
+# Swagger: ActionRun{id,index_in_repo,status,workflow_id,commit_sha,event}, ActionRunJob{id,
+# name,status,attempt}; an Actions commit status links its job as
+# target_url=/<owner>/<repo>/actions/runs/<index_in_repo>/jobs/<n>. A check's identity is the
+# server's (workflow_id, job name): the " (<event>)" suffix of a status context is not identity.
+# Base evidence comes only from the EXACT base branch head, and only the newest run per workflow
+# and the newest attempt per job count. ship.sh keeps the rest of the predicate (the candidate's
+# check failed, the full local gate passes).
+
+_RUN_TERMINAL = frozenset({"success", "failure", "cancelled", "skipped"})
+_RUN_JOB_TARGET = re.compile(r"/actions/runs/(\d+)/jobs/(\d+)/?$")
+_RUN_LIST_FIELDS = frozenset({"databaseId", "conclusion"})
+
+
+def _typed(obj: object, key: str, typ: type, label: str):
+    value = obj.get(key) if isinstance(obj, dict) else None
+    if not isinstance(value, typ) or isinstance(value, bool) or value == "":
+        raise ProviderError(f"Forgejo {label} has no usable '{key}' — unsupported Actions response")
+    return value
+
+
+def _action_run(raw: object) -> dict:
+    return {"id": _typed(raw, "id", int, "action run"), "number": _typed(raw, "index_in_repo", int, "action run"),
+            "sha": _typed(raw, "commit_sha", str, "action run"), "status": _typed(raw, "status", str, "action run"),
+            "workflow": _typed(raw, "workflow_id", str, "action run")}
+
+
+def _action_runs(api: Api, query: str) -> list[dict]:
+    data = api.call("GET", api.repo_path(f"/actions/runs?{query}&limit={PAGE_LIMIT}"))
+    rows = data.get("workflow_runs") if isinstance(data, dict) else None
+    if rows is None and isinstance(data, dict) and data.get("total_count") == 0:
+        rows = []
+    if not isinstance(rows, list):
+        raise ProviderError("Forgejo run list response has no workflow_runs — unsupported Actions response")
+    total = data.get("total_count")
+    if isinstance(total, int) and total > len(rows):
+        raise ProviderError("Forgejo run list is truncated — refusing to judge from partial evidence")
+    return [_action_run(r) for r in rows]
+
+
+def _runs_on_sha(api: Api, sha: str) -> list[dict]:
+    runs = _action_runs(api, "head_sha=" + urllib.parse.quote(sha, safe=""))
+    if any(r["sha"] != sha for r in runs):
+        raise ProviderError("Forgejo returned a run for another commit to a head_sha query — refusing")
+    return runs
+
+
+def _latest_per_workflow(runs: list[dict]) -> list[dict]:
+    latest: dict[str, dict] = {}
+    for run in runs:
+        if run["workflow"] not in latest or run["id"] > latest[run["workflow"]]["id"]:
+            latest[run["workflow"]] = run
+    return sorted(latest.values(), key=lambda r: -r["id"])
+
+
+def _run_jobs(api: Api, run_id: int) -> list[dict]:
+    """Jobs in id order (the order the /jobs/<n> link indexes), each field type-checked."""
+    raw = api.call("GET", api.repo_path(f"/actions/runs/{run_id}/jobs"))
+    if not isinstance(raw, list):
+        raise ProviderError(f"Forgejo returned no job list for run {run_id} — unsupported Actions response")
+    jobs = [{"id": _typed(j, "id", int, "action job"), "name": _typed(j, "name", str, "action job"),
+             "status": _typed(j, "status", str, "action job"), "attempt": _typed(j, "attempt", int, "action job")}
+            for j in raw]
+    return sorted(jobs, key=lambda j: j["id"])
+
+
+def _latest_attempts(jobs: list[dict]) -> list[dict]:
+    latest: dict[str, dict] = {}
+    for job in jobs:
+        prev = latest.get(job["name"])
+        if prev is not None and prev["attempt"] == job["attempt"]:
+            raise ProviderError(f"two '{job['name']}' jobs share attempt {job['attempt']} — ambiguous evidence")
+        if prev is None or job["attempt"] > prev["attempt"]:
+            latest[job["name"]] = job
+    return list(latest.values())
+
+
+def _pinned_pr(ctx: "Context") -> PullRequest:
+    """The one PR this ship run pinned (the known-flake gate runs after the first PR read)."""
+    pins = sorted(Path(ctx.state_dir).glob("pr-*.head")) if ctx.state_dir else []
+    numbers = [p.name[3:-5] for p in pins]
+    if len(numbers) != 1 or not numbers[0].isdigit():
+        raise ProviderError("run evidence needs exactly one pinned PR in this ship run — refusing")
+    return ctx.pr(int(numbers[0]))
+
+
+def _candidate_identities(pr: PullRequest) -> dict[tuple[str, str], list[str]]:
+    """(workflow_id, job name) -> the candidate's own status contexts backed by that Actions job.
+    A context without an Actions job link on the pinned head has no identity (never matches)."""
+    found: dict[tuple[str, str], list[str]] = {}
+    for status in _combined_statuses(pr):
+        context = status.get("context") if isinstance(status, dict) else None
+        m = _RUN_JOB_TARGET.search(str((status or {}).get("target_url") or ""))
+        if not context or not m:
+            continue
+        runs = _action_runs(pr.api, f"run_number={int(m.group(1))}")
+        if len(runs) != 1 or runs[0]["sha"] != pr.pinned_sha:
+            continue
+        jobs = _run_jobs(pr.api, runs[0]["id"])
+        index = int(m.group(2))
+        if index < len(jobs):
+            found.setdefault((runs[0]["workflow"], jobs[index]["name"]), []).append(context)
+    return found
+
+
+def _base_head(pr: PullRequest) -> str:
+    return _require_str(_base_branch(pr).get("commit"), "id", "base branch commit.id")
+
+
+def run_list(ctx: "Context", branch: str, workflow: str | None, limit: int) -> list[dict]:
+    pr = _pinned_pr(ctx)
+    if branch != pr.base_ref:
+        raise ProviderError(f"run evidence is read only for this PR's base branch '{pr.base_ref}', not '{branch}'")
+    runs = _latest_per_workflow(_runs_on_sha(pr.api, _base_head(pr)))
+    if workflow:
+        runs = [r for r in runs if r["workflow"] == workflow]
+    return [{"databaseId": r["id"], "conclusion": r["status"]} for r in runs if r["status"] in _RUN_TERMINAL][:limit]
+
+
+def run_view_jobs(ctx: "Context", run_id: int) -> list[dict]:
+    pr = _pinned_pr(ctx)
+    base_head = _base_head(pr)
+    latest = {r["id"]: r for r in _latest_per_workflow(_runs_on_sha(pr.api, base_head))}
+    run = latest.get(run_id)
+    if run is None:
+        raise ProviderError(f"run {run_id} is not the newest run of its workflow on the base head "
+                            f"{base_head[:12]} — refusing it as base evidence")
+    identities = _candidate_identities(pr)
+    out = []
+    for job in _latest_attempts(_run_jobs(pr.api, run_id)):
+        for context in identities.get((run["workflow"], job["name"]), []):
+            out.append({"name": context, "conclusion": job["status"], "workflowId": run["workflow"],
+                        "job": job["name"], "runId": run_id, "attempt": job["attempt"]})
+    return out
+
+
+def gh_run(ctx: "Context", action: str, rest: list[str]) -> str:
+    if action == "list":
+        pos, o = _take_opts(rest, {"--branch", "--workflow", "--status", "--limit", "--json", "-q", "--jq"}, set())
+        fields = [f for f in (o.get("--json") or "").split(",") if f]
+        limit = o.get("--limit", "20")
+        if (pos or not o.get("--branch") or o.get("--status") != "completed" or not fields
+                or not set(fields) <= _RUN_LIST_FIELDS or not limit.isdigit()):
+            raise ProviderError("this `gh run list` shape is unsupported on the Forgejo provider (only "
+                                "`--branch <base> --status completed --json databaseId,conclusion`)")
+        rows = run_list(ctx, o["--branch"], o.get("--workflow"), int(limit))
+        return _emit([{f: r[f] for f in fields} for r in rows], o.get("-q") or o.get("--jq"))
+    if action == "view":
+        pos, o = _take_opts(rest, {"--json", "-q", "--jq"}, set())
+        if len(pos) != 1 or not pos[0].isdigit() or o.get("--json") != "jobs":
+            raise ProviderError("this `gh run view` shape is unsupported on the Forgejo provider (only `<id> --json jobs`)")
+        return _emit({"jobs": run_view_jobs(ctx, int(pos[0]))}, o.get("-q") or o.get("--jq"))
+    raise _unsupported(["run", action])
+
+
 def _unsupported(argv: list[str]) -> ProviderError:
     shown = " ".join(argv[:3])
     return ProviderError(f"`gh {shown} ...` is unsupported on the Forgejo provider — this gate has no "
@@ -815,6 +970,8 @@ def run_gh(ctx: Context, argv: list[str]) -> str:
         return gh_api(ctx, argv[1:])
     if len(argv) >= 2 and argv[0] == "repo":
         return gh_repo(ctx, argv[1], argv[2:])
+    if len(argv) >= 2 and argv[0] == "run":
+        return gh_run(ctx, argv[1], argv[2:])
     raise _unsupported(argv or [""])
 
 

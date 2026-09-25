@@ -58,6 +58,7 @@ class FakeForgejo:
             "review_comments": {}, "timeline": [], "files": ["docs/x.md"], "commits": [],
             "branch_protection": {"enable_status_check": False, "status_check_contexts": []},
             "merge_head_override": None, "redirect_to": None, "pr_get_status_after_merge": None,
+            "runs": [], "run_jobs": {},
         }
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.port = self.server.server_address[1]
@@ -155,6 +156,21 @@ class FakeForgejo:
             return listing(s["commits"])
         if sub == "/pulls/1/files":
             return listing([{"filename": f} for f in s["files"]])
+        if sub == "/actions/runs" and method == "GET":
+            runs = s["runs"]
+            if "head_sha" in query:
+                runs = [r for r in runs if r.get("commit_sha", query["head_sha"][0]) == query["head_sha"][0]]
+            if "run_number" in query:
+                runs = [r for r in runs if r.get("index_in_repo") == int(query["run_number"][0])]
+            runs = sorted(runs, key=lambda r: -r["id"])
+            return 200, {"total_count": len(runs), "workflow_runs": runs}, "application/json"
+        m = re.fullmatch(r"/actions/runs/(\d+)", sub)
+        if m:
+            run = next((r for r in s["runs"] if r["id"] == int(m.group(1))), None)
+            return (200, run, "application/json") if run else (404, {"message": "no run"}, "application/json")
+        m = re.fullmatch(r"/actions/runs/(\d+)/jobs", sub)
+        if m:
+            return 200, s["run_jobs"].get(int(m.group(1)), []), "application/json"
         if sub == "/pulls/1.diff":
             return 200, b"diff --git a/docs/x.md b/docs/x.md\n+hello\n", "text/plain"
         return 404, {"message": f"no route {method} {sub}"}, "application/json"
@@ -469,14 +485,168 @@ def test_merge_without_credential_or_with_raced_head_fails(api_fake, tmp_path, m
         fp.run_gh(_ctx_for(api_fake, tmp_path), ["pr", "merge", "1", "--squash"])
 
 
+# --- read-only Actions evidence for --known-flake -------------------------------------------
+# Identity of a check = (server workflow_id, job name). The status context's " (<event>)" suffix
+# is not identity; the base evidence must come from the EXACT base branch head.
+
+_CAND_CTX = "tests / pytest (pull_request)"
+
+
+def _run(rid, number, sha, status, workflow="tests.yml", event="push", **extra):
+    return {"id": rid, "index_in_repo": number, "commit_sha": sha, "status": status,
+            "workflow_id": workflow, "event": event, **extra}
+
+
+def _job(jid, rid, name, status, attempt=1, **extra):
+    return {"id": jid, "run_id": rid, "name": name, "status": status, "attempt": attempt, **extra}
+
+
+def _seed_flake(fake, *, base_status="failure", base_workflow="tests.yml", base_job="pytest",
+                cand_job="pytest", cand_workflow="tests.yml"):
+    """Candidate head H fails `tests / pytest (pull_request)` (run #7); base head B has run #5."""
+    head = _seed(fake)
+    base = fake.state["main_sha"]
+    fake.state["statuses"][head] = [{
+        "context": _CAND_CTX, "status": "failure", "target_url": "/o/r/actions/runs/7/jobs/0",
+        "created_at": "2020-01-02T00:00:00Z", "updated_at": "2020-01-02T00:00:00Z"}]
+    fake.state["runs"] = [
+        _run(70, 7, head, "failure", workflow=cand_workflow, event="pull_request"),
+        _run(50, 5, base, base_status, workflow=base_workflow, unknown_future_field={"x": 1}),
+    ]
+    fake.state["run_jobs"] = {
+        70: [_job(700, 70, cand_job, "failure")],
+        50: [_job(500, 50, base_job, base_status, extra_field="ignored")],
+    }
+    return head, base
+
+
+def _run_list(ctx, *extra):
+    out = fp.run_gh(ctx, ["run", "list", "--branch", "main", *extra, "--status", "completed",
+                          "--limit", "5", "--json", "databaseId,conclusion"])
+    return json.loads(out)
+
+
+def _run_view_jobs(ctx, rid):
+    return json.loads(fp.run_gh(ctx, ["run", "view", str(rid), "--json", "jobs", "-q", ".jobs"]))
+
+
+def test_known_flake_evidence_matches_same_workflow_and_job_on_the_base_head(api_fake, tmp_path):
+    _seed_flake(api_fake)
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)  # ship pins the candidate head before the known-flake gate runs
+    assert _run_list(ctx) == [{"databaseId": 50, "conclusion": "failure"}]
+    jobs = _run_view_jobs(ctx, 50)
+    assert [(j["name"], j["conclusion"]) for j in jobs] == [(_CAND_CTX, "failure")]
+    assert jobs[0]["workflowId"] == "tests.yml" and jobs[0]["job"] == "pytest"  # receipt
+    assert all(r["method"] == "GET" for r in api_fake.requests)  # read-only
+
+
+@pytest.mark.parametrize("over", [
+    {"base_workflow": "other.yml"},  # same job name, different workflow file: no identity match
+    {"base_job": "lint"},  # same workflow, different job
+    {"cand_workflow": "nightly.yml"},  # the candidate's context comes from another workflow
+], ids=["other-workflow", "other-job", "candidate-other-workflow"])
+def test_known_flake_identity_collisions_never_match(api_fake, tmp_path, over):
+    _seed_flake(api_fake, **over)
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    for row in _run_list(ctx):
+        assert all(j["name"] != _CAND_CTX for j in _run_view_jobs(ctx, row["databaseId"]))
+
+
+def test_known_flake_cancelled_base_job_is_not_a_failure(api_fake, tmp_path):
+    _seed_flake(api_fake, base_status="cancelled")
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert [(j["name"], j["conclusion"]) for j in _run_view_jobs(ctx, 50)] == [(_CAND_CTX, "cancelled")]
+
+
+def test_known_flake_only_the_latest_run_and_attempt_count(api_fake, tmp_path):
+    head, base = _seed_flake(api_fake)
+    api_fake.state["runs"].append(_run(60, 6, base, "success"))  # newer run of the same workflow
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_list(ctx) == [{"databaseId": 60, "conclusion": "success"}]
+    api_fake.state["runs"].pop()
+    api_fake.state["run_jobs"][50].append(_job(501, 50, "pytest", "success", attempt=2))
+    assert [(j["name"], j["conclusion"]) for j in _run_view_jobs(ctx, 50)] == [(_CAND_CTX, "success")]
+
+
+def test_known_flake_missing_base_evidence_is_empty_not_confirmed(api_fake, tmp_path):
+    _seed_flake(api_fake)
+    api_fake.state["runs"] = [r for r in api_fake.state["runs"] if r["id"] != 50]
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_list(ctx) == []
+
+
+def test_known_flake_refuses_a_run_that_is_not_on_the_exact_base_head(api_fake, tmp_path):
+    head, _base = _seed_flake(api_fake)
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    with pytest.raises(fp.ProviderError, match="base"):
+        _run_view_jobs(ctx, 70)  # the candidate's own run is never base evidence
+
+
+def test_known_flake_external_status_without_a_run_link_has_no_identity(api_fake, tmp_path):
+    head, _base = _seed_flake(api_fake)
+    api_fake.state["statuses"][head][0]["target_url"] = "https://ci.example/build/7"
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_view_jobs(ctx, 50) == []
+
+
+@pytest.mark.parametrize("drop", ["workflow_id", "commit_sha", "status", "id"])
+def test_known_flake_missing_required_run_field_fails_closed(api_fake, tmp_path, drop):
+    _seed_flake(api_fake)
+    del api_fake.state["runs"][1][drop]
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    with pytest.raises(fp.ProviderError):
+        _run_list(ctx)
+
+
+@pytest.mark.parametrize("argv", [
+    ["run", "list", "--branch", "main", "--json", "databaseId,conclusion"],  # no --status completed
+    ["run", "list", "--branch", "main", "--status", "completed", "--json", "databaseId,headSha"],
+    ["run", "list", "--status", "completed", "--json", "databaseId"],  # no --branch
+    ["run", "view", "50", "--json", "jobs,url"],
+    ["run", "view", "50", "--log-failed"],
+    ["run", "rerun", "50"],
+])
+def test_known_flake_unsupported_run_shapes_fail_closed(api_fake, tmp_path, argv):
+    _seed_flake(api_fake)
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    with pytest.raises(fp.ProviderError):
+        fp.run_gh(ctx, argv)
+
+
+def test_ship_known_flake_confirmed_on_forgejo_then_runs_the_local_gate(forge):
+    fake, head = forge["fake"], forge["head"]
+    base = fake.state["main_sha"]
+    fake.state["statuses"][head] = [{
+        "context": _CAND_CTX, "status": "failure", "target_url": "/o/r/actions/runs/7/jobs/0",
+        "created_at": "2020-01-02T00:00:00Z", "updated_at": "2020-01-02T00:00:00Z"}]
+    fake.state["runs"] = [_run(70, 7, head, "failure", event="pull_request"), _run(50, 5, base, "failure")]
+    fake.state["run_jobs"] = {70: [_job(700, 70, "pytest", "failure")], 50: [_job(500, 50, "pytest", "failure")]}
+    r = _ship(forge, "--dry-run", "--known-flake", _CAND_CTX, SHIP_LOCAL_TEST_CMD="true")
+    out = r.stdout + r.stderr
+    assert f"'{_CAND_CTX}' asserted via --known-flake and CONFIRMED" in out, out
+    fake.state["run_jobs"][50] = [_job(500, 50, "pytest", "success")]
+    r = _ship(forge, "--dry-run", "--known-flake", _CAND_CTX, SHIP_LOCAL_TEST_CMD="true")
+    assert r.returncode != 0 and "could NOT be confirmed" in r.stdout + r.stderr
+    assert fake.merges() == [] and _gh_log(forge) == ""
+
+
 # --- every gh call site in ship.sh is mapped or fails closed ----------------------------------
 
 MAPPED = {("pr", "view"), ("pr", "diff"), ("pr", "merge"), ("pr", "comment"), ("pr", "edit"),
-          ("api", "graphql"), ("repo", "view")}
+          ("api", "graphql"), ("repo", "view"), ("run", "list"), ("run", "view")}
 # Sites the Forgejo provider deliberately does NOT map (GitHub Actions evidence): each must fail.
 UNSUPPORTED_PROBES = {
-    ("run", "list"): ["run", "list", "--branch", "main"],
-    ("run", "view"): ["run", "view", "1", "--json", "jobs"],
+    ("run", "list", "no-status"): ["run", "list", "--branch", "main"],
+    ("run", "view", "no-json"): ["run", "view", "1"],
     ("api", "repos/{owner}/{repo}/actions/runs?head_sha=$head_sha&per_page=20"): ["api", "repos/o/r/actions/runs"],
     ("api", "repos/{owner}/{repo}/commits/$head_sha/check-runs?per_page=100"): ["api", "repos/o/r/commits/x/check-runs"],
     ("api", "repos/{owner}/{repo}/check-runs/$id/annotations"): ["api", "repos/o/r/check-runs/1/annotations"],

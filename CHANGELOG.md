@@ -27,6 +27,10 @@
   `--config` for the acceptance gate and the post-merge notify (UB-25: a Tasks-app ticket shipped
   from a Forgejo repository). A missing file, and any acceptance result that cannot be evaluated,
   refuses the merge.
+- `ci/ship`: `--known-flake` works on Forgejo from read-only Actions evidence (UB-25). A check's
+  identity is the server's workflow id plus job name; base evidence comes only from the exact
+  base branch head, newest run per workflow and newest attempt per job. The predicate and the
+  local gate are unchanged; missing or malformed evidence refuses.
 
 ### Fixed
 
