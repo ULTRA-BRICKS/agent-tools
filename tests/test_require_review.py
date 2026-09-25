@@ -26,6 +26,7 @@ Run from the repo root::
 
 from __future__ import annotations
 
+import html
 import importlib.util
 import io
 import json
@@ -92,6 +93,14 @@ def _run(command, cwd, monkeypatch, *, marker: Path,
 
 def _decision(out: str) -> str:
     return json.loads(out)["decision"]
+
+
+def _assert_html_escaped_in_question(raw_question: str, value: str) -> None:
+    """The hatch question is Telegram HTML: `value` must arrive escaped, never raw."""
+    escaped = html.escape(value, quote=False)
+    assert escaped != value, "test input must contain a character that HTML-escapes"
+    assert escaped in raw_question and value not in raw_question
+    assert value in html.unescape(raw_question)
 
 
 def _touch_marker(marker: Path) -> None:
@@ -1031,7 +1040,7 @@ def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert not injected.exists()
-    assert justification in json.loads(question.read_text())["question"]
+    _assert_html_escaped_in_question(json.loads(question.read_text())["question"], justification)
 
 
 def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
@@ -1058,7 +1067,7 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
     assert asked.exists()
     assert not injected.exists()
-    assert justification in json.loads(question.read_text())["question"]
+    _assert_html_escaped_in_question(json.loads(question.read_text())["question"], justification)
 
 
 def test_hatch_justification_exit1_blocks_citing_denied(tmp_path, monkeypatch):

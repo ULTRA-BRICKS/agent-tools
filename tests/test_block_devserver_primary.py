@@ -14,6 +14,7 @@ Run from the repo root::
 
 from __future__ import annotations
 
+import html
 import importlib.util
 import io
 import json
@@ -128,6 +129,14 @@ def _run(cwd: Path, monkeypatch, command: str, env: dict | None = None) -> tuple
 
 def _decision(out: str) -> str:
     return json.loads(out)["decision"]
+
+
+def _assert_html_escaped_in_question(raw_question: str, value: str) -> None:
+    """The hatch question is Telegram HTML: `value` must arrive escaped, never raw."""
+    escaped = html.escape(value, quote=False)
+    assert escaped != value, "test input must contain a character that HTML-escapes"
+    assert escaped in raw_question and value not in raw_question
+    assert value in html.unescape(raw_question)
 
 
 # ── DENY: known dev-server commands on the default branch, enrolled ───────────────────────
@@ -621,11 +630,10 @@ def test_hatch_question_shows_full_command_not_just_label(tmp_path, monkeypatch)
         "RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY": "One-off verification, worktree busy.",
     })
     assert code == 0 and _decision(out) == "allow"
-    question = capture.read_text()
-    assert command in question, (
-        "the human-facing hatch question must contain the FULL original command string, "
-        "not just the short classifier label for the segment that triggered the block"
-    )
+    raw_question = json.loads(capture.read_text())["question"]
+    # The human-facing question must carry the FULL original command string, not just the
+    # short classifier label for the segment that triggered the block.
+    _assert_html_escaped_in_question(raw_question, command)
 
 
 def test_hatch_justification_exit1_blocks_citing_denial(tmp_path, monkeypatch):
