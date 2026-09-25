@@ -768,6 +768,11 @@ _WRAPPED_AND_CHAINED_BLOCKED = [
     "if true; then fj issue close 5; fi",
     "fj issue create 'x; y && z | w' --body 'a $(b) `c` d > e < f'",
     'fj issue comment 5 "line1; gh pr view 3 && echo | cat"',
+    # A `<<` inside shell arithmetic is a shift, not a heredoc opener: the next lines stay shell.
+    "python3 bench.py $((1<<10))\ngh issue create --title bypass --body x",
+    "node --max-old-space-size=$((1<<10)) server.js\nfj issue create t --body x",
+    "x=$((SIZE<<SHIFT)); python3 run.py\nfj issue close 5",
+    "(( n = 1 << 4 )); python3 run.py\ngh issue create --title x",
 ]
 
 

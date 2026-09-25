@@ -926,10 +926,15 @@ def _interpreter_kind(argv: list[str]) -> str | None:
     return None
 
 
+# `$(( … ))` / `(( … ))` arithmetic (one nesting level of parens inside). A `<<` there is a
+# left shift, not a heredoc opener; treating it as one would swallow every following line.
+_ARITHMETIC = re.compile(r"\$?\(\((?:[^()]|\([^()]*\))*\)\)")
+
+
 def _heredoc_openers(line: str) -> list[tuple[str | None, bool, str]]:
     """Every `<<DELIM` / `<<-DELIM` on one shell line, tagged with the interpreter kind of the
     command it feeds (None = plain data heredoc such as `cat <<EOF`)."""
-    tokens = _tokenize_line(line)
+    tokens = _tokenize_line(_ARITHMETIC.sub(" 0 ", line))
     if not tokens:
         return []
     found: list[tuple[str | None, bool, str]] = []
