@@ -973,9 +973,25 @@ _DISPLAY_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         rf"\1\2\3:{_REDACTED}",
     ),
+    (  # a token used as the whole `-u`/`--user` value (`-u TOKEN`, `-u TOKEN:`). Token-length
+        # only (16+), so `git push -u origin` / `sort -u file` stay readable.
+        re.compile(
+            r"(?<!\S)(-u\s*|--user[=\s]+|--proxy-user[=\s]+)(['\"]?)([A-Za-z0-9_.~+/-]{16,}):?(?=['\"\s]|$)"
+        ),
+        rf"\1\2{_REDACTED}",
+    ),
     (  # URL userinfo: `https://user:pass@host`
         re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)([^/\s:@'\"]+):([^/\s@'\"]+)@"),
         rf"\1\2:{_REDACTED}@",
+    ),
+    (  # URL userinfo that is a bare token: `https://TOKEN@host` (token-length, so `git@` stays)
+        re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)([A-Za-z0-9_.~+-]{16,})@"),
+        rf"\1{_REDACTED}@",
+    ),
+    (  # curl's short cookie flag with inline pairs: `-b 'a=1; b=2'` / `-b a=1` (a cookie FILE
+        # path has no `=` and is left alone)
+        re.compile(r"(?<!\S)(-b\s*)(?:(['\"])[^'\"\n]*=[^'\"\n]*|([^\s'\"=]+=[^\s'\"]+))"),
+        rf"\1\2{_REDACTED}",
     ),
     (  # credential query parameters
         re.compile(
@@ -993,7 +1009,7 @@ _DISPLAY_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (  # `GITEA_TOKEN=X cmd`, `API_KEY='X'`, `-f token=X`
         re.compile(
-            r"(?i)(?<![\w-])([a-z_][a-z0-9_]*(?:token|secret|password|passwd|api_?key"
+            r"(?i)(?<![\w-])([a-z0-9_]*(?:token|secret|password|passwd|api_?key"
             r"|private_key|credentials?)[a-z0-9_]*)=('[^']*'|\"[^\"]*\"|[^\s;&|'\"]+)"
         ),
         rf"\1={_REDACTED}",

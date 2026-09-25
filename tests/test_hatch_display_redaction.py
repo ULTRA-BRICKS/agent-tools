@@ -72,6 +72,16 @@ _SECRET_COMMANDS = [
     f"wget --proxy-password={_PASS} {_ISSUES}",  # gitleaks:allow
     f"curl -H 'Cookie: sid={_TOKEN}; csrf={_PASS}' -X POST {_ISSUES}",  # gitleaks:allow
     f"curl --cookie 'sid={_TOKEN}; csrf={_PASS}' -X POST {_ISSUES}",  # gitleaks:allow
+    # A token used as the whole username (no password), and bare keyword-named variables.
+    f"curl -u {_TOKEN} -X POST {_ISSUES}",  # gitleaks:allow
+    f"curl -u {_TOKEN}: -X POST {_ISSUES}",  # gitleaks:allow
+    f"curl --user '{_TOKEN}' -X POST {_ISSUES}",  # gitleaks:allow
+    f"curl -X POST https://{_TOKEN}@forge.example/api/v1/repos/org/repo/issues",  # gitleaks:allow
+    f"curl -b 'sid={_TOKEN}; csrf={_PASS}' -X POST {_ISSUES}",  # gitleaks:allow
+    f"curl -b sid={_TOKEN} -X POST {_ISSUES}",  # gitleaks:allow
+    f"TOKEN={_TOKEN} curl -XPOST {_ISSUES} -d title=x",  # gitleaks:allow
+    f"API_KEY='{_TOKEN}' gh api repos/org/repo/issues -f title=x",  # gitleaks:allow
+    f"gh api repos/org/repo/issues -f title=x -f token={_TOKEN}",  # gitleaks:allow
 ]
 
 
@@ -100,6 +110,11 @@ def test_redaction_keeps_the_command_intelligible():
         f"curl {_ISSUES}?state=open&page=2",
         "gh api repos/org/repo/issues -f title='Token handling is broken'",
         "fj issue comment 5 'rotate the password policy doc'",
+        "git push -u origin main",
+        "git checkout -b feature/token-rotation",
+        "curl -b cookies.txt https://forge.example/api/v1/version",
+        "git clone ssh://git@forge.example/org/repo.git",
+        "sort -u names.txt",
         "",
     ],
 )
