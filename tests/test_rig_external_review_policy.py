@@ -20,7 +20,12 @@ def policy():
 @pytest.fixture
 def config_path(tmp_path):
     root = tmp_path / 'machine' / 'rig'
-    root.mkdir(parents=True, mode=0o700)
+    root.mkdir(parents=True)
+    # mkdir's mode is masked by the umask and does not apply to created parents; a CI
+    # runner with umask 000 would leave both directories world-writable, which the policy
+    # (correctly) treats as untrusted. chmod is umask-independent.
+    for directory in (root.parent, root):
+        directory.chmod(0o700)
     return root / 'config.yaml'
 
 def write(path, required=False, owners=None):
