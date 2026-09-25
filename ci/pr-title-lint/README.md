@@ -5,8 +5,12 @@ Validates the **PR title** against [Conventional Commits](https://www.convention
 the default branch — so this keeps history clean and machine-parseable (changelog tools,
 semantic-release, `git log` greps by type).
 
-**Standard engine = [amannn/action-semantic-pull-request](https://github.com/amannn/action-semantic-pull-request)**
-— the de-facto action for this.
+**Engine = a dependency-free inline check** (stdlib `python3`, on every runner image) that applies
+the same rules as [amannn/action-semantic-pull-request](https://github.com/amannn/action-semantic-pull-request).
+That action was dropped because it calls the GitHub REST API and crashes on Forgejo / Gitea runners
+(`Cannot read properties of undefined (reading 'login')`). The inline check makes no API call: it
+reads the title from the event payload (`$GITHUB_EVENT_PATH`), so it behaves the same on GitHub and
+on Forgejo.
 
 ## Quick start
 
@@ -17,11 +21,16 @@ cp ci/pr-title-lint/workflow.yml .github/workflows/pr-title-lint.yml
 
 ## Knobs
 
-- `types` — the allowed Conventional types (default: the standard set). Trim to taste.
-- `scopes` / `requireScope` — restrict scopes to a list, and/or require one. Leave `scopes`
-  unset to allow any scope.
-- `subjectPattern` — a regex the subject must match (default: lowercase start, no trailing
-  period).
+Env on the workflow step:
+
+- `TYPES` — the allowed Conventional types, space-separated (default: the standard set). Trim to taste.
+- `SCOPES` / `REQUIRE_SCOPE` — restrict scopes to a space-separated list, and/or require one
+  (`"true"`). Leave `SCOPES` empty to allow any scope.
+- `SUBJECT_PATTERN` — a regex the subject must match (default: lowercase start, no trailing
+  period); `SUBJECT_PATTERN_ERROR` is the message, with `{subject}` / `{title}` placeholders.
+
+A manual run (`workflow_dispatch` with a `title` input) validates a given title — useful to
+test the gate itself.
 
 ## Scope: title only
 
@@ -32,12 +41,13 @@ if you don't squash-merge.
 
 ## Pinning
 
-`amannn/action-semantic-pull-request` is SHA-pinned (`# v6.1.1`).
+Nothing to pin: the check uses no third-party action, only the runner's `python3`.
 
 ## Why `pull_request_target`
 
-So the action can post a helpful failure comment. It reads **only the title** from the event
-payload — it never checks out or runs PR-head code, so the privileged token is safe.
+So the trusted base-branch copy of the check runs (a PR cannot weaken the gate it must pass).
+It reads **only the title** from the event payload — it never checks out or runs PR-head code,
+and the job needs no token scope beyond `contents: read`.
 
 ## When to use
 

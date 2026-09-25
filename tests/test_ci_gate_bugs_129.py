@@ -962,7 +962,8 @@ def test_codeql_detect_does_not_use_pipe_grep_q():
     code = "\n".join(
         ln for ln in CODEQL_WF.read_text().splitlines() if not ln.lstrip().startswith("#")
     )
-    detect = code.split("- name: Detect source for this language", 1)[1].split("- name: Initialize CodeQL", 1)[0]
+    detect = code.split("- name: Detect source for this language", 1)[1].split("- name: Install the CodeQL CLI", 1)[0]
+    assert "- name: Install the CodeQL CLI" in code, "detect must be followed by the CLI install step"
     assert "git ls-files | grep -qiE" not in detect
     assert "grep -q" not in detect
     assert 'tracked="$(git ls-files)"' in detect

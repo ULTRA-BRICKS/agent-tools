@@ -20,7 +20,7 @@ dependencies = []
 test = ["pytest"]
 
 [project.urls]
-Homepage = "https://github.com/alex-mextner/agent-tools"
+Homepage = "https://git.hyperide.ai/ultrabricks/agent-tools"
 
 # This pyproject lives INSIDE the package directory: the package's modules (__init__.py,
 # core.py) sit next to this file, not in a subdirectory. So map the import package

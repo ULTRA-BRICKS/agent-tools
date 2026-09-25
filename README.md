@@ -354,8 +354,8 @@ Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 - **[task-cli](https://git.hyperide.ai/ultrabricks/task-cli)** — the enforced ticket interface: every request becomes a well-formed ticket, with acceptance criteria, motivation, user-impact & screenshots enforced by the tool. Backends: GitHub Issues (default) and Linear.
 - **[pm-cli](https://git.hyperide.ai/ultrabricks/pm-cli)** — autonomous project-manager coordinator over the task/tg/rig ecosystem: an event-sourced work queue projected from an append-only JSONL log. Release 1 observes and reconciles on unforgeable evidence; it does not dispatch or edit code.
 - **`dev`** (`lib/agenttools_dev/`) — project-scoped dev/e2e process runner shipped in this repo: runs a repo's `rig.yaml` scripts and manages background dev servers / e2e jobs, with a safe-by-default `dev stop` that only kills runners scoped to the current repo. See [`lib/agenttools_dev/README.md`](lib/agenttools_dev/README.md).
-- **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
-- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
+- **[draw-cli](https://git.hyperide.ai/ultrabricks/draw-cli)** — text-to-image via Hugging Face
+- **[3d-cli](https://git.hyperide.ai/ultrabricks/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
 - **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
 Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.

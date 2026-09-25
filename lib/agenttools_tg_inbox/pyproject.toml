@@ -18,7 +18,7 @@ dependencies = []
 test = ["pytest"]
 
 [project.urls]
-Homepage = "https://github.com/alex-mextner/agent-tools"
+Homepage = "https://git.hyperide.ai/ultrabricks/agent-tools"
 
 # This pyproject lives INSIDE the package directory (same layout as agenttools_tmux_inject).
 [tool.setuptools]

@@ -2,7 +2,7 @@
 
 Every ecosystem CLI (`tg-ctl`, `review`, …) ships an `install-hooks`-style command that
 writes agent-harness hooks directly (`~/.claude/settings.json`, `~/.codex/hooks.json`, …).
-When [`rig`](https://github.com/alex-mextner/rig-cli) is also installed, those direct
+When [`rig`](https://git.hyperide.ai/ultrabricks/rig-cli) is also installed, those direct
 writers become a **second** source of truth for the same hooks — the exact duplication
 that makes codex warn `loading hooks from both …` and lets two tools fight over one file.
 

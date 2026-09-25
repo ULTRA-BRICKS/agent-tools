@@ -5,28 +5,39 @@
 # semantic-release / changelog generators work). This validates the title against the
 # Conventional Commits spec: `type(optional-scope)!: subject`.
 #
-# Standard engine = amannn/action-semantic-pull-request (the de-facto action for this).
+# Engine = a dependency-free inline check (stdlib python3, present on every runner image).
+# It applies the same rules as amannn/action-semantic-pull-request, which it replaced: that
+# action calls the GitHub REST API, so it crashes on Forgejo/Gitea runners ("Cannot read
+# properties of undefined (reading 'login')"). This check makes NO API call — it reads the
+# title from the event payload ($GITHUB_EVENT_PATH), so it runs the same on GitHub and Forgejo.
 #
 # INSTALL: copy to .github/workflows/pr-title-lint.yml.
 #
-# KNOBS: edit `types` / `scopes` / `requireScope` below. Default types are the Conventional
-# Commits set. Leave `scopes` unset to allow any scope.
+# KNOBS (env on the step below): TYPES / SCOPES / REQUIRE_SCOPE / SUBJECT_PATTERN (+ its
+# error text). Default types are the Conventional Commits set. Leave SCOPES empty to allow
+# any scope.
 #
 # Note: a sibling check on the commit MESSAGES themselves (not just the PR title) belongs in
 # a commit-msg git-hook — see ../../git-hooks/. This gate is specifically the squash-title.
 #
-# Triggered by `pull_request_target` so it can post a helpful failure comment on the PR; it
-# reads ONLY the title from the event payload — it never checks out or runs PR code.
+# Triggered by `pull_request_target` (the trusted base copy of this check runs, not the PR's);
+# it reads ONLY the title from the event payload — it never checks out or runs PR code. A
+# manual `workflow_dispatch` validates a given title (handy to test the gate itself).
 
 name: pr-title-lint
 
 on:
   pull_request_target:
     types: [opened, edited, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      title:
+        description: 'PR title to validate (manual runs have no PR in the event payload)'
+        required: true
+        type: string
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   pr-title-lint:
@@ -34,31 +45,69 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate PR title (Conventional Commits)
-        uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          # Conventional Commit types. Trim/extend to taste.
-          types: |
-            feat
-            fix
-            docs
-            style
-            refactor
-            perf
-            test
-            build
-            ci
-            chore
-            revert
-          # Allowed scopes — leave commented to allow ANY scope.
-          # scopes: |
-          #   api
-          #   ui
-          #   deps
-          requireScope: false
+          # Conventional Commit types (space-separated). Trim/extend to taste.
+          TYPES: feat fix docs style refactor perf test build ci chore revert
+          # Allowed scopes (space-separated) — leave empty to allow ANY scope.
+          SCOPES: ""
+          REQUIRE_SCOPE: "false"
           # Subject must not start uppercase / end with a period (Conventional style).
-          subjectPattern: ^(?![A-Z])(?!.*\.$).+$
-          subjectPatternError: |
+          SUBJECT_PATTERN: '^(?![A-Z])(?!.*\.$).+$'
+          SUBJECT_PATTERN_ERROR: |
             The PR title subject "{subject}" is invalid: it must start lowercase and not
             end with a period. Example: feat(api): add pagination to list endpoints
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          def fail(msg):
+              # One ::error:: annotation; newlines are %0A-encoded per the workflow-command spec.
+              msg = msg.strip()
+              enc = msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error::{enc}")
+              print(msg, file=sys.stderr)
+              sys.exit(1)
+
+          types = os.environ.get("TYPES", "").split()
+          scopes = os.environ.get("SCOPES", "").split()
+          require_scope = os.environ.get("REQUIRE_SCOPE", "false").strip().lower() == "true"
+          subject_pattern = os.environ.get("SUBJECT_PATTERN", "")
+
+          event = {}
+          path = os.environ.get("GITHUB_EVENT_PATH", "")
+          if path and os.path.isfile(path):
+              with open(path, encoding="utf-8") as fh:
+                  event = json.load(fh)
+          title = (event.get("pull_request") or {}).get("title")
+          if title is None:  # workflow_dispatch: the title comes from the manual input
+              title = (event.get("inputs") or {}).get("title")
+          if not isinstance(title, str) or not title.strip():
+              fail("Could not read the PR title from the event payload ($GITHUB_EVENT_PATH) — failing closed.")
+          title = title.strip()
+
+          available = "\n".join(f" - {t}" for t in types)
+          m = re.match(r"^(\w*)(?:\((.*)\))?!?: (.*)$", title)
+          if not m or not m.group(1):
+              fail(f'No release type found in pull request title "{title}". Add a prefix to indicate '
+                   "what kind of release this pull request corresponds to. For reference, see "
+                   f"https://www.conventionalcommits.org/\n\nAvailable types:\n{available}")
+          ptype, scope, subject = m.group(1), m.group(2), m.group(3)
+          if ptype not in types:
+              fail(f'Unknown release type "{ptype}" found in pull request title "{title}". \n\n'
+                   f"Available types:\n{available}")
+          given = [s.strip() for s in (scope or "").split(",") if s.strip()]
+          if require_scope and not given:
+              msg = f'No scope found in pull request title "{title}".'
+              if scopes:
+                  msg += f" Scope must match one of: {', '.join(scopes)}."
+              fail(msg)
+          unknown = [s for s in given if scopes and s not in scopes]
+          if unknown:
+              fail(f'Unknown scope{"s" if len(unknown) > 1 else ""} "{",".join(unknown)}" found in pull '
+                   f'request title "{title}". Scope must match one of: {", ".join(scopes)}.')
+          if subject_pattern and not re.match(subject_pattern, subject):
+              template = os.environ.get("SUBJECT_PATTERN_ERROR", "") or (
+                  f'The PR title subject "{{subject}}" does not match the pattern "{subject_pattern}".')
+              fail(template.replace("{subject}", subject).replace("{title}", title))
+          print(f'PR title OK: "{title}"')
+          PY
