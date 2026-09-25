@@ -76,6 +76,13 @@
 #                          Under --dry-run the edit is only printed.
 #   --screenshot P [D]     attach a local screenshot P (desc D) via SHIP_IMAGE_UPLOAD_CMD,
 #                          then post it as a PR comment. Repeatable.
+#   --task-config PATH     explicit task-cli config file for this ship's ticket (e.g. a Tasks-app
+#                          ticket shipped from a repo whose own task routing points elsewhere).
+#                          Passed as task-cli's standard `--config PATH` to the acceptance gate
+#                          (`task gate`) and the post-merge `task mark-shipped` / auto-close
+#                          `task done`. A missing/unreadable file refuses before any merge, and with
+#                          it every "could not evaluate" acceptance outcome refuses instead of
+#                          skipping. Accepts --task-config=PATH too.
 #   --known-flake NAME     assert that the FAILED check named NAME (as printed by the green-CI
 #                          gate's own "x <name> -> <conclusion>" refusal lines) is a pre-existing
 #                          failure unrelated to this diff — a confirmed CI flake, not the "CI is
@@ -117,6 +124,10 @@
 #   SHIP_MAIN_CHECKOUT     path to the primary (main) checkout for the post-merge pull.
 #                          Default: first worktree in `git worktree list`.
 #   SHIP_DEFAULT_BRANCH    base branch name (default: main).
+#   SHIP_PROVIDER          github | forgejo | auto (default). auto: a github.com / local-path origin
+#                          uses gh unchanged; any other origin must answer the Forgejo version
+#                          probe and then routes gh through ci/ship/forgejo_provider.py (see the
+#                          "provider dispatch" block and ci/ship/README.md "Forgejo provider").
 #   SHIP_UI_PATH_REGEX     ERE; changed files matching it => "UI-touching" (screenshot
 #                          required). Default covers common front-end paths. Empty = never
 #                          treat as UI (disables the screenshot gate).
@@ -297,6 +308,8 @@ PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""; REPO
 # --rewrite-magic-close: let the magic-close gate rewrite Closes/Fixes/Resolves -> Refs via
 # `gh pr edit` and continue, instead of refusing. See "magic-close keyword gate" below.
 REWRITE_MAGIC_CLOSE=0
+# --task-config PATH: task-cli `--config` for the acceptance gate and the post-merge notify.
+TASK_CONFIG=""; TASK_CONFIG_ARGS=()
 SHOT_PATHS=(); SHOT_DESCS=()
 # --known-flake NAME, repeatable — see the "known-flake gate" block below _ci_github_status_indicator.
 KNOWN_FLAKES=()
@@ -311,7 +324,7 @@ KF_AUDIT_PENDING=""
 # current thread is never touched (see the gate below).
 RESOLVE_THREADS=0
 case "${SHIP_RESOLVE_ADDRESSED_THREADS:-}" in 1|true|yes) RESOLVE_THREADS=1 ;; esac
-USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--rewrite-magic-close] [--screenshot <path> [desc]]... [--known-flake <check-name>]...'
+USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--rewrite-magic-close] [--screenshot <path> [desc]]... [--known-flake <check-name>]... [--task-config <path>]'
 
 # Path to the review-quorum gate's hatch-escalation helper (ci/ship/review_quorum_hatch.py),
 # derived ONLY from this script's own location. That helper imports the shared
@@ -351,6 +364,10 @@ while [ "$i" -lt "$n" ]; do
     --no-review-dwell-ok)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--no-review-dwell-ok needs a <reason>." >&2; exit 1; }
       NO_DWELL_OK=${args[$i]}; [ -n "$NO_DWELL_OK" ] || { echo "--no-review-dwell-ok reason empty." >&2; exit 1; } ;;
+    --task-config=*) TASK_CONFIG=${a#--task-config=}; [ -n "$TASK_CONFIG" ] || { echo "--task-config= needs a <path>." >&2; exit 1; } ;;
+    --task-config)
+      i=$((i+1)); { [ "$i" -lt "$n" ] && [ -n "${args[$i]}" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--task-config needs a <path>." >&2; exit 1; }
+      TASK_CONFIG=${args[$i]} ;;
     --known-flake)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--known-flake needs a <check-name>." >&2; exit 1; }
       [ -n "${args[$i]}" ] || { echo "--known-flake check-name empty." >&2; exit 1; }
@@ -388,6 +405,23 @@ if [ -n "$REPO_FLAG" ]; then
     */*)   : ;; # ok
     *)     echo "Refusing: --repo value '$REPO_FLAG' is not in owner/repo form." >&2; exit 1 ;;
   esac
+fi
+
+# --task-config: resolve against the caller's cwd and prove it is a readable regular file NOW,
+# before any gate runs — a ticket config that cannot be read must never reach the merge.
+if [ -n "$TASK_CONFIG" ]; then
+  case "$TASK_CONFIG" in /*) : ;; *) TASK_CONFIG="$ORIG_PWD/$TASK_CONFIG" ;; esac
+  if [ ! -f "$TASK_CONFIG" ] || [ ! -r "$TASK_CONFIG" ]; then
+    echo "Refusing: --task-config '$TASK_CONFIG' is not a readable file — the ticket cannot be routed, so its acceptance cannot be proven." >&2
+    exit 1
+  fi
+  # Routing only: a task-cli config can also carry enforcement settings (e.g. switching the
+  # acceptance gate off), which would make a caller-supplied file a self-service bypass.
+  if ! python3 -I "$_SHIP_SELF_DIR/task_config_guard.py" "$TASK_CONFIG"; then
+    echo "Refusing: --task-config must be a routing-only task-cli config (backend + its routing block); see ci/ship/task_config_guard.py." >&2
+    exit 1
+  fi
+  TASK_CONFIG_ARGS=(--config "$TASK_CONFIG")
 fi
 
 DEFAULT_BRANCH="${SHIP_DEFAULT_BRANCH:-main}"
@@ -511,6 +545,124 @@ abort_if_cwd_core_bare() {  # the cwd may be a subdir of the corrupt checkout �
 abort_if_cwd_core_bare
 
 ROOT=$(git rev-parse --show-toplevel); cd "$ROOT"
+
+# --- provider dispatch (GitHub default; a Forgejo origin routes gh through an adapter) ------
+# Every gate below reads the PR through `gh`. On a checkout whose `origin` is a Forgejo host,
+# the real gh resolves some OTHER remote (e.g. an archived GitHub mirror) and every gate would
+# read the wrong repository. So for a Forgejo origin ship binds a shell FUNCTION named `gh` to
+# ci/ship/forgejo_provider.py: the SAME gate code runs against Forgejo evidence, and anything
+# the adapter cannot map exits non-zero, which every call site treats as refuse / no evidence.
+# The function is local to this shell — task-cli, review-cli and the hatch helpers never see it.
+# github.com, local-path and no-origin checkouts (the test harness) take the unchanged path.
+# SHIP_PROVIDER=github|forgejo|auto (default auto) pins the choice, e.g. for GitHub Enterprise.
+SHIP_PROVIDER_RESOLVED=github
+_SHIP_FORGEJO_PY="$_SHIP_SELF_DIR/forgejo_provider.py"
+_SHIP_ORIGIN_URL_RAW=$(git remote get-url origin 2>/dev/null) || _SHIP_ORIGIN_URL_RAW=""
+# The origin's HOST (lowercase), from `scheme://[user@]host[:port]/path` or scp-style
+# `[user@]host:path`; empty for anything else. Decides on the host, never a URL substring.
+_ship_origin_host() {
+  local h="$1"
+  case "$h" in
+    *://*) h="${h#*://}"; h="${h%%/*}"; h="${h##*@}"; h="${h%%:*}" ;;
+    *:*)   h="${h%%:*}"; h="${h##*@}" ;;
+    *)     h="" ;;
+  esac
+  printf '%s' "$h" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+_ship_provider_wants_forgejo_probe() {
+  case "${SHIP_PROVIDER:-auto}" in
+    github) return 1 ;;
+    forgejo) return 0 ;;
+    auto) : ;;
+    *) echo "Refusing: SHIP_PROVIDER='${SHIP_PROVIDER}' — expected github, forgejo or auto." >&2; exit 1 ;;
+  esac
+  case "$_SHIP_ORIGIN_URL_RAW" in
+    ""|/*|./*|../*|file://*) return 1 ;;
+  esac
+  case "$(_ship_origin_host "$_SHIP_ORIGIN_URL_RAW")" in
+    github.com|www.github.com|ssh.github.com) return 1 ;;
+  esac
+  return 0
+}
+# Per-run evidence ledger for the Forgejo provider. Several call sites below tolerate a failed
+# gh (`|| true`, `2>/dev/null`, a fallback value), so a non-zero exit alone can be swallowed.
+# The wrapper logs `start` before and `ok` after every call and appends each failure to
+# fatal.log; _ship_forgejo_final_preflight refuses unless the ledger is intact, every start has an
+# ok, and fatal.log is empty. A ledger that cannot be created is a refusal right here.
+_ship_forgejo_init_state() {
+  _SHIP_FORGEJO_STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ship-forgejo.XXXXXX" 2>/dev/null) || _SHIP_FORGEJO_STATE_DIR=""
+  if [ -z "$_SHIP_FORGEJO_STATE_DIR" ] || ! : > "$_SHIP_FORGEJO_STATE_DIR/fatal.log" \
+     || ! : > "$_SHIP_FORGEJO_STATE_DIR/calls.log" || ! echo ready > "$_SHIP_FORGEJO_STATE_DIR/ready"; then
+    echo "Refusing: could not create the Forgejo provider's per-run evidence ledger under ${TMPDIR:-/tmp} — without it a swallowed provider failure would be invisible." >&2
+    exit 1
+  fi
+  trap '_ship_forgejo_cleanup "$?"' EXIT
+}
+# EXIT trap. A `read … < <(gh …)` call runs the wrapper in a background subshell that can still
+# be finishing when ship refuses and exits, so first let every started call record its outcome
+# (bounded), then — on a refusal — summarize the ledger on stderr, and only then remove it.
+_ship_forgejo_cleanup() {  # $1 = ship's exit status
+  local dir="$_SHIP_FORGEJO_STATE_DIR" i=0 started finished failed
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  while :; do
+    started=$(grep -c '^start$' "$dir/calls.log" 2>/dev/null) || started=0
+    finished=$(grep -cE '^(ok|fail)$' "$dir/calls.log" 2>/dev/null) || finished=0
+    { [ "$started" -le "$finished" ] || [ "$i" -ge 100 ]; } && break
+    sleep 0.1; i=$((i+1))
+  done
+  if [ "$1" != "0" ]; then
+    failed=$(grep -c '^fail$' "$dir/calls.log" 2>/dev/null) || failed=0
+    echo "[ship] forgejo evidence ledger: ${started} call(s) started, $((finished - failed)) completed, ${failed} failed$([ "$started" -gt "$finished" ] && echo ", $((started - finished)) still running at exit")." >&2
+    [ -s "$dir/fatal.log" ] && sed 's/^/[ship]   - /' "$dir/fatal.log" >&2
+  fi
+  rm -rf "$dir"
+}
+_ship_forgejo_gh() {
+  local dir="$_SHIP_FORGEJO_STATE_DIR" rc=0 before after out
+  if ! echo start >> "$dir/calls.log"; then
+    echo broken > "$dir/broken" 2>/dev/null || true
+    echo "[ship] forgejo provider: cannot write the evidence ledger — refusing this gh call." >&2
+    return 1
+  fi
+  before=$(wc -c < "$dir/fatal.log" 2>/dev/null) || before=-1
+  # The provider's stdout is held until its outcome is in the ledger: a caller reading from a
+  # process substitution can react (and ship can exit) the moment output appears, so recording
+  # afterwards could race the EXIT trap. The trailing `x` keeps trailing newlines intact.
+  out=$(python3 -I "$_SHIP_FORGEJO_PY" gh "$@"; rc=$?; printf x; exit "$rc") || rc=$?
+  out=${out%x}
+  if [ "$rc" -ne 0 ]; then
+    echo fail >> "$dir/calls.log" 2>/dev/null || echo broken > "$dir/broken" 2>/dev/null || true
+    # The provider records its own detailed reason; write a line only when it could not
+    # (a signal, a crash before main(), an unwritable ledger) so no failure goes unrecorded.
+    after=$(wc -c < "$dir/fatal.log" 2>/dev/null) || after=-1
+    if [ "$after" -le "$before" ] || [ "$before" -lt 0 ]; then
+      printf 'gh %s: exit %s (no reason recorded by the provider)\n' "$(printf '%s ' "${@:1:3}" | LC_ALL=C tr '\n' ' ')" "$rc" \
+        >> "$dir/fatal.log" 2>/dev/null || echo broken > "$dir/broken" 2>/dev/null || true
+    fi
+    printf '%s' "$out"
+    return "$rc"
+  fi
+  echo ok >> "$dir/calls.log" || { echo broken > "$dir/broken" 2>/dev/null || true; }
+  printf '%s' "$out"
+  return 0
+}
+if _ship_provider_wants_forgejo_probe; then
+  command -v python3 >/dev/null 2>&1 || { echo "Refusing: python3 is required for the Forgejo provider." >&2; exit 1; }
+  if ! _SHIP_FORGEJO_ID=$(SHIP_FORGEJO_ORIGIN_URL="$_SHIP_ORIGIN_URL_RAW" python3 -I "$_SHIP_FORGEJO_PY" detect); then
+    echo "Refusing: origin is not github.com and was not confirmed as a Forgejo instance (see above) — refusing rather than letting gh pick another remote. For GitHub Enterprise set SHIP_PROVIDER=github." >&2
+    exit 1
+  fi
+  if [ -n "$REPO_FLAG" ] || [ -n "${GH_SHIP_REPO:-}" ] || [ -n "${GH_REPO:-}" ]; then
+    echo "Refusing: --repo / GH_SHIP_REPO / GH_REPO are GitHub-only; for a Forgejo PR run ship from that repository's checkout." >&2
+    exit 1
+  fi
+  SHIP_PROVIDER_RESOLVED=forgejo
+  _ship_forgejo_init_state
+  export SHIP_FORGEJO_STATE_DIR="$_SHIP_FORGEJO_STATE_DIR" SHIP_FORGEJO_ORIGIN_URL="$_SHIP_ORIGIN_URL_RAW"
+  gh() { _ship_forgejo_gh "$@"; }
+  echo "[ship] provider: $_SHIP_FORGEJO_ID (gh calls routed through ci/ship/forgejo_provider.py)"
+fi
+
 command -v gh >/dev/null 2>&1 || { echo "gh CLI not found" >&2; exit 1; }
 
 # --- cross-repo (--repo) support -------------------------------------------------------
@@ -802,6 +954,9 @@ ci_appears_structurally_down() {
   local total="$1" failed="$2"
   # Test escape hatch: force-trigger detection without the heuristics.
   [ "${SHIP_TEST_CI_DOWN:-0}" = "1" ] && return 0
+  # Both outage signals below are GitHub-only (githubstatus.com, Actions run timing); a Forgejo
+  # PR's failing checks are never re-classified as an outage.
+  [ "${SHIP_PROVIDER_RESOLVED:-github}" = "forgejo" ] && return 1
   [ "${total:-0}" -gt 0 ] || return 1
   # Only fire when ≥ 80% of checks failed — a partial failure is a real failure.
   # Use cross-multiplication (failed*10 >= total*8) to avoid the integer-truncation
@@ -1371,10 +1526,18 @@ _empty_rollup_is_ci_outage() {
   ref="origin/$base"
   git -C "$ROOT" fetch -q origin "$base:refs/remotes/origin/$base" 2>/dev/null || true
   git -C "$ROOT" rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || return 1
+  # Forgejo Actions reads the FIRST non-empty of .forgejo/workflows, .gitea/workflows,
+  # .github/workflows; GitHub reads only .github/workflows.
+  local wf_dir=".github/workflows" d
+  if [ "${SHIP_PROVIDER_RESOLVED:-github}" = "forgejo" ]; then
+    for d in .forgejo/workflows .gitea/workflows .github/workflows; do
+      if [ -n "$(git -C "$ROOT" ls-tree --name-only "$ref" -- "$d/" 2>/dev/null)" ]; then wf_dir="$d"; break; fi
+    done
+  fi
   while IFS= read -r f; do
     case "$f" in *.yml|*.yaml) : ;; *) continue ;; esac
     git -C "$ROOT" show "$ref:$f" 2>/dev/null | _workflow_on_block | _on_block_declares_pr_trigger && return 0
-  done < <(git -C "$ROOT" ls-tree -r --name-only "$ref" -- .github/workflows/ 2>/dev/null)
+  done < <(git -C "$ROOT" ls-tree -r --name-only "$ref" -- "$wf_dir/" 2>/dev/null)
   return 1
 }
 
@@ -3043,7 +3206,12 @@ _external_review_hatch_check() {  # uses $PR $BRANCH $DRY_RUN
 # this gate. All local/CI/review-quorum checks above remain in force.
 EXTREV_RIG_SOURCE=0
 if [ "$EXTREV_ENABLED" = "1" ]; then
-  EXTREV_RIG_TARGET=$(gh repo view "${_EFFECTIVE_TARGET:-${_CWD_ORIGIN_REPO:-}}" --json nameWithOwner,url -q 'select(.url | startswith("https://github.com/")) | .nameWithOwner' 2>/dev/null) || EXTREV_RIG_TARGET=""
+  if [ "${SHIP_PROVIDER_RESOLVED:-github}" = "forgejo" ]; then
+    # The same trusted machine policy, checked against the Forgejo origin's own owner/repo.
+    EXTREV_RIG_TARGET=$(gh repo view "" --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || EXTREV_RIG_TARGET=""
+  else
+    EXTREV_RIG_TARGET=$(gh repo view "${_EFFECTIVE_TARGET:-${_CWD_ORIGIN_REPO:-}}" --json nameWithOwner,url -q 'select(.url | startswith("https://github.com/")) | .nameWithOwner' 2>/dev/null) || EXTREV_RIG_TARGET=""
+  fi
   EXTREV_RIG_DECISION=$(python3 -I "$_SHIP_SELF_DIR/rig_external_review_policy.py" "$EXTREV_RIG_TARGET" "$ROOT" 2>/dev/null) || EXTREV_RIG_DECISION=enabled
   if [ "$EXTREV_RIG_DECISION" = "disabled" ]; then
     EXTREV_ENABLED=0
@@ -3546,8 +3714,25 @@ _acceptance_gate_fully_accepted() {  # $1 = task gate --json stdout (exit 0) -> 
     ' >/dev/null 2>&1
   then printf '1'; else printf ''; fi
 }
+# Strict path only: an exit-0 answer counts as accepted ONLY when the JSON itself says ok=true
+# with the ticket's acceptance gate enabled and the ticket not cancelled. On GitHub an exit 0
+# with gate_enabled=false / cancelled is accepted (the repo's own policy); a caller-supplied
+# config must not be able to reach that shortcut.
+_acceptance_gate_strict_verify() {  # $1 = code $2 = task gate --json stdout (exit 0)
+  local where; where=$(_acceptance_gate_strict)
+  [ -n "$where" ] || return 0
+  if command -v jq >/dev/null 2>&1 \
+     && printf '%s' "$2" | jq -e '.ok == true and .gate_enabled == true and .state != "cancelled"' >/dev/null 2>&1; then
+    return 0
+  fi
+  { echo "Refusing: acceptance gate ${where} — task gate ${1} exited 0 but did not report an enforced acceptance (ok=true, gate_enabled=true, not cancelled): $(printf '%s' "$2" | LC_ALL=C tr '\n' ' ')"
+    echo "  An acceptance gate disabled for this ticket or repository is not evidence. Enable it (or record a post-merge-acceptance reason ON the ticket), then re-run ship."; } >&2
+  _ticket_gate_audit_log acceptance refused "$1" "strict: exit 0 without an enforced ok"
+  exit 1
+}
 _acceptance_gate_pass() {  # $1 = task code $2 = `task gate --json` STDOUT ONLY (exit 0)
   local reason="" have_jq=0
+  _acceptance_gate_strict_verify "$1" "$2"
   command -v jq >/dev/null 2>&1 && have_jq=1
   if [ "$have_jq" = "1" ]; then
     reason=$(printf '%s' "$2" | jq -r '.post_merge_acceptance // ""' 2>/dev/null) || reason=""
@@ -3624,6 +3809,33 @@ _acceptance_gate_is_task_cli() {
     *) return 1 ;;
   esac
 }
+# An acceptance gate that could not be EVALUATED (task-cli missing, a foreign `task`, an
+# unparseable payload, `task gate` exit >= 2 — e.g. task-cli cannot route the ticket for this
+# origin, or the --task-config file is invalid) is a logged skip on GitHub. On the Forgejo
+# provider, and whenever --task-config names the ticket's tracker explicitly, it is a refusal:
+# missing ticket evidence must never read as an accepted gate there. Returns 0 only on the
+# skip path (the caller then returns); the refusal path exits.
+# $1 = code (may be empty)  $2 = audit detail  $3 = the GitHub-path warning line
+# Strict acceptance: the Forgejo provider or an explicit --task-config. Prints where it applies.
+_acceptance_gate_strict() {
+  local where=""
+  [ "${SHIP_PROVIDER_RESOLVED:-github}" = "forgejo" ] && where="on the Forgejo provider"
+  [ -n "$TASK_CONFIG" ] && where="${where:+$where, }with --task-config $TASK_CONFIG"
+  [ -n "$where" ] && printf '%s' "$where"
+  return 0
+}
+_acceptance_gate_unavailable() {
+  local where; where=$(_acceptance_gate_strict)
+  if [ -n "$where" ]; then
+    { echo "Refusing: acceptance gate could not evaluate ${1:-the ticket} ${where} (${2}) — ticket evidence is required, not skipped."
+      echo "  Make \`task gate ${1:-<code>} --json\` work from this checkout (task-cli must route the ticket), then re-run ship."; } >&2
+    _ticket_gate_audit_log acceptance refused "$1" "forgejo: could not evaluate: $2"
+    exit 1
+  fi
+  echo "$3" >&2
+  _ticket_gate_audit_log acceptance skipped "$1" "$2"
+  return 0
+}
 _acceptance_gate() {
   # The ops off-switches only echo, like the other gates' off-switches (no audit line: the
   # env one is a per-invocation operator choice, the .ship-config one is audited by being
@@ -3636,8 +3848,8 @@ _acceptance_gate() {
     0|false|no) echo "[ship] acceptance gate disabled by the committed .ship-config (SHIP_ACCEPTANCE_GATE=${SHIP_CFG_ACCEPTANCE_GATE})."; return 0 ;;
   esac
   if ! command -v task >/dev/null 2>&1; then
-    echo "[ship] acceptance gate: task-cli not on PATH — skipping (install task-cli to gate merges on accepted criteria)." >&2
-    _ticket_gate_audit_log acceptance skipped "" "task-cli not on PATH"; return 0
+    _acceptance_gate_unavailable "" "task-cli not on PATH" \
+      "[ship] acceptance gate: task-cli not on PATH — skipping (install task-cli to gate merges on accepted criteria)."; return 0
   fi
   if [ "${_FOREIGN_REPO_INVOKE:-0}" = "1" ]; then
     echo "[ship] acceptance gate: --repo targets a foreign remote — skipping (a local 'task' here reads the wrong project)." >&2
@@ -3646,8 +3858,8 @@ _acceptance_gate() {
   local code; code=$(_ship_derive_task_code_for_notify)
   if [ -z "$code" ]; then
     if ! _acceptance_gate_is_task_cli; then
-      echo "[ship] WARNING: acceptance gate could not evaluate — '$(command -v task)' on PATH did not look like task-cli (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping." >&2
-      _ticket_gate_audit_log acceptance skipped "" "'task' on PATH does not look like task-cli"; return 0
+      _acceptance_gate_unavailable "" "'task' on PATH does not look like task-cli" \
+        "[ship] WARNING: acceptance gate could not evaluate — '$(command -v task)' on PATH did not look like task-cli (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping."; return 0
     fi
     { echo "Refusing: acceptance gate — could not derive a task code for #$PR. A PR with no ticket has no acceptance criteria, so nothing can be proven."
       echo "  Fix: task create   (open a ticket with acceptance criteria) and reference it from the branch, title, or body (Refs #N / Refs HYP-N), then task gate <code> must exit 0."
@@ -3670,7 +3882,7 @@ _acceptance_gate() {
   # diagnostic text, never the JSON stdout `$out` needs to stay pure).
   errfile=$(mktemp 2>/dev/null) || errfile=/dev/null
   # From "$ROOT", not via -C: task-cli's -C is a per-subcommand flag (see the notify step).
-  out=$(cd "$ROOT" && task gate "$code" --json 2>"$errfile") || rc=$?
+  out=$(cd "$ROOT" && task gate "$code" ${TASK_CONFIG_ARGS[@]+"${TASK_CONFIG_ARGS[@]}"} --json 2>"$errfile") || rc=$?
   if [ "$errfile" != "/dev/null" ] && [ -s "$errfile" ]; then
     echo "[ship] acceptance gate: task-cli stderr: $(LC_ALL=C tr '\n' ' ' < "$errfile")" >&2
   fi
@@ -3685,8 +3897,8 @@ _acceptance_gate() {
   # proceed with NOTHING actually verified (review finding, round 3, Opus).
   if [ "$rc" = "0" ] || [ "$rc" = "1" ]; then
     if ! _acceptance_gate_looks_like_task_cli_json "$out"; then
-      echo "[ship] WARNING: acceptance gate could not evaluate ${code} — '$(command -v task)' on PATH did not return task-cli's expected JSON shape (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
-      _ticket_gate_audit_log acceptance skipped "$code" "'task' on PATH does not look like task-cli"
+      _acceptance_gate_unavailable "$code" "'task' on PATH does not look like task-cli" \
+        "[ship] WARNING: acceptance gate could not evaluate ${code} — '$(command -v task)' on PATH did not return task-cli's expected JSON shape (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')"
       return 0
     fi
   fi
@@ -3694,8 +3906,8 @@ _acceptance_gate() {
     0) _acceptance_gate_pass "$code" "$out" ;;
     1) _acceptance_gate_refuse "$code" "$out" ;;
     *)
-      echo "[ship] WARNING: acceptance gate could not evaluate ${code} (task gate exit ${rc}) — skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
-      _ticket_gate_audit_log acceptance skipped "$code" "could not evaluate: exit ${rc}" ;;
+      _acceptance_gate_unavailable "$code" "could not evaluate: exit ${rc}" \
+        "[ship] WARNING: acceptance gate could not evaluate ${code} (task gate exit ${rc}) — skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" ;;
   esac
 }
 # Whether `$1` (task gate's stdout) looks like task-cli's OWN JSON contract, not just any
@@ -3711,14 +3923,41 @@ _acceptance_gate_looks_like_task_cli_json() {
 }
 _acceptance_gate
 
+# --- Forgejo final preflight -------------------------------------------------------------
+# Some call sites above tolerate a failed gh (`|| true`, `2>/dev/null`, a fallback value), so
+# a provider refusal could be swallowed there. The adapter records every failure in a per-run
+# receipt; re-read the PR once more (a moved head is recorded too), then refuse on ANY entry.
+# The merge itself still sends the pinned head as head_commit_id (server-side race check).
+_ship_forgejo_final_preflight() {
+  [ "${SHIP_PROVIDER_RESOLVED:-github}" = "forgejo" ] || return 0
+  gh pr view "$PR" --json headRefOid -q '.headRefOid' >/dev/null 2>&1 || true
+  local dir="$_SHIP_FORGEJO_STATE_DIR" starts oks problem=""
+  if [ ! -f "$dir/ready" ] || [ ! -f "$dir/fatal.log" ] || [ ! -f "$dir/calls.log" ] || [ -e "$dir/broken" ]; then
+    problem="the evidence ledger is missing or could not be written"
+  elif [ -s "$dir/fatal.log" ]; then
+    problem="provider call(s) failed"
+  else
+    starts=$(grep -c '^start$' "$dir/calls.log" 2>/dev/null) || starts=0
+    oks=$(grep -c '^ok$' "$dir/calls.log" 2>/dev/null) || oks=0
+    [ "$starts" -gt 0 ] && [ "$starts" = "$oks" ] || problem="provider call(s) did not complete (started ${starts}, completed ${oks})"
+  fi
+  [ -z "$problem" ] && return 0
+  { echo "Refusing: Forgejo provider evidence is incomplete for this run — ${problem}; no gate result can be trusted:"
+    [ -s "$dir/fatal.log" ] && sed 's/^/  - /' "$dir/fatal.log"
+    echo "  Fix the cause (or drop the GitHub-only flag that needs it), then re-run ship."; } >&2
+  exit 1
+}
+
 # --- merge -----------------------------------------------------------------------------
 if [ "$SKIP_CI" = "1" ]; then
   # Deny-by-default: the --skip-ci admin bypass proceeds ONLY on a one-time live Telegram approval
   # (RIG_HATCH_REQUEST_SHIP_SKIP_CI). Refuses here otherwise — before any merge.
   _skip_ci_hatch_gate
+  _ship_forgejo_final_preflight
   echo "[ship] --skip-ci: admin-merging PR #${PR} (${BRANCH}) --${MERGE_METHOD} --admin ..."
   run gh pr merge "$PR" "--$MERGE_METHOD" --admin
 else
+  _ship_forgejo_final_preflight
   echo "[ship] preflight clean — merging PR #${PR} (${BRANCH}) --${MERGE_METHOD} ..."
   run gh pr merge "$PR" "--$MERGE_METHOD"
 fi
@@ -3790,7 +4029,7 @@ _ship_notify_task_cli() {
   # target directory sidesteps the ordering question entirely (task-cli's own `-C` default is
   # `.`). `run` is a stateless passthrough (see its definition above) with no parent-shell side
   # effects, so scoping the `cd` around it too is safe.
-  local -a mark_args=(mark-shipped "$code" --pr "$pr_url")
+  local -a mark_args=(mark-shipped "$code" --pr "$pr_url" ${TASK_CONFIG_ARGS[@]+"${TASK_CONFIG_ARGS[@]}"})
   [ -n "$merge_sha" ] && mark_args+=(--commit "$merge_sha")
   if (cd "$ROOT" || { echo "[ship] WARNING: could not cd to $ROOT for task-cli notify." >&2; exit 1; }; run task "${mark_args[@]}"); then
     # Only auto-close AFTER a successful mark-shipped (review finding, round 3, Codex): if
@@ -3824,7 +4063,7 @@ _ship_auto_close_accepted_ticket() {
   echo "[ship] acceptance gate: ${code} was fully accepted before the merge — closing it now: task done ${code} ..."
   # Same "cd $ROOT, don't pass -C" reasoning as the mark-shipped call above; output flows
   # straight through (not captured) — same style as that call.
-  if (cd "$ROOT" || { echo "[ship] WARNING: could not cd to $ROOT to auto-close ${code}." >&2; exit 1; }; run task done "$code"); then
+  if (cd "$ROOT" || { echo "[ship] WARNING: could not cd to $ROOT to auto-close ${code}." >&2; exit 1; }; run task done "$code" ${TASK_CONFIG_ARGS[@]+"${TASK_CONFIG_ARGS[@]}"}); then
     echo "[ship] ${code} closed — task done succeeded (acceptance was already proven before the merge)."
     _ticket_gate_audit_log acceptance auto-closed "$code" ""
   else
