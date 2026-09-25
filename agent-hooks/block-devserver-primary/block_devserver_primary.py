@@ -468,7 +468,7 @@ def _peel_command_wrappers(toks: list[str]) -> list[str]:
     immediately followed by something that LOOKS like a flag (`sudo -u dev npm run dev`, `nice
     -n10 npm run dev`) is left ALONE — unpeeled, hence unclassified, hence a MISS (the safe
     direction: worse coverage, never a false allow from a mis-parsed peel). Tracked as a
-    follow-up ([agent-tools#463](https://github.com/alex-mextner/agent-tools/issues/463)) to
+    follow-up ([agent-tools#463](https://git.hyperide.ai/ultrabricks/agent-tools/issues/463)) to
     extend this to the sibling's full flag-aware peel and to `bash -c`/`sh -c` re-parsing —
     this bare form alone already closes the `nohup .../env .../sudo ... &` shape without that
     added complexity."""

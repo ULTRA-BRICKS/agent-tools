@@ -302,7 +302,7 @@ longest descriptor timeout_ms (960,000)  <  OMP_HOOK_BRIDGE_TIMEOUT_MS (2,000,00
 ```
 
 Set the last one in `~/.omp/agent/config.yml`
-([rig-cli#363](https://github.com/alex-mextner/rig-cli/issues/363) tracks provisioning it):
+([rig-cli#363](https://git.hyperide.ai/ultrabricks/rig-cli/issues/363) tracks provisioning it):
 
 ```yaml
 extensionHandlers:

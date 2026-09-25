@@ -29,7 +29,7 @@ test = ["pytest"]
 agenttools-stall-watchdog = "agenttools_stall_watchdog.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/alex-mextner/agent-tools"
+Homepage = "https://git.hyperide.ai/ultrabricks/agent-tools"
 
 # This pyproject lives INSIDE the package directory (mirrors agenttools_tmux_inject, not
 # agenttools_daemon's `packages.find`): __init__.py/core.py/actions.py/cli.py sit next to
