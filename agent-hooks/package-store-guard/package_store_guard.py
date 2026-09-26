@@ -135,12 +135,6 @@ _MOVERS = frozenset({"mv"})
 _FIND_EXEC_OPS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 _FIND_VALUELESS_OPTS = frozenset({"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"})
 _FIND_EXPR_START = frozenset({"(", "!", ")", "\\(", "\\!"})
-_FIND_FILTERS = frozenset({
-    "-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex",
-    "-type", "-xtype", "-newer", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin",
-    "-size", "-user", "-group", "-perm", "-links", "-empty", "-inum", "-samefile", "-lname",
-    "-ilname", "-uid", "-gid", "-nouser", "-nogroup", "-prune",
-})
 # `$(bun pm cache)` / `$(uv cache dir)` — the substitution must END there: `$(bun pm cache rm)`
 # is a wipe, not a path, and must reach the bun check instead.
 _STORE_SUBST_RE = re.compile(r"\b(?P<bun>bun\s+pm\s+cache)\s*[)`]|\b(?P<uv>uv\s+cache\s+dir)\s*[)`]")
@@ -192,9 +186,10 @@ def _basename(tok: str) -> str:
     return tok.replace("\\", "/").rsplit("/", 1)[-1]
 
 
-def _unquoted_heredocs(line: str) -> list[tuple[str, bool, str]]:
-    """(delimiter, `<<-`, text before `<<`) for each here-doc a line opens OUTSIDE quotes/comments."""
-    found: list[tuple[str, bool, str]] = []
+def _unquoted_heredocs(line: str) -> list[tuple[str, bool, str, str]]:
+    """(delimiter, `<<-`, text before `<<`, text after the opener) for each here-doc a line opens
+    OUTSIDE quotes and comments."""
+    found: list[tuple[str, bool, str, str]] = []
     quote: str | None = None
     i = 0
     while i < len(line):
@@ -212,16 +207,16 @@ def _unquoted_heredocs(line: str) -> list[tuple[str, bool, str]]:
         elif line.startswith("<<", i) and not line.startswith("<<<", i):
             m = _HEREDOC_RE.match(line, i)
             if m:
-                found.append((m.group("delim"), bool(m.group("dash")), line[:i]))
+                found.append((m.group("delim"), bool(m.group("dash")), line[:i], line[m.end():]))
                 i = m.end()
                 continue
         i += 1
     return found
 
 
-def _feeds_a_shell(before: str) -> bool:
-    """`bash <<EOF` / `sudo sh -s <<EOF` / `ssh host <<EOF`: the here-doc body is a script."""
-    toks = re.split(r"&&|\|\||[;|&(]", before)[-1].split()
+def _runs_stdin_as_script(stage: str) -> bool:
+    """Does this pipeline stage read a shell script from stdin (`bash`, `sudo sh -s`, `ssh host`)?"""
+    toks = stage.split()
     while toks and (
         _basename(toks[0]) in _WRAPPERS or _ASSIGNMENT.match(toks[0]) or toks[0].startswith("-") or toks[0].isdigit()
     ):
@@ -232,7 +227,7 @@ def _feeds_a_shell(before: str) -> bool:
     flags = [a for a in args if a.startswith("-")]
     operands = [a for a in args if not a.startswith("-")]
     if head in _SHELLS:
-        # `bash -c '…' <<EOF` / `bash script.sh <<EOF` read the body as data; `bash -s x` does not
+        # `bash -c '…'` / `bash script.sh` read stdin as data; `bash -s x` does not
         if any("c" in f[1:] for f in flags if not f.startswith("--")):
             return False
         return not operands or "-s" in flags
@@ -241,22 +236,71 @@ def _feeds_a_shell(before: str) -> bool:
     return False
 
 
+def _heredoc_is_script(before: str, after: str) -> bool:
+    """`bash <<EOF`, `ssh host <<EOF` or `cat <<EOF | bash`: the here-doc body is a script."""
+    if _runs_stdin_as_script(re.split(r"&&|\|\||[;|&(]", before)[-1]):
+        return True
+    stages = re.split(r"&&|\|\||;", after)[0].split("|")[1:]  # the rest of this pipeline
+    return any(_runs_stdin_as_script(stage) for stage in stages)
+
+
 def strip_heredoc_bodies(command: str) -> str:
     """Drop here-document bodies — `cat > f <<'EOF' … EOF` text is data, not commands — except
-    a body fed to a shell (`bash <<EOF`, `ssh host <<EOF`), which is a script and stays."""
+    a body fed to a shell (`bash <<EOF`, `cat <<EOF | sh`, `ssh host <<EOF`), which is a script."""
     out: list[str] = []
     pending: list[tuple[str, bool, bool]] = []
     for line in command.split("\n"):
         if pending:
             delim, dash, keep = pending[0]
-            if (line.lstrip("\t") if dash else line) == delim:
+            bare = line.rstrip("\r")
+            if (bare.lstrip("\t") if dash else bare) == delim:
                 pending.pop(0)
             elif keep:
                 out.append(line)
             continue
         out.append(line)
-        pending.extend((delim, dash, _feeds_a_shell(before)) for delim, dash, before in _unquoted_heredocs(line))
+        pending.extend(
+            (delim, dash, _heredoc_is_script(before, after)) for delim, dash, before, after in _unquoted_heredocs(line)
+        )
     return "\n".join(out)
+
+
+def substitution_bodies(text: str) -> list[str]:
+    """The commands inside `$( … )` and backticks (not in single quotes, not `$(( … ))`
+    arithmetic): the shell runs them wherever they appear, so each is inspected on its own."""
+    bodies: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if ch == "'" and quote is None:
+            quote = "'"
+        elif ch == '"':
+            quote = None if quote == '"' else '"'
+        elif text.startswith("$(", i) and not text.startswith("$((", i):
+            depth, j = 1, i + 2
+            while j < len(text) and depth:
+                depth += {"(": 1, ")": -1}.get(text[j], 0)
+                j += 1
+            bodies.append(text[i + 2 : j - 1] if depth == 0 else text[i + 2 :])
+            i = j
+            continue
+        elif ch == "`":
+            end = text.find("`", i + 1)
+            end = len(text) if end < 0 else end
+            bodies.append(text[i + 1 : end])
+            i = end + 1
+            continue
+        i += 1
+    return [b for b in bodies if b.strip()]
 
 
 def _newlines_to_separators(text: str) -> str:
@@ -351,13 +395,31 @@ def _strip_leading(argv: list[str]) -> list[str]:
 
 
 class _Ctx:
-    """Per-command state: effective cwd, shell variables, store paths the current pipeline named."""
+    """Per-command state: effective cwd (+ pushd stack / OLDPWD), shell variables, store paths the
+    current pipeline named, and symlinks an earlier `ln -s` in the same command created."""
 
     def __init__(self, cwd: str, variables: dict[str, str] | None = None) -> None:
         self.cwd = cwd
+        self.oldpwd = cwd
+        self.dirstack: list[str] = []
         self.vars: dict[str, str] = dict(variables or {})
         self.store_seen: str | None = None  # label of a store path an earlier piped segment named
-        self.pending_inner: list[str] = []  # command substitutions found in an assignment
+        self.links_made: set[str] = set()
+
+    def chdir(self, head: str, args: list[str]) -> None:
+        """Track `cd X`, `cd`, `cd -`, `pushd X`, `popd` so relative paths resolve correctly."""
+        dests = _positional(args)
+        if head == "popd":
+            if self.dirstack:
+                self.oldpwd, self.cwd = self.cwd, self.dirstack.pop()
+            return
+        if dests and dests[0] == "-":
+            self.cwd, self.oldpwd = self.oldpwd, self.cwd
+            return
+        target = _expand(dests[0], self.cwd, self.vars) if dests else _home()
+        if head == "pushd":
+            self.dirstack.append(self.cwd)
+        self.oldpwd, self.cwd = self.cwd, target
 
 
 def _unwrap(argv: list[str], ctx: _Ctx) -> tuple[list[str], str, list[str], bool]:
@@ -473,6 +535,8 @@ def uv_cache_roots() -> list[str]:
 _ROOT_ENV = ("HOME", "USERPROFILE", "BUN_INSTALL", "BUN_INSTALL_CACHE_DIR", "UV_CACHE_DIR", "XDG_CACHE_HOME", "LOCALAPPDATA")
 
 
+# The argument is only the cache key: the roots depend on these env vars, so a HOME/BUN_INSTALL
+# change must produce a new entry instead of stale roots.
 @functools.lru_cache(maxsize=8)
 def _roots_for(_env_key: tuple[str, ...]) -> tuple[tuple[str, list[str]], ...]:
     return tuple(
@@ -582,11 +646,54 @@ def _check_delete(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     return _check_remove(head, _positional(rest), rest, ctx, cwd)
 
 
+def _mv_cp_operands(rest: list[str]) -> tuple[list[str], str | None, bool]:
+    """(sources, destination, destination is a directory by syntax) for `mv`/`cp` argv tails."""
+    target_dir: str | None = None
+    operands: list[str] = []
+    end_of_opts = False
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if not end_of_opts and tok == "--":
+            end_of_opts = True
+        elif not end_of_opts and tok in {"-t", "--target-directory"} and i + 1 < len(rest):
+            target_dir = rest[i + 1]
+            i += 1
+        elif not end_of_opts and tok.startswith("--target-directory="):
+            target_dir = tok.split("=", 1)[1]
+        elif end_of_opts or not tok.startswith("-") or tok == "-":
+            operands.append(tok)
+        i += 1
+    if target_dir is not None:
+        return operands, target_dir, True
+    if len(operands) < 2:
+        return [], None, False
+    return operands[:-1], operands[-1], operands[-1].endswith("/") or len(operands) > 2
+
+
+def _renamed_to_node_modules(sources: list[str], dest: str | None, into_dir: bool, ctx: _Ctx, cwd: str) -> bool:
+    """`mv .nm node_modules` / `cp -P .nm node_modules` where `.nm` is a symlink: the same
+    write-through shape as `ln -s … node_modules`, one step later."""
+    if dest is None:
+        return False
+    dest_abs = _expand(dest, cwd, ctx.vars)
+    into_dir = into_dir or os.path.isdir(dest_abs)
+    for src in sources:
+        src_abs = _expand(src, cwd, ctx.vars)
+        if not (os.path.islink(src_abs) or src_abs in ctx.links_made):
+            continue
+        name = os.path.join(dest_abs, _basename(src_abs)) if into_dir else dest_abs
+        if _is_node_modules(name):
+            return True
+    return False
+
+
 def _check_mv(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     rest = argv[1:]
-    operands = _positional(rest)
-    has_target_dir = any(t == "-t" or t.startswith("--target-directory") for t in rest)
-    return _check_remove("mv", operands if has_target_dir else operands[:-1], rest, ctx, cwd)
+    sources, dest, into_dir = _mv_cp_operands(rest)
+    if _renamed_to_node_modules(sources, dest, into_dir, ctx, cwd):
+        return _SYMLINK_MSG
+    return _check_remove("mv", sources, rest, ctx, cwd)
 
 
 def _find_paths(rest: list[str]) -> list[str]:
@@ -619,26 +726,21 @@ def _find_deletes(rest: list[str]) -> bool:
     return False
 
 
-def _find_filters(rest: list[str]) -> bool:
-    """Whether a `find` expression narrows what it matches (-name, -type, -mtime, …)."""
-    return any(tok in _FIND_FILTERS for tok in rest)
-
-
 def _check_find(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     rest = argv[1:]
     if not _find_deletes(rest):
         return None
-    # A walk rooted at or inside the store deletes store entries. One rooted ABOVE it deletes
-    # only what its filters match — but with no filter (`find ~/.bun -delete`) it is `rm -rf`.
-    allow_ancestor = not _find_filters(rest)
+    # Any deleting walk rooted at, inside, or ABOVE a store can reach it: filters such as
+    # `-type d`, `-name cache` or `-prune` still match store entries. Root the walk at the
+    # directory you mean instead (`find ./build -name '*.o' -delete`).
     for path in _find_paths(rest):
-        label = _protected_hit(path, cwd, ctx.vars, allow_ancestor=allow_ancestor)
+        label = _protected_hit(path, cwd, ctx.vars, allow_ancestor=True)
         if label:
-            return _STORE_MSG.format(what=f"`find {path} ... -delete/-exec rm` inside {label}")
+            return _STORE_MSG.format(what=f"`find {path} ... -delete/-exec rm` reaches {label}")
     return None
 
 
-def _ln_link_names(argv: list[str], cwd: str) -> list[str] | None:
+def _ln_link_names(argv: list[str], cwd: str, local: dict[str, str] | None = None) -> list[str] | None:
     """Link paths an `ln -s` would create; None if this `ln` does not make a symlink."""
     symbolic = False
     no_target_dir = False
@@ -692,7 +794,7 @@ def _ln_link_names(argv: list[str], cwd: str) -> list[str] | None:
         return into_dir  # `ln -s SRC DIR/` and `ln -s A B DIR` always link INSIDE the dir
     # `ln -s SRC DEST` makes DEST, or DEST/basename(SRC) when DEST is an existing directory
     # (-n/-h: a symlink to a directory counts as a plain file).
-    dest_abs = _expand(dest, cwd)
+    dest_abs = _expand(dest, cwd, local)
     if os.path.isdir(dest_abs) and not (no_deref and os.path.islink(dest_abs)):
         return into_dir
     return [dest]
@@ -703,25 +805,31 @@ def _is_node_modules(name: str) -> bool:
     return (base.casefold() if _CASE_INSENSITIVE_FS else base) == "node_modules"
 
 
-def _check_ln(argv: list[str], cwd: str) -> str | None:
-    if any(_is_node_modules(name) for name in _ln_link_names(argv, cwd) or []):
+def _check_ln(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
+    names = [_expand_vars(n, ctx.vars) for n in _ln_link_names(argv, cwd, ctx.vars) or []]
+    if any(_is_node_modules(name) for name in names):
         return _SYMLINK_MSG
+    ctx.links_made.update(_expand(n, cwd, ctx.vars) for n in names)
     return None
 
 
-def _check_cp(argv: list[str], cwd: str) -> str | None:
-    """GNU `cp -s`/`--symbolic-link` (`-rs` builds a tree of links) is `ln -s` by another name."""
-    flags = [t for t in argv[1:] if t.startswith("-") and t != "-"]
-    if not any(f == "--symbolic-link" or (not f.startswith("--") and "s" in f[1:]) for f in flags):
+def _check_cp(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
+    """GNU `cp -s`/`--symbolic-link` (`-rs` builds a tree of links) is `ln -s` by another name, and
+    copying a symlink itself (`cp -P`/`-a`, BSD `cp -R`) onto node_modules is a rename of it."""
+    rest = argv[1:]
+    sources, dest, into_dir = _mv_cp_operands(rest)
+    if dest is None:
         return None
-    operands = _positional(argv[1:])
-    if len(operands) < 2:
-        return None
-    dest = operands[-1]
-    names = [os.path.join(dest, _basename(src.rstrip("/"))) for src in operands[:-1]]
-    if len(operands) == 2 and not dest.endswith("/") and not os.path.isdir(_expand(dest, cwd)):
-        names = [dest]
-    return _SYMLINK_MSG if any(_is_node_modules(n) for n in names) else None
+    flags = [t for t in rest if t.startswith("-") and t != "-"]
+    symbolic = any(f == "--symbolic-link" or (not f.startswith("--") and "s" in f[1:]) for f in flags)
+    if symbolic:
+        dest_abs = _expand(dest, cwd, ctx.vars)
+        into_dir = into_dir or os.path.isdir(dest_abs)
+        names = [os.path.join(dest, _basename(src.rstrip("/"))) for src in sources] if into_dir else [dest]
+        return _SYMLINK_MSG if any(_is_node_modules(_expand_vars(n, ctx.vars)) for n in names) else None
+    if _renamed_to_node_modules(sources, dest, into_dir, ctx, cwd):
+        return _SYMLINK_MSG
+    return None
 
 
 def _nearest_lockfile(start: str) -> tuple[str, str] | None:
@@ -859,8 +967,8 @@ def _record_assignments(seg: list[str], ctx: _Ctx) -> list[str]:
 
     Only a pure statement records variables: in `NAME=x cmd …` the shell expands cmd's arguments
     BEFORE applying the inline env, so NAME means nothing to cmd — and cmd is still inspected.
-    A command substitution in any assignment runs either way, so it is queued for inspection
-    (unless it is just `$(bun pm cache)` / `$(uv cache dir)`, which only prints a path).
+    Command substitutions anywhere in the command are inspected separately (see
+    :func:`substitution_bodies`).
     """
     words = seg[1:] if seg and seg[0] in _DECLARERS else seg
     groups, rest = _assignment_prefix(words)
@@ -874,8 +982,6 @@ def _record_assignments(seg: list[str], ctx: _Ctx) -> list[str]:
         value = m.group("value")
         substitution = len(group) > 1 or "$(" in value or "`" in value
         store = _store_substitution(text)
-        if substitution and store is None:
-            ctx.pending_inner.append(text[len(m.group("name")) + 1 :].strip().lstrip("$").strip("()`\"' "))
         if rest:
             continue  # inline env for the command in ``rest``
         if store is not None:
@@ -886,12 +992,11 @@ def _record_assignments(seg: list[str], ctx: _Ctx) -> list[str]:
 
 
 def _note_store_paths(argv: list[str], ctx: _Ctx, cwd: str) -> None:
-    """Remember a store path a piped segment names, for a later `| xargs rm`. An unfiltered
-    `find <ancestor>` lists the store too, so there an ancestor counts."""
+    """Remember a store path a piped segment names, for a later `| xargs rm`. A `find` rooted
+    above a store lists store entries too, so there an ancestor counts."""
     if ctx.store_seen:
         return
-    head = _basename(argv[0])
-    allow_ancestor = head == "find" and not _find_filters(argv[1:])
+    allow_ancestor = _basename(argv[0]) == "find"
     for tok in argv[1:]:
         if tok.startswith("-"):
             continue
@@ -916,9 +1021,9 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool) -> str | 
     if head == "find":
         return _check_find(argv, ctx, cwd)
     if head == "ln":
-        return _check_ln(argv, cwd)
+        return _check_ln(argv, ctx, cwd)
     if head == "cp":
-        return _check_cp(argv, cwd)
+        return _check_cp(argv, ctx, cwd)
     if head in {"npm", "pnpm", "yarn"}:
         return _check_pm(argv, ctx, cwd)
     return None
@@ -926,17 +1031,20 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool) -> str | 
 
 def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | None = None) -> str | None:
     """The block message for ``command`` run from ``cwd``, or None to allow."""
+    command = strip_heredoc_bodies(command)
     ctx = _Ctx(cwd, _vars)
-    for seg, piped in _segments(_tokenize(strip_heredoc_bodies(command))):
+    if _depth < _MAX_DEPTH:
+        for body in substitution_bodies(command):
+            msg = inspect(body, cwd, _depth + 1, ctx.vars)
+            if msg:
+                return msg
+    for seg, piped in _segments(_tokenize(command)):
         if not piped:
             ctx.store_seen = None  # `| xargs rm` only inherits paths from its own pipeline
         argv = _record_assignments(_strip_redirects(seg), ctx)
-        nested = ctx.pending_inner
-        ctx.pending_inner = []
-        seg_cwd, via_xargs = ctx.cwd, False
-        if argv:
-            argv, seg_cwd, unwrapped, via_xargs = _unwrap(argv, ctx)
-            nested += unwrapped
+        if not argv:
+            continue
+        argv, seg_cwd, nested, via_xargs = _unwrap(argv, ctx)
         for inner in nested:
             if _depth < _MAX_DEPTH:
                 msg = inspect(inner, seg_cwd, _depth + 1, ctx.vars)
@@ -945,12 +1053,8 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
         if not argv:
             continue
         head = _basename(argv[0])
-        if head in {"cd", "pushd"}:
-            dests = _positional(argv[1:])
-            if dests and dests[0] != "-":
-                ctx.cwd = _expand(dests[0], ctx.cwd, ctx.vars)
-            elif not dests:
-                ctx.cwd = _home()
+        if head in {"cd", "pushd", "popd"}:
+            ctx.chdir(head, argv[1:])
             continue
         inner_cmd, inner_cwd = _shell_c_payload(argv), seg_cwd
         if inner_cmd is None and head == "ssh":

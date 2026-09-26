@@ -36,23 +36,25 @@ symlinks created *inside* `node_modules`, a symlink merely pointing at a `node_m
 another name, read-only `find … -exec test`/`-print` in the store, and `bun pm cache` (prints the
 path).
 
-Commands are parsed, not raw-matched: `&&`/`;`/`|` segments, `cd`/`pushd` (for relative paths
-and lockfile lookup), shell assignments (`NAME=…`, `export NAME=$(bun pm cache)`, and the
-command substitutions inside them) and `${NAME:-default}`, wrappers (`sudo [-D dir]`,
-`env [-C dir] [-S '…']`, `timeout`, `nohup`, `xargs`, `busybox`), `bash -c`/`sh -lc`/`fish -c`/
-`eval` payloads with their `$1`/`$@` operands bound, `ssh host '<cmd>'` remote commands,
-here-docs fed to a shell (`bash <<EOF`, `ssh host <<EOF`), redirections, and `cp -s` (a symlink
-by another name). Other here-doc bodies, quoted multi-line arguments and comments are data and
-are skipped. `node_modules` and store paths compare case-insensitively on macOS/Windows. A
-command shlex cannot parse (an unbalanced quote) is re-read leniently instead of allowed — the
-real shell would reject it anyway. `uv cache clean <pkg>` is blocked too (the user's rule is
-"never clean the caches"); ask the human for a one-package clean.
+Commands are parsed, not raw-matched: `&&`/`;`/`|` segments, `cd`/`pushd`/`popd`/`cd -` (for
+relative paths and lockfile lookup), shell assignments (`NAME=…`, `export NAME=$(bun pm cache)`)
+and `${NAME:-default}`, every `$( … )`/backtick body wherever it appears (`echo $(bun pm cache rm)`),
+wrappers (`sudo [-D dir]`, `env [-C dir] [-S '…']`, `timeout`, `nohup`, `xargs`, `busybox`),
+`bash -c`/`sh -lc`/`fish -c`/`eval` payloads with their `$1`/`$@` operands bound,
+`ssh host '<cmd>'` remote commands, here-docs fed to a shell (`bash <<EOF`, `cat <<EOF | sh`,
+`ssh host <<EOF`), redirections, `cp -s` (a symlink by another name), and renaming or copying a
+symlink onto `node_modules` (`ln -s … .nm && mv .nm node_modules`, `cp -P .nm node_modules`).
+Other here-doc bodies, quoted multi-line arguments and comments are data and are skipped.
+`node_modules` and store paths compare case-insensitively on macOS/Windows. A command shlex
+cannot parse (an unbalanced quote) is re-read leniently instead of allowed — the real shell would
+reject it anyway. `uv cache clean <pkg>` is blocked too (the user's rule is "never clean the
+caches"); ask the human for a one-package clean.
 
-A `find` rooted above the store is blocked when it has no filter (`find ~/.bun -delete` is
-`rm -rf ~/.bun`); with a filter (`find ~ -name '*.orig' -delete`) it only deletes what matches
-and stays allowed.
+A deleting `find` (`-delete`, `-exec rm …`) is blocked when its walk starts at, inside, or ABOVE a
+store — filters such as `-type d`, `-name cache` or `-prune` still match store entries. Start the
+walk at the directory you mean (`find ./build -name '*.o' -delete`).
 
-Known gaps (best effort, not a sandbox): other command substitutions as arguments
+Known gaps (best effort, not a sandbox): the RESULT of a substitution used as an argument
 (`rm -rf $(cat list)`), deletes from other languages (`python -c 'shutil.rmtree(…)'`), a
 variable set in an earlier, separate tool call, and a deliberately obfuscated command.
 

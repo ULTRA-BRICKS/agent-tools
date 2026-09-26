@@ -163,7 +163,7 @@ def test_uv_cache_dir_env_is_protected(home, tmp_path, monkeypatch):
         "rm -rf ~/.cache/pip",
         "rm -rf ~/.cache/pip*",
         "rm -rf /tmp/scratch",
-        "find ~ -name '*.orig' -delete",
+        "find ./build -name '*.o' -delete",
         "find ~/.bun/install/cache -name '*.tgz' -print",
         "find ~/.bun/install/cache/links -type l ! -exec test -e {} \\; -print 2>/dev/null | wc -l",
         "ls ~/.bun/install/cache | head",
@@ -363,7 +363,7 @@ def test_round_two_pm_bypasses_block(bun_repo, home, monkeypatch):
         "cat <<'EOF' | tee notes.md\nbun pm cache rm\nEOF",
         "cp -r src dst",
         "cp -s a b",
-        "find ~ -name '*.orig' -delete",
+        "find /tmp/scratch -type f -delete",
         "X=$(ls); echo $X",
     ],
 )
@@ -391,6 +391,52 @@ def test_ln_to_an_existing_dir_links_inside_it(home, tmp_path, monkeypatch):
     _blocked("ln -s /main/node_modules wt", monkeypatch, tmp_path)
     _allowed("ln -s ../repo/node_modules nm-alias", monkeypatch, tmp_path)
     _blocked("ln -s ../node_modules node_modules '", monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # command substitutions run wherever they appear
+        "echo $(bun pm cache rm)",
+        'touch "$(rm -rf ~/.bun/install/cache)"',
+        "$(uv cache clean)",
+        "echo `bun pm cache rm`",
+        # a here-doc piped into a shell is a script
+        "cat <<'EOF' | bash\nrm -rf ~/.bun/install/cache\nEOF",
+        "cat <<EOF | sh -s\nuv cache clean\nEOF",
+        # CRLF line endings still close the here-doc
+        "cat <<EOF > x\r\nhello\r\nEOF\r\nrm -rf ~/.bun/install/cache",
+        # filters do not make a delete walk above the store safe
+        "find ~/.bun -type d -delete",
+        "find ~/.bun -name cache -exec rm -rf {} +",
+        "find ~/.bun -prune -delete",
+        "find ~ -name '*' -delete",
+        "find ~ -name '*.orig' -delete",
+    ],
+)
+def test_round_three_store_bypasses_block(command, home, tmp_path, monkeypatch):
+    _blocked(command, monkeypatch, tmp_path)
+
+
+def test_renaming_a_symlink_into_node_modules_blocks(home, tmp_path, monkeypatch):
+    _blocked("ln -s /main/node_modules .nm && mv .nm node_modules", monkeypatch, tmp_path)
+    os.symlink(tmp_path, tmp_path / ".nm")
+    _blocked("mv .nm node_modules", monkeypatch, tmp_path)
+    _blocked("cp -P .nm node_modules", monkeypatch, tmp_path)
+    _blocked('X=node_modules; ln -s /main/nm "$X"', monkeypatch, tmp_path)
+    (tmp_path / "plain").mkdir()
+    _allowed("mv plain node_modules", monkeypatch, tmp_path)  # a real directory, not a link
+
+
+def test_directory_stack_keeps_relative_paths_honest(home, tmp_path, monkeypatch):
+    _allowed("pushd ~/.bun/install && popd && rm -rf cache", monkeypatch, tmp_path)
+    _allowed("cd ~/.bun/install; cd -; rm -rf cache", monkeypatch, tmp_path)
+    _blocked("pushd /tmp && pushd ~/.bun/install && rm -rf cache", monkeypatch, tmp_path)
+
+
+def test_mv_into_the_store_is_not_a_removal(home, tmp_path, monkeypatch):
+    _allowed("mv -t ~/.bun/install/cache /tmp/foo", monkeypatch, tmp_path)
+    _blocked("mv -t /tmp ~/.bun/install/cache", monkeypatch, tmp_path)
 
 
 # ── node_modules symlinks ──────────────────────────────────────────────────────
