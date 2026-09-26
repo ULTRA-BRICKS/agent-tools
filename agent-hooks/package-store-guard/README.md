@@ -37,16 +37,24 @@ another name, read-only `find … -exec test`/`-print` in the store, and `bun pm
 path).
 
 Commands are parsed, not raw-matched: `&&`/`;`/`|` segments, `cd`/`pushd` (for relative paths
-and lockfile lookup), shell assignments (`NAME=…`, `export NAME=$(bun pm cache)`) and
-`${NAME:-default}`, wrappers (`sudo [-D dir]`, `env [-C dir] [-S '…']`, `timeout`, `nohup`,
-`xargs`, `busybox`), `bash -c`/`sh -lc`/`fish -c`/`eval` payloads, `ssh host '<cmd>'` remote
-commands, redirections, and here-doc bodies (skipped: they are data). Paths compare
-case-insensitively on macOS/Windows. A command shlex cannot parse (an unbalanced quote) is re-read
-leniently instead of allowed — the real shell would reject it anyway.
+and lockfile lookup), shell assignments (`NAME=…`, `export NAME=$(bun pm cache)`, and the
+command substitutions inside them) and `${NAME:-default}`, wrappers (`sudo [-D dir]`,
+`env [-C dir] [-S '…']`, `timeout`, `nohup`, `xargs`, `busybox`), `bash -c`/`sh -lc`/`fish -c`/
+`eval` payloads with their `$1`/`$@` operands bound, `ssh host '<cmd>'` remote commands,
+here-docs fed to a shell (`bash <<EOF`, `ssh host <<EOF`), redirections, and `cp -s` (a symlink
+by another name). Other here-doc bodies, quoted multi-line arguments and comments are data and
+are skipped. `node_modules` and store paths compare case-insensitively on macOS/Windows. A
+command shlex cannot parse (an unbalanced quote) is re-read leniently instead of allowed — the
+real shell would reject it anyway. `uv cache clean <pkg>` is blocked too (the user's rule is
+"never clean the caches"); ask the human for a one-package clean.
 
-Known gaps (best effort, not a sandbox): other command substitutions (`rm -rf $(cat list)`), a
-`find` rooted *above* the store (`find ~ -delete`), deletes from other languages
-(`python -c 'shutil.rmtree(…)'`), and a variable set in an earlier, separate tool call.
+A `find` rooted above the store is blocked when it has no filter (`find ~/.bun -delete` is
+`rm -rf ~/.bun`); with a filter (`find ~ -name '*.orig' -delete`) it only deletes what matches
+and stays allowed.
+
+Known gaps (best effort, not a sandbox): other command substitutions as arguments
+(`rm -rf $(cat list)`), deletes from other languages (`python -c 'shutil.rmtree(…)'`), a
+variable set in an earlier, separate tool call, and a deliberately obfuscated command.
 
 ## Fail policy
 

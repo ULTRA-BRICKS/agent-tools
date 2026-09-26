@@ -24,12 +24,13 @@ Blocks five shapes, each with the command to run instead:
    only ``package-lock.json`` (an npm-only subproject) stays allowed, as do global installs.
 
 Parsing is best-effort but deliberately wide: ``&&``/``;``/``|`` segments, ``cd``/``pushd``,
-``NAME=value`` / ``NAME=$(bun pm cache)`` assignments and ``${NAME:-default}``, wrappers
-(``sudo``, ``env -S``/``env -C``, ``timeout``, ``xargs``, ``busybox``), ``bash -c``/``eval``/
-``ssh host '…'`` payloads, redirections and here-doc bodies (data, not commands). A command shlex
-cannot parse is re-read leniently rather than allowed. Known gaps: other command substitutions,
-``find ~ -delete`` (a walk rooted above the store, with or without filters), and code in other
-languages (``python -c 'shutil.rmtree(…)'``).
+``NAME=value`` / ``NAME=$(bun pm cache)`` assignments (and the substitutions inside them),
+``${NAME:-default}``, wrappers (``sudo``, ``env -S``/``env -C``, ``timeout``, ``xargs``,
+``busybox``), ``bash -c``/``eval``/``ssh host '…'`` payloads with ``$1``/``$@`` bound, here-docs
+fed to a shell, redirections, and ``cp -s``. Other here-doc bodies are data, not commands. A
+command shlex cannot parse is re-read leniently rather than allowed. Known gaps: command
+substitutions used as arguments (``rm -rf $(cat list)``) and code in other languages
+(``python -c 'shutil.rmtree(…)'``).
 
 Past bugs this exists for (2026-09): agents symlinked a worktree's node_modules to the main
 checkout; bun 1.4.2's ``bun install`` inside such a worktree wrote THROUGH the link and corrupted
@@ -96,7 +97,9 @@ _SSH_VALUE_FLAGS = frozenset({
     "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p",
     "-Q", "-R", "-S", "-W", "-w", "-B",
 })
-_MAX_DEPTH = 4
+_MAX_DEPTH = 4  # nested bash -c / eval / ssh / env -S payloads
+_MAX_WRAPPERS = 16  # sudo env timeout … peeled per command
+_MAX_LOCKFILE_WALK = 64  # parent dirs searched for the nearest lockfile
 
 # ── package managers and stores ───────────────────────────────────────────────
 _BUN_LOCKFILES = ("bun.lock", "bun.lockb")
@@ -132,7 +135,15 @@ _MOVERS = frozenset({"mv"})
 _FIND_EXEC_OPS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 _FIND_VALUELESS_OPTS = frozenset({"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"})
 _FIND_EXPR_START = frozenset({"(", "!", ")", "\\(", "\\!"})
-_STORE_SUBST_RE = re.compile(r"\b(?P<bun>bun\s+pm\s+cache)\b|\b(?P<uv>uv\s+cache\s+dir)\b")
+_FIND_FILTERS = frozenset({
+    "-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex",
+    "-type", "-xtype", "-newer", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin",
+    "-size", "-user", "-group", "-perm", "-links", "-empty", "-inum", "-samefile", "-lname",
+    "-ilname", "-uid", "-gid", "-nouser", "-nogroup", "-prune",
+})
+# `$(bun pm cache)` / `$(uv cache dir)` — the substitution must END there: `$(bun pm cache rm)`
+# is a wipe, not a path, and must reach the bun check instead.
+_STORE_SUBST_RE = re.compile(r"\b(?P<bun>bun\s+pm\s+cache)\s*[)`]|\b(?P<uv>uv\s+cache\s+dir)\s*[)`]")
 _CASE_INSENSITIVE_FS = sys.platform in {"darwin", "win32"}
 
 _STORE_MSG = (
@@ -181,18 +192,70 @@ def _basename(tok: str) -> str:
     return tok.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+def _unquoted_heredocs(line: str) -> list[tuple[str, bool, str]]:
+    """(delimiter, `<<-`, text before `<<`) for each here-doc a line opens OUTSIDE quotes/comments."""
+    found: list[tuple[str, bool, str]] = []
+    quote: str | None = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t;&|("):
+            break  # the rest of the line is a comment
+        elif line.startswith("<<", i) and not line.startswith("<<<", i):
+            m = _HEREDOC_RE.match(line, i)
+            if m:
+                found.append((m.group("delim"), bool(m.group("dash")), line[:i]))
+                i = m.end()
+                continue
+        i += 1
+    return found
+
+
+def _feeds_a_shell(before: str) -> bool:
+    """`bash <<EOF` / `sudo sh -s <<EOF` / `ssh host <<EOF`: the here-doc body is a script."""
+    toks = re.split(r"&&|\|\||[;|&(]", before)[-1].split()
+    while toks and (
+        _basename(toks[0]) in _WRAPPERS or _ASSIGNMENT.match(toks[0]) or toks[0].startswith("-") or toks[0].isdigit()
+    ):
+        toks = toks[1:]  # wrappers, their flags, `timeout 60`, inline env
+    if not toks:
+        return False
+    head, args = _basename(toks[0]), toks[1:]
+    flags = [a for a in args if a.startswith("-")]
+    operands = [a for a in args if not a.startswith("-")]
+    if head in _SHELLS:
+        # `bash -c '…' <<EOF` / `bash script.sh <<EOF` read the body as data; `bash -s x` does not
+        if any("c" in f[1:] for f in flags if not f.startswith("--")):
+            return False
+        return not operands or "-s" in flags
+    if head == "ssh":
+        return _ssh_remote_command(toks) is None  # only a host: stdin is the remote login shell
+    return False
+
+
 def strip_heredoc_bodies(command: str) -> str:
-    """Drop here-document bodies: `cat > f <<'EOF' ... EOF` text is data, not commands."""
+    """Drop here-document bodies — `cat > f <<'EOF' … EOF` text is data, not commands — except
+    a body fed to a shell (`bash <<EOF`, `ssh host <<EOF`), which is a script and stays."""
     out: list[str] = []
-    pending: list[tuple[str, bool]] = []
+    pending: list[tuple[str, bool, bool]] = []
     for line in command.split("\n"):
         if pending:
-            delim, dash = pending[0]
+            delim, dash, keep = pending[0]
             if (line.lstrip("\t") if dash else line) == delim:
                 pending.pop(0)
+            elif keep:
+                out.append(line)
             continue
         out.append(line)
-        pending.extend((m.group("delim"), bool(m.group("dash"))) for m in _HEREDOC_RE.finditer(line))
+        pending.extend((delim, dash, _feeds_a_shell(before)) for delim, dash, before in _unquoted_heredocs(line))
     return "\n".join(out)
 
 
@@ -294,6 +357,7 @@ class _Ctx:
         self.cwd = cwd
         self.vars: dict[str, str] = dict(variables or {})
         self.store_seen: str | None = None  # label of a store path an earlier piped segment named
+        self.pending_inner: list[str] = []  # command substitutions found in an assignment
 
 
 def _unwrap(argv: list[str], ctx: _Ctx) -> tuple[list[str], str, list[str], bool]:
@@ -302,7 +366,7 @@ def _unwrap(argv: list[str], ctx: _Ctx) -> tuple[list[str], str, list[str], bool
     nested: list[str] = []
     via_xargs = False
     argv = _strip_leading(argv)
-    for _ in range(16):
+    for _ in range(_MAX_WRAPPERS):
         if not argv or _basename(argv[0]) not in _WRAPPERS:
             break
         wrapper = _basename(argv[0])
@@ -337,7 +401,7 @@ def _unwrap(argv: list[str], ctx: _Ctx) -> tuple[list[str], str, list[str], bool
                 i += 1
                 continue
             break
-        rest = rest[i:] if rest else rest
+        rest = rest[i:]
         if wrapper == "timeout" and rest and re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", rest[0]):
             rest = rest[1:]
         argv = _strip_leading(rest)
@@ -355,7 +419,7 @@ def _expand_vars(text: str, local: dict[str, str], _depth: int = 0) -> str:
         value = local.get(name, os.environ.get(name))
         op = m.group("op")
         if op and (value is None or (op == ":-" and value == "")):
-            return _expand_vars(m.group("default") or "", local, _depth + 1) if _depth < 4 else ""
+            return _expand_vars(m.group("default") or "", local, _depth + 1) if _depth < _MAX_DEPTH else ""
         return value if value is not None else m.group(0)
 
     return _VAR_RE.sub(repl, text)
@@ -555,14 +619,20 @@ def _find_deletes(rest: list[str]) -> bool:
     return False
 
 
+def _find_filters(rest: list[str]) -> bool:
+    """Whether a `find` expression narrows what it matches (-name, -type, -mtime, …)."""
+    return any(tok in _FIND_FILTERS for tok in rest)
+
+
 def _check_find(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     rest = argv[1:]
     if not _find_deletes(rest):
         return None
+    # A walk rooted at or inside the store deletes store entries. One rooted ABOVE it deletes
+    # only what its filters match — but with no filter (`find ~/.bun -delete`) it is `rm -rf`.
+    allow_ancestor = not _find_filters(rest)
     for path in _find_paths(rest):
-        # find removes only what matches, so a walk rooted ABOVE the store is not flagged;
-        # one rooted at or inside the store deletes store entries.
-        label = _protected_hit(path, cwd, ctx.vars, allow_ancestor=False)
+        label = _protected_hit(path, cwd, ctx.vars, allow_ancestor=allow_ancestor)
         if label:
             return _STORE_MSG.format(what=f"`find {path} ... -delete/-exec rm` inside {label}")
     return None
@@ -628,17 +698,36 @@ def _ln_link_names(argv: list[str], cwd: str) -> list[str] | None:
     return [dest]
 
 
+def _is_node_modules(name: str) -> bool:
+    base = _basename(name.rstrip("/"))
+    return (base.casefold() if _CASE_INSENSITIVE_FS else base) == "node_modules"
+
+
 def _check_ln(argv: list[str], cwd: str) -> str | None:
-    for name in _ln_link_names(argv, cwd) or []:
-        if _basename(name.rstrip("/")) == "node_modules":
-            return _SYMLINK_MSG
+    if any(_is_node_modules(name) for name in _ln_link_names(argv, cwd) or []):
+        return _SYMLINK_MSG
     return None
+
+
+def _check_cp(argv: list[str], cwd: str) -> str | None:
+    """GNU `cp -s`/`--symbolic-link` (`-rs` builds a tree of links) is `ln -s` by another name."""
+    flags = [t for t in argv[1:] if t.startswith("-") and t != "-"]
+    if not any(f == "--symbolic-link" or (not f.startswith("--") and "s" in f[1:]) for f in flags):
+        return None
+    operands = _positional(argv[1:])
+    if len(operands) < 2:
+        return None
+    dest = operands[-1]
+    names = [os.path.join(dest, _basename(src.rstrip("/"))) for src in operands[:-1]]
+    if len(operands) == 2 and not dest.endswith("/") and not os.path.isdir(_expand(dest, cwd)):
+        names = [dest]
+    return _SYMLINK_MSG if any(_is_node_modules(n) for n in names) else None
 
 
 def _nearest_lockfile(start: str) -> tuple[str, str] | None:
     """(dir, lockfile name) of the nearest ancestor-or-self holding any JS lockfile."""
     cur = os.path.abspath(start)
-    for _ in range(64):
+    for _ in range(_MAX_LOCKFILE_WALK):
         for name in (*_BUN_LOCKFILES, *_OTHER_LOCKFILES):
             if os.path.isfile(os.path.join(cur, name)):
                 return cur, name
@@ -697,8 +786,26 @@ def _check_pm(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
 # ── driver ────────────────────────────────────────────────────────────────────
 
 
+def _bind_positional(script: str, params: list[str]) -> str:
+    """`bash -c 'rm -rf "$1"' _ <path>`: substitute `$0`…`$9`, `${N}`, `$@`, `$*` from the
+    operands (tilde-expanded, as the outer shell passed them). Values are spliced in unquoted:
+    a path with spaces may split, which only matters for display, not for the verdict."""
+    values = [os.path.expanduser(p) for p in params]
+
+    def repl(m: re.Match[str]) -> str:
+        token = m.group("n") or m.group("bn") or m.group("all")
+        if token in {"@", "*"}:
+            return " ".join(values[1:])
+        idx = int(token)
+        return values[idx] if idx < len(values) else ""
+
+    # `"$@"` expands to one word per operand, so its quotes must go with it
+    script = re.sub(r'"\$[@*]"', lambda _m: " ".join(values[1:]), script)
+    return re.sub(r"\$\{(?P<bn>\d)\}|\$(?P<n>\d)|\$(?P<all>[@*])", repl, script)
+
+
 def _shell_c_payload(argv: list[str]) -> str | None:
-    """`bash -c '...'` / `sh -lc "..."` / `eval '...'` → the inner command string."""
+    """`bash -c '...' [$0 $1…]` / `sh -lc "..."` / `eval '...'` → the inner command string."""
     head = _basename(argv[0])
     if head == "eval":
         return " ".join(argv[1:]) or None
@@ -706,7 +813,9 @@ def _shell_c_payload(argv: list[str]) -> str | None:
         return None
     for i, tok in enumerate(argv[1:], start=1):
         if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
-            return argv[i + 1] if i + 1 < len(argv) else None
+            if i + 1 >= len(argv):
+                return None
+            return _bind_positional(argv[i + 1], argv[i + 2 :])
     return None
 
 
@@ -726,36 +835,67 @@ def _ssh_remote_command(argv: list[str]) -> str | None:
     return None
 
 
-def _record_assignments(seg: list[str], ctx: _Ctx) -> bool:
-    """`NAME=value` / `export NAME=$(bun pm cache)` segments update ``ctx.vars``. True if consumed."""
+def _assignment_prefix(words: list[str]) -> tuple[list[list[str]], list[str]]:
+    """Split leading `NAME=value` words (a `NAME=$( … )` spans shlex's split tokens) from the rest."""
+    groups: list[list[str]] = []
+    i = 0
+    while i < len(words) and _ASSIGNMENT.match(words[i]):
+        j = i + 1
+        if words[i].endswith("$") and j < len(words) and words[j] == "(":
+            depth = 0
+            while j < len(words):
+                depth += {"(": 1, ")": -1}.get(words[j], 0)
+                j += 1
+                if depth == 0:
+                    break
+        groups.append(words[i:j])
+        i = j
+    return groups, words[i:]
+
+
+def _record_assignments(seg: list[str], ctx: _Ctx) -> list[str]:
+    """Strip leading `NAME=…` words and return the command left to inspect (``[]`` for a pure
+    assignment statement such as `export NAME=$(bun pm cache)`).
+
+    Only a pure statement records variables: in `NAME=x cmd …` the shell expands cmd's arguments
+    BEFORE applying the inline env, so NAME means nothing to cmd — and cmd is still inspected.
+    A command substitution in any assignment runs either way, so it is queued for inspection
+    (unless it is just `$(bun pm cache)` / `$(uv cache dir)`, which only prints a path).
+    """
     words = seg[1:] if seg and seg[0] in _DECLARERS else seg
-    first = _ASSIGNMENT.match(words[0]) if words else None
-    if first is None:
-        return False
-    if not all(_ASSIGNMENT.match(w) for w in words) and not _store_substitution(" ".join(words)):
-        return False  # `NAME=x cmd …` is an inline env for cmd, not a shell assignment
-    text = " ".join(words)
-    store = _store_substitution(text)
-    if store is not None:
-        ctx.vars[first.group("name")] = store
-        return True
-    for word in words:
-        m = _ASSIGNMENT.match(word)
-        if m:
-            value = m.group("value")
-            if "$(" not in value and "`" not in value:
-                ctx.vars[m.group("name")] = _expand_vars(value, ctx.vars)
-    return True
+    groups, rest = _assignment_prefix(words)
+    if not groups:
+        return seg
+    for group in groups:
+        m = _ASSIGNMENT.match(group[0])
+        if not m:
+            continue
+        text = " ".join(group)
+        value = m.group("value")
+        substitution = len(group) > 1 or "$(" in value or "`" in value
+        store = _store_substitution(text)
+        if substitution and store is None:
+            ctx.pending_inner.append(text[len(m.group("name")) + 1 :].strip().lstrip("$").strip("()`\"' "))
+        if rest:
+            continue  # inline env for the command in ``rest``
+        if store is not None:
+            ctx.vars[m.group("name")] = store
+        elif not substitution:
+            ctx.vars[m.group("name")] = _expand_vars(value, ctx.vars)
+    return rest
 
 
 def _note_store_paths(argv: list[str], ctx: _Ctx, cwd: str) -> None:
-    """Remember a store path an earlier segment names, for a later `| xargs rm`."""
+    """Remember a store path a piped segment names, for a later `| xargs rm`. An unfiltered
+    `find <ancestor>` lists the store too, so there an ancestor counts."""
     if ctx.store_seen:
         return
+    head = _basename(argv[0])
+    allow_ancestor = head == "find" and not _find_filters(argv[1:])
     for tok in argv[1:]:
         if tok.startswith("-"):
             continue
-        label = _protected_hit(tok, cwd, ctx.vars, allow_ancestor=False)
+        label = _protected_hit(tok, cwd, ctx.vars, allow_ancestor=allow_ancestor)
         if label:
             ctx.store_seen = label
             return
@@ -777,6 +917,8 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool) -> str | 
         return _check_find(argv, ctx, cwd)
     if head == "ln":
         return _check_ln(argv, cwd)
+    if head == "cp":
+        return _check_cp(argv, cwd)
     if head in {"npm", "pnpm", "yarn"}:
         return _check_pm(argv, ctx, cwd)
     return None
@@ -788,10 +930,13 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
     for seg, piped in _segments(_tokenize(strip_heredoc_bodies(command))):
         if not piped:
             ctx.store_seen = None  # `| xargs rm` only inherits paths from its own pipeline
-        seg = _strip_redirects(seg)
-        if _record_assignments(seg, ctx):
-            continue
-        argv, seg_cwd, nested, via_xargs = _unwrap(seg, ctx)
+        argv = _record_assignments(_strip_redirects(seg), ctx)
+        nested = ctx.pending_inner
+        ctx.pending_inner = []
+        seg_cwd, via_xargs = ctx.cwd, False
+        if argv:
+            argv, seg_cwd, unwrapped, via_xargs = _unwrap(argv, ctx)
+            nested += unwrapped
         for inner in nested:
             if _depth < _MAX_DEPTH:
                 msg = inspect(inner, seg_cwd, _depth + 1, ctx.vars)
@@ -825,23 +970,23 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
 
 # Cheap pre-filter: a command naming none of these cannot hit any rule.
 _HINT = re.compile(
-    r"\b(?:bun|bunx|uv|rm|rmdir|unlink|trash|srm|shred|gio|mv|find|ln|npm|pnpm|yarn)\b"
+    r"\b(?:bun|bunx|uv|rm|rmdir|unlink|trash|srm|shred|gio|mv|find|ln|cp|npm|pnpm|yarn)\b"
 )
 
 
 def main() -> int:
     try:
         event = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError) as exc:
-        warn(f"could not parse event: {exc} — allowing")
+        args = event.get("args") if isinstance(event, dict) else None
+        args = args if isinstance(args, dict) else {}
+        command = args.get("command") or args.get("cmd") or (event.get("command") if isinstance(event, dict) else "") or ""
+        cwd = str((event.get("cwd") if isinstance(event, dict) else None) or args.get("cwd") or os.getcwd())
+    except (ValueError, AttributeError, TypeError) as exc:
+        warn(f"could not read the event: {exc} — allowing")
         emit("allow")
         return 0
-
-    args = event.get("args") or {}
-    command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):
         command = str(command)
-    cwd = str(event.get("cwd") or args.get("cwd") or os.getcwd())
 
     if not _HINT.search(command):
         emit("allow")

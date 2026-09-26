@@ -307,6 +307,85 @@ def test_more_foreign_pm_verbs_block_with_the_right_verb(command, verb, bun_repo
     assert f"`{verb}`" in msg
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # a here-doc fed to a shell is a script, not data
+        "bash <<'EOF'\nbun pm cache rm\nEOF",
+        "sh <<EOF\nrm -rf ~/.bun/install/cache\nEOF",
+        "sudo bash -s <<'EOF'\nuv cache clean\nEOF",
+        "ssh mac <<'EOF'\nbun pm cache rm\nEOF",
+        "ssh -o BatchMode=yes mac <<'EOF'\nrm -rf ~/.bun/install/cache\nEOF",
+        # a quoted or commented `<<EOF` opens no here-doc
+        "echo 'tip: <<EOF starts a heredoc'\nbun pm cache rm",
+        "echo hi # <<EOF\nbun pm cache rm",
+        # command substitutions and inline assignments
+        "FOO=$(bun pm cache rm)",
+        "X=$(bun pm cache) rm -rf ~/.bun/install/cache",
+        'C="$(uv cache dir)" rm -rf ~/.cache/uv',
+        # bash -c operands bind to $0/$1/$@
+        "bash -c 'rm -rf \"$1\"' _ ~/.bun/install/cache",
+        "bash -c '\"$@\"' _ bun pm cache rm",
+        # an unfiltered find from an ancestor deletes everything below it
+        "find ~/.bun -delete",
+        "find ~/.cache -delete",
+        "cd ~/.bun && find . -delete",
+    ],
+)
+def test_round_two_store_bypasses_block(command, home, tmp_path, monkeypatch):
+    _blocked(command, monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -c 'ln -s \"$1\" \"$2\"' _ /main/node_modules node_modules",
+        "cp -s /main/node_modules node_modules",
+        "cp -rs /main/node_modules node_modules",
+        "cp --symbolic-link /main/node_modules node_modules",
+    ],
+)
+def test_round_two_symlink_bypasses_block(command, home, tmp_path, monkeypatch):
+    assert "symlink node_modules" in _blocked(command, monkeypatch, tmp_path)
+
+
+def test_round_two_pm_bypasses_block(bun_repo, home, monkeypatch):
+    _blocked("bash -c '\"$@\"' _ npm install", monkeypatch, bun_repo)
+    _blocked("X=$(bun pm cache) npm install", monkeypatch, bun_repo)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -c 'echo hi' <<EOF\nbun pm cache rm\nEOF",
+        "python3 - <<'EOF'\nprint('bun pm cache rm')\nEOF",
+        "bash script.sh <<EOF\nrm -rf ~/.bun/install/cache\nEOF",
+        "cat <<'EOF' | tee notes.md\nbun pm cache rm\nEOF",
+        "cp -r src dst",
+        "cp -s a b",
+        "find ~ -name '*.orig' -delete",
+        "X=$(ls); echo $X",
+    ],
+)
+def test_round_two_neighbours_allowed(command, home, tmp_path, monkeypatch):
+    _allowed(command, monkeypatch, tmp_path)
+
+
+@pytest.mark.skipif(sys.platform not in {"darwin", "win32"}, reason="case-insensitive filesystems only")
+def test_node_modules_case_variant_blocks_on_case_insensitive_filesystems(home, tmp_path, monkeypatch):
+    _blocked("ln -s /main/node_modules Node_Modules", monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize("event", [{"args": ["rm", "-rf", "x"]}, ["not", "a", "dict"], {"args": "bun pm cache rm"}])
+def test_malformed_event_shapes_allow_instead_of_crashing(event, monkeypatch):
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    assert psg.main() == 0
+    assert json.loads(out.getvalue())["decision"] == "allow"
+
+
 def test_ln_to_an_existing_dir_links_inside_it(home, tmp_path, monkeypatch):
     (tmp_path / "wt").mkdir()
     _blocked("ln -s /main/node_modules wt", monkeypatch, tmp_path)
