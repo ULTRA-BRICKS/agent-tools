@@ -1,0 +1,9 @@
+{
+  "id": "package-store-guard",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/package-store-guard/package_store_guard.py",
+  "priority": 20,
+  "timeout_ms": 5000,
+  "on_error": "closed",
+  "description": "Keeps the shared package stores and store-backed installs intact. Blocks `bun pm cache rm`, deleting/moving ~/.bun/install/cache (or an ancestor, or anything inside it), `uv cache clean` / `uv cache prune --all|--ci` and deleting ~/.cache/uv, creating a symlink named node_modules (`ln -s`/`ln -sfn` — bun install writes through it into the other checkout), and `npm install`/`npm ci`/`pnpm install`/`yarn` where the nearest lockfile is bun.lock/bun.lockb (npm-only subprojects with package-lock.json and global installs stay allowed). Each block names the command to run instead (`bun install --frozen-lockfile`, `rig worktree gc`). No self-service bypass."
+}

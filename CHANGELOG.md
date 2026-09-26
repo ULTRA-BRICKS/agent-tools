@@ -4,6 +4,14 @@
 
 ### Added
 
+- `agent-hooks/package-store-guard` (pre-bash, every harness): blocks wiping a shared package
+  store (`bun pm cache rm`, deleting/moving `~/.bun/install/cache` or an ancestor, `uv cache
+  clean`, `uv cache prune --all`/`--ci`, deleting `~/.cache/uv`), creating a symlink named
+  `node_modules`, and `npm install`/`npm ci`/`pnpm install`/`yarn` where the nearest lockfile is
+  `bun.lock`/`bun.lockb`. Each block names the replacement (`bun install --frozen-lockfile`,
+  `rig worktree gc`). Its `blurb.md` adds the SessionStart rule that disk cleanup never wipes
+  package-manager caches or stores.
+
 - `ci/ship`: Forgejo provider (UB-25). `gh ship` now ships a PR from a checkout whose `origin` is
   a Forgejo host instead of silently reading the wrong remote. A gh-shaped adapter
   (`ci/ship/forgejo_provider.py`) feeds the unchanged gates from the Forgejo API, pins the PR head
