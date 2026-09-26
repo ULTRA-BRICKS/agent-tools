@@ -179,7 +179,7 @@ _HOOK_MANAGER_INSTALLS = {
     "husky": frozenset({"", "install", "init"}),
     "simple-git-hooks": frozenset({""}),
 }
-_GIT_TIMEOUT_S = 3
+_GIT_TIMEOUT_S = 1.5  # at most two git queries per check: well inside the 5 s descriptor budget
 _NIX_RUNNERS = frozenset({"run", "shell", "develop", "build"})
 
 _STORE_MSG = (
@@ -594,7 +594,10 @@ def _unwrap(argv: list[str], ctx: _Ctx) -> tuple[list[str], str, list[str], bool
         i = 0
         while i < len(rest):
             tok = rest[i]
-            if _ASSIGNMENT.match(tok):
+            m = _ASSIGNMENT.match(tok)
+            if m:
+                if wrapper == "env":
+                    ctx.inline_env[m.group("name")] = m.group("value")  # `env NAME=v cmd`
                 i += 1
                 continue
             flag, eq, attached = tok.partition("=")
@@ -791,8 +794,8 @@ def _positional(argv: list[str]) -> list[str]:
 
 
 def _check_bun(argv: list[str]) -> str | None:
-    words = [t for t in argv[1:] if not t.startswith("-")]
-    for i in range(len(words) - 2):  # a valued flag (`--cwd /x`) may sit in front
+    words = [t for t in argv[1:] if not t.startswith("-")]  # a valued flag (`--cwd /x`) may sit in front
+    for i in range(len(words) - 2):
         if words[i] == "pm" and words[i + 1] == "cache" and words[i + 2] in _BUN_CACHE_VERBS:
             return _STORE_MSG.format(what=f"`bun pm cache {words[i + 2]}`")
     return None
@@ -1108,27 +1111,47 @@ def _check_hook_manager(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     dispatcher dir), they overwrite the global composer for every repo (2026-09-26: a postinstall
     `lefthook install` replaced ~/.config/git/hooks/pre-commit — secret scan and review gate)."""
     head = _cmd(argv[0])
+    if any(t in _INFO_FLAGS for t in argv[1:]):
+        return None  # `husky --help`, `lefthook -v`
     words = [t for t in argv[1:] if not t.startswith("-")]
     verb = words[0] if words else ""
     if verb not in _HOOK_MANAGER_INSTALLS[head]:
         return None
-    if any(k.startswith("GIT_CONFIG_KEY_") and v.lower() == "core.hookspath" for k, v in ctx.inline_env.items()):
-        return None  # an explicit per-command hooksPath (the documented way to target .git/hooks)
-    hooks_path = _git(cwd, "config", "--get", "core.hooksPath")
-    if not hooks_path:
-        return None  # the default: the repo's own .git/hooks
-    top = _git(cwd, "rev-parse", "--show-toplevel")
-    if top is None:
-        return None
-    resolved = _expand(hooks_path, top)
-    inside = [top, _git(cwd, "rev-parse", "--absolute-git-dir") or top]
-    common = _git(cwd, "rev-parse", "--git-common-dir")
-    if common:
-        inside.append(_expand(common, top))
-    if any(_components(resolved)[: len(_components(d))] == _components(d) for d in inside):
+    paths = _git(cwd, "rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir")
+    if not paths or len(paths.splitlines()) < 3:
+        return None  # not inside a work tree: nothing to protect here
+    top, git_dir, common = paths.splitlines()[:3]
+    explicit = _explicit_hooks_path(ctx.inline_env)
+    if explicit is not None:
+        # the documented per-command override — honoured only if it really lands in this repo
+        for probe in ("$(git rev-parse --absolute-git-dir)", "$(git rev-parse --git-dir)", "`git rev-parse --absolute-git-dir`"):
+            explicit = explicit.replace(probe, git_dir)
+        hooks_path = explicit if explicit and "$(" not in explicit and "`" not in explicit else "<unresolvable>"
+    else:
+        hooks_path = _git(cwd, "config", "--get", "core.hooksPath") or ""
+        if not hooks_path:
+            return None  # the default: the repo's own .git/hooks
+    resolved = _expand(_expand_vars(hooks_path, ctx.vars), top)
+    inside = [top, git_dir, _expand(common, top)]
+    if hooks_path != "<unresolvable>" and any(
+        _components(resolved)[: len(_components(d))] == _components(d) for d in inside
+    ):
         return None  # a repo-local hooks dir (`.husky/_`, `.git/hooks`)
     shown = f"{head} {verb}".strip()
     return _HOOK_MANAGER_MSG.format(tool=shown, path=resolved)
+
+
+def _explicit_hooks_path(env: dict[str, str]) -> str | None:
+    """core.hooksPath set for this one command via GIT_CONFIG_COUNT/KEY_n/VALUE_n (git reads the
+    KEY/VALUE pairs only below a valid COUNT), or None."""
+    try:
+        count = int(env.get("GIT_CONFIG_COUNT", "0").strip("\"'"))
+    except ValueError:
+        return None
+    for n in range(max(0, min(count, 64))):
+        if env.get(f"GIT_CONFIG_KEY_{n}", "").strip("\"'").lower() == "core.hookspath":
+            return env.get(f"GIT_CONFIG_VALUE_{n}", "").strip("\"'")
+    return None
 
 
 def _nearest_lockfile(start: str) -> tuple[str, str] | None:
@@ -1271,6 +1294,7 @@ def _record_assignments(seg: list[str], ctx: _Ctx) -> list[str]:
     """
     words = seg[1:] if seg and seg[0] in _DECLARERS else seg
     groups, rest = _assignment_prefix(words)
+    ctx.inline_env = {}
     if not groups:
         return seg
     for group in groups:
@@ -1279,7 +1303,8 @@ def _record_assignments(seg: list[str], ctx: _Ctx) -> list[str]:
             continue
         value = " ".join([m.group("value"), *group[1:]]).strip() if len(group) > 1 else m.group("value")
         if rest:
-            continue  # inline env for the command in ``rest``
+            ctx.inline_env[m.group("name")] = value  # inline env for the command in ``rest``
+            continue
         resolved = _store_value(value)
         if "$(" not in resolved and "`" not in resolved:
             ctx.vars[m.group("name")] = _expand_vars(resolved.strip("\"'"), ctx.vars)
@@ -1320,16 +1345,20 @@ def _launched_argv(argv: list[str]) -> list[str] | None:
     `npm exec [--] X …`, `pnpm dlx|exec X …`, `yarn dlx|exec X …` → `X …`."""
     head = _cmd(argv[0])
     rest = argv[1:]
-    if head in {"npm", "pnpm", "yarn"}:
+    if head in {"npm", "pnpm", "yarn", "bun"}:
         words = [t for t in rest if not t.startswith("-")]
-        if not words or words[0] not in {"exec", "x", "dlx"}:
+        runner_verbs = {"x"} if head == "bun" else {"exec", "x", "dlx"}
+        if not words or words[0] not in runner_verbs:
             return None
         rest = rest[rest.index(words[0]) + 1 :]
     elif head not in {"npx", "bunx", "corepack", "pnpx"}:
         return None
     i = 0
     while i < len(rest) and rest[i].startswith("-"):
-        i += 2 if rest[i] in {"-p", "--package", "-c", "--call"} else 1
+        flag, eq, attached = rest[i].partition("=")
+        if flag in {"-c", "--call"}:  # `npx -c '…'` is `sh -c '…'` in the package env
+            return ["sh", "-c", attached if eq else (rest[i + 1] if i + 1 < len(rest) else "")]
+        i += 2 if rest[i] in {"-p", "--package"} else 1
     launched = rest[i:]
     if not launched:
         return None
@@ -1349,6 +1378,9 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool, depth: in
         if not launched:
             break
         argv = launched
+    script = _shell_c_payload(argv)
+    if script is not None:  # `npx -c '…'` became `sh -c '…'`
+        return inspect(script, cwd, depth + 1, ctx.vars) if depth < _MAX_DEPTH else None
     head = _cmd(argv[0])
     if via_xargs and ctx.store_seen and head in _REMOVERS:
         return _STORE_MSG.format(what=f"`… | xargs {head}` over paths in {ctx.store_seen}")
@@ -1392,9 +1424,6 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
         argv = _record_assignments(plain, ctx)
         if not argv:
             continue
-        ctx.inline_env = dict(
-            m.group("name", "value") for w in plain[: len(plain) - len(argv)] if (m := _ASSIGNMENT.match(w))
-        )
         argv, seg_cwd, nested, via_xargs = _unwrap(argv, ctx)
         if here_string is not None and argv and _stdin_script_dir(" ".join(shlex.quote(a) for a in argv)) is not None:
             nested.append(here_string)  # `bash <<< '…'`: the string is the script

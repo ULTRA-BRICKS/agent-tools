@@ -602,6 +602,41 @@ def test_hook_managers_allowed_with_a_repo_local_hooks_path(home, tmp_path, monk
     _allowed("lefthook run pre-commit", monkeypatch, repo)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "GIT_CONFIG_KEY_0=core.hooksPath lefthook install",  # no COUNT: git ignores the key
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/elsewhere/hooks lefthook install",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=\"$(cat /tmp/p)\" lefthook install",
+        "bun x lefthook install",
+        "npx -p lefthook -c 'lefthook install'",
+    ],
+)
+def test_hook_manager_overrides_must_really_stay_in_the_repo(command, home, tmp_path, monkeypatch):
+    global_hooks = tmp_path / "global-git-hooks"
+    global_hooks.mkdir()
+    _blocked(command, monkeypatch, _repo_with_hooks_path(tmp_path, str(global_hooks)))
+
+
+@pytest.mark.parametrize("command", ["husky --help", "simple-git-hooks --version", "lefthook -h"])
+def test_hook_manager_info_flags_allowed(command, home, tmp_path, monkeypatch):
+    global_hooks = tmp_path / "global-git-hooks"
+    global_hooks.mkdir()
+    _allowed(command, monkeypatch, _repo_with_hooks_path(tmp_path, str(global_hooks)))
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["npx -c 'rm -rf ~/.bun/install/cache'", "npx --call='bun pm cache rm'", "npm exec -c 'uv cache clean'"],
+)
+def test_package_runner_call_scripts_are_inspected(command, home, tmp_path, monkeypatch):
+    _blocked(command, monkeypatch, tmp_path)
+
+
+def test_bun_x_is_a_package_runner(bun_repo, home, monkeypatch):
+    _blocked("bun x npm install", monkeypatch, bun_repo)
+
+
 def test_mv_into_the_store_is_not_a_removal(home, tmp_path, monkeypatch):
     _allowed("mv -t ~/.bun/install/cache /tmp/foo", monkeypatch, tmp_path)
     _blocked("mv -t /tmp ~/.bun/install/cache", monkeypatch, tmp_path)
