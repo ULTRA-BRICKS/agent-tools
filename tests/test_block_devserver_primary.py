@@ -14,6 +14,7 @@ Run from the repo root::
 
 from __future__ import annotations
 
+import html
 import importlib.util
 import io
 import json
@@ -621,7 +622,8 @@ def test_hatch_question_shows_full_command_not_just_label(tmp_path, monkeypatch)
         "RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY": "One-off verification, worktree busy.",
     })
     assert code == 0 and _decision(out) == "allow"
-    question = capture.read_text()
+    # the ButtonRequest JSON on stdin; its question is Telegram HTML (&, <, > escaped)
+    question = html.unescape(json.loads(capture.read_text())["question"])
     assert command in question, (
         "the human-facing hatch question must contain the FULL original command string, "
         "not just the short classifier label for the segment that triggered the block"

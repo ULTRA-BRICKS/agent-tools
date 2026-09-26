@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- `ci/ship`: Forgejo provider (UB-25). `gh ship` now ships a PR from a checkout whose `origin` is
+  a Forgejo host instead of silently reading the wrong remote. A gh-shaped adapter
+  (`ci/ship/forgejo_provider.py`) feeds the unchanged gates from the Forgejo API, pins the PR head
+  and merges with `head_commit_id`, binds credentials to the origin host, and refuses every call
+  it cannot back with Forgejo evidence. See `ci/ship/README.md` "Forgejo provider".
+- `ci/ship`: `--task-config <path>` routes the ship's ticket through task-cli's standard
+  `--config` for the acceptance gate and the post-merge notify (UB-25: a Tasks-app ticket shipped
+  from a Forgejo repository). A missing file, and any acceptance result that cannot be evaluated,
+  refuses the merge.
+
 ### Fixed
 
 - `omp-hook-bridge`: round-3 hardening of the `eval` tool's write-call secret-scan heuristic
