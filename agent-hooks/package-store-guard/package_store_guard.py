@@ -51,6 +51,7 @@ import functools
 import json
 import os
 import re
+import secrets
 import shlex
 import sys
 
@@ -63,7 +64,7 @@ _SHELL_SEPS = frozenset({"&&", "||", ";", "|", "&", ";;", "|&", ";&", ";;&"})
 _PIPES = frozenset({"|", "|&"})
 _PUNCT = frozenset("();<>|&")
 _ESCAPED_SEMI = "__package_store_guard_escaped_semicolon__"
-_SUBST_MARK = "__psg_subst_{}__"
+_SUBST_MARK = "__psg_subst_{}_{}__"
 # Longest first, so `&&` wins over `&` and `;;&` over `;;`.
 _OPERATORS = ("<<<", ";;&", "&>>", "&&", "||", ";;", ";&", "|&", "&>", ">>", ">&", "<&", ">|", "<>", "<<",
               "(", ")", ";", "|", "&", "<", ">")
@@ -71,7 +72,9 @@ _LEADING_SHELL_NOISE = frozenset({"(", ")", "{", "}", "!", "then", "do", "else",
 _ASSIGNMENT = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>.*)$", re.DOTALL)
 _DECLARERS = frozenset({"export", "local", "declare", "typeset", "readonly"})
 _REDIRECT_OPS = frozenset({">", ">>", "<", ">&", "&>", "&>>", "<&", ">|", "<>", "<<", "<<<"})
-_HEREDOC_RE = re.compile(r"<<(?!<)(?P<dash>-)?\s*(?P<q>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_]*)(?P=q)")
+_HEREDOC_RE = re.compile(
+    r"<<(?!<)(?P<dash>-)?[ \t]*(?:'(?P<sq>[^'\n]*)'|\"(?P<dq>[^\"\n]*)\"|(?P<bare>[^\s'\"<>|&;()]+))"
+)
 _VAR_RE = re.compile(
     r"\$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)(?:(?P<op>:?-)(?P<default>[^}]*))?\}"
     r"|\$(?P<bare>[A-Za-z_][A-Za-z0-9_]*)"
@@ -80,11 +83,12 @@ _GLOB_CHARS = re.compile(r"[*?\[]")
 _SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish"})
 _WRAPPERS = frozenset({
     "timeout", "env", "nice", "time", "stdbuf", "nohup", "setsid", "unbuffer", "command",
-    "sudo", "doas", "exec", "caffeinate", "busybox", "xargs",
+    "sudo", "doas", "exec", "caffeinate", "busybox", "xargs", "xcrun",
 })
 _WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
     "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
-    "env": frozenset({"-u", "--unset"}),
+    "env": frozenset({"-u", "--unset", "-a", "--argv0"}),
+    "exec": frozenset({"-a"}),
     "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
     "nice": frozenset({"-n", "--adjustment"}),
     "sudo": frozenset({"-u", "--user", "-g", "--group", "-C", "--close-from", "-h", "--host", "-p", "--prompt"}),
@@ -102,7 +106,8 @@ _SSH_VALUE_FLAGS = frozenset({
     "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p",
     "-Q", "-R", "-S", "-W", "-w", "-B",
 })
-_MAX_DEPTH = 4  # nested bash -c / eval / ssh / env -S payloads
+_MAX_DEPTH = 4  # nested bash -c / eval / ssh / env -S / -exec payloads
+_MAX_VAR_DEPTH = 4  # `${A:-${B:-…}}` defaults
 _MAX_WRAPPERS = 16  # sudo env timeout … peeled per command
 _MAX_LOCKFILE_WALK = 64  # parent dirs searched for the nearest lockfile
 
@@ -152,6 +157,18 @@ _STORE_SPAN_RE = re.compile(
 # ── banned VM runtimes (colima & co. filled the Mac's disk; agents kept reinstalling them) ──
 _VM_RUNTIMES = frozenset({"colima", "lima", "podman", "podman-desktop", "orbstack", "docker-desktop"})
 _VM_START_VERBS = {"colima": frozenset({"start", "restart", "install"}), "limactl": frozenset({"start", "create"})}
+_VM_SUBCOMMANDS = {
+    "colima": frozenset({
+        "start", "stop", "restart", "delete", "status", "list", "ls", "ssh", "ssh-config", "kubernetes",
+        "nerdctl", "prune", "template", "update", "version", "completion", "help", "install",
+    }),
+    "limactl": frozenset({
+        "start", "stop", "create", "delete", "rm", "list", "ls", "shell", "edit", "copy", "cp", "info",
+        "prune", "factory-reset", "sudoers", "disk", "snapshot", "validate", "show-ssh", "protect",
+        "unprotect", "start-at-login", "help", "completion", "tunnel",
+    }),
+}
+_VM_APPS = frozenset({"docker", "docker desktop", "orbstack", "podman desktop", "colima"})
 _BREW_INSTALL_VERBS = frozenset({"install", "reinstall", "upgrade"})
 _NIX_RUNNERS = frozenset({"run", "shell", "develop", "build"})
 
@@ -167,7 +184,7 @@ _STORE_MSG = (
 _SYMLINK_MSG = (
     "[package-store-guard] BLOCKED: do not symlink node_modules to another checkout. `bun install` "
     "in a worktree whose node_modules is a symlink writes THROUGH it and corrupts the other "
-    "checkout (bun 1.4.2, hypercalendarbot 2026-09-09). Run `bun install --frozen-lockfile` in "
+    "checkout (bun 1.4.2 did exactly this on 2026-09-09). Run `bun install --frozen-lockfile` in "
     "this worktree instead: with rig's ~/.bunfig.toml (isolated linker + globalStore) it only "
     "creates symlinks into the shared store — a few MB, seconds — unless the repo's own "
     "bunfig.toml asks for a local layout. `rig worktree create` already does this for bun repos."
@@ -236,7 +253,10 @@ def _unquoted_heredocs(line: str) -> list[tuple[str, bool, str, str]]:
         elif line.startswith("<<", i) and not line.startswith("<<<", i):
             m = _HEREDOC_RE.match(line, i)
             if m:
-                found.append((m.group("delim"), bool(m.group("dash")), line[:i], line[m.end():]))
+                delim = m.group("sq") if m.group("sq") is not None else m.group("dq")
+                if delim is None:
+                    delim = m.group("bare").replace("\\", "")  # `<<\EOF` quotes it too
+                found.append((delim, bool(m.group("dash")), line[:i], line[m.end():]))
                 i = m.end()
                 continue
         i += 1
@@ -399,7 +419,7 @@ def _split_operators(tok: str) -> list[str]:
 def _protect_substitutions(text: str) -> tuple[str, list[str]]:
     """Swap each `$( … )` / backtick span (outside single quotes) for a placeholder word, so its
     parens and inner `;`/quotes neither split the surrounding word nor end the command."""
-    spans: list[str] = []
+    spans: list[str] = [secrets.token_hex(6)]  # [0] is this call's nonce
     out: list[str] = []
     quote: str | None = None
     i = 0
@@ -426,7 +446,7 @@ def _protect_substitutions(text: str) -> tuple[str, list[str]]:
             end = len(text) if close < 0 else close + 1
         if end > 0:
             spans.append(text[i:end])
-            out.append(_SUBST_MARK.format(len(spans) - 1))
+            out.append(_SUBST_MARK.format(spans[0], len(spans) - 1))
             i = end
             continue
         if ch == "'" and quote is None:
@@ -439,9 +459,16 @@ def _protect_substitutions(text: str) -> tuple[str, list[str]]:
 
 
 def _restore_substitutions(tok: str, spans: list[str]) -> str:
-    if "__psg_subst_" not in tok:
+    """Put this call's `$( … )` spans back; a marker-like word typed in the command stays as is."""
+    prefix = f"__psg_subst_{spans[0]}_"
+    if prefix not in tok:
         return tok
-    return re.sub(r"__psg_subst_(\d+)__", lambda m: spans[int(m.group(1))], tok)
+
+    def back(m: re.Match[str]) -> str:
+        idx = int(m.group(1))
+        return spans[idx] if 0 < idx < len(spans) else m.group(0)
+
+    return re.sub(re.escape(prefix) + r"(\d+)__", back, tok)
 
 
 def _tokenize(command: str) -> list[str]:
@@ -583,7 +610,7 @@ def _expand_vars(text: str, local: dict[str, str], _depth: int = 0) -> str:
         value = local.get(name, os.environ.get(name))
         op = m.group("op")
         if op and (value is None or (op == ":-" and value == "")):
-            return _expand_vars(m.group("default") or "", local, _depth + 1) if _depth < _MAX_DEPTH else ""
+            return _expand_vars(m.group("default") or "", local, _depth + 1) if _depth < _MAX_VAR_DEPTH else ""
         return value if value is not None else m.group(0)
 
     return _VAR_RE.sub(repl, text)
@@ -671,7 +698,7 @@ def _target_hits_root(target: list[str], root: list[str], *, allow_ancestor: boo
 
 
 def _protected_hit(raw_target: str, ctx_cwd: str, local: dict[str, str], *, allow_ancestor: bool = True) -> str | None:
-    target = _components(_expand(raw_target, ctx_cwd, local))
+    target = _components(_expand(_store_value(raw_target), ctx_cwd, local))
     for label, root in _protected_roots():
         if _target_hits_root(target, root, allow_ancestor=allow_ancestor):
             return label
@@ -710,8 +737,9 @@ def _positional(argv: list[str]) -> list[str]:
 
 def _check_bun(argv: list[str]) -> str | None:
     words = [t for t in argv[1:] if not t.startswith("-")]
-    if len(words) >= 3 and words[0] == "pm" and words[1] == "cache" and words[2] in _BUN_CACHE_VERBS:
-        return _STORE_MSG.format(what="`bun pm cache " + words[2] + "`")
+    for i in range(len(words) - 2):  # a valued flag (`--cwd /x`) may sit in front
+        if words[i] == "pm" and words[i + 1] == "cache" and words[i + 2] in _BUN_CACHE_VERBS:
+            return _STORE_MSG.format(what="`bun pm cache " + words[i + 2] + "`")
     return None
 
 
@@ -976,9 +1004,9 @@ def _check_vm_runtime(argv: list[str]) -> str | None:
     words = [t for t in argv[1:] if not t.startswith("-")]
     flags = [t for t in argv[1:] if t.startswith("-")]
     if head in _VM_START_VERBS:
-        # the verb may follow a flag value (`colima --profile x start`)
-        verb = next((w for w in words[:2] if w in _VM_START_VERBS[head]), None)
-        return _VM_MSG.format(what=f"`{head} {verb}`") if verb else None
+        # the verb is the first known subcommand; valued flags (`--profile ci --arch x`) precede it
+        verb = next((w for w in words if w in _VM_SUBCOMMANDS[head]), None)
+        return _VM_MSG.format(what=f"`{head} {verb}`") if verb in _VM_START_VERBS[head] else None
     if head == "brew" and words and words[0] in _BREW_INSTALL_VERBS:
         for pkg in words[1:]:
             name = _vm_package(pkg)
@@ -989,6 +1017,12 @@ def _check_vm_runtime(argv: list[str]) -> str | None:
         for ref in words[1:]:
             if _vm_package(ref):
                 return _VM_MSG.format(what=f"`nix {words[0]} {ref}`")
+        return None
+    if head == "open":
+        # `open -a Docker` / `open -a OrbStack` launch the VM app itself
+        for i, tok in enumerate(argv[1:-1], start=1):
+            if tok in {"-a", "-b"} and _basename(argv[i + 1]).removesuffix(".app").lower() in _VM_APPS:
+                return _VM_MSG.format(what=f"`open {tok} {argv[i + 1]}`")
         return None
     if head in {"nix-env", "nix-shell"} and any(f.startswith(("-i", "-p", "--install", "--packages")) for f in flags):
         for ref in words:
@@ -1025,7 +1059,7 @@ def _pm_install_target(tool: str, argv: list[str], cwd: str, local: dict[str, st
         if tok == "--location" and i + 1 < len(rest) and rest[i + 1] in {"global", "user"}:
             return None
         flag, eq, attached = tok.partition("=")
-        if flag in _PM_DIR_FLAGS or (flag == "-C" and tool == "pnpm"):
+        if flag in _PM_DIR_FLAGS or (flag == "-C" and tool in {"pnpm", "npm"}):
             target = attached if eq else (rest[i + 1] if i + 1 < len(rest) else "")
             project_dir = _expand(target, cwd, local)
             i += 1 if eq else 2
@@ -1204,7 +1238,7 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool, depth: in
         return _check_cp(argv, ctx, cwd)
     if head in {"npm", "pnpm", "yarn"}:
         return _check_pm(argv, ctx, cwd)
-    if head in {"colima", "limactl", "brew", "nix", "nix-env", "nix-shell"}:
+    if head in {"colima", "limactl", "brew", "nix", "nix-env", "nix-shell", "open"}:
         return _check_vm_runtime(argv)
     return None
 
@@ -1221,10 +1255,13 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
     for seg, piped in _segments(_tokenize(command)):
         if not piped:
             ctx.store_seen = None  # `| xargs rm` only inherits paths from its own pipeline
+        here_string = next((seg[k + 1] for k, t in enumerate(seg[:-1]) if t == "<<<"), None)
         argv = _record_assignments(_strip_redirects(seg), ctx)
         if not argv:
             continue
         argv, seg_cwd, nested, via_xargs = _unwrap(argv, ctx)
+        if here_string is not None and argv and _stdin_script_dir(" ".join(shlex.quote(a) for a in argv)) is not None:
+            nested.append(here_string)  # `bash <<< '…'`: the string is the script
         for inner in nested:
             if _depth < _MAX_DEPTH:
                 msg = inspect(inner, seg_cwd, _depth + 1, ctx.vars)
@@ -1255,7 +1292,7 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
 # Cheap pre-filter: a command naming none of these cannot hit any rule.
 _HINT = re.compile(
     r"\b(?:bun|bunx|uv|rm|rmdir|unlink|trash|srm|shred|gio|mv|find|ln|cp|npm|pnpm|yarn"
-    r"|colima|limactl|brew|nix|nix-env|nix-shell)\b",
+    r"|colima|limactl|brew|nix|nix-env|nix-shell|open)\b",
     re.IGNORECASE,
 )
 

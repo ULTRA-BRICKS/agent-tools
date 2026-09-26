@@ -480,6 +480,55 @@ def test_round_five_neighbours_allowed(command, home, tmp_path, monkeypatch):
     _allowed(command, monkeypatch, tmp_path)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<BUILD-LOG-1\nsome text\nBUILD-LOG-1\nbun pm cache rm",
+        'find "$(bun pm cache)/links" -mindepth 1 -delete',
+        "find $(uv cache dir) -delete",
+        "ls $(bun pm cache) | xargs rm -rf",
+        "bun --cwd /x pm cache rm",
+        "bun pm cache clean",
+        "bun pm cache clear",
+        "colima --profile ci --arch aarch64 start",
+        "rm -rf ~/.bun/install/cache __psg_subst_0__",
+        "bun pm cache rm __psg_subst_abc_1__",
+        "exec -a foo rm -rf ~/.bun/install/cache",
+        "env -a foo rm -rf ~/.bun/install/cache",
+        "env --argv0 foo bun pm cache rm",
+        "xcrun rm -rf ~/.bun/install/cache",
+        "bash <<< 'rm -rf ~/.bun/install/cache'",
+        "bash -s <<< 'bun pm cache rm'",
+        "open -a Docker",
+        "open -a OrbStack",
+        "open -a 'Docker Desktop'",
+        "open -a /Applications/OrbStack.app",
+    ],
+)
+def test_round_six_bypasses_block(command, home, tmp_path, monkeypatch):
+    _blocked(command, monkeypatch, tmp_path)
+
+
+def test_npm_dash_c_redirects_the_lockfile_lookup(bun_repo, home, tmp_path, monkeypatch):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    _blocked(f"npm -C {bun_repo} install", monkeypatch, elsewhere)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<'NOTES-2'\nrm -rf ~/.bun/install/cache\nNOTES-2",
+        "grep x <<< 'rm -rf ~/.bun/install/cache'",
+        "bash -c 'echo hi' <<< 'bun pm cache rm'",
+        "open -a Safari https://example.com",
+        "open .",
+    ],
+)
+def test_round_six_neighbours_allowed(command, home, tmp_path, monkeypatch):
+    _allowed(command, monkeypatch, tmp_path)
+
+
 def test_mv_into_the_store_is_not_a_removal(home, tmp_path, monkeypatch):
     _allowed("mv -t ~/.bun/install/cache /tmp/foo", monkeypatch, tmp_path)
     _blocked("mv -t /tmp ~/.bun/install/cache", monkeypatch, tmp_path)
@@ -666,7 +715,7 @@ def test_descriptor_shape():
     assert spec["id"] == "package-store-guard"
     assert spec["point"] == "pre-bash"
     assert spec["cmd"].endswith("/agent-hooks/package-store-guard/package_store_guard.py")
-    assert spec["on_error"] in {"open", "closed"}
+    assert spec["on_error"] == "closed"
 
 
 def test_script_is_executable():

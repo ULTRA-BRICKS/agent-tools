@@ -1,5 +1,7 @@
 # package-store-guard
 
+**Point:** `pre-bash` · **Fail policy:** `closed` · **Priority:** 20
+
 A `pre-bash` agent-hook that keeps the machine's shared package stores, and the installs that
 link into them, intact — and keeps banned, disk-filling container VM runtimes (colima & co.) off
 the machine.
@@ -30,7 +32,7 @@ from `~/.cache/uv`. Four agent habits kept undoing that:
 | uv cache wipe | `uv cache clean`; `uv cache prune --all` / `--ci`; `rm -rf ~/.cache/uv` (also `$UV_CACHE_DIR`, `${UV_CACHE_DIR:-…}`, `$XDG_CACHE_HOME/uv`) | same — plain `uv cache prune` (unused entries only) stays allowed |
 | `node_modules` symlink | `ln -s <main>/node_modules node_modules`, `ln -sfn …`, `ln -s <main>/node_modules .`, `ln -s <main>/node_modules <existing-dir>`, `ln -s <main>/node_modules` | `bun install --frozen-lockfile` in the worktree |
 | foreign PM in a bun project | npm `install`/`i`/`ci`/`add`/`update`/`uninstall`/`rm`/`prune`/`dedupe`, pnpm `install`/`add`/`update`/`remove`/`prune`, bare `yarn`/`yarn install`/`add`/`remove`, where the **nearest** lockfile (cwd, `cd`, `--prefix`, `--dir`, `--cwd`, `pnpm -C`, walking up) is `bun.lock`/`bun.lockb` | `bun install --frozen-lockfile`, `bun add <pkg>`, `bun remove <pkg>` |
-| banned container VM runtime | `colima start`/`restart`/`install`, `limactl start`/`create`, `brew install`/`reinstall`/`upgrade` of `colima`/`lima`/`podman`/`podman-desktop`/`orbstack`/`docker-desktop` (and `--cask docker`), `nix run`/`shell`/`profile install nixpkgs#colima` (conloca's `act-sim.sh` suggests it), `nix-env -iA nixpkgs.colima`, `nix-shell -p colima` | docker compose through Apple `container` / `mocker`; the sme-archiving-gc tests through the native fake-gcs-server backend |
+| banned container VM runtime | `colima start`/`restart`/`install`, `limactl start`/`create`, `brew install`/`reinstall`/`upgrade` of `colima`/`lima`/`podman`/`podman-desktop`/`orbstack`/`docker-desktop` (and `--cask docker`), `nix run`/`shell`/`profile install nixpkgs#colima` (conloca's `act-sim.sh` suggests it), `nix-env -iA nixpkgs.colima`, `nix-shell -p colima`, and launching the app (`open -a Docker`, `open -a OrbStack`) | docker compose through Apple `container` / `mocker`; the sme-archiving-gc tests through the native fake-gcs-server backend |
 
 Colima and similar VMs are banned on this machine: their disk images kept filling the Mac's disk,
 and agents kept reinstalling them. `colima status`/`stop`/`delete`, `limactl list`/`stop`, and
@@ -45,10 +47,10 @@ path).
 Commands are parsed, not raw-matched: `&&`/`;`/`|` segments, `cd`/`pushd`/`popd`/`cd -` (for
 relative paths and lockfile lookup), shell assignments (`NAME=…`, `export NAME=$(bun pm cache)`)
 and `${NAME:-default}`, every `$( … )`/backtick body wherever it appears (`echo $(bun pm cache rm)`),
-wrappers (`sudo [-D dir]`, `env [-C dir] [-S '…']`, `timeout`, `nohup`, `xargs`, `busybox`),
+wrappers (`sudo [-D dir]`, `env [-C dir] [-S '…'] [-a name]`, `exec -a name`, `timeout`, `nohup`, `xargs`, `busybox`, `xcrun`),
 `bash -c`/`sh -lc`/`fish -c`/`eval` payloads with their `$1`/`$@` operands bound,
-`ssh host '<cmd>'` remote commands, here-docs fed to a shell (`bash <<EOF`, `cat <<EOF | sh`,
-`ssh host <<EOF`), redirections, `cp -s` (a symlink by another name), and renaming or copying a
+`ssh host '<cmd>'` remote commands, here-docs and here-strings fed to a shell (`bash <<EOF`,
+`cat <<EOF | sh`, `ssh host <<EOF`, `bash <<< '…'`), `python -m uv`, redirections, `cp -s` (a symlink by another name), and renaming or copying a
 symlink onto `node_modules` (`ln -s … .nm && mv .nm node_modules`, `cp -P .nm node_modules`).
 Other here-doc bodies, quoted multi-line arguments and comments are data and are skipped.
 `node_modules` and store paths compare case-insensitively on macOS/Windows. A command shlex
