@@ -974,6 +974,10 @@ def test_process_substitution_neighbours_allowed(command, home, tmp_path, monkey
         "pnpm run husky",
         "pnpm husky init",
         "npm run -- simple-git-hooks",
+        "pnpm -C . lefthook install",
+        "yarn --cwd . lefthook install",
+        "uv --project x run lefthook add pre-commit",
+        "lefthook install -v",
     ],
 )
 def test_every_package_runner_reaches_the_hook_manager_check(command, home, tmp_path, monkeypatch):
@@ -1008,3 +1012,16 @@ def test_git_is_asked_once_per_query_per_command(home, tmp_path, monkeypatch):
     calls.clear()
     psg.inspect_command("lefthook install", str(repo))
     assert not [c for c in calls if c and c[0] == "git"]
+
+
+def test_a_dotfiles_repo_at_home_does_not_make_the_global_hooks_dir_local(home, monkeypatch):
+    """A work tree at $HOME contains ~/.config/git/hooks, rig's global dispatcher dir: a hook
+    manager installing there still replaces the composer for every repo."""
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    global_hooks = home / ".config" / "git" / "hooks"
+    global_hooks.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=home, check=True)
+    subprocess.run(["git", "config", "core.hooksPath", str(global_hooks)], cwd=home, check=True)
+    _blocked("lefthook install", monkeypatch, home)
+    subprocess.run(["git", "config", "core.hooksPath", ".husky/_"], cwd=home, check=True)
+    _allowed("npx husky install", monkeypatch, home)

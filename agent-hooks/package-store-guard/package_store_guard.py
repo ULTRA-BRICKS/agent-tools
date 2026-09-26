@@ -1174,9 +1174,9 @@ def _check_hook_manager(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     dispatcher dir), they overwrite the global composer for every repo (2026-09-26: a postinstall
     `lefthook install` replaced ~/.config/git/hooks/pre-commit — secret scan and review gate)."""
     head = _cmd(argv[0])
-    if any(t in _INFO_FLAGS for t in argv[1:]):
-        return None  # `husky --help`, `lefthook -v`
     words = [t for t in argv[1:] if not t.startswith("-")]
+    if not words and any(t in _INFO_FLAGS for t in argv[1:]):
+        return None  # `husky --help`, `lefthook --version`; `lefthook install -v` still installs
     verb = words[0] if words else ""
     if verb not in _HOOK_MANAGER_INSTALLS[head]:
         return None
@@ -1202,7 +1202,11 @@ def _check_hook_manager(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     real = os.path.realpath(resolved)  # a symlink out of the repo is not repo-local
     inside = [os.path.realpath(d) for d in (top, git_dir, _expand(common, top))]
     linked_now = any(resolved == made or resolved.startswith(made + os.sep) for made in ctx.links_made)
-    if hooks_path != "<unresolvable>" and not linked_now and any(
+    # the user's global git config dir is never repo-local, even inside a work tree at $HOME
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(_home(), ".config")
+    global_git = _components(os.path.realpath(os.path.join(xdg, "git")))
+    in_global = _components(real)[: len(global_git)] == global_git
+    if hooks_path != "<unresolvable>" and not linked_now and not in_global and any(
         _components(real)[: len(_components(d))] == _components(d) for d in inside
     ):
         return None  # a repo-local hooks dir (`.husky/_`, `.git/hooks`)
@@ -1411,6 +1415,24 @@ def _python_module_argv(argv: list[str]) -> list[str] | None:
     return None
 
 
+def _words_at(rest: list[str], value_flags: frozenset[str]) -> list[tuple[int, str]]:
+    """The non-flag words of ``rest`` with their positions, skipping the value of each flag in
+    ``value_flags`` (`pnpm -C dir lefthook install` → lefthook); after `--` every word counts."""
+    out: list[tuple[int, str]] = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--":
+            out.extend((j, rest[j]) for j in range(i + 1, len(rest)))
+            break
+        if tok.startswith("-"):
+            i += 2 if tok in value_flags else 1
+            continue
+        out.append((i, tok))
+        i += 1
+    return out
+
+
 def _launched_argv(argv: list[str]) -> list[str] | None:
     """The command a package runner launches: `npx X …`, `bunx X …`, `corepack X …`,
     `npm exec [--] X …`, `pnpm dlx|exec X …`, `yarn dlx|exec X …`, `bun|npm|pnpm|yarn run X …`,
@@ -1419,24 +1441,30 @@ def _launched_argv(argv: list[str]) -> list[str] | None:
     which no rule matches."""
     head = _cmd(argv[0])
     rest = argv[1:]
-    value_flags = {"-p", "--package"}
+    value_flags: frozenset[str] = frozenset({"-p", "--package"})
     if head in {"uvx", "uv"}:
-        words = [t for t in rest if not t.startswith("-")]
         if head == "uv":
-            verb = ["tool", "run"] if words[:2] == ["tool", "run"] else ["run"] if words[:1] == ["run"] else None
-            if verb is None:
+            words = _words_at(rest, _UV_VALUE_FLAGS | _UV_RUN_VALUE_FLAGS)
+            names = [w for _, w in words]
+            if names[:2] == ["tool", "run"]:
+                rest = rest[words[1][0] + 1 :]
+            elif names[:1] == ["run"]:
+                rest = rest[words[0][0] + 1 :]
+            else:
                 return None
-            rest = rest[rest.index(words[len(verb) - 1]) + 1 :]
         value_flags = _UV_RUN_VALUE_FLAGS
     elif head in {"npm", "pnpm", "yarn", "bun"}:
-        words = [t for t in rest if not t.startswith("-")]
+        words = _words_at(rest, _PM_VALUE_FLAGS if head == "npm" else _PNPM_YARN_VALUE_FLAGS)
         runner_verbs = {"x", "run"} if head == "bun" else {"exec", "x", "dlx", "run"}
-        if words and head != "npm" and words[0] in _HOOK_MANAGER_INSTALLS:
-            rest = rest[rest.index(words[0]) :]  # `yarn lefthook install` runs the bin
-        elif not words or words[0] not in runner_verbs:
+        if not words:
             return None
+        at, first = words[0]
+        if head != "npm" and first in _HOOK_MANAGER_INSTALLS:
+            rest = rest[at:]  # `yarn lefthook install` runs the bin
+        elif first in runner_verbs:
+            rest = rest[at + 1 :]
         else:
-            rest = rest[rest.index(words[0]) + 1 :]
+            return None
     elif head not in {"npx", "bunx", "corepack", "pnpx"}:
         return None
     i = 0
