@@ -30,8 +30,8 @@
 #                            no outdated flag, so there every unresolved conversation counts).
 #
 # Usage:
-#   sh ci/review-threads/review-threads.sh 123
-#   PR_NUMBER=123 sh ci/review-threads/review-threads.sh
+#   bash ci/review-threads/review-threads.sh 123
+#   PR_NUMBER=123 bash ci/review-threads/review-threads.sh
 set -euo pipefail
 
 PR="${1:-${PR_NUMBER:-}}"
@@ -163,7 +163,7 @@ case "$PROVIDER" in
       echo "note: IGNORE_OUTDATED=1 has no Forgejo equivalent (the API has no outdated flag) — counting every unresolved conversation." >&2
     fi
     # Fail-CLOSED on an API error: a silent 0 would let an unresolved PR merge.
-    if UNRESOLVED=$(forgejo_unresolved) && [[ "$UNRESOLVED" =~ ^[0-9]+$ ]]; then
+    if UNRESOLVED=$(forgejo_unresolved) && case "$UNRESOLVED" in ""|*[!0-9]*) false ;; esac; then
       :
     else
       echo "::error::could not query review conversations for PR #$PR (Forgejo API failed) — failing closed." >&2
