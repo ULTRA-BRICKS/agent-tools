@@ -32,8 +32,8 @@ from `~/.cache/uv`. Four agent habits kept undoing that:
 | uv cache wipe | `uv cache clean`; `uv cache prune --all` / `--ci`; `rm -rf ~/.cache/uv` (also `$UV_CACHE_DIR`, `${UV_CACHE_DIR:-…}`, `$XDG_CACHE_HOME/uv`) | same — plain `uv cache prune` (unused entries only) stays allowed |
 | `node_modules` symlink | `ln -s <main>/node_modules node_modules`, `ln -sfn …`, `ln -s <main>/node_modules .`, `ln -s <main>/node_modules <existing-dir>`, `ln -s <main>/node_modules` | `bun install --frozen-lockfile` in the worktree |
 | foreign PM in a bun project | npm `install`/`i`/`ci`/`add`/`update`/`uninstall`/`rm`/`prune`/`dedupe`, pnpm `install`/`add`/`update`/`remove`/`prune`, bare `yarn`/`yarn install`/`add`/`remove`, where the **nearest** lockfile (cwd, `cd`, `--prefix`, `--dir`, `--cwd`, `pnpm -C`, walking up) is `bun.lock`/`bun.lockb` | `bun install --frozen-lockfile`, `bun add <pkg>`, `bun remove <pkg>` |
-| banned container VM runtime | `colima start`/`restart`/`install`, `limactl start`/`create`, `brew install`/`reinstall`/`upgrade` of `colima`/`lima`/`podman`/`podman-desktop`/`orbstack`/`docker-desktop` (and `--cask docker`), `nix run`/`shell`/`profile install nixpkgs#colima` (conloca's `act-sim.sh` suggests it), `nix-env -iA nixpkgs.colima`, `nix-shell -p colima`, and launching the app (`open -a Docker`, `open -a OrbStack`) | docker compose through Apple `container` / `mocker`; the sme-archiving-gc tests through the native fake-gcs-server backend |
-| hook manager into a global hooksPath | `lefthook install`/`add`, `husky`/`husky install`/`init`, `simple-git-hooks` (also via `npx`/`bunx`/`pnpm exec`) when `core.hooksPath` resolves OUTSIDE the repo — rig's global dispatcher dir, where the shim replaces the pre-commit composer (secret scan + review gate) for every repo | install into the repo's own `.git/hooks`, which the global composer runs first: `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$(git rev-parse --absolute-git-dir)/hooks" lefthook install`; `rig status` flags a replaced composer, `rig apply` restores it |
+| banned container VM runtime | `colima start`/`restart`/`install`, `limactl start`/`create`, `brew install`/`reinstall`/`upgrade` of `colima`/`lima`/`podman`/`podman-desktop`/`orbstack`/`docker-desktop` (and `--cask docker`), `nix run`/`shell`/`profile install nixpkgs#colima` (conloca's `act-sim.sh` suggests it), `nix-env -iA nixpkgs.colima`, `nix-shell -p colima`, `podman machine init`/`start`, and launching the app (`open -a Docker`, `open -a OrbStack`) | docker compose through Apple `container` / `mocker`; the sme-archiving-gc tests through the native fake-gcs-server backend |
+| hook manager into a global hooksPath | `lefthook install`/`add`, `husky`/`husky install`/`init`, `simple-git-hooks` (also via `npx`/`bunx`/`bun run`/`yarn`/`pnpm`/`uvx`/`uv run`) when `core.hooksPath` resolves OUTSIDE the repo — rig's global dispatcher dir, where the shim replaces the pre-commit composer (secret scan + review gate) for every repo | install into the repo's own `.git/hooks`, which the global composer runs first: `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$(git rev-parse --absolute-git-dir)/hooks" lefthook install`; `rig status` flags a replaced composer, `rig apply` restores it |
 
 Colima and similar VMs are banned on this machine: their disk images kept filling the Mac's disk,
 and agents kept reinstalling them. `colima status`/`stop`/`delete`, `limactl list`/`stop`, and
@@ -47,7 +47,7 @@ path).
 
 Commands are parsed, not raw-matched: `&&`/`;`/`|` segments, `cd`/`pushd`/`popd`/`cd -` (for
 relative paths and lockfile lookup), shell assignments (`NAME=…`, `export NAME=$(bun pm cache)`)
-and `${NAME:-default}`, every `$( … )`/backtick body wherever it appears (`echo $(bun pm cache rm)`),
+and `${NAME:-default}`, every `$( … )`/backtick/`<( … )` body wherever it appears (`echo $(bun pm cache rm)`, `cat <(bun pm cache rm)`),
 wrappers (`sudo [-D dir]`, `env [-C dir] [-S '…'] [-a name]`, `exec -a name`, `timeout`, `nohup`, `xargs`, `busybox`, `xcrun`),
 `bash -c`/`sh -lc`/`fish -c`/`eval` payloads with their `$1`/`$@` operands bound,
 `ssh host '<cmd>'` remote commands, here-docs and here-strings fed to a shell (`bash <<EOF`,
@@ -67,8 +67,11 @@ walk at the directory you mean (`find ./build -name '*.o' -delete`).
 
 Known gaps (best effort, not a sandbox): the RESULT of a substitution used as an argument or as the
 command word (`rm -rf $(cat list)`, `$(echo rm) -rf …`), a package's own install script running a
-hook manager (a `postinstall: lefthook install` — fix the package), deletes from other languages (`python -c 'shutil.rmtree(…)'`), a
-variable set in an earlier, separate tool call, and a deliberately obfuscated command.
+hook manager (a `postinstall: lefthook install` — fix the package), a store ANCESTOR printed into
+`| xargs rm -r` (`echo ~/.bun | xargs rm -rf`; a store path itself is caught), deletes from other languages (`python -c 'shutil.rmtree(…)'`), a
+variable set in an earlier, separate tool call, a runner's `-C`/`--cwd` directory for the
+hooksPath lookup (the check reads the command's own cwd), and a deliberately obfuscated command
+(ANSI-C `$'…'` quoting, shells or `eval`s nested more than four deep).
 
 ## Fail policy
 
