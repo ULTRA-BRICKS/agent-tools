@@ -25,20 +25,28 @@ from `~/.cache/uv`. Four agent habits kept undoing that:
 
 | Shape | Examples | Instead |
 | --- | --- | --- |
-| bun store wipe | `bun pm cache rm`; `rm -rf ~/.bun/install/cache` (also `~/.bun`, `~/.bun/install/cache/links`, `$BUN_INSTALL_CACHE_DIR`, `rm -rf "$(bun pm cache)"`, `mv`/`trash`/`find … -delete` of it) | `rig worktree gc --yes` / `rig worktree remove <name>`, or delete one worktree's `node_modules` and re-run `bun install --frozen-lockfile` |
-| uv cache wipe | `uv cache clean`; `uv cache prune --all` / `--ci`; `rm -rf ~/.cache/uv` (also `$UV_CACHE_DIR`, `$XDG_CACHE_HOME/uv`) | same — plain `uv cache prune` (unused entries only) stays allowed |
-| `node_modules` symlink | `ln -s <main>/node_modules node_modules`, `ln -sfn …`, `ln -s <main>/node_modules .`, `ln -s <main>/node_modules` | `bun install --frozen-lockfile` in the worktree |
-| foreign PM in a bun project | `npm install`/`npm i`/`npm ci`/`npm add`/`npm update`, `pnpm install`/`add`, bare `yarn`/`yarn install`/`yarn add` where the **nearest** lockfile (cwd, `cd`, `--prefix`, `--dir`, `--cwd`, walking up) is `bun.lock`/`bun.lockb` | `bun install --frozen-lockfile`, `bun add <pkg>`, `bun remove <pkg>` |
+| bun store wipe | `bun pm cache rm`; `rm -rf ~/.bun/install/cache` (also `~/.bun`, `~/.bun/install/cache/links`, `$BUN_INSTALL_CACHE_DIR`, `rm -rf "$(bun pm cache)"`, `X=$(bun pm cache); rm -rf "$X"`, `mv`/`trash`/`rmdir`/`find [-L] … -delete`/`-exec rm` of it, `ls <store> \| xargs rm`) | `rig worktree gc --yes` / `rig worktree remove <name>`, or delete one worktree's `node_modules` and re-run `bun install --frozen-lockfile` |
+| uv cache wipe | `uv cache clean`; `uv cache prune --all` / `--ci`; `rm -rf ~/.cache/uv` (also `$UV_CACHE_DIR`, `${UV_CACHE_DIR:-…}`, `$XDG_CACHE_HOME/uv`) | same — plain `uv cache prune` (unused entries only) stays allowed |
+| `node_modules` symlink | `ln -s <main>/node_modules node_modules`, `ln -sfn …`, `ln -s <main>/node_modules .`, `ln -s <main>/node_modules <existing-dir>`, `ln -s <main>/node_modules` | `bun install --frozen-lockfile` in the worktree |
+| foreign PM in a bun project | npm `install`/`i`/`ci`/`add`/`update`/`uninstall`/`rm`/`prune`/`dedupe`, pnpm `install`/`add`/`update`/`remove`/`prune`, bare `yarn`/`yarn install`/`add`/`remove`, where the **nearest** lockfile (cwd, `cd`, `--prefix`, `--dir`, `--cwd`, `pnpm -C`, walking up) is `bun.lock`/`bun.lockb` | `bun install --frozen-lockfile`, `bun add <pkg>`, `bun remove <pkg>` |
 
 Allowed on purpose: `npm i -g <tool>` (global), npm in a subproject whose nearest lockfile is
 `package-lock.json`, `npm run …`/`yarn test`/`npx …`, `rm -rf node_modules` in a worktree,
-symlinks created *inside* `node_modules`, `find ~ … -delete` (a walk that merely passes through
-the store's ancestor), and `bun pm cache` (prints the path).
+symlinks created *inside* `node_modules`, a symlink merely pointing at a `node_modules` under
+another name, read-only `find … -exec test`/`-print` in the store, and `bun pm cache` (prints the
+path).
 
 Commands are parsed, not raw-matched: `&&`/`;`/`|` segments, `cd`/`pushd` (for relative paths
-and lockfile lookup), `sudo`/`env`/`timeout`/`nohup` wrappers, `bash -c`/`sh -lc`/`eval`
-payloads, and `ssh host '<cmd>'` remote commands are all followed. A command shlex cannot parse
-is allowed unless it literally spells `bun pm cache rm` / `uv cache clean`.
+and lockfile lookup), shell assignments (`NAME=…`, `export NAME=$(bun pm cache)`) and
+`${NAME:-default}`, wrappers (`sudo [-D dir]`, `env [-C dir] [-S '…']`, `timeout`, `nohup`,
+`xargs`, `busybox`), `bash -c`/`sh -lc`/`fish -c`/`eval` payloads, `ssh host '<cmd>'` remote
+commands, redirections, and here-doc bodies (skipped: they are data). Paths compare
+case-insensitively on macOS/Windows. A command shlex cannot parse (an unbalanced quote) is re-read
+leniently instead of allowed — the real shell would reject it anyway.
+
+Known gaps (best effort, not a sandbox): other command substitutions (`rm -rf $(cat list)`), a
+`find` rooted *above* the store (`find ~ -delete`), deletes from other languages
+(`python -c 'shutil.rmtree(…)'`), and a variable set in an earlier, separate tool call.
 
 ## Fail policy
 

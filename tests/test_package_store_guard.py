@@ -165,6 +165,7 @@ def test_uv_cache_dir_env_is_protected(home, tmp_path, monkeypatch):
         "rm -rf /tmp/scratch",
         "find ~ -name '*.orig' -delete",
         "find ~/.bun/install/cache -name '*.tgz' -print",
+        "find ~/.bun/install/cache/links -type l ! -exec test -e {} \\; -print 2>/dev/null | wc -l",
         "ls ~/.bun/install/cache | head",
         "du -sh ~/.bun/install/cache",
         "mv /tmp/a ~/.cache/uv-notes",
@@ -179,6 +180,138 @@ def test_store_neighbours_allowed(command, home, tmp_path, monkeypatch):
 def test_unparseable_command_still_blocks_literal_store_wipe(home, tmp_path, monkeypatch):
     _blocked("bun pm cache rm; echo 'unterminated", monkeypatch, tmp_path)
     _allowed("echo 'unterminated", monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # heredoc bodies are data (commit messages, docs), even with an apostrophe in them
+        "git commit -F - <<'EOF'\nfeat: guard\n\nrm -rf ~/.bun/install/cache is what we block, don't.\nbun pm cache rm\nEOF",
+        "cat > notes.md <<EOF\nln -s /main/node_modules node_modules\nnpm install\nEOF\necho done",
+        "cat <<-EOF\n\tuv cache clean\n\tEOF",
+        # a quoted multi-line argument stays one token
+        'git commit -m "feat: guard\n\nbun pm cache rm is blocked now"',
+        # comments never run
+        "echo hi # rm -rf ~/.bun/install/cache",
+    ],
+)
+def test_data_that_mentions_blocked_commands_is_allowed(command, home, bun_repo, monkeypatch):
+    _allowed(command, monkeypatch, bun_repo)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<EOF > x\nhello\nEOF\nbun pm cache rm",
+        "echo start\nrm -rf ~/.bun/install/cache",
+        "rm -rf \\\n  ~/.bun/install/cache",
+        "echo hi # comment\nbun pm cache rm",
+    ],
+)
+def test_commands_after_heredocs_comments_and_continuations_still_block(command, home, tmp_path, monkeypatch):
+    _blocked(command, monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ln -s /main/node_modules node_modules >/dev/null 2>&1",
+        "ln -sfn /main/node_modules node_modules 2>/dev/null || true",
+        "rm -rf ~/.bun/install/cache 2>/dev/null",
+    ],
+)
+def test_redirections_do_not_hide_operands(command, home, tmp_path, monkeypatch):
+    _blocked(command, monkeypatch, tmp_path)
+
+
+def test_redirect_target_is_not_an_operand(home, tmp_path, monkeypatch):
+    _allowed("ln -s ../pkg node_modules/pkg > node_modules", monkeypatch, tmp_path)
+
+
+# ── review hardening: indirection, wrappers, find options, pipelines ─────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find -L ~/.bun/install/cache/links -xtype l -delete",
+        "find -H ~/.bun/install/cache -delete",
+        "find -f ~/.bun/install/cache -delete",
+        "find -O3 ~/.bun/install/cache/links -mindepth 1 -exec rm -rf {} +",
+        'X=$(bun pm cache); rm -rf "$X"',
+        'X="$(bun pm cache)" && rm -rf "$X/links"',
+        "CACHE=~/.bun/install/cache && rm -rf $CACHE",
+        'export C="$(uv cache dir)"; rm -rf "$C"',
+        'rm -rf "${UV_CACHE_DIR:-$HOME/.cache/uv}"',
+        "ls ~/.bun/install/cache/links | xargs rm -rf",
+        "find ~/.bun/install/cache -name '*' -print0 | xargs -0 rm -f",
+        "find ~/.bun/install/cache/links -type l ! -exec test -e {} \\; -print0 | xargs -0 rm -f",
+        "find ~/.bun/install/cache/links -type l -exec rm {} \\;",
+        "busybox rm -rf ~/.bun/install/cache",
+        "fish -c 'bun pm cache rm'",
+        "env -S 'rm -rf ~/.bun/install/cache'",
+        "env --split-string='bun pm cache rm'",
+        "env -C ~/.bun/install rm -rf cache",
+        "sudo -D ~/.bun/install rm -rf cache",
+        "rm -rf -- ~/.bun/install/cache",
+        "rmdir ~/.bun/install/cache",
+        "unlink ~/.bun/install/cache",
+        "rm -rf ~/.bun/install/cache '",
+    ],
+)
+def test_indirect_store_wipes_block(command, home, tmp_path, monkeypatch):
+    _blocked(command, monkeypatch, tmp_path)
+
+
+def test_bun_install_env_root_is_protected(home, tmp_path, monkeypatch):
+    monkeypatch.setenv("BUN_INSTALL", str(tmp_path / "bunhome"))
+    _blocked(f"rm -rf {tmp_path / 'bunhome' / 'install' / 'cache'}", monkeypatch, tmp_path)
+
+
+@pytest.mark.skipif(sys.platform not in {"darwin", "win32"}, reason="case-insensitive filesystems only")
+def test_case_variants_block_on_case_insensitive_filesystems(home, tmp_path, monkeypatch):
+    _blocked("rm -rf ~/.BUN/install/cache", monkeypatch, tmp_path)
+    _blocked("rm -rf ~/.cache/UV", monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find ~/.bun/install/cache -name '*.tgz' -exec sha256sum {} +",
+        "X=$(bun pm cache); du -sh \"$X\"",
+        "du -sh ~/.bun/install/cache; ls | xargs rm -f",
+        "ls ~/.bun/install/cache | xargs -n1 echo",
+        "env -C /tmp ls",
+        "FOO=bar npm run build",
+    ],
+)
+def test_indirection_neighbours_allowed(command, home, tmp_path, monkeypatch):
+    _allowed(command, monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command,verb",
+    [
+        ("npm uninstall lodash", "npm uninstall"),
+        ("npm rm lodash", "npm rm"),
+        ("npm prune", "npm prune"),
+        ("pnpm remove zod", "pnpm remove"),
+        ("pnpm -w install", "pnpm install"),
+        ("yarn remove zod", "yarn remove"),
+        ("npm --loglevel warn install", "npm install"),
+        ("npm ci '", "npm ci"),
+    ],
+)
+def test_more_foreign_pm_verbs_block_with_the_right_verb(command, verb, bun_repo, home, monkeypatch):
+    msg = _blocked(command, monkeypatch, bun_repo)
+    assert f"`{verb}`" in msg
+
+
+def test_ln_to_an_existing_dir_links_inside_it(home, tmp_path, monkeypatch):
+    (tmp_path / "wt").mkdir()
+    _blocked("ln -s /main/node_modules wt", monkeypatch, tmp_path)
+    _allowed("ln -s ../repo/node_modules nm-alias", monkeypatch, tmp_path)
+    _blocked("ln -s ../node_modules node_modules '", monkeypatch, tmp_path)
 
 
 # ── node_modules symlinks ──────────────────────────────────────────────────────

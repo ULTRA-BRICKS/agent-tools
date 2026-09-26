@@ -10,18 +10,26 @@ Assumptions: rig's ``bun.enabled`` writes ``~/.bunfig.toml`` with ``linker = "is
 ``~/.bun/install/cache/links``, so the bun cache IS the store: wiping it breaks every install on the
 machine. uv venvs are cloned from ``~/.cache/uv``; wiping it turns every later sync into a cold,
 full-copy download. The hook reads the command string only (plus the lockfiles that decide whether a
-directory is a bun project); it never runs the command.
+directory is a bun project, and whether an ``ln`` destination is a directory); it never runs it.
 
 Blocks five shapes, each with the command to run instead:
 
 1. ``bun pm cache rm`` (the whole global store);
 2. deleting or moving ``~/.bun/install/cache`` (or an ancestor such as ``~/.bun``, or anything
-   inside it) with ``rm``/``rmdir``/``unlink``/``trash``/``mv``/``find -delete``;
+   inside it) with ``rm``/``rmdir``/``unlink``/``trash``/``mv``/``find -delete``/``… | xargs rm``;
 3. ``uv cache clean``, ``uv cache prune --all``/``--ci``, and deleting ``~/.cache/uv``;
 4. creating a symlink named ``node_modules`` (``ln -s``, ``ln -sfn``, ``ln -s <src> .``, ...);
-5. ``npm install``/``npm ci``/``pnpm install``/``yarn`` (and their add/update verbs) where the nearest
-   lockfile is ``bun.lock``/``bun.lockb``. A directory whose nearest lockfile is only
-   ``package-lock.json`` (an npm-only subproject) stays allowed, as do global installs.
+5. npm/pnpm/yarn install-class verbs (install/ci/add/update/uninstall/remove/prune, bare ``yarn``)
+   where the nearest lockfile is ``bun.lock``/``bun.lockb``. A directory whose nearest lockfile is
+   only ``package-lock.json`` (an npm-only subproject) stays allowed, as do global installs.
+
+Parsing is best-effort but deliberately wide: ``&&``/``;``/``|`` segments, ``cd``/``pushd``,
+``NAME=value`` / ``NAME=$(bun pm cache)`` assignments and ``${NAME:-default}``, wrappers
+(``sudo``, ``env -S``/``env -C``, ``timeout``, ``xargs``, ``busybox``), ``bash -c``/``eval``/
+``ssh host '…'`` payloads, redirections and here-doc bodies (data, not commands). A command shlex
+cannot parse is re-read leniently rather than allowed. Known gaps: other command substitutions,
+``find ~ -delete`` (a walk rooted above the store, with or without filters), and code in other
+languages (``python -c 'shutil.rmtree(…)'``).
 
 Past bugs this exists for (2026-09): agents symlinked a worktree's node_modules to the main
 checkout; bun 1.4.2's ``bun install`` inside such a worktree wrote THROUGH the link and corrupted
@@ -34,6 +42,7 @@ No self-service bypass: a genuine exception is the human's call.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import json
 import os
 import re
@@ -44,53 +53,87 @@ BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 HOOK_ID = "package-store-guard"
 
+# ── shell grammar ─────────────────────────────────────────────────────────────
 _SHELL_SEPS = frozenset({"&&", "||", ";", "|", "&", ";;", "|&", ";&", ";;&"})
-_LEADING_SHELL_NOISE = frozenset({"(", ")", "{", "}", "!", "then", "do", "else", "elif", "time"})
-_INLINE_ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_PIPES = frozenset({"|", "|&"})
+_PUNCT = frozenset("();<>|&")
+_ESCAPED_SEMI = "__package_store_guard_escaped_semicolon__"
+# Longest first, so `&&` wins over `&` and `;;&` over `;;`.
+_OPERATORS = ("<<<", ";;&", "&>>", "&&", "||", ";;", ";&", "|&", "&>", ">>", ">&", "<&", ">|", "<>", "<<",
+              "(", ")", ";", "|", "&", "<", ">")
+_LEADING_SHELL_NOISE = frozenset({"(", ")", "{", "}", "!", "then", "do", "else", "elif"})
+_ASSIGNMENT = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>.*)$", re.DOTALL)
+_DECLARERS = frozenset({"export", "local", "declare", "typeset", "readonly"})
+_REDIRECT_OPS = frozenset({">", ">>", "<", ">&", "&>", "&>>", "<&", ">|", "<>", "<<", "<<<"})
+_HEREDOC_RE = re.compile(r"<<(?!<)(?P<dash>-)?\s*(?P<q>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_]*)(?P=q)")
+_VAR_RE = re.compile(
+    r"\$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)(?:(?P<op>:?-)(?P<default>[^}]*))?\}"
+    r"|\$(?P<bare>[A-Za-z_][A-Za-z0-9_]*)"
+)
+_GLOB_CHARS = re.compile(r"[*?\[]")
+_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish"})
 _WRAPPERS = frozenset({
     "timeout", "env", "nice", "time", "stdbuf", "nohup", "setsid", "unbuffer", "command",
-    "sudo", "doas", "exec", "caffeinate",
+    "sudo", "doas", "exec", "caffeinate", "busybox", "xargs",
 })
 _WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
     "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
-    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
+    "env": frozenset({"-u", "--unset"}),
     "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
     "nice": frozenset({"-n", "--adjustment"}),
-    "sudo": frozenset({"-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir"}),
+    "sudo": frozenset({"-u", "--user", "-g", "--group", "-C", "--close-from", "-h", "--host", "-p", "--prompt"}),
     "doas": frozenset({"-u", "-C"}),
+    "xargs": frozenset({"-n", "-I", "-P", "-L", "-d", "-E", "-s", "-a", "-J", "-R", "-S",
+                        "--max-args", "--max-procs", "--delimiter", "--arg-file"}),
 }
-_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
-_GLOB_CHARS = re.compile(r"[*?\[]")
-
-_BUN_LOCKFILES = ("bun.lock", "bun.lockb")
-_OTHER_LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock")
-
-_NPM_INSTALL_VERBS = frozenset({
-    "install", "i", "in", "ins", "inst", "insta", "instal", "isnt", "isnta", "isntal", "isntall",
-    "add", "ci", "clean-install", "ic", "install-clean", "isntall-clean", "install-test", "it",
-    "install-ci-test", "cit", "update", "up", "upgrade", "udpate",
-})
-_PNPM_INSTALL_VERBS = frozenset({"install", "i", "add", "update", "up", "upgrade"})
-_YARN_INSTALL_VERBS = frozenset({"install", "add", "upgrade", "up"})
-_NPM_VALUE_FLAGS = frozenset({
-    "--prefix", "-C", "--dir", "--cwd", "-w", "--workspace", "--filter", "-F", "--registry",
-    "--cache", "--userconfig", "--loglevel", "--reporter", "--mutex", "--modules-folder",
-})
-_INFO_FLAGS = frozenset({"-v", "--version", "-h", "--help"})
-_BUN_CACHE_VERBS = frozenset({"rm", "clean", "clear", "remove", "delete"})
+# Wrapper flags whose value is a directory the wrapped command runs in.
+_WRAPPER_CHDIR_FLAGS: dict[str, frozenset[str]] = {
+    "env": frozenset({"-C", "--chdir"}),
+    "sudo": frozenset({"-D", "--chdir"}),
+}
+_ENV_SPLIT_FLAGS = frozenset({"-S", "--split-string"})
 _SSH_VALUE_FLAGS = frozenset({
     "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p",
     "-Q", "-R", "-S", "-W", "-w", "-B",
 })
-# Store wipes spelled literally inside a command shlex cannot parse (unbalanced quotes).
-_UNPARSEABLE_STORE_WIPE = re.compile(
-    r"\bbun\s+pm\s+cache\s+(?:rm|clean|clear|remove|delete)\b|\buv\s+cache\s+clean\b"
-)
+_MAX_DEPTH = 4
+
+# ── package managers and stores ───────────────────────────────────────────────
+_BUN_LOCKFILES = ("bun.lock", "bun.lockb")
+_OTHER_LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock")
+_NPM_INSTALL_VERBS = frozenset({
+    "install", "i", "in", "ins", "inst", "insta", "instal", "isnt", "isnta", "isntal", "isntall",
+    "add", "ci", "clean-install", "ic", "install-clean", "isntall-clean", "install-test", "it",
+    "install-ci-test", "cit", "update", "up", "upgrade", "udpate",
+    "uninstall", "unlink", "remove", "rm", "r", "un", "prune", "dedupe", "ddp",
+})
+_PNPM_INSTALL_VERBS = frozenset({
+    "install", "i", "add", "update", "up", "upgrade", "remove", "rm", "uninstall", "un", "prune",
+})
+_YARN_INSTALL_VERBS = frozenset({"install", "add", "upgrade", "up", "remove"})
+# Value-taking flags shared by npm/pnpm/yarn. npm's `-w <workspace>` takes a value; pnpm's and
+# yarn's `-w` (workspace root) do not — treating it as one there would swallow the verb.
+_PM_VALUE_FLAGS = frozenset({
+    "--prefix", "-C", "--dir", "--cwd", "-w", "--workspace", "--filter", "-F", "--registry",
+    "--cache", "--userconfig", "--loglevel", "--reporter", "--mutex", "--modules-folder",
+})
+_PNPM_YARN_VALUE_FLAGS = _PM_VALUE_FLAGS - {"-w"}
+_PM_DIR_FLAGS = frozenset({"--prefix", "--dir", "--cwd"})
+_PM_GLOBAL_FLAGS = frozenset({"-g", "--global", "--location=global", "--location=user"})
+_INFO_FLAGS = frozenset({"-v", "--version", "-h", "--help"})
+_BUN_CACHE_VERBS = frozenset({"rm", "clean", "clear", "remove", "delete"})
 _UV_VALUE_FLAGS = frozenset({
     "--cache-dir", "--directory", "--project", "--config-file", "--color", "--python", "-p",
     "--allow-insecure-host", "--python-preference",
 })
+_UV_PRUNE_WIPE_FLAGS = frozenset({"--all", "--ci"})
 _DELETERS = frozenset({"rm", "rmdir", "unlink", "trash", "srm", "shred", "gio"})
+_MOVERS = frozenset({"mv"})
+_FIND_EXEC_OPS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_FIND_VALUELESS_OPTS = frozenset({"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"})
+_FIND_EXPR_START = frozenset({"(", "!", ")", "\\(", "\\!"})
+_STORE_SUBST_RE = re.compile(r"\b(?P<bun>bun\s+pm\s+cache)\b|\b(?P<uv>uv\s+cache\s+dir)\b")
+_CASE_INSENSITIVE_FS = sys.platform in {"darwin", "win32"}
 
 _STORE_MSG = (
     "[package-store-guard] BLOCKED: this would wipe a shared package store ({what}). "
@@ -106,8 +149,8 @@ _SYMLINK_MSG = (
     "in a worktree whose node_modules is a symlink writes THROUGH it and corrupts the other "
     "checkout (bun 1.4.2, hypercalendarbot 2026-09-09). Run `bun install --frozen-lockfile` in "
     "this worktree instead: with rig's ~/.bunfig.toml (isolated linker + globalStore) it only "
-    "creates symlinks into the shared store — a few MB, seconds. `rig worktree create` already "
-    "does this for bun repos."
+    "creates symlinks into the shared store — a few MB, seconds — unless the repo's own "
+    "bunfig.toml asks for a local layout. `rig worktree create` already does this for bun repos."
 )
 _NPM_MSG = (
     "[package-store-guard] BLOCKED: `{tool}` in a bun project ({lockdir} has {lockfile}). "
@@ -138,80 +181,189 @@ def _basename(tok: str) -> str:
     return tok.replace("\\", "/").rsplit("/", 1)[-1]
 
 
-def _tokenize(command: str) -> list[str] | None:
-    """punctuation_chars so `true;rm` / `a&&b` split; newlines are command separators."""
+def strip_heredoc_bodies(command: str) -> str:
+    """Drop here-document bodies: `cat > f <<'EOF' ... EOF` text is data, not commands."""
+    out: list[str] = []
+    pending: list[tuple[str, bool]] = []
+    for line in command.split("\n"):
+        if pending:
+            delim, dash = pending[0]
+            if (line.lstrip("\t") if dash else line) == delim:
+                pending.pop(0)
+            continue
+        out.append(line)
+        pending.extend((m.group("delim"), bool(m.group("dash"))) for m in _HEREDOC_RE.finditer(line))
+    return "\n".join(out)
+
+
+def _newlines_to_separators(text: str) -> str:
+    """Unquoted newlines separate commands; quoted ones stay inside their token."""
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and quote != "'" and i + 1 < len(text):
+            if text[i + 1] == "\n" and quote is None:
+                out.append(" ")  # line continuation
+            elif text[i + 1] == ";" and quote is None:
+                out.append(_ESCAPED_SEMI)  # find's `-exec … \;` terminator, not a separator
+            else:
+                out.append(text[i : i + 2])
+            i += 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "\n":
+            out.append("\n ; ")  # after the newline, so a `#` comment cannot swallow it
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _split_operators(tok: str) -> list[str]:
+    """shlex glues adjacent punctuation (`);`, `)&&`) into one token; split it into operators."""
+    if not tok or any(ch not in _PUNCT for ch in tok):
+        return [tok]
+    out: list[str] = []
+    i = 0
+    while i < len(tok):
+        op = next((o for o in _OPERATORS if tok.startswith(o, i)), tok[i])
+        out.append(op)
+        i += len(op)
+    return out
+
+
+def _tokenize(command: str) -> list[str]:
+    """Shell-ish tokens. A command shlex rejects (unbalanced quotes) is re-read leniently —
+    the real shell would reject it too, so over-reading it costs nothing."""
     try:
-        out: list[str] = []
-        for i, line in enumerate(command.splitlines()):
-            if not line.strip():
-                continue
-            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
-            lex.whitespace_split = True
-            toks = list(lex)
-            if i and out and toks:
-                out.append(";")
-            out.extend(toks)
-        return out
+        lex = shlex.shlex(_newlines_to_separators(command), posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return [
+            piece.replace(_ESCAPED_SEMI, "\\;") for tok in lex for piece in _split_operators(tok)
+        ]
     except ValueError:
-        return None
+        spaced = re.sub(r"(&&|\|\||;|\||&)", r" \1 ", command.replace("\n", " ; "))
+        return [t.strip("'\"") for t in spaced.split() if t.strip("'\"")]
 
 
-def _segments(tokens: list[str]) -> list[list[str]]:
-    segs: list[list[str]] = [[]]
+def _segments(tokens: list[str]) -> list[tuple[list[str], bool]]:
+    """Simple commands, each with whether it is piped from the previous one."""
+    segs: list[tuple[list[str], bool]] = [([], False)]
     for tok in tokens:
         if tok in _SHELL_SEPS:
-            segs.append([])
+            segs.append(([], tok in _PIPES))
         else:
-            segs[-1].append(tok)
-    return [s for s in segs if s]
+            segs[-1][0].append(tok)
+    return [s for s in segs if s[0]]
+
+
+def _strip_redirects(argv: list[str]) -> list[str]:
+    """Drop `>file`, `2>&1`, `<in`, `<<EOF` so their targets never read as operands."""
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in _REDIRECT_OPS:
+            if out and out[-1].isdigit():
+                out.pop()  # the fd number of `2>` / `1>&`
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    return out
 
 
 def _strip_leading(argv: list[str]) -> list[str]:
     i = 0
-    while i < len(argv) and (argv[i] in _LEADING_SHELL_NOISE or _INLINE_ENV.match(argv[i])):
+    while i < len(argv) and (argv[i] in _LEADING_SHELL_NOISE or _ASSIGNMENT.match(argv[i])):
         i += 1
     return argv[i:]
 
 
-def _skip_wrapper_args(wrapper: str, argv: list[str]) -> list[str]:
-    value_flags = _WRAPPER_VALUE_FLAGS.get(wrapper, frozenset())
-    i = 0
-    while i < len(argv):
-        tok = argv[i]
-        if _INLINE_ENV.match(tok):
-            i += 1
-            continue
-        if tok in value_flags:
-            i += 2
-            continue
-        if any(tok.startswith(f"{flag}=") for flag in value_flags):
-            i += 1
-            continue
-        if tok.startswith("-"):
-            i += 1
-            continue
-        break
-    rest = argv[i:]
-    if wrapper == "timeout" and rest and re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", rest[0]):
-        rest = rest[1:]
-    return rest
+class _Ctx:
+    """Per-command state: effective cwd, shell variables, store paths the current pipeline named."""
+
+    def __init__(self, cwd: str, variables: dict[str, str] | None = None) -> None:
+        self.cwd = cwd
+        self.vars: dict[str, str] = dict(variables or {})
+        self.store_seen: str | None = None  # label of a store path an earlier piped segment named
 
 
-def _strip_wrappers(argv: list[str]) -> list[str]:
-    guard = 0
+def _unwrap(argv: list[str], ctx: _Ctx) -> tuple[list[str], str, list[str], bool]:
+    """Peel wrappers. Returns (argv, cwd for it, nested command strings, came through xargs)."""
+    cwd = ctx.cwd
+    nested: list[str] = []
+    via_xargs = False
     argv = _strip_leading(argv)
-    while argv and _basename(argv[0]) in _WRAPPERS and guard < 16:
-        guard += 1
-        argv = _strip_leading(_skip_wrapper_args(_basename(argv[0]), argv[1:]))
-    return argv
+    for _ in range(16):
+        if not argv or _basename(argv[0]) not in _WRAPPERS:
+            break
+        wrapper = _basename(argv[0])
+        via_xargs = via_xargs or wrapper == "xargs"
+        value_flags = _WRAPPER_VALUE_FLAGS.get(wrapper, frozenset())
+        chdir_flags = _WRAPPER_CHDIR_FLAGS.get(wrapper, frozenset())
+        rest = argv[1:]
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if _ASSIGNMENT.match(tok):
+                i += 1
+                continue
+            flag, eq, attached = tok.partition("=")
+            if wrapper == "env" and flag in _ENV_SPLIT_FLAGS:
+                payload = attached if eq else (rest[i + 1] if i + 1 < len(rest) else "")
+                nested.append(" ".join([payload, *rest[i + (1 if eq else 2):]]))
+                rest = []
+                break
+            if flag in chdir_flags:
+                target = attached if eq else (rest[i + 1] if i + 1 < len(rest) else "")
+                cwd = _expand(target, cwd, ctx.vars)
+                i += 1 if eq else 2
+                continue
+            if tok in value_flags:
+                i += 2
+                continue
+            if eq and flag in value_flags:
+                i += 1
+                continue
+            if tok.startswith("-"):
+                i += 1
+                continue
+            break
+        rest = rest[i:] if rest else rest
+        if wrapper == "timeout" and rest and re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", rest[0]):
+            rest = rest[1:]
+        argv = _strip_leading(rest)
+    return argv, cwd, nested, via_xargs
 
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 
 
-def _expand(path: str, cwd: str) -> str:
+def _expand_vars(text: str, local: dict[str, str], _depth: int = 0) -> str:
+    """`$NAME`, `${NAME}`, `${NAME:-default}` from command-local assignments, then the env."""
+
+    def repl(m: re.Match[str]) -> str:
+        name = m.group("braced") or m.group("bare")
+        value = local.get(name, os.environ.get(name))
+        op = m.group("op")
+        if op and (value is None or (op == ":-" and value == "")):
+            return _expand_vars(m.group("default") or "", local, _depth + 1) if _depth < 4 else ""
+        return value if value is not None else m.group(0)
+
+    return _VAR_RE.sub(repl, text)
+
+
+def _expand(path: str, cwd: str, local: dict[str, str] | None = None) -> str:
     """Expand ~ / $VARS and anchor a relative path at the effective cwd (no symlink resolution)."""
-    expanded = os.path.expanduser(os.path.expandvars(path))
+    expanded = os.path.expanduser(_expand_vars(path, local or {}))
     if not os.path.isabs(expanded):
         expanded = os.path.join(cwd, expanded)
     return os.path.normpath(expanded)
@@ -219,30 +371,29 @@ def _expand(path: str, cwd: str) -> str:
 
 def _components(path: str) -> list[str]:
     norm = os.path.normpath(path).replace("\\", "/")
-    return [c for c in norm.split("/") if c not in ("", ".")]
+    parts = [c for c in norm.split("/") if c not in ("", ".")]
+    return [c.casefold() for c in parts] if _CASE_INSENSITIVE_FS else parts
 
 
 def _home() -> str:
     return os.path.expanduser("~")
 
 
-def bun_store_roots() -> list[tuple[str, str]]:
-    """(label, absolute path) of every bun global-store location this machine may use."""
-    home = _home()
-    roots = [os.path.join(home, ".bun", "install", "cache")]
+def bun_store_roots() -> list[str]:
+    """Every bun global-store location this machine may use."""
+    roots = [os.path.join(_home(), ".bun", "install", "cache")]
     bun_install = os.environ.get("BUN_INSTALL", "").strip()
     if bun_install:
         roots.append(os.path.join(os.path.expanduser(bun_install), "install", "cache"))
     explicit = os.environ.get("BUN_INSTALL_CACHE_DIR", "").strip()
     if explicit:
         roots.append(os.path.expanduser(explicit))
-    return [("the bun global store", os.path.normpath(r)) for r in dict.fromkeys(roots)]
+    return [os.path.normpath(r) for r in dict.fromkeys(roots)]
 
 
-def uv_cache_roots() -> list[tuple[str, str]]:
-    """(label, absolute path) of every uv cache location this machine may use."""
-    home = _home()
-    roots = [os.path.join(home, ".cache", "uv")]
+def uv_cache_roots() -> list[str]:
+    """Every uv cache location this machine may use."""
+    roots = [os.path.join(_home(), ".cache", "uv")]
     xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
     if xdg:
         roots.append(os.path.join(os.path.expanduser(xdg), "uv"))
@@ -252,42 +403,57 @@ def uv_cache_roots() -> list[tuple[str, str]]:
     local_app = os.environ.get("LOCALAPPDATA", "").strip()
     if local_app:
         roots.append(os.path.join(local_app, "uv", "cache"))
-    return [("the uv cache", os.path.normpath(r)) for r in dict.fromkeys(roots)]
+    return [os.path.normpath(r) for r in dict.fromkeys(roots)]
 
 
-def _protected_roots() -> list[tuple[str, str]]:
-    return bun_store_roots() + uv_cache_roots()
+_ROOT_ENV = ("HOME", "USERPROFILE", "BUN_INSTALL", "BUN_INSTALL_CACHE_DIR", "UV_CACHE_DIR", "XDG_CACHE_HOME", "LOCALAPPDATA")
 
 
-def _target_hits_root(target: str, root: str, *, allow_ancestor: bool) -> bool:
-    """True when ``target`` (may hold glob chars) equals, contains, or lies inside ``root``.
+@functools.lru_cache(maxsize=8)
+def _roots_for(_env_key: tuple[str, ...]) -> tuple[tuple[str, list[str]], ...]:
+    return tuple(
+        [("the bun global store", _components(r)) for r in bun_store_roots()]
+        + [("the uv cache", _components(r)) for r in uv_cache_roots()]
+    )
 
-    Compared component-wise with fnmatch so `~/.bun/install/cache/*` and `~/.cache/*` match
-    while `~/.cache/pip*` does not reach `~/.cache/uv`.
+
+def _protected_roots() -> tuple[tuple[str, list[str]], ...]:
+    return _roots_for(tuple(os.environ.get(v, "") for v in _ROOT_ENV))
+
+
+def _target_hits_root(target: list[str], root: list[str], *, allow_ancestor: bool) -> bool:
+    """True when ``target`` components (may hold globs) equal, contain, or lie inside ``root``.
+
+    Component-wise fnmatch, so `~/.bun/install/cache/*` and `~/.cache/*` match while
+    `~/.cache/pip*` does not reach `~/.cache/uv`.
     """
-    t = _components(target)
-    r = _components(root)
-    if not t:
+    if not target:
         return allow_ancestor  # `/` itself contains everything
-    common = min(len(t), len(r))
-    for i in range(common):
-        pattern = t[i]
+    for pattern, part in zip(target, root):
         if _GLOB_CHARS.search(pattern):
-            if not fnmatch.fnmatchcase(r[i], pattern):
+            if not fnmatch.fnmatchcase(part, pattern):
                 return False
-        elif pattern != r[i]:
+        elif pattern != part:
             return False
-    if len(t) >= len(r):
+    if len(target) >= len(root):
         return True  # equal to the root, or inside it
     return allow_ancestor  # an ancestor of the root: deleting it deletes the root
 
 
-def _protected_hit(raw_target: str, cwd: str, *, allow_ancestor: bool = True) -> str | None:
-    target = _expand(raw_target, cwd)
+def _protected_hit(raw_target: str, ctx_cwd: str, local: dict[str, str], *, allow_ancestor: bool = True) -> str | None:
+    target = _components(_expand(raw_target, ctx_cwd, local))
     for label, root in _protected_roots():
         if _target_hits_root(target, root, allow_ancestor=allow_ancestor):
             return label
     return None
+
+
+def _store_substitution(text: str) -> str | None:
+    """`$(bun pm cache)` / `$(uv cache dir)` inside ``text`` → that store's path."""
+    m = _STORE_SUBST_RE.search(text)
+    if not m:
+        return None
+    return bun_store_roots()[0] if m.group("bun") else uv_cache_roots()[0]
 
 
 # ── per-command checks ────────────────────────────────────────────────────────
@@ -313,7 +479,7 @@ def _check_bun(argv: list[str]) -> str | None:
     return None
 
 
-def _uv_words(argv: list[str]) -> list[str]:
+def _check_uv(argv: list[str]) -> str | None:
     words: list[str] = []
     i = 1
     while i < len(argv):
@@ -321,79 +487,92 @@ def _uv_words(argv: list[str]) -> list[str]:
         if tok in _UV_VALUE_FLAGS:
             i += 2
             continue
-        if tok.startswith("-"):
-            i += 1
-            continue
-        words.append(tok)
+        if not tok.startswith("-"):
+            words.append(tok)
         i += 1
-    return words
-
-
-def _check_uv(argv: list[str]) -> str | None:
-    words = _uv_words(argv)
     if len(words) >= 2 and words[0] == "cache":
         if words[1] == "clean":
             return _STORE_MSG.format(what="`uv cache clean`")
-        if words[1] == "prune" and any(t in {"--all", "--ci"} for t in argv):
+        if words[1] == "prune" and _UV_PRUNE_WIPE_FLAGS.intersection(argv):
             return _STORE_MSG.format(what="`uv cache prune --all/--ci`")
     return None
 
 
-def _substitutes_store_path(argv: list[str]) -> bool:
-    """`rm -rf $(bun pm cache)` / `rm -rf "$(uv cache dir)"`: the target is the store itself."""
-    text = " ".join(argv)
-    return bool(re.search(r"\bbun\s+pm\s+cache\b|\buv\s+cache\s+dir\b", text))
+def _check_remove(head: str, operands: list[str], rest: list[str], ctx: _Ctx, cwd: str) -> str | None:
+    if _store_substitution(" ".join(rest)):
+        return _STORE_MSG.format(what=f"`{head}` of the store path")
+    for target in operands:
+        label = _protected_hit(target, cwd, ctx.vars)
+        if label:
+            return _STORE_MSG.format(what=f"`{head} {target}` removes {label}")
+    return None
 
 
-def _check_delete(argv: list[str], cwd: str) -> str | None:
+def _check_delete(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     head = _basename(argv[0])
     rest = argv[1:]
     if head == "gio":
         if not rest or rest[0] not in {"trash", "remove"}:
             return None
         rest = rest[1:]
-    if _substitutes_store_path(rest):
-        return _STORE_MSG.format(what=f"`{head}` of the store path")
-    for target in _positional(rest):
-        label = _protected_hit(target, cwd)
-        if label:
-            return _STORE_MSG.format(what=f"`{head} {target}` removes {label}")
-    return None
+    return _check_remove(head, _positional(rest), rest, ctx, cwd)
 
 
-def _check_mv(argv: list[str], cwd: str) -> str | None:
+def _check_mv(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     rest = argv[1:]
     operands = _positional(rest)
-    has_target_dir = any(t in {"-t"} or t.startswith("--target-directory") for t in rest)
-    sources = operands if has_target_dir else operands[:-1]
-    if _substitutes_store_path(rest):
-        return _STORE_MSG.format(what="`mv` of the store path")
-    for src in sources:
-        label = _protected_hit(src, cwd)
-        if label:
-            return _STORE_MSG.format(what=f"`mv {src}` moves {label} away")
-    return None
+    has_target_dir = any(t == "-t" or t.startswith("--target-directory") for t in rest)
+    return _check_remove("mv", operands if has_target_dir else operands[:-1], rest, ctx, cwd)
 
 
-def _check_find(argv: list[str], cwd: str) -> str | None:
-    rest = argv[1:]
-    if not any(t in {"-delete", "-exec", "-execdir", "-ok", "-okdir"} for t in rest):
-        return None
-    for tok in rest:
-        if tok.startswith("-") or tok in {"(", "!", ")"}:
+def _find_paths(rest: list[str]) -> list[str]:
+    """Starting points of a `find`: after its leading options (-H/-L/-P, -O3, -D x, BSD -f p)."""
+    paths: list[str] = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok in _FIND_VALUELESS_OPTS or re.fullmatch(r"-O\d*", tok):
+            i += 1
+        elif tok in {"-f", "-D"} and i + 1 < len(rest):
+            if tok == "-f":
+                paths.append(rest[i + 1])
+            i += 2
+        else:
             break
-        # find prunes only what matches, so an ancestor (`find ~ -name x -delete`) is fine;
-        # a walk rooted at or inside the store deletes store entries.
-        label = _protected_hit(tok, cwd, allow_ancestor=False)
+    while i < len(rest) and not (rest[i].startswith("-") or rest[i] in _FIND_EXPR_START):
+        paths.append(rest[i])
+        i += 1
+    return paths
+
+
+def _find_deletes(rest: list[str]) -> bool:
+    """`-delete`, or an `-exec`/`-execdir`/`-ok` whose command removes or moves files."""
+    for i, tok in enumerate(rest):
+        if tok == "-delete":
+            return True
+        if tok in _FIND_EXEC_OPS and i + 1 < len(rest) and _basename(rest[i + 1]) in _DELETERS | _MOVERS:
+            return True
+    return False
+
+
+def _check_find(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
+    rest = argv[1:]
+    if not _find_deletes(rest):
+        return None
+    for path in _find_paths(rest):
+        # find removes only what matches, so a walk rooted ABOVE the store is not flagged;
+        # one rooted at or inside the store deletes store entries.
+        label = _protected_hit(path, cwd, ctx.vars, allow_ancestor=False)
         if label:
-            return _STORE_MSG.format(what=f"`find {tok} ... -delete/-exec` inside {label}")
+            return _STORE_MSG.format(what=f"`find {path} ... -delete/-exec rm` inside {label}")
     return None
 
 
-def _ln_link_names(argv: list[str]) -> list[str] | None:
+def _ln_link_names(argv: list[str], cwd: str) -> list[str] | None:
     """Link paths an `ln -s` would create; None if this `ln` does not make a symlink."""
     symbolic = False
     no_target_dir = False
+    no_deref = False
     target_dir: str | None = None
     operands: list[str] = []
     end_of_opts = False
@@ -407,6 +586,8 @@ def _ln_link_names(argv: list[str]) -> list[str] | None:
                 symbolic = True
             elif tok == "--no-target-directory":
                 no_target_dir = True
+            elif tok == "--no-dereference":
+                no_deref = True
             elif tok.startswith("--target-directory="):
                 target_dir = tok.split("=", 1)[1]
             elif tok == "--target-directory" and i + 1 < len(argv):
@@ -414,10 +595,9 @@ def _ln_link_names(argv: list[str]) -> list[str] | None:
                 i += 1
         elif not end_of_opts and tok.startswith("-") and tok != "-":
             flags = tok[1:]
-            if "s" in flags:
-                symbolic = True
-            if "T" in flags:
-                no_target_dir = True
+            symbolic = symbolic or "s" in flags
+            no_target_dir = no_target_dir or "T" in flags
+            no_deref = no_deref or "n" in flags or "h" in flags
             if "t" in flags:
                 after = flags.split("t", 1)[1]
                 if after:
@@ -438,17 +618,18 @@ def _ln_link_names(argv: list[str]) -> list[str] | None:
     into_dir = [os.path.join(dest, _basename(src.rstrip("/"))) for src in operands[:-1]]
     if no_target_dir:
         return [dest]
-    if dest.endswith("/"):
-        return into_dir  # `ln -s SRC DIR/` always links INSIDE DIR
-    # `ln -s SRC DEST` makes DEST, or DEST/basename(SRC) when DEST is an existing directory.
-    return [dest, *into_dir]
+    if dest.endswith("/") or len(operands) > 2:
+        return into_dir  # `ln -s SRC DIR/` and `ln -s A B DIR` always link INSIDE the dir
+    # `ln -s SRC DEST` makes DEST, or DEST/basename(SRC) when DEST is an existing directory
+    # (-n/-h: a symlink to a directory counts as a plain file).
+    dest_abs = _expand(dest, cwd)
+    if os.path.isdir(dest_abs) and not (no_deref and os.path.islink(dest_abs)):
+        return into_dir
+    return [dest]
 
 
-def _check_ln(argv: list[str]) -> str | None:
-    names = _ln_link_names(argv)
-    if not names:
-        return None
-    for name in names:
+def _check_ln(argv: list[str], cwd: str) -> str | None:
+    for name in _ln_link_names(argv, cwd) or []:
         if _basename(name.rstrip("/")) == "node_modules":
             return _SYMLINK_MSG
     return None
@@ -458,10 +639,7 @@ def _nearest_lockfile(start: str) -> tuple[str, str] | None:
     """(dir, lockfile name) of the nearest ancestor-or-self holding any JS lockfile."""
     cur = os.path.abspath(start)
     for _ in range(64):
-        for name in _BUN_LOCKFILES:
-            if os.path.isfile(os.path.join(cur, name)):
-                return cur, name
-        for name in _OTHER_LOCKFILES:
+        for name in (*_BUN_LOCKFILES, *_OTHER_LOCKFILES):
             if os.path.isfile(os.path.join(cur, name)):
                 return cur, name
         parent = os.path.dirname(cur)
@@ -471,60 +649,49 @@ def _nearest_lockfile(start: str) -> tuple[str, str] | None:
     return None
 
 
-def _pm_install_dir(tool: str, argv: list[str], cwd: str) -> str | None:
-    """The project dir an install-class npm/pnpm/yarn command targets; None when not an install."""
+def _pm_install_target(tool: str, argv: list[str], cwd: str, local: dict[str, str]) -> tuple[str, str] | None:
+    """(project dir, verb) of an install-class npm/pnpm/yarn command; None when not one."""
     rest = argv[1:]
     words: list[str] = []
     project_dir = cwd
-    value_flags = _NPM_VALUE_FLAGS if tool == "npm" else _NPM_VALUE_FLAGS - {"-w"}
+    value_flags = _PM_VALUE_FLAGS if tool == "npm" else _PNPM_YARN_VALUE_FLAGS
     i = 0
     while i < len(rest):
         tok = rest[i]
-        if tok in {"-g", "--global"} or tok in {"--location=global", "--location=user"}:
-            return None
-        if tok in _INFO_FLAGS:
+        if tok in _PM_GLOBAL_FLAGS or tok in _INFO_FLAGS:
             return None
         if tok == "--location" and i + 1 < len(rest) and rest[i + 1] in {"global", "user"}:
             return None
-        if tok in {"--prefix", "--dir", "--cwd"} or (tok == "-C" and tool == "pnpm"):
-            if i + 1 < len(rest):
-                project_dir = _expand(rest[i + 1], cwd)
-            i += 2
+        flag, eq, attached = tok.partition("=")
+        if flag in _PM_DIR_FLAGS or (flag == "-C" and tool == "pnpm"):
+            target = attached if eq else (rest[i + 1] if i + 1 < len(rest) else "")
+            project_dir = _expand(target, cwd, local)
+            i += 1 if eq else 2
             continue
-        for flag in ("--prefix=", "--dir=", "--cwd="):
-            if tok.startswith(flag):
-                project_dir = _expand(tok[len(flag):], cwd)
         if tok in value_flags:
             i += 2
             continue
-        if tok.startswith("-"):
-            i += 1
-            continue
-        words.append(tok)
+        if not tok.startswith("-"):
+            words.append(tok)
         i += 1
-    if tool == "npm":
-        return project_dir if words and words[0] in _NPM_INSTALL_VERBS else None
-    if tool == "pnpm":
-        return project_dir if words and words[0] in _PNPM_INSTALL_VERBS else None
-    if tool == "yarn":
-        return project_dir if not words or words[0] in _YARN_INSTALL_VERBS else None
+    verbs = {"npm": _NPM_INSTALL_VERBS, "pnpm": _PNPM_INSTALL_VERBS, "yarn": _YARN_INSTALL_VERBS}[tool]
+    if words and words[0] in verbs:
+        return project_dir, words[0]
+    if tool == "yarn" and not words:
+        return project_dir, "install"
     return None
 
 
-def _check_pm(argv: list[str], cwd: str) -> str | None:
+def _check_pm(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     tool = _basename(argv[0])
-    project_dir = _pm_install_dir(tool, argv, cwd)
-    if project_dir is None:
+    target = _pm_install_target(tool, argv, cwd, ctx.vars)
+    if target is None:
         return None
+    project_dir, verb = target
     found = _nearest_lockfile(project_dir)
-    if found is None:
+    if found is None or found[1] not in _BUN_LOCKFILES:
         return None
-    lockdir, lockfile = found
-    if lockfile not in _BUN_LOCKFILES:
-        return None
-    verb = next((t for t in argv[1:] if not t.startswith("-")), "")
-    shown = f"{tool} {verb}".strip()
-    return _NPM_MSG.format(tool=shown, lockdir=lockdir, lockfile=lockfile)
+    return _NPM_MSG.format(tool=f"{tool} {verb}", lockdir=found[0], lockfile=found[1])
 
 
 # ── driver ────────────────────────────────────────────────────────────────────
@@ -549,65 +716,110 @@ def _ssh_remote_command(argv: list[str]) -> str | None:
     host_seen = False
     while i < len(argv):
         tok = argv[i]
-        if not host_seen:
-            if tok in _SSH_VALUE_FLAGS:
-                i += 2
-                continue
-            if tok.startswith("-"):
-                i += 1
-                continue
-            host_seen = True
-            i += 1
+        if host_seen:
+            return " ".join(argv[i:]) or None
+        if tok in _SSH_VALUE_FLAGS:
+            i += 2
             continue
-        return " ".join(argv[i:]) or None
+        host_seen = not tok.startswith("-")
+        i += 1
     return None
 
 
-def inspect(command: str, cwd: str, _depth: int = 0) -> str | None:
+def _record_assignments(seg: list[str], ctx: _Ctx) -> bool:
+    """`NAME=value` / `export NAME=$(bun pm cache)` segments update ``ctx.vars``. True if consumed."""
+    words = seg[1:] if seg and seg[0] in _DECLARERS else seg
+    first = _ASSIGNMENT.match(words[0]) if words else None
+    if first is None:
+        return False
+    if not all(_ASSIGNMENT.match(w) for w in words) and not _store_substitution(" ".join(words)):
+        return False  # `NAME=x cmd …` is an inline env for cmd, not a shell assignment
+    text = " ".join(words)
+    store = _store_substitution(text)
+    if store is not None:
+        ctx.vars[first.group("name")] = store
+        return True
+    for word in words:
+        m = _ASSIGNMENT.match(word)
+        if m:
+            value = m.group("value")
+            if "$(" not in value and "`" not in value:
+                ctx.vars[m.group("name")] = _expand_vars(value, ctx.vars)
+    return True
+
+
+def _note_store_paths(argv: list[str], ctx: _Ctx, cwd: str) -> None:
+    """Remember a store path an earlier segment names, for a later `| xargs rm`."""
+    if ctx.store_seen:
+        return
+    for tok in argv[1:]:
+        if tok.startswith("-"):
+            continue
+        label = _protected_hit(tok, cwd, ctx.vars, allow_ancestor=False)
+        if label:
+            ctx.store_seen = label
+            return
+
+
+def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool) -> str | None:
+    head = _basename(argv[0])
+    if via_xargs and ctx.store_seen and head in _DELETERS | _MOVERS:
+        return _STORE_MSG.format(what=f"`… | xargs {head}` over paths in {ctx.store_seen}")
+    if head in {"bun", "bunx"}:
+        return _check_bun(argv)
+    if head == "uv":
+        return _check_uv(argv)
+    if head in _DELETERS:
+        return _check_delete(argv, ctx, cwd)
+    if head in _MOVERS:
+        return _check_mv(argv, ctx, cwd)
+    if head == "find":
+        return _check_find(argv, ctx, cwd)
+    if head == "ln":
+        return _check_ln(argv, cwd)
+    if head in {"npm", "pnpm", "yarn"}:
+        return _check_pm(argv, ctx, cwd)
+    return None
+
+
+def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | None = None) -> str | None:
     """The block message for ``command`` run from ``cwd``, or None to allow."""
-    tokens = _tokenize(command)
-    if tokens is None:
-        hit = _UNPARSEABLE_STORE_WIPE.search(command)
-        return _STORE_MSG.format(what=f"`{hit.group(0)}`") if hit else None
-    eff_cwd = cwd
-    for seg in _segments(tokens):
-        argv = _strip_wrappers(seg)
+    ctx = _Ctx(cwd, _vars)
+    for seg, piped in _segments(_tokenize(strip_heredoc_bodies(command))):
+        if not piped:
+            ctx.store_seen = None  # `| xargs rm` only inherits paths from its own pipeline
+        seg = _strip_redirects(seg)
+        if _record_assignments(seg, ctx):
+            continue
+        argv, seg_cwd, nested, via_xargs = _unwrap(seg, ctx)
+        for inner in nested:
+            if _depth < _MAX_DEPTH:
+                msg = inspect(inner, seg_cwd, _depth + 1, ctx.vars)
+                if msg:
+                    return msg
         if not argv:
             continue
         head = _basename(argv[0])
         if head in {"cd", "pushd"}:
             dests = _positional(argv[1:])
             if dests and dests[0] != "-":
-                eff_cwd = _expand(dests[0], eff_cwd)
+                ctx.cwd = _expand(dests[0], ctx.cwd, ctx.vars)
             elif not dests:
-                eff_cwd = _home()
+                ctx.cwd = _home()
             continue
-        inner = _shell_c_payload(argv)
-        inner_cwd = eff_cwd
-        if inner is None and head == "ssh":
-            inner, inner_cwd = _ssh_remote_command(argv), _home()
-        if inner is not None and _depth < 4:
-            inner_msg = inspect(inner, inner_cwd, _depth + 1)
-            if inner_msg:
-                return inner_msg
+        inner_cmd, inner_cwd = _shell_c_payload(argv), seg_cwd
+        if inner_cmd is None and head == "ssh":
+            inner_cmd, inner_cwd = _ssh_remote_command(argv), _home()
+        if inner_cmd is not None:
+            if _depth < _MAX_DEPTH:
+                msg = inspect(inner_cmd, inner_cwd, _depth + 1, ctx.vars)
+                if msg:
+                    return msg
             continue
-        msg: str | None = None
-        if head in {"bun", "bunx"}:
-            msg = _check_bun(argv)
-        elif head == "uv":
-            msg = _check_uv(argv)
-        elif head in _DELETERS:
-            msg = _check_delete(argv, eff_cwd)
-        elif head == "mv":
-            msg = _check_mv(argv, eff_cwd)
-        elif head == "find":
-            msg = _check_find(argv, eff_cwd)
-        elif head == "ln":
-            msg = _check_ln(argv)
-        elif head in {"npm", "pnpm", "yarn"}:
-            msg = _check_pm(argv, eff_cwd)
+        msg = _check_argv(argv, ctx, seg_cwd, via_xargs)
         if msg:
             return msg
+        _note_store_paths(argv, ctx, seg_cwd)
     return None
 
 
