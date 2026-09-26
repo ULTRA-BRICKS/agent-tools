@@ -16,10 +16,10 @@ it.
 | [`trivy/`](trivy/) | Filesystem scan for dependency CVEs + secrets + IaC/Dockerfile misconfig in one pass — any repo | **Trivy** (aquasecurity) | SHA-pinned GH Action + shell runner |
 | [`ai-review/`](ai-review/) | Post an AI reviewer's findings on each PR (advisory) — any repo with an AI review CLI + key | **configurable** (codex / review-cli / …) | PR workflow + generic diff-review script |
 | [`copilot-findings/`](copilot-findings/) | Surface (optionally gate) Copilot review comments + Autofix alerts — repos using Copilot | GitHub APIs (review comments + code-scanning) | workflow + aggregation script + honest manual flow |
-| [`review-threads/`](review-threads/) | Block merge while review threads are unresolved — when you lack branch-protection admin or want it in-repo | `gh api` GraphQL `reviewThreads` | workflow + shell script |
+| [`review-threads/`](review-threads/) | Block merge while review threads are unresolved — when you lack branch-protection admin or want it in-repo | `gh api` GraphQL `reviewThreads` (GitHub) / Forgejo REST API (Forgejo, Gitea) | workflow + shell script |
 | [`pr-checklist/`](pr-checklist/) | Block merge while PR-body `- [ ]` boxes are unchecked — repos with an acceptance-criteria template | github-script + tested parser | tamper-resistant workflow + parser + test + PR template |
 | [`screenshots/`](screenshots/) | Require an embedded image on UI-touching PRs (at open AND merge) — front-end repos | `gh` PR metadata + path glob | workflow + shell script |
-| [`pr-title-lint/`](pr-title-lint/) | Enforce Conventional Commits on the PR title — repos that squash-merge | **amannn/action-semantic-pull-request** | pinned GH Action |
+| [`pr-title-lint/`](pr-title-lint/) | Enforce Conventional Commits on the PR title — repos that squash-merge | dependency-free inline check (amannn/action-semantic-pull-request's rules, no API call) | workflow (runs on GitHub and Forgejo) |
 | [`leftover-grep/`](leftover-grep/) | Fail on `.only`/`debugger`/`console.log`/untracked-TODO/conflict-markers in added code — any repo | dependency-free grep on the diff | workflow + shell script |
 | [`ship/`](ship/) | Green-CI-gated PR merge + cleanup, with the above preflights — a client-side merge command | `gh` + git | portable ship script (all project coupling optional) |
 

@@ -7,6 +7,24 @@ don't cherry-pick 36 skills, 8 hooks, and 12 CI gates by hand. You install the w
 through one front door — [`rig`](https://git.hyperide.ai/ultrabricks/rig-cli) — which reads a
 committed `rig.yaml` and wires it in. agent-tools is the **what**; rig is the **how**.
 
+## Install
+
+agent-tools is content, not a command — [`rig`](https://git.hyperide.ai/ultrabricks/rig-cli) applies it. Install rig (any way
+from [rig-cli → Install](https://git.hyperide.ai/ultrabricks/rig-cli#install); on Windows use uv), then give it a checkout of
+this repo where it looks for one — `~/work/agent-tools`, `~/xp/agent-tools` or `~/agent-tools`:
+
+```bash
+uv tool install git+https://git.hyperide.ai/ultrabricks/rig-cli            # or pipx / the one-liner — see rig-cli
+git clone https://git.hyperide.ai/ultrabricks/agent-tools ~/work/agent-tools
+rig init                                       # scaffold rig.yaml + preview; `rig apply commit` applies
+```
+
+A checkout elsewhere: `rig config set --global agent_tools_source <path> --commit` (or
+`RIG_AGENT_TOOLS_SOURCE=<path>`). Update: `git pull` in the checkout, then `rig apply commit`.
+
+> The canonical repo is **git.hyperide.ai/ultrabricks/agent-tools**; `github.com/alex-mextner/agent-tools`
+> is a frozen, archived mirror.
+
 ## Quick start — the single front door (`rig init`)
 
 You enter agent-tools through `rig`. One command, run once, scaffolds a `rig.yaml`, wires in
