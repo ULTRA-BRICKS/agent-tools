@@ -171,7 +171,15 @@ _VM_SUBCOMMANDS = {
     }),
 }
 assert _VM_SUBCOMMANDS.keys() == _VM_START_VERBS.keys(), "every VM runtime needs its subcommand list"
-_VM_APPS = frozenset({"docker", "docker desktop", "orbstack", "podman desktop", "colima"})
+# flags that take NO value; any other flag before the subcommand consumes the next word
+_VM_BOOL_FLAGS = {
+    "colima": frozenset({"-v", "--verbose", "--very-verbose", "-h", "--help", "--version", "-f", "--force"}),
+    "limactl": frozenset({"--debug", "-h", "--help", "-v", "--version", "--tty", "-y", "--yes"}),
+}
+_VM_APPS = frozenset({
+    "docker", "docker desktop", "orbstack", "podman desktop", "colima",
+    "com.docker.docker", "dev.kdrag0n.macvirt", "com.orbstack.orbstack", "io.podman_desktop.podmandesktop",
+})
 _BREW_INSTALL_VERBS = frozenset({"install", "reinstall", "upgrade"})
 # hook managers → the verbs that (re)write hook shims into core.hooksPath ("" = bare command)
 _HOOK_MANAGER_INSTALLS = {
@@ -941,7 +949,7 @@ def _check_find(argv: list[str], ctx: _Ctx, cwd: str, depth: int = 0) -> str | N
     # an -exec tail is a command of its own (`-exec rm -rf <store> {} +`, `-exec bash -c '…'`)
     for tail in _find_exec_tails(rest):
         if tail and depth < _MAX_DEPTH:
-            msg = inspect(" ".join(shlex.quote(t.replace("{}", paths[0])) for t in tail), cwd, depth + 1, ctx.vars)
+            msg = inspect_command(" ".join(shlex.quote(t.replace("{}", paths[0])) for t in tail), cwd, depth + 1, ctx.vars)
             if msg:
                 return msg
     if not _find_deletes(rest):
@@ -1061,14 +1069,29 @@ def _vm_package(ref: str) -> str | None:
     return name if name in _VM_RUNTIMES else None
 
 
+def _vm_verb(head: str, rest: list[str]) -> str | None:
+    """The subcommand of `colima …` / `limactl …`, found the way their CLI parser (cobra) finds it:
+    a `--flag` without `=` consumes the next word as its value unless it is a known boolean, so
+    `colima --profile stop status` runs `status` and `colima --profile ci --arch x start` runs
+    `start`."""
+    booleans = _VM_BOOL_FLAGS.get(head, frozenset())
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok.startswith("-"):
+            i += 1 if ("=" in tok or tok in booleans or tok == "--") else 2
+            continue
+        return tok if tok in _VM_SUBCOMMANDS[head] else None
+    return None
+
+
 def _check_vm_runtime(argv: list[str]) -> str | None:
     """`colima start`, `limactl start`, `brew install colima`, `nix run nixpkgs#colima`, …"""
     head = _cmd(argv[0])
     words = [t for t in argv[1:] if not t.startswith("-")]
     flags = [t for t in argv[1:] if t.startswith("-")]
     if head in _VM_START_VERBS:
-        # the verb is the first known subcommand; valued flags (`--profile ci --arch x`) precede it
-        verb = next((w for w in words if w in _VM_SUBCOMMANDS[head]), None)
+        verb = _vm_verb(head, argv[1:])
         return _VM_MSG.format(what=f"`{head} {verb}`") if verb in _VM_START_VERBS[head] else None
     if head == "brew" and words and words[0] in _BREW_INSTALL_VERBS:
         for pkg in words[1:]:
@@ -1084,7 +1107,7 @@ def _check_vm_runtime(argv: list[str]) -> str | None:
     if head == "open":
         # `open -a Docker` / `open -a OrbStack` launch the VM app itself
         for i, tok in enumerate(argv[1:-1], start=1):
-            if tok in {"-a", "-b"} and _basename(argv[i + 1]).removesuffix(".app").lower() in _VM_APPS:
+            if tok in {"-a", "-b"} and _basename(argv[i + 1]).lower().removesuffix(".app") in _VM_APPS:
                 return _VM_MSG.format(what=f"`open {tok} {argv[i + 1]}`")
         return None
     if head in {"nix-env", "nix-shell"} and any(f.startswith(("-i", "-p", "--install", "--packages")) for f in flags):
@@ -1094,12 +1117,12 @@ def _check_vm_runtime(argv: list[str]) -> str | None:
     return None
 
 
-def _git(cwd: str, *args: str) -> str | None:
-    """A read-only git query in ``cwd`` (stdout, stripped), or None when it fails."""
+def _git(cwd: str, *args: str, git_dir: str | None = None) -> str | None:
+    """A read-only git query in ``cwd`` (stdout, stripped), or None when it fails. ``git_dir``
+    mirrors a `GIT_DIR=…` the gated command sets, so the query sees the repo the command will."""
+    cmd = ["git", "-C", cwd, *([f"--git-dir={git_dir}"] if git_dir else []), *args]
     try:
-        res = subprocess.run(
-            ["git", "-C", cwd, *args], capture_output=True, text=True, timeout=_GIT_TIMEOUT_S
-        )
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=_GIT_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return None
     return res.stdout.strip() if res.returncode == 0 else None
@@ -1117,24 +1140,30 @@ def _check_hook_manager(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     verb = words[0] if words else ""
     if verb not in _HOOK_MANAGER_INSTALLS[head]:
         return None
-    paths = _git(cwd, "rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir")
+    env = {**ctx.vars, **ctx.inline_env}  # `export GIT_CONFIG_…; lefthook install` counts too
+    git_dir_env = env.get("GIT_DIR") and _expand(env["GIT_DIR"].strip("\"'"), cwd, ctx.vars)
+    paths = _git(cwd, "rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir", git_dir=git_dir_env)
     if not paths or len(paths.splitlines()) < 3:
-        return None  # not inside a work tree: nothing to protect here
+        # outside any repo the manager has nothing to install into — unless GIT_DIR points
+        # somewhere this check could not read: then fail closed
+        return _HOOK_MANAGER_MSG.format(tool=_cmd(argv[0]), path="<unknown: GIT_DIR>") if git_dir_env else None
     top, git_dir, common = paths.splitlines()[:3]
-    explicit = _explicit_hooks_path(ctx.inline_env)
+    explicit = _explicit_hooks_path(env)
     if explicit is not None:
         # the documented per-command override — honoured only if it really lands in this repo
         for probe in ("$(git rev-parse --absolute-git-dir)", "$(git rev-parse --git-dir)", "`git rev-parse --absolute-git-dir`"):
             explicit = explicit.replace(probe, git_dir)
         hooks_path = explicit if explicit and "$(" not in explicit and "`" not in explicit else "<unresolvable>"
     else:
-        hooks_path = _git(cwd, "config", "--get", "core.hooksPath") or ""
+        hooks_path = _git(cwd, "config", "--get", "core.hooksPath", git_dir=git_dir_env) or ""
         if not hooks_path:
             return None  # the default: the repo's own .git/hooks
     resolved = _expand(_expand_vars(hooks_path, ctx.vars), top)
-    inside = [top, git_dir, _expand(common, top)]
-    if hooks_path != "<unresolvable>" and any(
-        _components(resolved)[: len(_components(d))] == _components(d) for d in inside
+    real = os.path.realpath(resolved)  # a symlink out of the repo is not repo-local
+    inside = [os.path.realpath(d) for d in (top, git_dir, _expand(common, top))]
+    linked_now = any(resolved == made or resolved.startswith(made + os.sep) for made in ctx.links_made)
+    if hooks_path != "<unresolvable>" and not linked_now and any(
+        _components(real)[: len(_components(d))] == _components(d) for d in inside
     ):
         return None  # a repo-local hooks dir (`.husky/_`, `.git/hooks`)
     shown = f"{head} {verb}".strip()
@@ -1308,6 +1337,8 @@ def _record_assignments(seg: list[str], ctx: _Ctx) -> list[str]:
         resolved = _store_value(value)
         if "$(" not in resolved and "`" not in resolved:
             ctx.vars[m.group("name")] = _expand_vars(resolved.strip("\"'"), ctx.vars)
+        elif m.group("name").startswith(("GIT_CONFIG_", "GIT_DIR")):
+            ctx.vars[m.group("name")] = resolved  # kept raw: the hook-manager check resolves it
     return rest
 
 
@@ -1380,7 +1411,7 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool, depth: in
         argv = launched
     script = _shell_c_payload(argv)
     if script is not None:  # `npx -c '…'` became `sh -c '…'`
-        return inspect(script, cwd, depth + 1, ctx.vars) if depth < _MAX_DEPTH else None
+        return inspect_command(script, cwd, depth + 1, ctx.vars) if depth < _MAX_DEPTH else None
     head = _cmd(argv[0])
     if via_xargs and ctx.store_seen and head in _REMOVERS:
         return _STORE_MSG.format(what=f"`… | xargs {head}` over paths in {ctx.store_seen}")
@@ -1407,13 +1438,13 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool, depth: in
     return None
 
 
-def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | None = None) -> str | None:
+def inspect_command(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | None = None) -> str | None:
     """The block message for ``command`` run from ``cwd``, or None to allow."""
     command = strip_heredoc_bodies(command)
     ctx = _Ctx(cwd, _vars)
     if _depth < _MAX_DEPTH:
         for body in substitution_bodies(command):
-            msg = inspect(body, cwd, _depth + 1, ctx.vars)
+            msg = inspect_command(body, cwd, _depth + 1, ctx.vars)
             if msg:
                 return msg
     for seg, piped in _segments(_tokenize(command)):
@@ -1424,12 +1455,16 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
         argv = _record_assignments(plain, ctx)
         if not argv:
             continue
+        if argv and "$" in argv[0]:
+            word = _expand_vars(argv[0], {**ctx.vars, **ctx.inline_env})
+            if word != argv[0]:
+                argv = [*word.split(), *argv[1:]]  # unquoted expansion word-splits
         argv, seg_cwd, nested, via_xargs = _unwrap(argv, ctx)
         if here_string is not None and argv and _stdin_script_dir(" ".join(shlex.quote(a) for a in argv)) is not None:
             nested.append(here_string)  # `bash <<< '…'`: the string is the script
         for inner in nested:
             if _depth < _MAX_DEPTH:
-                msg = inspect(inner, seg_cwd, _depth + 1, ctx.vars)
+                msg = inspect_command(inner, seg_cwd, _depth + 1, ctx.vars)
                 if msg:
                     return msg
         if not argv:
@@ -1443,7 +1478,7 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
             inner_cmd, inner_cwd = _ssh_remote_command(argv), _home()
         if inner_cmd is not None:
             if _depth < _MAX_DEPTH:
-                msg = inspect(inner_cmd, inner_cwd, _depth + 1, ctx.vars)
+                msg = inspect_command(inner_cmd, inner_cwd, _depth + 1, ctx.vars)
                 if msg:
                     return msg
             continue
@@ -1482,7 +1517,7 @@ def main() -> int:
         emit("allow")
         return 0
     try:
-        message = inspect(command, cwd)
+        message = inspect_command(command, cwd)
     except Exception as exc:  # noqa: BLE001 — a parser bug must not wedge every shell call
         warn(f"inspection failed ({exc!r}) — allowing")
         emit("allow")

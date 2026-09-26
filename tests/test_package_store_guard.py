@@ -637,6 +637,42 @@ def test_bun_x_is_a_package_runner(bun_repo, home, monkeypatch):
     _blocked("bun x npm install", monkeypatch, bun_repo)
 
 
+def test_vm_verb_is_the_subcommand_not_a_flag_value(home, tmp_path, monkeypatch):
+    _allowed("colima --profile stop status", monkeypatch, tmp_path)
+    _allowed("colima --verbose status", monkeypatch, tmp_path)
+    _blocked("colima --verbose start", monkeypatch, tmp_path)
+    _blocked("colima -p work start --cpu 4", monkeypatch, tmp_path)
+    _blocked("open -b com.docker.docker", monkeypatch, tmp_path)
+
+
+def test_a_variable_command_word_is_its_value(home, tmp_path, monkeypatch):
+    _blocked("C=rm; $C -rf ~/.bun/install/cache", monkeypatch, tmp_path)
+    _blocked('W="bun pm"; $W cache rm', monkeypatch, tmp_path)
+
+
+def test_hook_manager_follows_git_dir_and_exported_overrides(home, tmp_path, monkeypatch):
+    global_hooks = tmp_path / "global-git-hooks"
+    global_hooks.mkdir()
+    repo = _repo_with_hooks_path(tmp_path, str(global_hooks))
+    elsewhere = tmp_path / "not-a-repo"
+    elsewhere.mkdir()
+    _blocked(f"GIT_DIR={repo}/.git lefthook install", monkeypatch, elsewhere)
+    _blocked(f"env GIT_DIR={repo}/.git lefthook install", monkeypatch, elsewhere)
+    _allowed(
+        'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath '
+        'GIT_CONFIG_VALUE_0="$(git rev-parse --absolute-git-dir)/hooks"; lefthook install',
+        monkeypatch,
+        repo,
+    )
+    # a repo-local-looking path that is (or becomes) a link out of the repo is not repo-local
+    _blocked(
+        f"ln -sfn {global_hooks} .git/hook-link && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath "
+        "GIT_CONFIG_VALUE_0=.git/hook-link lefthook install",
+        monkeypatch,
+        repo,
+    )
+
+
 def test_mv_into_the_store_is_not_a_removal(home, tmp_path, monkeypatch):
     _allowed("mv -t ~/.bun/install/cache /tmp/foo", monkeypatch, tmp_path)
     _blocked("mv -t /tmp ~/.bun/install/cache", monkeypatch, tmp_path)
@@ -799,7 +835,7 @@ def test_internal_error_allows(home, tmp_path, monkeypatch):
     def _boom(*_a, **_k):
         raise RuntimeError("parser bug")
 
-    monkeypatch.setattr(psg, "inspect", _boom)
+    monkeypatch.setattr(psg, "inspect_command", _boom)
     _allowed("npm install", monkeypatch, tmp_path)
 
 

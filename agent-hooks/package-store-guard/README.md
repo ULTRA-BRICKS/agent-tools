@@ -67,7 +67,8 @@ walk at the directory you mean (`find ./build -name '*.o' -delete`).
 
 Known gaps (best effort, not a sandbox): the RESULT of a substitution used as an argument or as the
 command word (`rm -rf $(cat list)`, `$(echo rm) -rf …`), a package's own install script running a
-hook manager (a `postinstall: lefthook install` — fix the package), deletes from other languages (`python -c 'shutil.rmtree(…)'`), a
+hook manager (a `postinstall: lefthook install` — fix the package), a store ANCESTOR printed into
+`| xargs rm -r` (`echo ~/.bun | xargs rm -rf`; a store path itself is caught), deletes from other languages (`python -c 'shutil.rmtree(…)'`), a
 variable set in an earlier, separate tool call, and a deliberately obfuscated command.
 
 ## Fail policy
