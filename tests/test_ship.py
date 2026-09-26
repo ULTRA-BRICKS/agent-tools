@@ -431,6 +431,22 @@ def test_upload_png_quote_in_path_is_not_shell_injected(repo_with_pr_worktree, t
     assert f"uploaded 'desc' -> https://example.invalid/uploaded.png" in r.stdout, r.stdout
 
 
+@pytest.mark.parametrize("shot", ["C:/nowhere/ui.png", "C:\\nowhere\\ui.png", "\\\\srv\\share\\ui.png"])
+def test_screenshot_windows_absolute_path_is_not_rebased_on_cwd(repo_with_pr_worktree, tmp_path, shot):
+    """A Windows drive or UNC screenshot path is absolute on Git Bash for Windows: ship keeps it
+    as given (the same rule as --task-config), never `$PWD/C:/…`."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text("#!/usr/bin/env bash\necho https://example.invalid/u.png\n", encoding="utf-8")
+    uploader.chmod(0o755)
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test", "--screenshot", shot, "desc",
+        cwd=wt, env=_screenshot_upload_env(main, bindir, uploader),
+    )
+    assert f"screenshot not found: {shot} (" in r.stderr, r.stdout + r.stderr
+
+
 def test_upload_png_file_token_quote_in_path_is_not_shell_injected(repo_with_pr_worktree, tmp_path):
     """Same HYP-1260 regression as above, but for the `{FILE}` token branch of upload_png()
     (`SHIP_IMAGE_UPLOAD_CMD` containing a literal `{FILE}` placeholder rather than appending
