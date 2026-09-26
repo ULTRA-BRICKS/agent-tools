@@ -54,6 +54,12 @@ _BARE_FLAG_VALUES = frozenset({"1", "true", "yes", "on"})
 # short enough that a real phrase still qualifies.
 _MIN_JUSTIFICATION_CHARS = 8
 
+# Late-approval grant token minted by tg-ctl after an approval arrives after the
+# original ask has already expired. This exact format is the cross-repo contract
+# with tg-cli's features/tg-ctl/grants.ts.
+_APPROVED_GRANT_RE = re.compile(r"^approved:(hgr-[0-9a-f]{12})$")
+_GRANT_LOOKUP_TIMEOUT_S = 15.0
+
 
 def _is_written_justification(text: str) -> bool:
     """True when `text` is a real written reason, not a flag or a stub.
@@ -276,6 +282,19 @@ def request_hatch_approval(
     if raw is None and command is not None:
         raw = _parse_inline_hatch_value(env_var, command)
     if raw is None:
+        try:
+            pull_result = _pull_late_grant(
+                hook_id, ctx, cwd=cwd, env_var=env_var, command=command, env_map=env_map,
+                tg_ctl_candidates=tg_ctl_candidates, critical=critical,
+            )
+        except Exception:
+            pull_result = None
+        if pull_result is not None:
+            _append_overrides_log(
+                hook_id, env_var, pull_result, command=command, cwd=cwd, justification="",
+                context=ctx, env_map=env_map, overrides_log_path=overrides_log_path,
+            )
+            return pull_result
         return HatchApprovalResult(
             requested=False,
             approved=False,
@@ -290,6 +309,7 @@ def request_hatch_approval(
             cwd=cwd,
             env_var=env_var,
             raw=raw,
+            command=command,
             tg_ctl_candidates=tg_ctl_candidates,
             timeout_s=timeout_s,
             process_margin_s=process_margin_s,
@@ -319,7 +339,133 @@ def request_hatch_approval(
     return result
 
 
-def _operation_fingerprint(hook_id: str, context: Mapping[str, object]) -> str:
+def _quote_preserving_tokens(command: str) -> list[str] | None:
+    """Tokenize like a shell WOULD SEE a command, but KEEP every quote character in the token
+    text — the fingerprint form (`_canonical_bash_fingerprint`): quote style is shell SEMANTICS
+    (`'$x'` is a literal argument, `"$x"` expands it), so the two must stay distinct tokens.
+    Splits on unquoted whitespace and on runs of the separator chars (`;&|`); a backslash
+    outside quotes escapes the next char (both kept); inside `'…'` nothing escapes and every
+    character — including a literal newline — is verbatim; inside `"…"` only `\\"`/`\\\\`/
+    `\\$`/`` \\` `` escape (a `\\`-newline continuation is dropped, as the shell does). An
+    UNQUOTED newline is a command separator (normalized to `;`), an unquoted `\\`-newline a
+    continuation (folded to a space) — so `'a\\nb'` and `'a;b'` NEVER collide. Returns None on
+    unbalanced quotes (the caller falls back to the deterministic raw string)."""
+    tokens: list[str] = []
+    current: list[str] = []
+    quote = ""
+    i = 0
+
+    def _flush() -> None:
+        if current:
+            tokens.append("".join(current))
+            current.clear()
+
+    while i < len(command):
+        ch = command[i]
+        nxt = command[i + 1] if i + 1 < len(command) else ""
+        if quote == "'":
+            current.append(ch)
+            if ch == "'":
+                quote = ""
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and nxt:
+                if nxt == "\n":
+                    i += 2  # line continuation inside double quotes — removed, as the shell does
+                    continue
+                current.append(ch)
+                current.append(nxt)
+                i += 2
+                continue
+            current.append(ch)
+            if ch == '"':
+                quote = ""
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            current.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and nxt == "\n":
+            i += 2  # unquoted continuation — both chars removed, as the shell does
+            continue
+        if ch == "\n":
+            _flush()  # unquoted newline — a command separator, same as `;`
+            tokens.append(";")
+            i += 1
+            continue
+        if ch.isspace():
+            _flush()
+            i += 1
+            continue
+        if ch in _SEPARATOR_CHARS:
+            _flush()
+            end = i
+            while end < len(command) and command[end] in _SEPARATOR_CHARS:
+                end += 1
+            tokens.append(command[i:end])
+            i = end
+            continue
+        if ch == "\\" and nxt:
+            current.append(ch)
+            current.append(nxt)
+            i += 2
+            continue
+        current.append(ch)
+        i += 1
+    if quote:
+        return None  # unbalanced quotes — not tokenizable
+    _flush()
+    return tokens
+
+
+def _canonical_bash_fingerprint(env_var: str, command: str) -> str:
+    """The canonical form of a gated Bash command for grant binding: the leading
+    `RIG_HATCH_REQUEST_<HOOK>=...` inline assignment (a written justification OR an
+    `approved:<id>` token) is stripped, so `VAR="why" cmd`, `VAR=approved:<id> cmd`, and bare
+    `cmd` ALL canonicalize identically and the retry prefix is invisible to the daemon's
+    comparison. Separators are KEPT as tokens (`a && b` must not collide with `a; b`); other
+    leading assignments are preserved (they change what the shell runs).
+
+    Tokens are taken QUOTE-PRESERVING (`_quote_preserving_tokens`): quote style is
+    SHELL SEMANTICS, not formatting — `-- '$(x)'` passes a literal `$(x)` argument while
+    `-- "$(x)"` EXECUTES the substitution — so the two must NEVER share a fingerprint
+    (a grant for one must not verify the other). Whitespace between tokens normalizes away;
+    a `VAR='why'` vs `VAR="why"` prefix difference vanishes with the dropped assignment.
+    Untokenizable input (unbalanced quotes) falls back to the raw string — still deterministic
+    across an ask/retry of the same event."""
+
+    raw_tokens = _quote_preserving_tokens(command)
+    if raw_tokens is None:
+        return command
+    out: list[str] = []
+    at_segment_head = True
+    for token in raw_tokens:
+        if token and set(token) <= _SEPARATOR_CHARS:
+            out.append(token)
+            at_segment_head = True
+            continue
+        if at_segment_head:
+            name, sep, _value = token.partition("=")
+            if sep and _ASSIGNMENT_NAME_RE.match(name):
+                if name != env_var:
+                    out.append(token)  # another leading assignment stays — it changes the run
+                continue  # keep scanning this segment's leading assignment chain
+            at_segment_head = False
+        out.append(token)
+    # Tokens already carry their original quoting (posix=False); separator tokens are bare.
+    return " ".join(out)
+
+
+def _operation_fingerprint(
+    hook_id: str,
+    context: Mapping[str, object],
+    *,
+    env_var: str | None = None,
+    command: str | None = None,
+) -> str:
     """Deterministic identity for the OPERATION a hatch ask is about (tg-cli#398's late-approval
     grant protocol): `hookId` + this fingerprint is what `tg-ctl`'s `isGrantableRequest` needs to
     mint a grant when a human taps Approve after the request itself has already expired.
@@ -330,12 +476,198 @@ def _operation_fingerprint(hook_id: str, context: Mapping[str, object]) -> str:
     `context` always hashes the same across separate Python process invocations (each hook run is
     a fresh interpreter — there is no in-memory state to carry this identity another way).
     """
+    stable_context = dict(context)
+    if env_var is not None and command is not None:
+        canonical = _canonical_bash_fingerprint(env_var, command)
+        if "command" in stable_context:
+            stable_context["command"] = canonical
+        else:
+            stable_context["__command__"] = canonical
     return hashlib.sha256(
-        "\x00".join([hook_id, json.dumps(context, sort_keys=True, default=str)]).encode(
+        "\x00".join([hook_id, json.dumps(stable_context, sort_keys=True, default=str)]).encode(
             "utf-8", "surrogatepass"
         )
     ).hexdigest()
 
+
+
+def _grant_operation(
+    hook_id: str,
+    env_var: str,
+    context: Mapping[str, object],
+    cwd: str,
+    command: str | None,
+) -> dict[str, str]:
+    return {
+        "kind": hook_id,
+        "fingerprint": _operation_fingerprint(
+            hook_id, context, env_var=env_var, command=command
+        ),
+        "cwd": cwd,
+    }
+
+
+def _grant_reply_field(reply: object, key: str) -> str | None:
+    if not isinstance(reply, dict):
+        return None
+    value = reply.get(key)
+    if isinstance(value, str) and value:
+        return value
+    hook_output = reply.get("hookSpecificOutput")
+    if isinstance(hook_output, dict):
+        value = hook_output.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _grant_payload(
+    hook_id: str,
+    env_var: str,
+    context: Mapping[str, object],
+    cwd: str,
+    command: str | None,
+    env_map: Mapping[str, str],
+    *,
+    request_id: str,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "requestId": request_id,
+        "agent": _ASK_AGENT,
+        "kind": "permission",
+        "question": f"Verify a previously approved hatch grant for {hook_id}",
+        "title": f"Hatch grant: {hook_id}",
+        "decisionLabels": {"allow": "Approve", "deny": "Deny"},
+        "cwd": cwd,
+        "hookId": hook_id,
+        "operation": _grant_operation(hook_id, env_var, context, cwd, command),
+    }
+    pane_id = env_map.get("TMUX_PANE")
+    if pane_id:
+        payload["paneId"] = pane_id
+    return payload
+
+
+def _verify_hatch_grant(
+    hook_id: str,
+    approval_id: str,
+    context: Mapping[str, object],
+    *,
+    cwd: str,
+    env_var: str,
+    command: str | None,
+    env_map: Mapping[str, str],
+    tg_ctl_candidates: Sequence[Path | str] | None,
+    critical: bool,
+) -> HatchApprovalResult:
+    tg_ctl = _find_tg_ctl(tg_ctl_candidates)
+
+    def deny(reason: str) -> HatchApprovalResult:
+        return HatchApprovalResult(
+            requested=True,
+            approved=False,
+            reason=reason,
+            env_var=env_var,
+            env_present=True,
+            tg_ctl_path=str(tg_ctl) if tg_ctl is not None else None,
+            critical=critical,
+        )
+
+    if tg_ctl is None:
+        return deny("tg-ctl is not available; late-approval grant cannot be verified")
+
+    payload = _grant_payload(
+        hook_id, env_var, context, cwd, command, env_map,
+        request_id=f"hatch-verify-{hook_id}-{uuid.uuid4().hex[:12]}",
+    )
+    outcome = _run_tg_ctl_ask(
+        [str(tg_ctl), "ask", "--verify-grant", approval_id, "--hook", hook_id],
+        json.dumps(payload),
+        _GRANT_LOOKUP_TIMEOUT_S,
+        requested_timeout=_GRANT_LOOKUP_TIMEOUT_S,
+    )
+    if isinstance(outcome, str):
+        return deny(outcome)
+    returncode, out, err = outcome
+    if returncode != 0:
+        return deny(f"tg-ctl grant verification failed (exit {returncode})")
+    stdout_text = (out or "").strip()
+    if not stdout_text:
+        return deny("tg-ctl grant verification returned no reply")
+    try:
+        reply = json.loads(stdout_text)
+    except ValueError:
+        return deny("tg-ctl grant verification returned an invalid reply")
+    if _parse_ask_decision(reply) != "allow":
+        return deny("tg-ctl rejected the late-approval grant")
+    if _grant_reply_field(reply, "approvalId") != approval_id:
+        return deny("tg-ctl allow reply did not confirm the requested grant id")
+    original_request = _grant_reply_field(reply, "requestId")
+    if not original_request:
+        return deny("tg-ctl allow reply did not identify the original request")
+    return HatchApprovalResult(
+        requested=True,
+        approved=True,
+        reason=f"late-approval grant {approval_id} consumed (request {original_request})",
+        env_var=env_var,
+        env_present=True,
+        tg_ctl_path=str(tg_ctl),
+        critical=critical,
+    )
+
+
+def _pull_late_grant(
+    hook_id: str,
+    context: Mapping[str, object],
+    *,
+    cwd: str,
+    env_var: str,
+    command: str | None,
+    env_map: Mapping[str, str],
+    tg_ctl_candidates: Sequence[Path | str] | None,
+    critical: bool,
+) -> HatchApprovalResult | None:
+    if tg_ctl_candidates is None and os.environ.get("AGENTTOOLS_TEST_HERMETIC_HOME"):
+        return None
+    tg_ctl = _find_tg_ctl(tg_ctl_candidates)
+    if tg_ctl is None:
+        return None
+    payload = _grant_payload(
+        hook_id, env_var, context, cwd, command, env_map,
+        request_id=f"hatch-pull-{hook_id}-{uuid.uuid4().hex[:12]}",
+    )
+    outcome = _run_tg_ctl_ask(
+        [str(tg_ctl), "ask", "--verify-grant", "--pull", "--hook", hook_id],
+        json.dumps(payload),
+        _GRANT_LOOKUP_TIMEOUT_S,
+        requested_timeout=_GRANT_LOOKUP_TIMEOUT_S,
+    )
+    if isinstance(outcome, str):
+        return None
+    returncode, out, _err = outcome
+    if returncode != 0 or not (out or "").strip():
+        return None
+    try:
+        reply = json.loads((out or "").strip())
+    except ValueError:
+        return None
+    if _parse_ask_decision(reply) != "allow":
+        return None
+    approval_id = _grant_reply_field(reply, "approvalId")
+    original_request = _grant_reply_field(reply, "requestId")
+    if not approval_id or not re.fullmatch(r"hgr-[0-9a-f]{12}", approval_id):
+        return None
+    if not original_request:
+        return None
+    return HatchApprovalResult(
+        requested=True,
+        approved=True,
+        reason=f"late-approval grant {approval_id} consumed automatically (request {original_request})",
+        env_var=env_var,
+        env_present=True,
+        tg_ctl_path=str(tg_ctl),
+        critical=critical,
+    )
 
 def _request_present_hatch_approval(
     hook_id: str,
@@ -344,6 +676,7 @@ def _request_present_hatch_approval(
     cwd: str,
     env_var: str,
     raw: str,
+    command: str | None,
     tg_ctl_candidates: Sequence[Path | str] | None,
     timeout_s: float,
     process_margin_s: float,
@@ -356,6 +689,28 @@ def _request_present_hatch_approval(
             requested=False,
             approved=False,
             reason=f"{env_var} is blank; Telegram hatch escalation denied",
+            env_var=env_var,
+            env_present=True,
+            critical=critical,
+        )
+    grant_match = _APPROVED_GRANT_RE.fullmatch(justification)
+    if grant_match is not None:
+        return _verify_hatch_grant(
+            hook_id,
+            grant_match.group(1),
+            context,
+            cwd=cwd,
+            env_var=env_var,
+            command=command,
+            env_map=env_map,
+            tg_ctl_candidates=tg_ctl_candidates,
+            critical=critical,
+        )
+    if justification.startswith("approved:") and not any(ch.isspace() for ch in justification):
+        return HatchApprovalResult(
+            requested=True,
+            approved=False,
+            reason=f"{env_var} contains a malformed late-approval grant token",
             env_var=env_var,
             env_present=True,
             critical=critical,
@@ -431,7 +786,7 @@ def _request_present_hatch_approval(
     # fingerprint is what identifies "the same operation" across the two separate `tg-ctl ask`
     # invocations (the original, now-expired ask and the later retry) — see
     # `_operation_fingerprint`'s docstring for why the justification text is excluded.
-    operation_fingerprint = _operation_fingerprint(hook_id, context)
+    operation_fingerprint = _operation_fingerprint(hook_id, context, env_var=env_var, command=command)
     button_request = {
         "requestId": request_id,
         "agent": _ASK_AGENT,
