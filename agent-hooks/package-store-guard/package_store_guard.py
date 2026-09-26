@@ -63,6 +63,7 @@ _SHELL_SEPS = frozenset({"&&", "||", ";", "|", "&", ";;", "|&", ";&", ";;&"})
 _PIPES = frozenset({"|", "|&"})
 _PUNCT = frozenset("();<>|&")
 _ESCAPED_SEMI = "__package_store_guard_escaped_semicolon__"
+_SUBST_MARK = "__psg_subst_{}__"
 # Longest first, so `&&` wins over `&` and `;;&` over `;;`.
 _OPERATORS = ("<<<", ";;&", "&>>", "&&", "||", ";;", ";&", "|&", "&>", ">>", ">&", "<&", ">|", "<>", "<<",
               "(", ")", ";", "|", "&", "<", ">")
@@ -143,6 +144,10 @@ _FIND_EXPR_START = frozenset({"(", "!", ")", "\\(", "\\!"})
 # is a wipe, not a path, and must reach the bun check instead.
 _STORE_SUBST_RE = re.compile(r"\b(?P<bun>bun\s+pm\s+cache)\s*[)`]|\b(?P<uv>uv\s+cache\s+dir)\s*[)`]")
 _CASE_INSENSITIVE_FS = sys.platform in {"darwin", "win32"}
+_STORE_SPAN_RE = re.compile(
+    r"\$\(\s*(?:(?P<bun>bun\s+pm\s+cache)|(?P<uv>uv\s+cache\s+dir))\s*\)"
+    r"|`\s*(?:(?P<bun2>bun\s+pm\s+cache)|(?P<uv2>uv\s+cache\s+dir))\s*`"
+)
 
 # ── banned VM runtimes (colima & co. filled the Mac's disk; agents kept reinstalling them) ──
 _VM_RUNTIMES = frozenset({"colima", "lima", "podman", "podman-desktop", "orbstack", "docker-desktop"})
@@ -203,6 +208,13 @@ def _basename(tok: str) -> str:
     return tok.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+def _cmd(tok: str) -> str:
+    """A command word's name: its basename, casefolded where command lookup is case-insensitive
+    (macOS/Windows run `Bun pm cache rm` and `RM -rf` as bun and rm)."""
+    name = _basename(tok)
+    return name.casefold() if _CASE_INSENSITIVE_FS else name
+
+
 def _unquoted_heredocs(line: str) -> list[tuple[str, bool, str, str]]:
     """(delimiter, `<<-`, text before `<<`, text after the opener) for each here-doc a line opens
     OUTSIDE quotes and comments."""
@@ -231,54 +243,65 @@ def _unquoted_heredocs(line: str) -> list[tuple[str, bool, str, str]]:
     return found
 
 
-def _runs_stdin_as_script(stage: str) -> bool:
-    """Does this pipeline stage read a shell script from stdin (`bash`, `sudo sh -s`, `ssh host`)?"""
-    toks = stage.split()
-    while toks and (
-        _basename(toks[0]) in _WRAPPERS or _ASSIGNMENT.match(toks[0]) or toks[0].startswith("-") or toks[0].isdigit()
-    ):
-        toks = toks[1:]  # wrappers, their flags, `timeout 60`, inline env
+def _stdin_script_dir(stage: str) -> str | None:
+    """If this pipeline stage reads a shell script from stdin (`bash`, `sudo -u root sh -s`,
+    `env -C dir bash`, `ssh host`), the directory that script runs in (``"."``: unchanged);
+    else None. Wrappers are peeled by the same :func:`_unwrap` as commands."""
+    try:
+        toks = shlex.split(stage)
+    except ValueError:
+        toks = stage.split()
+    toks, cwd, _nested, _xargs = _unwrap(toks, _Ctx("."))
     if not toks:
-        return False
-    head, args = _basename(toks[0]), toks[1:]
+        return None
+    head, args = _cmd(toks[0]), toks[1:]
     flags = [a for a in args if a.startswith("-")]
     operands = [a for a in args if not a.startswith("-")]
     if head in _SHELLS:
         # `bash -c '…'` / `bash script.sh` read stdin as data; `bash -s x` does not
         if any("c" in f[1:] for f in flags if not f.startswith("--")):
-            return False
-        return not operands or "-s" in flags
-    if head == "ssh":
-        return _ssh_remote_command(toks) is None  # only a host: stdin is the remote login shell
-    return False
+            return None
+        return cwd if (not operands or "-s" in flags) else None
+    if head == "ssh" and _ssh_remote_command(toks) is None:
+        return _home()  # only a host: stdin is the remote login shell, in the remote home
+    return None
 
 
-def _heredoc_is_script(before: str, after: str) -> bool:
-    """`bash <<EOF`, `ssh host <<EOF` or `cat <<EOF | bash`: the here-doc body is a script."""
-    if _runs_stdin_as_script(re.split(r"&&|\|\||[;|&(]", before)[-1]):
-        return True
-    stages = re.split(r"&&|\|\||;", after)[0].split("|")[1:]  # the rest of this pipeline
-    return any(_runs_stdin_as_script(stage) for stage in stages)
+def _heredoc_script_dir(before: str, after: str) -> str | None:
+    """`bash <<EOF`, `ssh host <<EOF` or `cat <<EOF | bash`: the here-doc body is a script — the
+    directory it runs in; None when the body is data."""
+    found = _stdin_script_dir(re.split(r"&&|\|\||[;|&(]", before)[-1])
+    if found is not None:
+        return found
+    for stage in re.split(r"&&|\|\||;", after)[0].split("|")[1:]:  # the rest of this pipeline
+        found = _stdin_script_dir(stage)
+        if found is not None:
+            return found
+    return None
 
 
 def strip_heredoc_bodies(command: str) -> str:
     """Drop here-document bodies — `cat > f <<'EOF' … EOF` text is data, not commands — except
     a body fed to a shell (`bash <<EOF`, `cat <<EOF | sh`, `ssh host <<EOF`), which is a script."""
     out: list[str] = []
-    pending: list[tuple[str, bool, bool]] = []
+    pending: list[tuple[str, bool, str | None]] = []
     for line in command.split("\n"):
         if pending:
-            delim, dash, keep = pending[0]
+            delim, dash, script_dir = pending[0]
             bare = line.rstrip("\r")
             if (bare.lstrip("\t") if dash else bare) == delim:
                 pending.pop(0)
-            elif keep:
+                if script_dir not in (None, "."):
+                    out.append("popd")
+            elif script_dir is not None:
                 out.append(line)
             continue
         out.append(line)
-        pending.extend(
-            (delim, dash, _heredoc_is_script(before, after)) for delim, dash, before, after in _unquoted_heredocs(line)
-        )
+        for delim, dash, before, after in _unquoted_heredocs(line):
+            script_dir = _heredoc_script_dir(before, after)
+            if script_dir not in (None, ".") and not pending:
+                out.append(f"pushd {shlex.quote(script_dir)}")  # the script runs there
+            pending.append((delim, dash, script_dir))
     return "\n".join(out)
 
 
@@ -373,15 +396,66 @@ def _split_operators(tok: str) -> list[str]:
     return out
 
 
+def _protect_substitutions(text: str) -> tuple[str, list[str]]:
+    """Swap each `$( … )` / backtick span (outside single quotes) for a placeholder word, so its
+    parens and inner `;`/quotes neither split the surrounding word nor end the command."""
+    spans: list[str] = []
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and quote != "'":
+            out.append(text[i : i + 2])
+            i += 2
+            continue
+        if quote == "'":
+            quote = None if ch == "'" else quote
+            out.append(ch)
+            i += 1
+            continue
+        end = -1
+        if text.startswith("$(", i) and not text.startswith("$((", i):
+            depth, j = 1, i + 2
+            while j < len(text) and depth:
+                depth += {"(": 1, ")": -1}.get(text[j], 0)
+                j += 1
+            end = j
+        elif ch == "`":
+            close = text.find("`", i + 1)
+            end = len(text) if close < 0 else close + 1
+        if end > 0:
+            spans.append(text[i:end])
+            out.append(_SUBST_MARK.format(len(spans) - 1))
+            i = end
+            continue
+        if ch == "'" and quote is None:
+            quote = "'"
+        elif ch == '"':
+            quote = None if quote == '"' else '"'
+        out.append(ch)
+        i += 1
+    return "".join(out), spans
+
+
+def _restore_substitutions(tok: str, spans: list[str]) -> str:
+    if "__psg_subst_" not in tok:
+        return tok
+    return re.sub(r"__psg_subst_(\d+)__", lambda m: spans[int(m.group(1))], tok)
+
+
 def _tokenize(command: str) -> list[str]:
     """Shell-ish tokens. A command shlex rejects (unbalanced quotes) is re-read leniently —
     the real shell would reject it too, so over-reading it costs nothing."""
     try:
-        lex = shlex.shlex(_newlines_to_separators(command), posix=True, punctuation_chars=True)
+        protected, spans = _protect_substitutions(command)
+        lex = shlex.shlex(_newlines_to_separators(protected), posix=True, punctuation_chars=True)
         lex.whitespace_split = True
         lex.commenters = ""  # comments were already dropped, word-start `#` only
         return [
-            piece.replace(_ESCAPED_SEMI, "\\;") for tok in lex for piece in _split_operators(tok)
+            _restore_substitutions(piece.replace(_ESCAPED_SEMI, "\\;"), spans)
+            for tok in lex
+            for piece in _split_operators(tok)
         ]
     except ValueError:
         spaced = re.sub(r"(&&|\|\||;|\||&)", r" \1 ", command.replace("\n", " ; "))
@@ -457,9 +531,9 @@ def _unwrap(argv: list[str], ctx: _Ctx) -> tuple[list[str], str, list[str], bool
     via_xargs = False
     argv = _strip_leading(argv)
     for _ in range(_MAX_WRAPPERS):
-        if not argv or _basename(argv[0]) not in _WRAPPERS:
+        if not argv or _cmd(argv[0]) not in _WRAPPERS:
             break
-        wrapper = _basename(argv[0])
+        wrapper = _cmd(argv[0])
         via_xargs = via_xargs or wrapper == "xargs"
         value_flags = _WRAPPER_VALUE_FLAGS.get(wrapper, frozenset())
         chdir_flags = _WRAPPER_CHDIR_FLAGS.get(wrapper, frozenset())
@@ -604,6 +678,12 @@ def _protected_hit(raw_target: str, ctx_cwd: str, local: dict[str, str], *, allo
     return None
 
 
+def _store_value(value: str) -> str:
+    """`$(bun pm cache)/links` → `<bun store>/links`; other substitutions are left in place."""
+    value = _STORE_SPAN_RE.sub(lambda m: bun_store_roots()[0] if (m.group("bun") or m.group("bun2")) else uv_cache_roots()[0], value)
+    return value
+
+
 def _store_substitution(text: str) -> str | None:
     """`$(bun pm cache)` / `$(uv cache dir)` inside ``text`` → that store's path."""
     m = _STORE_SUBST_RE.search(text)
@@ -665,7 +745,7 @@ def _check_remove(head: str, operands: list[str], rest: list[str], ctx: _Ctx, cw
 
 
 def _check_delete(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
-    head = _basename(argv[0])
+    head = _cmd(argv[0])
     rest = argv[1:]
     if head == "gio":
         if not rest or rest[0] not in {"trash", "remove"}:
@@ -749,19 +829,41 @@ def _find_deletes(rest: list[str]) -> bool:
     for i, tok in enumerate(rest):
         if tok == "-delete":
             return True
-        if tok in _FIND_EXEC_OPS and i + 1 < len(rest) and _basename(rest[i + 1]) in _DELETERS | _MOVERS:
+        if tok in _FIND_EXEC_OPS and i + 1 < len(rest) and _cmd(rest[i + 1]) in _DELETERS | _MOVERS:
             return True
     return False
 
 
-def _check_find(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
+def _find_exec_tails(rest: list[str]) -> list[list[str]]:
+    """The commands after each `-exec`/`-execdir`/`-ok`, up to their `;`/`+` terminator."""
+    tails: list[list[str]] = []
+    i = 0
+    while i < len(rest):
+        if rest[i] in _FIND_EXEC_OPS:
+            j = i + 1
+            while j < len(rest) and rest[j] not in {"\\;", ";", "+"}:
+                j += 1
+            tails.append(rest[i + 1 : j])
+            i = j
+        i += 1
+    return tails
+
+
+def _check_find(argv: list[str], ctx: _Ctx, cwd: str, depth: int = 0) -> str | None:
     rest = argv[1:]
+    paths = _find_paths(rest) or ["."]  # no start path: find walks `.`
+    # an -exec tail is a command of its own (`-exec rm -rf <store> {} +`, `-exec bash -c '…'`)
+    for tail in _find_exec_tails(rest):
+        if tail and depth < _MAX_DEPTH:
+            msg = inspect(" ".join(shlex.quote(t.replace("{}", paths[0])) for t in tail), cwd, depth + 1, ctx.vars)
+            if msg:
+                return msg
     if not _find_deletes(rest):
         return None
     # Any deleting walk rooted at, inside, or ABOVE a store can reach it: filters such as
     # `-type d`, `-name cache` or `-prune` still match store entries. Root the walk at the
     # directory you mean instead (`find ./build -name '*.o' -delete`).
-    for path in _find_paths(rest):
+    for path in paths:
         label = _protected_hit(path, cwd, ctx.vars, allow_ancestor=True)
         if label:
             return _STORE_MSG.format(what=f"`find {path} ... -delete/-exec rm` reaches {label}")
@@ -870,7 +972,7 @@ def _vm_package(ref: str) -> str | None:
 
 def _check_vm_runtime(argv: list[str]) -> str | None:
     """`colima start`, `limactl start`, `brew install colima`, `nix run nixpkgs#colima`, …"""
-    head = _basename(argv[0])
+    head = _cmd(argv[0])
     words = [t for t in argv[1:] if not t.startswith("-")]
     flags = [t for t in argv[1:] if t.startswith("-")]
     if head in _VM_START_VERBS:
@@ -943,7 +1045,7 @@ def _pm_install_target(tool: str, argv: list[str], cwd: str, local: dict[str, st
 
 
 def _check_pm(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
-    tool = _basename(argv[0])
+    tool = _cmd(argv[0])
     target = _pm_install_target(tool, argv, cwd, ctx.vars)
     if target is None:
         return None
@@ -977,7 +1079,7 @@ def _bind_positional(script: str, params: list[str]) -> str:
 
 def _shell_c_payload(argv: list[str]) -> str | None:
     """`bash -c '...' [$0 $1…]` / `sh -lc "..."` / `eval '...'` → the inner command string."""
-    head = _basename(argv[0])
+    head = _cmd(argv[0])
     if head == "eval":
         return " ".join(argv[1:]) or None
     if head not in _SHELLS:
@@ -1041,16 +1143,12 @@ def _record_assignments(seg: list[str], ctx: _Ctx) -> list[str]:
         m = _ASSIGNMENT.match(group[0])
         if not m:
             continue
-        text = " ".join(group)
-        value = m.group("value")
-        substitution = len(group) > 1 or "$(" in value or "`" in value
-        store = _store_substitution(text)
+        value = " ".join([m.group("value"), *group[1:]]).strip() if len(group) > 1 else m.group("value")
         if rest:
             continue  # inline env for the command in ``rest``
-        if store is not None:
-            ctx.vars[m.group("name")] = store
-        elif not substitution:
-            ctx.vars[m.group("name")] = _expand_vars(value, ctx.vars)
+        resolved = _store_value(value)
+        if "$(" not in resolved and "`" not in resolved:
+            ctx.vars[m.group("name")] = _expand_vars(resolved.strip("\"'"), ctx.vars)
     return rest
 
 
@@ -1059,8 +1157,10 @@ def _note_store_paths(argv: list[str], ctx: _Ctx, cwd: str) -> None:
     above a store lists store entries too, so there an ancestor counts."""
     if ctx.store_seen:
         return
-    allow_ancestor = _basename(argv[0]) == "find"
-    for tok in argv[1:]:
+    is_find = _cmd(argv[0]) == "find"
+    candidates = (_find_paths(argv[1:]) or ["."]) if is_find else argv[1:]
+    allow_ancestor = is_find
+    for tok in candidates:
         if tok.startswith("-"):
             continue
         label = _protected_hit(tok, cwd, ctx.vars, allow_ancestor=allow_ancestor)
@@ -1069,8 +1169,23 @@ def _note_store_paths(argv: list[str], ctx: _Ctx, cwd: str) -> None:
             return
 
 
-def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool) -> str | None:
-    head = _basename(argv[0])
+def _python_module_argv(argv: list[str]) -> list[str] | None:
+    """`python3 -m uv cache clean` → `uv cache clean` (the module runs as that CLI)."""
+    if not re.fullmatch(r"python[0-9.]*", _cmd(argv[0])):
+        return None
+    for i, tok in enumerate(argv[1:-1], start=1):
+        if tok == "-m":
+            return argv[i + 1 :]
+        if not tok.startswith("-"):
+            return None  # a script path: not a module run
+    return None
+
+
+def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool, depth: int = 0) -> str | None:
+    module_argv = _python_module_argv(argv)
+    if module_argv:
+        argv = module_argv
+    head = _cmd(argv[0])
     if via_xargs and ctx.store_seen and head in _DELETERS | _MOVERS:
         return _STORE_MSG.format(what=f"`… | xargs {head}` over paths in {ctx.store_seen}")
     if head in {"bun", "bunx"}:
@@ -1082,7 +1197,7 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool) -> str | 
     if head in _MOVERS:
         return _check_mv(argv, ctx, cwd)
     if head == "find":
-        return _check_find(argv, ctx, cwd)
+        return _check_find(argv, ctx, cwd, depth)
     if head == "ln":
         return _check_ln(argv, ctx, cwd)
     if head == "cp":
@@ -1117,7 +1232,7 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
                     return msg
         if not argv:
             continue
-        head = _basename(argv[0])
+        head = _cmd(argv[0])
         if head in {"cd", "pushd", "popd"}:
             ctx.chdir(head, argv[1:])
             continue
@@ -1130,7 +1245,7 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
                 if msg:
                     return msg
             continue
-        msg = _check_argv(argv, ctx, seg_cwd, via_xargs)
+        msg = _check_argv(argv, ctx, seg_cwd, via_xargs, _depth)
         if msg:
             return msg
         _note_store_paths(argv, ctx, seg_cwd)
@@ -1140,7 +1255,8 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
 # Cheap pre-filter: a command naming none of these cannot hit any rule.
 _HINT = re.compile(
     r"\b(?:bun|bunx|uv|rm|rmdir|unlink|trash|srm|shred|gio|mv|find|ln|cp|npm|pnpm|yarn"
-    r"|colima|limactl|brew|nix|nix-env|nix-shell)\b"
+    r"|colima|limactl|brew|nix|nix-env|nix-shell)\b",
+    re.IGNORECASE,
 )
 
 

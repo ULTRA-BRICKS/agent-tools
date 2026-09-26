@@ -434,6 +434,52 @@ def test_directory_stack_keeps_relative_paths_honest(home, tmp_path, monkeypatch
     _blocked("pushd /tmp && pushd ~/.bun/install && rm -rf cache", monkeypatch, tmp_path)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # wrappers with valued flags in front of a shell reading a here-doc
+        "sudo -u root bash <<'EOF'\nbun pm cache rm\nEOF",
+        "env -C ~/.bun/install bash <<'EOF'\nrm -rf cache\nEOF",
+        "timeout 5m bash <<'EOF'\nrm -rf ~/.bun/install/cache\nEOF",
+        "nice -n 5 sh <<EOF\nuv cache clean\nEOF",
+        # an unquoted substitution with a suffix is still one assignment word
+        'X=$(bun pm cache)/links; rm -rf "$X"',
+        "X=`bun pm cache`; rm -rf $X",
+        # find without a start path walks `.`
+        "cd ~/.bun/install/cache && find -delete",
+        "cd ~/.bun/install/cache && find -print0 | xargs -0 rm -f",
+        # -exec tails are commands too
+        "find . -name '*.tgz' -exec rm -rf ~/.bun/install/cache {} +",
+        "find /tmp -exec bash -c 'rm -rf ~/.bun/install/cache' \\;",
+        # the uv CLI through python -m
+        "python -m uv cache clean",
+        "python3 -I -m uv cache prune --all",
+    ],
+)
+def test_round_five_bypasses_block(command, home, tmp_path, monkeypatch):
+    _blocked(command, monkeypatch, tmp_path)
+
+
+@pytest.mark.skipif(sys.platform not in {"darwin", "win32"}, reason="case-insensitive command lookup only")
+@pytest.mark.parametrize("command", ["Bun pm cache rm", "UV cache clean", "RM -rf ~/.bun/install/cache", "COLIMA start"])
+def test_command_names_are_case_insensitive_where_lookup_is(command, home, tmp_path, monkeypatch):
+    _blocked(command, monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . -name '*.o' -exec test -f {} \\;",
+        "python -m pytest -q",
+        "python3 script.py uv cache clean",
+        "X=$(date +%s); echo $X",
+        "echo \"$(git rev-parse HEAD); done\"",
+    ],
+)
+def test_round_five_neighbours_allowed(command, home, tmp_path, monkeypatch):
+    _allowed(command, monkeypatch, tmp_path)
+
+
 def test_mv_into_the_store_is_not_a_removal(home, tmp_path, monkeypatch):
     _allowed("mv -t ~/.bun/install/cache /tmp/foo", monkeypatch, tmp_path)
     _blocked("mv -t /tmp ~/.bun/install/cache", monkeypatch, tmp_path)
