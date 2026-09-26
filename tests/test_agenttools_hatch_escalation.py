@@ -91,7 +91,7 @@ def test_env_unset_is_not_requested_and_does_not_contact_tg_ctl(tmp_path):
         {"command": "git reset --hard"},
         cwd=str(repo),
         env={},
-        tg_ctl_candidates=[tg_ctl],
+        tg_ctl_candidates=[],
     )
 
     assert result.requested is False
@@ -884,7 +884,7 @@ def test_inline_only_matches_the_hooks_own_var(tmp_path):
         cwd=str(repo),
         env={},
         command=command,
-        tg_ctl_candidates=[tg_ctl],
+        tg_ctl_candidates=[],
     )
 
     assert result.requested is False
@@ -908,7 +908,7 @@ def test_inline_assignment_after_executable_is_not_consumed(tmp_path):
         cwd=str(repo),
         env={},
         command=command,
-        tg_ctl_candidates=[tg_ctl],
+        tg_ctl_candidates=[],
     )
 
     assert result.requested is False
@@ -927,7 +927,7 @@ def test_no_command_and_empty_env_is_not_requested(tmp_path):
         cwd=str(repo),
         env={},
         command=None,
-        tg_ctl_candidates=[tg_ctl],
+        tg_ctl_candidates=[],
     )
 
     assert result.requested is False
@@ -948,7 +948,7 @@ def test_inline_malformed_quoting_is_not_requested(tmp_path):
         cwd=str(repo),
         env={},
         command=command,
-        tg_ctl_candidates=[tg_ctl],
+        tg_ctl_candidates=[],
     )
 
     assert result.requested is False
@@ -1078,7 +1078,7 @@ def test_inline_quoted_separator_is_not_a_false_positive(tmp_path):
         cwd=str(repo),
         env={},
         command=command,
-        tg_ctl_candidates=[tg_ctl],
+        tg_ctl_candidates=[],
     )
 
     assert result.requested is False
@@ -1657,3 +1657,168 @@ def test_internal_exception_is_still_logged_as_denied(tmp_path, monkeypatch):
     assert len(entries) == 1
     assert entries[0]["decision"] == "denied"
     assert "simulated internal failure" in entries[0]["detail"]
+
+
+# --- late-approval grant redemption (agent-tools#771 / tg-cli#398) ----------------------------
+
+def _grant_allow_body(argv_file: Path, payload_file: Path, grant_id: str) -> str:
+    reply = json.dumps(
+        {
+            "requestId": "original-hatch-request",
+            "approvalId": grant_id,
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "allow"},
+            },
+        }
+    )
+    return (
+        f'printf "%s\\n" "$@" > "{argv_file}"\n'
+        f'cat > "{payload_file}"\n'
+        f"printf '%s' '{reply}'\n"
+        "exit 0\n"
+    )
+
+
+def test_late_grant_fingerprint_ignores_inline_hatch_value():
+    hook_id = "require-ticket-before-commit"
+    env_var = hatch_env_var(hook_id)
+    grant_id = "hgr-85d3654be317"
+    first = (
+        'cd /tmp/mocker-src && '
+        f'{env_var}="Scratch clone approved for one local commit" '
+        'git commit -m "feat: docker api"'
+    )
+    retry = (
+        'cd /tmp/mocker-src && '
+        f'{env_var}="approved:{grant_id}" '
+        'git commit -m "feat: docker api"'
+    )
+
+    first_fp = agenttools_hatch_escalation._operation_fingerprint(
+        hook_id, {"hook": hook_id, "command": first}, env_var=env_var, command=first
+    )
+    retry_fp = agenttools_hatch_escalation._operation_fingerprint(
+        hook_id, {"hook": hook_id, "command": retry}, env_var=env_var, command=retry
+    )
+
+    assert first_fp == retry_fp
+
+
+def test_approved_grant_token_verifies_once_without_posting_new_ask(tmp_path):
+    hook_id = "require-ticket-before-commit"
+    env_var = hatch_env_var(hook_id)
+    grant_id = "hgr-85d3654be317"
+    argv_file = tmp_path / "argv.txt"
+    payload_file = tmp_path / "payload.json"
+    tg_ctl = _write_tg_ctl(
+        tmp_path / "trusted" / "tg-ctl",
+        _grant_allow_body(argv_file, payload_file, grant_id),
+    )
+    command = (
+        'cd /tmp/mocker-src && '
+        f'{env_var}="approved:{grant_id}" '
+        'git commit -m "feat: docker api"'
+    )
+
+    result = request_hatch_approval(
+        hook_id,
+        {"hook": hook_id, "command": command},
+        cwd="/Users/ultra/tmp",
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+    )
+
+    assert result.approved is True
+    assert result.should_stop is True
+    argv = argv_file.read_text().splitlines()
+    assert argv == ["ask", "--verify-grant", grant_id, "--hook", hook_id]
+    payload = json.loads(payload_file.read_text())
+    assert payload["operation"]["fingerprint"]
+    assert payload["operation"]["cwd"] == "/Users/ultra/tmp"
+
+
+def test_malformed_approved_grant_token_never_posts_new_ask(tmp_path):
+    hook_id = "require-ticket-before-commit"
+    env_var = hatch_env_var(hook_id)
+    marker = tmp_path / "called"
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _allow_body(marker))
+
+    result = request_hatch_approval(
+        hook_id,
+        {"hook": hook_id, "command": "git commit -m x"},
+        cwd=str(tmp_path),
+        env={env_var: "approved:not-a-real-grant"},
+        command="git commit -m x",
+        tg_ctl_candidates=[tg_ctl],
+    )
+
+    assert result.approved is False
+    assert result.should_stop is True
+    assert "malformed" in result.reason
+    assert not marker.exists()
+
+
+def test_plain_retry_consumes_matching_grant_via_pull(tmp_path):
+    hook_id = "require-ticket-before-commit"
+    grant_id = "hgr-0123456789ab"
+    argv_file = tmp_path / "argv.txt"
+    payload_file = tmp_path / "payload.json"
+    tg_ctl = _write_tg_ctl(
+        tmp_path / "trusted" / "tg-ctl",
+        _grant_allow_body(argv_file, payload_file, grant_id),
+    )
+    command = 'git commit -m "feat: docker api"'
+
+    result = request_hatch_approval(
+        hook_id,
+        {"hook": hook_id, "command": command},
+        cwd=str(tmp_path),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+    )
+
+    assert result.approved is True
+    assert result.should_stop is True
+    argv = argv_file.read_text().splitlines()
+    assert argv == ["ask", "--verify-grant", "--pull", "--hook", hook_id]
+
+
+def test_pull_deny_falls_back_to_original_block_without_new_ask(tmp_path):
+    hook_id = "require-ticket-before-commit"
+    argv_file = tmp_path / "argv.txt"
+    payload_file = tmp_path / "payload.json"
+    deny = json.dumps(
+        {
+            "requestId": "retry",
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "deny", "message": "no outstanding grant"},
+            },
+        }
+    )
+    body = (
+        f'printf "%s\\n" "$@" > "{argv_file}"\n'
+        f'cat > "{payload_file}"\n'
+        f"printf '%s' '{deny}'\n"
+        "exit 0\n"
+    )
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", body)
+
+    result = request_hatch_approval(
+        hook_id,
+        {"hook": hook_id, "command": "git commit -m x"},
+        cwd=str(tmp_path),
+        env={},
+        command="git commit -m x",
+        tg_ctl_candidates=[tg_ctl],
+    )
+
+    assert result.requested is False
+    assert result.approved is False
+    assert result.should_stop is False
+    assert argv_file.read_text().splitlines() == [
+        "ask", "--verify-grant", "--pull", "--hook", hook_id
+    ]
