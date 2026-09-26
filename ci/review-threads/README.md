@@ -66,9 +66,10 @@ the script uses the **Forgejo REST API v1** instead of `gh` + GraphQL (neither e
 It needs only `bash` and stdlib `python3`; the API base is `$GITHUB_API_URL` (else
 `$GITHUB_SERVER_URL/api/v1`) and the token is the job token the workflow already passes as
 `GH_TOKEN`. The resolution rule is the one [`../ship/`](../ship/)'s Forgejo provider uses:
-every review's comments are read; a conversation is keyed by review id + `original_commit_id`
-+ path + line (`position` / `original_position`); a line-less comment is its own
-conversation; and a conversation is resolved only when its **first** comment has `resolver`.
+every review's comments are read; a conversation is what Forgejo's UI shows as one — every
+comment on the same path + line (`position` / `original_position`), across reviews and
+commits; a line-less comment is its own conversation; and a conversation is resolved only
+when its **first** comment has `resolver` ("Resolve conversation" marks only that one).
 Forgejo has no *outdated* flag, so `IGNORE_OUTDATED=1` is ignored there (every unresolved
 conversation counts). `REVIEW_THREADS_PROVIDER=github|forgejo|auto` overrides the choice —
 set `github` on GitHub Enterprise Server, whose server URL is not github.com.

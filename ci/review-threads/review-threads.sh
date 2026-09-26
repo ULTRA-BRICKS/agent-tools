@@ -14,9 +14,10 @@
 #            API base = $GITHUB_API_URL (else $GITHUB_SERVER_URL/api/v1); token = $GH_TOKEN
 #            (else $GITHUB_TOKEN) — the job token the workflow passes. Same conversation rule
 #            as ci/ship's Forgejo provider: every review's comments are read; a conversation is
-#            keyed by review id + original_commit_id + path + line (position/original_position);
-#            a line-less comment is its own conversation; it is resolved only when its FIRST
-#            comment has `resolver` (Forgejo resolves through the first comment).
+#            what Forgejo's UI shows as one: every comment on the same path + line
+#            (position/original_position), across reviews and commits; a line-less comment is
+#            its own conversation; it is resolved only when its FIRST comment has `resolver`
+#            ("Resolve conversation" marks the first comment only).
 #
 # Reads the PR number from $1 or $PR_NUMBER.
 #
@@ -132,8 +133,9 @@ def key(c):
     line = (c.get("position") or 0, c.get("original_position") or 0)
     if line == (0, 0):
         return ("single", c.get("id"))
-    return (c.get("pull_request_review_id"), c.get("original_commit_id") or c.get("commit_id") or "",
-            c.get("path") or "", line)
+    # Forgejo's own grouping: every comment on this path + signed line, whatever review or
+    # commit it came with, is ONE conversation, resolved through its first comment.
+    return (c.get("path") or "", line)
 
 
 conversations = {}

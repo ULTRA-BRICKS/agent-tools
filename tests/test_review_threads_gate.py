@@ -375,7 +375,7 @@ def test_script_jq_ignore_outdated_skips_outdated(tmp_path: Path):
 # ---------------------------------------------------------------------------
 # Forgejo provider: on a Forgejo/Gitea Actions runner there is no gh and no GraphQL, so the
 # script reads the Forgejo REST API with stdlib python3 and applies the SAME conversation rule
-# as ci/ship's Forgejo provider (keyed by review id + original_commit_id + path + line; a
+# as ci/ship's Forgejo provider (keyed by path + line across reviews and commits, as Forgejo's UI; a
 # conversation is resolved only when its FIRST comment has `resolver`). Driven against a local
 # fake API so the real script control flow and HTTP paths run.
 # ---------------------------------------------------------------------------
@@ -504,11 +504,21 @@ def test_forgejo_conversation_is_resolved_through_its_first_comment(tmp_path: Pa
 
 
 @needs_python3
-def test_forgejo_older_resolved_conversation_never_hides_a_newer_one(tmp_path: Path, forgejo):
-    """Same path + line, different review/commit = a different conversation."""
+def test_forgejo_groups_a_conversation_by_path_and_line_like_its_ui(tmp_path: Path, forgejo):
+    """Forgejo shows every comment on a path + line as ONE conversation, whatever review or
+    commit it came with, and "Resolve conversation" marks only its first comment. A reply posted
+    inside a new review, or a later comment on the same line, joins that conversation — keying
+    by review/commit left such groups unresolvable forever (two reviews on one line: rig-cli#482)."""
     srv = forgejo([
         {"id": 1, "comments": [_c(10, commit="old", resolved=True)]},
-        {"id": 2, "comments": [_c(20, commit="new")]},
+        {"id": 2, "comments": [_c(20, commit="new")]},  # a reply in another review, after a push
+    ])
+    res = _run_gate(tmp_path / "bin", "7", env_extra=_forgejo_env(srv))
+    assert res.returncode == 0, res.stdout + res.stderr
+
+    srv = forgejo([
+        {"id": 1, "comments": [_c(10)]},
+        {"id": 2, "comments": [_c(20)]},  # the rig-cli#482 shape: one line, two reviews
     ])
     res = _run_gate(tmp_path / "bin", "7", env_extra=_forgejo_env(srv))
     assert res.returncode == 1, res.stdout + res.stderr
