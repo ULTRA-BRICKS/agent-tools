@@ -157,13 +157,16 @@ print(unresolved)
 PY
 }
 
+# A non-empty run of digits (POSIX; `[[ =~ ]]` is bash-only).
+is_uint() { case "$1" in ""|*[!0-9]*) return 1 ;; esac; return 0; }
+
 case "$PROVIDER" in
   forgejo)
     if [ "$IGNORE_OUTDATED" = "1" ]; then
       echo "note: IGNORE_OUTDATED=1 has no Forgejo equivalent (the API has no outdated flag) — counting every unresolved conversation." >&2
     fi
     # Fail-CLOSED on an API error: a silent 0 would let an unresolved PR merge.
-    if UNRESOLVED=$(forgejo_unresolved) && case "$UNRESOLVED" in ""|*[!0-9]*) false ;; esac; then
+    if UNRESOLVED=$(forgejo_unresolved) && is_uint "$UNRESOLVED"; then
       :
     else
       echo "::error::could not query review conversations for PR #$PR (Forgejo API failed) — failing closed." >&2
