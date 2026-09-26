@@ -26,6 +26,7 @@ Run from the repo root::
 
 from __future__ import annotations
 
+import html
 import importlib.util
 import io
 import json
@@ -1031,7 +1032,7 @@ def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert not injected.exists()
-    assert justification in json.loads(question.read_text())["question"]
+    assert justification in html.unescape(json.loads(question.read_text())["question"])  # Telegram HTML
 
 
 def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
@@ -1058,7 +1059,7 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
     assert asked.exists()
     assert not injected.exists()
-    assert justification in json.loads(question.read_text())["question"]
+    assert justification in html.unescape(json.loads(question.read_text())["question"])  # Telegram HTML
 
 
 def test_hatch_justification_exit1_blocks_citing_denied(tmp_path, monkeypatch):
