@@ -35,6 +35,14 @@ worktree command itself (you can't bootstrap with the thing you're fixing). If t
 command exists but errors at create time, fix it (or report the blocker) rather than
 silently falling back to a raw, under-provisioned worktree.
 
+**JS dependencies in a new worktree:** install them *in* the worktree with the repo's own
+package manager — for a bun repo (`bun.lock`), `bun install --frozen-lockfile`, which links into
+the shared global store in seconds unless the repo's own `bunfig.toml` asks for a local layout.
+Never symlink `node_modules` to another checkout (`bun install` writes through the link and
+corrupts it), never `npm install`/`npm ci` in a bun repo (a full real copy), and never clear a
+package-manager cache or store to make room — reclaim disk by removing stale worktrees.
+`package-store-guard` blocks all three.
+
 ## Why
 
 The failure is silent and delayed: `git worktree add` succeeds, the code looks fine,
