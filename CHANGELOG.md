@@ -30,6 +30,10 @@
 
 ### Fixed
 
+- `git-hooks/global-dispatcher/install-local-hooks.sh`: the dedup scanner strips `VAR=value`
+  prefixes with one portable substitution instead of a GNU-only `sed ':a; …; ta'` loop. BSD sed
+  (macOS) warned "unused label" and stripped nothing, so an env-prefixed local scan such as
+  `GITLEAKS_CONFIG=x gitleaks git --staged` read as "no local secret scan" (agent-tools#810).
 - `omp-hook-bridge`: round-3 hardening of the `eval` tool's write-call secret-scan heuristic
   (agent-tools#614). Four further security-review findings closed:
   - A JS `\u{HEX}` Unicode code-point escape that widens to a literal backslash (e.g. `\u{5c}`)
