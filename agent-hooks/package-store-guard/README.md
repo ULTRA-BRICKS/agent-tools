@@ -3,8 +3,8 @@
 **Point:** `pre-bash` · **Fail policy:** `closed` · **Priority:** 20
 
 A `pre-bash` agent-hook that keeps the machine's shared package stores, and the installs that
-link into them, intact — and keeps banned, disk-filling container VM runtimes (colima & co.) off
-the machine.
+link into them, intact — keeps banned, disk-filling container VM runtimes (colima & co.) off
+the machine, and stops hook managers from overwriting rig's global git hooks.
 
 ## Why
 
@@ -33,6 +33,7 @@ from `~/.cache/uv`. Four agent habits kept undoing that:
 | `node_modules` symlink | `ln -s <main>/node_modules node_modules`, `ln -sfn …`, `ln -s <main>/node_modules .`, `ln -s <main>/node_modules <existing-dir>`, `ln -s <main>/node_modules` | `bun install --frozen-lockfile` in the worktree |
 | foreign PM in a bun project | npm `install`/`i`/`ci`/`add`/`update`/`uninstall`/`rm`/`prune`/`dedupe`, pnpm `install`/`add`/`update`/`remove`/`prune`, bare `yarn`/`yarn install`/`add`/`remove`, where the **nearest** lockfile (cwd, `cd`, `--prefix`, `--dir`, `--cwd`, `pnpm -C`, walking up) is `bun.lock`/`bun.lockb` | `bun install --frozen-lockfile`, `bun add <pkg>`, `bun remove <pkg>` |
 | banned container VM runtime | `colima start`/`restart`/`install`, `limactl start`/`create`, `brew install`/`reinstall`/`upgrade` of `colima`/`lima`/`podman`/`podman-desktop`/`orbstack`/`docker-desktop` (and `--cask docker`), `nix run`/`shell`/`profile install nixpkgs#colima` (conloca's `act-sim.sh` suggests it), `nix-env -iA nixpkgs.colima`, `nix-shell -p colima`, and launching the app (`open -a Docker`, `open -a OrbStack`) | docker compose through Apple `container` / `mocker`; the sme-archiving-gc tests through the native fake-gcs-server backend |
+| hook manager into a global hooksPath | `lefthook install`/`add`, `husky`/`husky install`/`init`, `simple-git-hooks` (also via `npx`/`bunx`/`pnpm exec`) when `core.hooksPath` resolves OUTSIDE the repo — rig's global dispatcher dir, where the shim replaces the pre-commit composer (secret scan + review gate) for every repo | install into the repo's own `.git/hooks`, which the global composer runs first: `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$(git rev-parse --absolute-git-dir)/hooks" lefthook install`; `rig status` flags a replaced composer, `rig apply` restores it |
 
 Colima and similar VMs are banned on this machine: their disk images kept filling the Mac's disk,
 and agents kept reinstalling them. `colima status`/`stop`/`delete`, `limactl list`/`stop`, and
@@ -50,7 +51,9 @@ and `${NAME:-default}`, every `$( … )`/backtick body wherever it appears (`ech
 wrappers (`sudo [-D dir]`, `env [-C dir] [-S '…'] [-a name]`, `exec -a name`, `timeout`, `nohup`, `xargs`, `busybox`, `xcrun`),
 `bash -c`/`sh -lc`/`fish -c`/`eval` payloads with their `$1`/`$@` operands bound,
 `ssh host '<cmd>'` remote commands, here-docs and here-strings fed to a shell (`bash <<EOF`,
-`cat <<EOF | sh`, `ssh host <<EOF`, `bash <<< '…'`), `python -m uv`, redirections, `cp -s` (a symlink by another name), and renaming or copying a
+`cat <<EOF | sh`, `ssh host <<EOF`, `bash <<< '…'`), `python -m uv`, package runners (`npx`,
+`bunx`, `corepack`, `npm exec`, `pnpm dlx`: `npx npm install` is `npm install`), brace expansion
+(`rm -rf ~/.bun/install/{cache,links}`), `mkdir` earlier in the same command, redirections, `cp -s` (a symlink by another name), and renaming or copying a
 symlink onto `node_modules` (`ln -s … .nm && mv .nm node_modules`, `cp -P .nm node_modules`).
 Other here-doc bodies, quoted multi-line arguments and comments are data and are skipped.
 `node_modules` and store paths compare case-insensitively on macOS/Windows. A command shlex
@@ -62,8 +65,9 @@ A deleting `find` (`-delete`, `-exec rm …`) is blocked when its walk starts at
 store — filters such as `-type d`, `-name cache` or `-prune` still match store entries. Start the
 walk at the directory you mean (`find ./build -name '*.o' -delete`).
 
-Known gaps (best effort, not a sandbox): the RESULT of a substitution used as an argument
-(`rm -rf $(cat list)`), deletes from other languages (`python -c 'shutil.rmtree(…)'`), a
+Known gaps (best effort, not a sandbox): the RESULT of a substitution used as an argument or as the
+command word (`rm -rf $(cat list)`, `$(echo rm) -rf …`), a package's own install script running a
+hook manager (a `postinstall: lefthook install` — fix the package), deletes from other languages (`python -c 'shutil.rmtree(…)'`), a
 variable set in an earlier, separate tool call, and a deliberately obfuscated command.
 
 ## Fail policy

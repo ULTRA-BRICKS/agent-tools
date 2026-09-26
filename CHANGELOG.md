@@ -12,8 +12,11 @@
   `rig worktree gc`). It also blocks installing or starting the banned container VM runtimes
   (`colima start`, `limactl start`, `brew install colima|lima|podman|orbstack|docker-desktop`,
   `nix run nixpkgs#colima`), pointing to Apple `container` / `mocker` and the native
-  fake-gcs-server backend. Its `blurb.md` adds the SessionStart rules that disk cleanup never
-  wipes package-manager caches or stores and that colima-style VMs stay off the machine.
+  fake-gcs-server backend, and `lefthook install`/`husky`/`simple-git-hooks` while
+  `core.hooksPath` points outside the repo (a postinstall `lefthook install` replaced the global
+  pre-commit composer on 2026-09-26). Its `blurb.md` adds the SessionStart rules that disk
+  cleanup never wipes package-manager caches or stores, that hook managers stay repo-local, and
+  that colima-style VMs stay off the machine.
 
 - `ci/ship`: Forgejo provider (UB-25). `gh ship` now ships a PR from a checkout whose `origin` is
   a Forgejo host instead of silently reading the wrong remote. A gh-shaped adapter

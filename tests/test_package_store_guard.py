@@ -529,6 +529,79 @@ def test_round_six_neighbours_allowed(command, home, tmp_path, monkeypatch):
     _allowed(command, monkeypatch, tmp_path)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cp -s /main/node_modules .nm && mv .nm node_modules",
+        "mkdir sub && ln -s /main/node_modules sub",
+        "rm -rf ~/.{bun/install/cache,cache/uv}",
+        "rm -rf ~/.bun/install/{cache,links}",
+        "find ~/.bun/install/{cache,tmp} -delete",
+        # oh-my-pi's .omp/commands/review-prs.md form
+        'MAIN="$(git rev-parse --show-toplevel)"\nWT="$(pwd)"\nln -snf "$MAIN/target"        "$WT/target"\nln -snf "$MAIN/node_modules"  "$WT/node_modules"',
+    ],
+)
+def test_round_seven_bypasses_block(command, home, tmp_path, monkeypatch):
+    _blocked(command, monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["npx npm install", "corepack npm ci", "npm exec -- npm install", "pnpm dlx npm install", "npx -y npm@10 ci"],
+)
+def test_package_runners_launching_npm_block_in_bun_repo(command, bun_repo, home, monkeypatch):
+    _blocked(command, monkeypatch, bun_repo)
+
+
+@pytest.mark.parametrize("command", ["npx tsc --noEmit", "bunx --bun vite", "corepack enable", "rm -rf ~/{a,b}/tmp"])
+def test_package_runner_neighbours_allowed(command, bun_repo, home, monkeypatch):
+    _allowed(command, monkeypatch, bun_repo)
+
+
+def test_expand_braces():
+    assert psg.expand_braces("a{b,c}d") == ["abd", "acd"]
+    assert psg.expand_braces("x{1,{2,3}}") == ["x1", "x2", "x3"]
+    assert psg.expand_braces("{nocomma}") == ["{nocomma}"]
+
+
+def _repo_with_hooks_path(tmp_path: Path, hooks_path: str | None) -> Path:
+    repo = tmp_path / "hookrepo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    if hooks_path is not None:
+        subprocess.run(["git", "config", "core.hooksPath", hooks_path], cwd=repo, check=True)
+    return repo
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["lefthook install", "npx lefthook install", "bunx lefthook add pre-commit", "husky", "npx husky install", "husky init", "npx simple-git-hooks"],
+)
+def test_hook_managers_blocked_with_a_global_hooks_path(command, home, tmp_path, monkeypatch):
+    global_hooks = tmp_path / "global-git-hooks"
+    global_hooks.mkdir()
+    repo = _repo_with_hooks_path(tmp_path, str(global_hooks))
+    msg = _blocked(command, monkeypatch, repo)
+    assert "core.hooksPath" in msg and "GIT_CONFIG_KEY_0=core.hooksPath" in msg
+
+
+def test_hook_managers_allowed_with_a_repo_local_hooks_path(home, tmp_path, monkeypatch):
+    _allowed("lefthook install", monkeypatch, _repo_with_hooks_path(tmp_path, None))
+    other = tmp_path / "other"
+    other.mkdir()
+    repo = _repo_with_hooks_path(other, ".husky/_")
+    _allowed("npx husky install", monkeypatch, repo)
+    outside = tmp_path / "third"
+    outside.mkdir()
+    repo = _repo_with_hooks_path(outside, str(tmp_path / "global-git-hooks"))
+    _allowed(
+        'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$(git rev-parse --absolute-git-dir)/hooks" lefthook install',
+        monkeypatch,
+        repo,
+    )
+    _allowed("lefthook run pre-commit", monkeypatch, repo)
+
+
 def test_mv_into_the_store_is_not_a_removal(home, tmp_path, monkeypatch):
     _allowed("mv -t ~/.bun/install/cache /tmp/foo", monkeypatch, tmp_path)
     _blocked("mv -t /tmp ~/.bun/install/cache", monkeypatch, tmp_path)

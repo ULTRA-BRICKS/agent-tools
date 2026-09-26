@@ -53,6 +53,7 @@ import os
 import re
 import secrets
 import shlex
+import subprocess
 import sys
 
 BLOCK_EXIT_CODE = 10
@@ -142,6 +143,7 @@ _UV_VALUE_FLAGS = frozenset({
 _UV_PRUNE_WIPE_FLAGS = frozenset({"--all", "--ci"})
 _DELETERS = frozenset({"rm", "rmdir", "unlink", "trash", "srm", "shred", "gio"})
 _MOVERS = frozenset({"mv"})
+_REMOVERS = _DELETERS | _MOVERS
 _FIND_EXEC_OPS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 _FIND_VALUELESS_OPTS = frozenset({"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"})
 _FIND_EXPR_START = frozenset({"(", "!", ")", "\\(", "\\!"})
@@ -168,8 +170,16 @@ _VM_SUBCOMMANDS = {
         "unprotect", "start-at-login", "help", "completion", "tunnel",
     }),
 }
+assert _VM_SUBCOMMANDS.keys() == _VM_START_VERBS.keys(), "every VM runtime needs its subcommand list"
 _VM_APPS = frozenset({"docker", "docker desktop", "orbstack", "podman desktop", "colima"})
 _BREW_INSTALL_VERBS = frozenset({"install", "reinstall", "upgrade"})
+# hook managers → the verbs that (re)write hook shims into core.hooksPath ("" = bare command)
+_HOOK_MANAGER_INSTALLS = {
+    "lefthook": frozenset({"install", "add"}),
+    "husky": frozenset({"", "install", "init"}),
+    "simple-git-hooks": frozenset({""}),
+}
+_GIT_TIMEOUT_S = 3
 _NIX_RUNNERS = frozenset({"run", "shell", "develop", "build"})
 
 _STORE_MSG = (
@@ -195,6 +205,16 @@ _VM_MSG = (
     "For docker compose use Apple `container` / `mocker`; for the sme-archiving-gc tests use the "
     "native fake-gcs-server backend. Do not install or start another VM runtime (colima, lima, "
     "podman, OrbStack, Docker Desktop) — ask the human if nothing else works."
+)
+_HOOK_MANAGER_MSG = (
+    "[package-store-guard] BLOCKED: `{tool}` would write its hook shims into core.hooksPath = {path}, "
+    "which is OUTSIDE this repo — rig's global hooks dir — and replace the global pre-commit "
+    "composer (secret scan + review gate) for EVERY repo (a postinstall `lefthook install` did "
+    "exactly that on 2026-09-26). The global composer already runs this repo's own "
+    ".git/hooks/<hook> first, so install the manager THERE: "
+    "`GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath "
+    "GIT_CONFIG_VALUE_0=\"$(git rev-parse --absolute-git-dir)/hooks\" {tool}`. If the global "
+    "pre-commit is already a shim, `rig status` flags it and `rig apply` restores it."
 )
 _NPM_MSG = (
     "[package-store-guard] BLOCKED: `{tool}` in a bun project ({lockdir} has {lockfile}). "
@@ -534,6 +554,12 @@ class _Ctx:
         self.vars: dict[str, str] = dict(variables or {})
         self.store_seen: str | None = None  # label of a store path an earlier piped segment named
         self.links_made: set[str] = set()
+        self.dirs_made: set[str] = set()  # `mkdir` earlier in the same command
+        self.inline_env: dict[str, str] = {}  # `NAME=value cmd …` of the command being checked
+
+    def is_dir(self, path: str) -> bool:
+        """A directory on disk, or one an earlier `mkdir` in this command creates."""
+        return os.path.isdir(path) or path in self.dirs_made
 
     def chdir(self, head: str, args: list[str]) -> None:
         """Track `cd X`, `cd`, `cd -`, `pushd X`, `popd` so relative paths resolve correctly."""
@@ -697,11 +723,40 @@ def _target_hits_root(target: list[str], root: list[str], *, allow_ancestor: boo
     return allow_ancestor  # an ancestor of the root: deleting it deletes the root
 
 
+def expand_braces(word: str, limit: int = 64) -> list[str]:
+    """Bash brace expansion of a word (`a{b,c}d` → `abd`, `acd`; nested; `{x}` without a comma is
+    literal), capped at ``limit`` results."""
+    depth = 0
+    start = -1
+    commas: list[int] = []
+    for i, ch in enumerate(word):
+        if ch == "{":
+            if depth == 0:
+                start, commas = i, []
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and commas:
+                pre, post = word[:start], word[i + 1 :]
+                cuts = [start, *commas, i]
+                out: list[str] = []
+                for a, b in zip(cuts, cuts[1:]):
+                    for mid in expand_braces(word[a + 1 : b], limit):
+                        out.extend(expand_braces(pre + mid + post, limit))
+                        if len(out) >= limit:
+                            return out[:limit]
+                return out
+        elif ch == "," and depth == 1:
+            commas.append(i)
+    return [word]
+
+
 def _protected_hit(raw_target: str, ctx_cwd: str, local: dict[str, str], *, allow_ancestor: bool = True) -> str | None:
-    target = _components(_expand(_store_value(raw_target), ctx_cwd, local))
-    for label, root in _protected_roots():
-        if _target_hits_root(target, root, allow_ancestor=allow_ancestor):
-            return label
+    for word in expand_braces(_store_value(raw_target)):
+        target = _components(_expand(word, ctx_cwd, local))
+        for label, root in _protected_roots():
+            if _target_hits_root(target, root, allow_ancestor=allow_ancestor):
+                return label
     return None
 
 
@@ -739,7 +794,7 @@ def _check_bun(argv: list[str]) -> str | None:
     words = [t for t in argv[1:] if not t.startswith("-")]
     for i in range(len(words) - 2):  # a valued flag (`--cwd /x`) may sit in front
         if words[i] == "pm" and words[i + 1] == "cache" and words[i + 2] in _BUN_CACHE_VERBS:
-            return _STORE_MSG.format(what="`bun pm cache " + words[i + 2] + "`")
+            return _STORE_MSG.format(what=f"`bun pm cache {words[i + 2]}`")
     return None
 
 
@@ -813,7 +868,7 @@ def _renamed_to_node_modules(sources: list[str], dest: str | None, into_dir: boo
     if dest is None:
         return False
     dest_abs = _expand(dest, cwd, ctx.vars)
-    into_dir = into_dir or os.path.isdir(dest_abs)
+    into_dir = into_dir or ctx.is_dir(dest_abs)
     for src in sources:
         src_abs = _expand(src, cwd, ctx.vars)
         if not (os.path.islink(src_abs) or src_abs in ctx.links_made):
@@ -857,7 +912,7 @@ def _find_deletes(rest: list[str]) -> bool:
     for i, tok in enumerate(rest):
         if tok == "-delete":
             return True
-        if tok in _FIND_EXEC_OPS and i + 1 < len(rest) and _cmd(rest[i + 1]) in _DELETERS | _MOVERS:
+        if tok in _FIND_EXEC_OPS and i + 1 < len(rest) and _cmd(rest[i + 1]) in _REMOVERS:
             return True
     return False
 
@@ -898,7 +953,8 @@ def _check_find(argv: list[str], ctx: _Ctx, cwd: str, depth: int = 0) -> str | N
     return None
 
 
-def _ln_link_names(argv: list[str], cwd: str, local: dict[str, str] | None = None) -> list[str] | None:
+def _ln_link_names(argv: list[str], cwd: str, local: dict[str, str] | None = None,
+                   dirs_made: frozenset[str] | set[str] = frozenset()) -> list[str] | None:
     """Link paths an `ln -s` would create; None if this `ln` does not make a symlink."""
     symbolic = False
     no_target_dir = False
@@ -953,7 +1009,7 @@ def _ln_link_names(argv: list[str], cwd: str, local: dict[str, str] | None = Non
     # `ln -s SRC DEST` makes DEST, or DEST/basename(SRC) when DEST is an existing directory
     # (-n/-h: a symlink to a directory counts as a plain file).
     dest_abs = _expand(dest, cwd, local)
-    if os.path.isdir(dest_abs) and not (no_deref and os.path.islink(dest_abs)):
+    if (os.path.isdir(dest_abs) or dest_abs in dirs_made) and not (no_deref and os.path.islink(dest_abs)):
         return into_dir
     return [dest]
 
@@ -964,7 +1020,7 @@ def _is_node_modules(name: str) -> bool:
 
 
 def _check_ln(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
-    names = [_expand_vars(n, ctx.vars) for n in _ln_link_names(argv, cwd, ctx.vars) or []]
+    names = [_expand_vars(n, ctx.vars) for n in _ln_link_names(argv, cwd, ctx.vars, ctx.dirs_made) or []]
     if any(_is_node_modules(name) for name in names):
         return _SYMLINK_MSG
     ctx.links_made.update(_expand(n, cwd, ctx.vars) for n in names)
@@ -982,9 +1038,13 @@ def _check_cp(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     symbolic = any(f == "--symbolic-link" or (not f.startswith("--") and "s" in f[1:]) for f in flags)
     if symbolic:
         dest_abs = _expand(dest, cwd, ctx.vars)
-        into_dir = into_dir or os.path.isdir(dest_abs)
+        into_dir = into_dir or ctx.is_dir(dest_abs)
         names = [os.path.join(dest, _basename(src.rstrip("/"))) for src in sources] if into_dir else [dest]
-        return _SYMLINK_MSG if any(_is_node_modules(_expand_vars(n, ctx.vars)) for n in names) else None
+        names = [_expand_vars(n, ctx.vars) for n in names]
+        if any(_is_node_modules(n) for n in names):
+            return _SYMLINK_MSG
+        ctx.links_made.update(_expand(n, cwd, ctx.vars) for n in names)  # like `ln -s`
+        return None
     if _renamed_to_node_modules(sources, dest, into_dir, ctx, cwd):
         return _SYMLINK_MSG
     return None
@@ -1029,6 +1089,46 @@ def _check_vm_runtime(argv: list[str]) -> str | None:
             if _vm_package(ref):
                 return _VM_MSG.format(what=f"`{head} … {ref}`")
     return None
+
+
+def _git(cwd: str, *args: str) -> str | None:
+    """A read-only git query in ``cwd`` (stdout, stripped), or None when it fails."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", cwd, *args], capture_output=True, text=True, timeout=_GIT_TIMEOUT_S
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def _check_hook_manager(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
+    """`lefthook install`, `husky`/`husky install`, `simple-git-hooks` write their shims into
+    whatever core.hooksPath resolves to. When that is a path OUTSIDE the repo (rig's global
+    dispatcher dir), they overwrite the global composer for every repo (2026-09-26: a postinstall
+    `lefthook install` replaced ~/.config/git/hooks/pre-commit — secret scan and review gate)."""
+    head = _cmd(argv[0])
+    words = [t for t in argv[1:] if not t.startswith("-")]
+    verb = words[0] if words else ""
+    if verb not in _HOOK_MANAGER_INSTALLS[head]:
+        return None
+    if any(k.startswith("GIT_CONFIG_KEY_") and v.lower() == "core.hookspath" for k, v in ctx.inline_env.items()):
+        return None  # an explicit per-command hooksPath (the documented way to target .git/hooks)
+    hooks_path = _git(cwd, "config", "--get", "core.hooksPath")
+    if not hooks_path:
+        return None  # the default: the repo's own .git/hooks
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    if top is None:
+        return None
+    resolved = _expand(hooks_path, top)
+    inside = [top, _git(cwd, "rev-parse", "--absolute-git-dir") or top]
+    common = _git(cwd, "rev-parse", "--git-common-dir")
+    if common:
+        inside.append(_expand(common, top))
+    if any(_components(resolved)[: len(_components(d))] == _components(d) for d in inside):
+        return None  # a repo-local hooks dir (`.husky/_`, `.git/hooks`)
+    shown = f"{head} {verb}".strip()
+    return _HOOK_MANAGER_MSG.format(tool=shown, path=resolved)
 
 
 def _nearest_lockfile(start: str) -> tuple[str, str] | None:
@@ -1215,12 +1315,42 @@ def _python_module_argv(argv: list[str]) -> list[str] | None:
     return None
 
 
+def _launched_argv(argv: list[str]) -> list[str] | None:
+    """The command a package runner launches: `npx X …`, `bunx X …`, `corepack X …`,
+    `npm exec [--] X …`, `pnpm dlx|exec X …`, `yarn dlx|exec X …` → `X …`."""
+    head = _cmd(argv[0])
+    rest = argv[1:]
+    if head in {"npm", "pnpm", "yarn"}:
+        words = [t for t in rest if not t.startswith("-")]
+        if not words or words[0] not in {"exec", "x", "dlx"}:
+            return None
+        rest = rest[rest.index(words[0]) + 1 :]
+    elif head not in {"npx", "bunx", "corepack", "pnpx"}:
+        return None
+    i = 0
+    while i < len(rest) and rest[i].startswith("-"):
+        i += 2 if rest[i] in {"-p", "--package", "-c", "--call"} else 1
+    launched = rest[i:]
+    if not launched:
+        return None
+    spec = launched[0]
+    at = spec.rfind("@")
+    if at > 0:  # `npm@10`, `@scope/pkg@1.2` → the package's own command name
+        spec = spec[:at]
+    return [spec, *launched[1:]]
+
+
 def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool, depth: int = 0) -> str | None:
     module_argv = _python_module_argv(argv)
     if module_argv:
         argv = module_argv
+    for _ in range(_MAX_WRAPPERS):  # `npx npm install`, `corepack npm ci`, `npx husky`
+        launched = _launched_argv(argv)
+        if not launched:
+            break
+        argv = launched
     head = _cmd(argv[0])
-    if via_xargs and ctx.store_seen and head in _DELETERS | _MOVERS:
+    if via_xargs and ctx.store_seen and head in _REMOVERS:
         return _STORE_MSG.format(what=f"`… | xargs {head}` over paths in {ctx.store_seen}")
     if head in {"bun", "bunx"}:
         return _check_bun(argv)
@@ -1240,6 +1370,8 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool, depth: in
         return _check_pm(argv, ctx, cwd)
     if head in {"colima", "limactl", "brew", "nix", "nix-env", "nix-shell", "open"}:
         return _check_vm_runtime(argv)
+    if head in _HOOK_MANAGER_INSTALLS:
+        return _check_hook_manager(argv, ctx, cwd)
     return None
 
 
@@ -1256,9 +1388,13 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
         if not piped:
             ctx.store_seen = None  # `| xargs rm` only inherits paths from its own pipeline
         here_string = next((seg[k + 1] for k, t in enumerate(seg[:-1]) if t == "<<<"), None)
-        argv = _record_assignments(_strip_redirects(seg), ctx)
+        plain = _strip_redirects(seg)
+        argv = _record_assignments(plain, ctx)
         if not argv:
             continue
+        ctx.inline_env = dict(
+            m.group("name", "value") for w in plain[: len(plain) - len(argv)] if (m := _ASSIGNMENT.match(w))
+        )
         argv, seg_cwd, nested, via_xargs = _unwrap(argv, ctx)
         if here_string is not None and argv and _stdin_script_dir(" ".join(shlex.quote(a) for a in argv)) is not None:
             nested.append(here_string)  # `bash <<< '…'`: the string is the script
@@ -1285,6 +1421,8 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
         msg = _check_argv(argv, ctx, seg_cwd, via_xargs, _depth)
         if msg:
             return msg
+        if head == "mkdir":
+            ctx.dirs_made.update(_expand(d, seg_cwd, ctx.vars) for d in _positional(argv[1:]))
         _note_store_paths(argv, ctx, seg_cwd)
     return None
 
@@ -1292,7 +1430,7 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
 # Cheap pre-filter: a command naming none of these cannot hit any rule.
 _HINT = re.compile(
     r"\b(?:bun|bunx|uv|rm|rmdir|unlink|trash|srm|shred|gio|mv|find|ln|cp|npm|pnpm|yarn"
-    r"|colima|limactl|brew|nix|nix-env|nix-shell|open)\b",
+    r"|colima|limactl|brew|nix|nix-env|nix-shell|open|lefthook|husky|simple-git-hooks)\b",
     re.IGNORECASE,
 )
 
