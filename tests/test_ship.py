@@ -5164,141 +5164,217 @@ def test_no_repo_flag_path_is_unchanged(repo_with_pr_worktree, tmp_path):
 
 
 # ---------------------------------------------------------------------------------------
-# Stash-pop conflict detection after main-checkout refresh (#77)
+# Dirty primary checkout / dirty PR worktree (agent-tools#809, tg#17970).
 #
-# ship.sh now uses `git pull --ff-only --autostash` for the main-checkout refresh.
-# --autostash is a no-op on a clean tree; when the checkout has uncommitted changes and
-# those conflict with the incoming pull, git stash pop exits non-zero and the index
-# contains UU-class unmerged files.  ship.sh must detect that and exit 1 with a clear
-# diagnostic (naming the conflicting files and the PR merge status), not silently leave
-# the main checkout broken.
+# The post-merge local sync of the PRIMARY checkout must never stash, reset, clean, check out
+# or overwrite it. A dirty primary (or one not on the default branch) only skips that sync,
+# with an explicit message; the remote merge still happens. A dirty worktree that HOLDS the PR
+# branch still refuses the merge, but names the path, the branch and the staged / unstaged /
+# untracked files separately, followed by sorting instructions. (Supersedes #77's
+# `pull --autostash` refresh, which stashed the primary and dropped its staged state.)
 # ---------------------------------------------------------------------------------------
 
 @pytest.fixture
-def repo_with_stash_conflict(tmp_path):
-    """A repo where the main checkout will have a stash-pop conflict after the post-merge
-    pull.  Setup:
-      - origin/main has a file `shared.py` with content "origin\n"
-      - the main checkout has an uncommitted change to the same line ("local\n")
-      - the incoming pull changes the same line to "incoming\n"
-    When `git pull --autostash` runs it stashes the local edit, fast-forwards, then tries
-    to pop — but "local" conflicts with "incoming" on the same line, producing a UU
-    unmerged entry."""
+def repo_with_advanced_origin(tmp_path):
+    """A repo whose origin/main is ONE commit ahead of the primary checkout (so a post-merge
+    sync is observable), with branch `feat` pushed and checked out in a linked worktree.
+    Returns (primary, pr_worktree, origin_main_sha)."""
     if not shutil.which("bash") or not shutil.which("git"):
         pytest.skip("bash/git required")
 
-    # --- bare origin ---
     origin = tmp_path / "origin.git"
     _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
 
-    # --- main checkout seeded at origin/main ---
     main = tmp_path / "main"
     main.mkdir()
     _git("init", "-q", "-b", "main", cwd=main)
     _git("config", "user.email", "t@t", cwd=main)
     _git("config", "user.name", "t", cwd=main)
     _git("remote", "add", "origin", str(origin), cwd=main)
-    (main / "shared.py").write_text("origin\n", encoding="utf-8")
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "notes.txt").write_text("base notes\n", encoding="utf-8")
     _git("add", "-A", cwd=main)
     _git("commit", "-qm", "init", cwd=main)
     _git("push", "-q", "origin", "main", cwd=main)
 
-    # --- push a conflicting commit to origin/main ---
-    # We push via a sibling clone so the main checkout stays at the old SHA.
-    sibling = tmp_path / "sibling"
-    sibling.mkdir()
-    _git("clone", "-q", str(origin), str(sibling), cwd=tmp_path)
-    _git("config", "user.email", "t@t", cwd=sibling)
-    _git("config", "user.name", "t", cwd=sibling)
-    (sibling / "shared.py").write_text("incoming\n", encoding="utf-8")
-    _git("add", "-A", cwd=sibling)
-    _git("commit", "-qm", "advance origin/main", cwd=sibling)
-    _git("push", "-q", "origin", "main", cwd=sibling)
-
-    # --- dirty the main checkout with a conflicting local edit ---
-    # This is uncommitted — autostash will stash it, pull advances, pop conflicts.
-    (main / "shared.py").write_text("local\n", encoding="utf-8")
-
-    # --- PR branch (`feat`) — diverges from init via an unrelated file, pushed ---
-    _git("fetch", "-q", "origin", cwd=main)
-    # Start feat from the init commit (before origin/main advanced).
-    _git("checkout", "-q", "-b", "feat", "HEAD", cwd=main)
-    (main / "feat.py").write_text("# feat work\n", encoding="utf-8")
-    _git("add", "feat.py", cwd=main)
-    _git("commit", "-qm", "feat: add feature", cwd=main)
+    _git("branch", "feat", cwd=main)
     _git("push", "-q", "origin", "feat", cwd=main)
-
-    # --- go back to main and apply the conflicting uncommitted edit ---
-    _git("checkout", "-q", "main", cwd=main)
-    # main is still at the init commit (origin/main is now one ahead via sibling).
-    # Dirty shared.py with local content — autostash will stash it, pull advances, pop conflicts.
-    (main / "shared.py").write_text("local\n", encoding="utf-8")
-    # Leave it uncommitted so autostash picks it up.
-
-    # Add a linked worktree for `feat` so ship.sh can run its preflight checks.
     wt = tmp_path / "wt-feat"
     _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
 
-    return main
+    # Advance origin/main from a separate clone so the primary stays one commit behind.
+    sibling = tmp_path / "sibling-clone"
+    _git("clone", "-q", str(origin), str(sibling), cwd=tmp_path)
+    _git("config", "user.email", "t@t", cwd=sibling)
+    _git("config", "user.name", "t", cwd=sibling)
+    (sibling / "merged.py").write_text("# the squash-merged PR content\n", encoding="utf-8")
+    _git("add", "merged.py", cwd=sibling)
+    _git("commit", "-qm", "squash: feat (#1)", cwd=sibling)
+    _git("push", "-q", "origin", "main", cwd=sibling)
+    origin_sha = _git("rev-parse", "HEAD", cwd=sibling).stdout.strip()
+    return main, wt, origin_sha
 
 
-def test_stash_pop_conflict_exits_nonzero_with_diagnostic(repo_with_stash_conflict, tmp_path):
-    """When git pull --autostash produces a stash-pop conflict in the main checkout, ship
-    must exit 1 with a diagnostic that:
-      - confirms the PR IS merged (so the user doesn't re-run ship and double-merge),
-      - names the conflicting files,
-      - tells the user how to resolve manually.
-    The conflict must NOT be silently swallowed."""
-    main = repo_with_stash_conflict
+def _tree_snapshot(d: Path) -> dict:
+    """Everything the 'never touch the primary' contract covers: HEAD, branch, the raw status
+    (index vs worktree columns), the stash list and the bytes of every non-.git file."""
+    files = {}
+    for p in sorted(d.rglob("*")):
+        if ".git" in p.relative_to(d).parts or not p.is_file():
+            continue
+        files[str(p.relative_to(d))] = p.read_bytes()
+    return {
+        "head": _sh("git", "rev-parse", "HEAD", cwd=d).stdout,
+        "branch": _sh("git", "symbolic-ref", "--quiet", "--short", "HEAD", cwd=d).stdout,
+        "status": _sh("git", "status", "--porcelain=v1", "--untracked-files=all", cwd=d).stdout,
+        "stash": _sh("git", "stash", "list", cwd=d).stdout,
+        "files": files,
+    }
+
+
+def _dirty_all_three(d: Path) -> None:
+    """Staged modification of a tracked file + unstaged modification + untracked file."""
+    (d / "README.md").write_text("# staged local edit\n", encoding="utf-8")
+    _git("add", "README.md", cwd=d)
+    (d / "notes.txt").write_text("unstaged local edit\n", encoding="utf-8")
+    (d / "scratch.log").write_text("untracked local file\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("launch_from", ["primary", "pr_worktree"])
+def test_dirty_primary_does_not_block_merge_and_is_left_untouched(
+    repo_with_advanced_origin, tmp_path, launch_from
+):
+    main, wt, origin_sha = repo_with_advanced_origin
     bindir = _fake_gh_dir(tmp_path)
+    _dirty_all_three(main)
+    before = _tree_snapshot(main)
+    assert before["head"].strip() != origin_sha
 
-    env = dict(os.environ)
-    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
-    env["SHIP_TEST_BRANCH"] = "feat"
-    env["SHIP_DEFAULT_BRANCH"] = "main"
-    env["SHIP_MAIN_CHECKOUT"] = str(main)
-    r = _sh(
-        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
-        cwd=main, env=env,
-    )
+    r = _run_ship(main, bindir, cwd=main if launch_from == "primary" else wt)
 
-    # The merge itself succeeded — only the post-merge stash-pop conflicted.
-    assert "merged #1" in r.stdout, (
-        f"expected fake merge to report merged #1:\n{r.stdout}\n{r.stderr}"
-    )
-    # ship must exit non-zero to signal that the main checkout needs manual attention.
-    assert r.returncode != 0, (
-        f"ship should exit non-zero on a stash-pop conflict; got 0\n{r.stdout}\n{r.stderr}"
-    )
-    # Diagnostic confirms the merge is done (so the user doesn't double-merge).
-    assert "IS merged" in r.stderr, (
-        f"diagnostic must confirm PR is merged:\n{r.stderr}"
-    )
-    # Diagnostic names the conflicting file.
-    assert "shared.py" in r.stderr, (
-        f"diagnostic must name the conflicting file(s):\n{r.stderr}"
-    )
-    # Diagnostic tells the user how to resolve.
-    assert "stash drop" in r.stderr, (
-        f"diagnostic must mention stash drop for resolution:\n{r.stderr}"
-    )
-
-
-def test_stash_pop_no_conflict_clean_tree_passes(repo_with_pr_worktree, tmp_path):
-    """Happy path: a clean main checkout → --autostash is a no-op, pull fast-forwards,
-    ship exits 0.  Proves --autostash doesn't break the normal case."""
-    main, _wt = repo_with_pr_worktree
-    bindir = _fake_gh_dir(tmp_path)
-
-    r = _run_ship(main, bindir)
-
-    assert r.returncode == 0, (
-        f"clean main checkout should not trigger stash-pop conflict\n{r.stdout}\n{r.stderr}"
-    )
+    assert r.returncode == 0, f"dirty primary must not fail the ship\n{r.stdout}\n{r.stderr}"
     assert "merged #1" in r.stdout, r.stdout
-    assert "stash-pop" not in r.stderr.lower(), (
-        f"unexpected stash-pop error on a clean checkout:\n{r.stderr}"
+    after = _tree_snapshot(main)
+    assert after == before, (
+        "primary checkout was modified (HEAD/index/files/stash) — it must be left untouched"
     )
+    out = r.stdout + r.stderr
+    assert "skipped the local sync of the main checkout" in out, out
+    assert str(main) in out and "uncommitted changes" in out, out
+    assert "was NOT stashed, reset, cleaned, checked out or overwritten" in out, out
+    assert "#1 IS merged" in out, out
+    assert "git -C" in out and "pull --ff-only origin main" in out, out
+    # The PR worktree itself was clean, so cleanup still removes it.
+    assert not wt.exists(), f"clean PR worktree should still be cleaned up\n{out}"
+
+
+def test_primary_on_other_branch_is_not_checked_out(repo_with_advanced_origin, tmp_path):
+    main, wt, _origin_sha = repo_with_advanced_origin
+    bindir = _fake_gh_dir(tmp_path)
+    _git("checkout", "-q", "-b", "local-experiment", cwd=main)
+    before = _tree_snapshot(main)
+
+    r = _run_ship(main, bindir, cwd=wt)
+
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert _tree_snapshot(main) == before, "primary on another branch was checked out/changed"
+    out = r.stdout + r.stderr
+    assert "skipped the local sync of the main checkout" in out, out
+    assert "local-experiment" in out, out
+
+
+def test_clean_primary_is_still_synced(repo_with_advanced_origin, tmp_path):
+    main, wt, origin_sha = repo_with_advanced_origin
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(main, bindir, cwd=wt)
+
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    head = _sh("git", "rev-parse", "HEAD", cwd=main).stdout.strip()
+    assert head == origin_sha, f"clean primary was not fast-forwarded\n{r.stdout}\n{r.stderr}"
+    assert "skipped the local sync" not in r.stdout + r.stderr
+    assert _sh("git", "stash", "list", cwd=main).stdout == ""
+
+
+def test_pr_branch_in_clean_primary_returns_to_default_branch(tmp_path):
+    """The PR branch checked out in the PRIMARY itself (no linked worktree): after the merge
+    cleanup detaches it, the primary must end back on the default branch, synced."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("checkout", "-q", "-b", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(main, bindir, cwd=main)
+
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    branch = _sh("git", "symbolic-ref", "--quiet", "--short", "HEAD", cwd=main).stdout.strip()
+    assert branch == "main", f"primary left on {branch!r}\n{r.stdout}\n{r.stderr}"
+    assert "skipped the local sync" not in r.stdout + r.stderr
+
+
+def test_dirty_sibling_worktree_does_not_block(repo_with_advanced_origin, tmp_path):
+    main, wt, origin_sha = repo_with_advanced_origin
+    bindir = _fake_gh_dir(tmp_path)
+    sib = tmp_path / "wt-other"
+    _git("worktree", "add", "-q", "-b", "other", str(sib), "main", cwd=main)
+    _dirty_all_three(sib)
+    before = _tree_snapshot(sib)
+
+    r = _run_ship(main, bindir, cwd=wt)
+
+    assert r.returncode == 0, f"dirty sibling must not block\n{r.stdout}\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
+    assert _tree_snapshot(sib) == before, "unrelated sibling worktree was modified"
+    # Clean primary is still synced.
+    assert _sh("git", "rev-parse", "HEAD", cwd=main).stdout.strip() == origin_sha
+
+
+def test_dirty_pr_worktree_refusal_lists_every_class_and_instructions(
+    repo_with_advanced_origin, tmp_path
+):
+    main, wt, _origin_sha = repo_with_advanced_origin
+    bindir = _fake_gh_dir(tmp_path)
+    _dirty_all_three(wt)
+    before = _tree_snapshot(wt)
+
+    r = _run_ship(main, bindir, cwd=wt)
+
+    assert r.returncode != 0, f"dirty PR worktree must refuse\n{r.stdout}\n{r.stderr}"
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+    err = r.stderr
+    assert "uncommitted changes" in err, err
+    assert f"worktree {wt} (branch feat)" in err, err
+    staged = err.split("Staged (")[1].split("Unstaged (")[0]
+    unstaged = err.split("Unstaged (")[1].split("Untracked (")[0]
+    untracked = err.split("Untracked (")[1].split("Sort them")[0]
+    assert "README.md" in staged and "notes.txt" not in staged and "scratch.log" not in staged
+    assert "notes.txt" in unstaged and "README.md" not in unstaged and "scratch.log" not in unstaged
+    assert "scratch.log" in untracked and "README.md" not in untracked
+    for needle in (
+        "meaningful atomic commits",
+        "re-run the checks and the review",
+        "verified copy",
+        "ticket or another worktree",
+        "Delete files that are proven junk",
+        "ignore",
+        "Ask the user only",
+        "Never run `git add -A` blindly",
+    ):
+        assert needle in err, f"missing instruction {needle!r}:\n{err}"
+    assert _tree_snapshot(wt) == before, "refusal must not modify the PR worktree"
 
 
 # ── review-dwell gate ──────────────────────────────────────────────────────────────────────

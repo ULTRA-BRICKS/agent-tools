@@ -14,7 +14,11 @@
 #     #764/HYP-1380 merged this way). Deny-by-default, no self-service override — see the
 #     external-review gate below (mirrors the review-quorum/--skip-ci hatch pattern).
 #   • A UI-touching PR has no embedded screenshot (see ci/screenshots/) — unless overridden.
-#   • The local branch has unpushed/diverged commits, or its worktree is dirty.
+#   • The local branch has unpushed/diverged commits, or the worktree holding the PR branch is
+#     dirty (the refusal lists its staged / unstaged / untracked files and how to sort them).
+#     A dirty PRIMARY checkout or an unrelated sibling worktree never blocks the merge: the
+#     primary is never stashed / reset / cleaned / checked out, only its post-merge sync is
+#     skipped (with an explicit message) when it is not safe.
 #   • The review-quorum bar (Guard-B of the self-merge-authority program) is not met: the
 #     PR's task code has fewer than SHIP_REVIEW_QUORUM_MIN_ITER PASSED review-cli iterations,
 #     across SHIP_REVIEW_QUORUM_MIN_ROLES distinct BOARD ROLES among those passed iterations —
@@ -121,7 +125,8 @@
 # asymmetry for a benign shipper, it is not a claim to withstand a hostile PATH.)
 #
 # Knobs (env):
-#   SHIP_MAIN_CHECKOUT     path to the primary (main) checkout for the post-merge pull.
+#   SHIP_MAIN_CHECKOUT     path to the primary (main) checkout for the post-merge fast-forward
+#                          (skipped, never forced, when that checkout is dirty or off-branch).
 #                          Default: first worktree in `git worktree list`.
 #   SHIP_DEFAULT_BRANCH    base branch name (default: main).
 #   SHIP_PROVIDER          github | forgejo | auto (default). auto: a github.com / local-path origin
@@ -1965,6 +1970,46 @@ else
   echo "[ship] review-dwell gate OK — PR #$PR is ${ELAPSED}s past its last push (window ${DWELL}s)."
 fi
 
+# --- dirty-tree reporting (agent-tools#809, tg#17970) ---------------------------------
+# Print a checkout's uncommitted state as three separate lists (staged / unstaged / untracked),
+# each capped so a huge untracked tree can't flood the terminal. Read-only.
+_SHIP_DIRT_LIST_CAP=50
+_print_tree_dirt() {  # $1 = dir, $2 = line prefix
+  local dir="$1" prefix="$2" label files n
+  for label in Staged Unstaged Untracked; do
+    case "$label" in
+      Staged)    files=$(git -C "$dir" diff --cached --name-only 2>/dev/null) ;;
+      Unstaged)  files=$(git -C "$dir" diff --name-only 2>/dev/null) ;;
+      Untracked) files=$(git -C "$dir" ls-files --others --exclude-standard --directory 2>/dev/null) ;;
+    esac
+    n=0; [ -n "$files" ] && n=$(printf '%s\n' "$files" | wc -l | tr -d ' ')
+    echo "${prefix}${label} (${n}):"
+    if [ "$n" -eq 0 ]; then
+      echo "${prefix}  (none)"
+    else
+      printf '%s\n' "$files" | awk -v p="${prefix}  " -v cap="$_SHIP_DIRT_LIST_CAP" \
+        'NR<=cap{print p $0} END{if (NR>cap) print p "... and " NR-cap " more"}'
+    fi
+  done
+}
+
+# The worktree that holds the PR branch is dirty: refuse BEFORE merging, and say exactly what is
+# uncommitted and how to sort it. Nothing is modified — no stash, no discard, no `git add`.
+_refuse_dirty_pr_worktree() {  # $1 = worktree path
+  local wt="$1"
+  { echo "Refusing: worktree $wt (branch $BRANCH) has uncommitted changes. PR #$PR was NOT merged."
+    _print_tree_dirt "$wt" "  "
+    echo "Sort them before shipping; do not throw away useful work:"
+    echo "  1. Commit the changes that belong to this PR as meaningful atomic commits, push, then re-run the checks and the review."
+    echo "  2. Move material that does not belong to this PR into a ticket or another worktree with a verified copy (compare it) before removing it here."
+    echo "  3. Delete files that are proven junk."
+    echo "  4. Add generated or local-only files to an appropriate ignore (.gitignore, or .git/info/exclude for machine-local files)."
+    echo "  5. Ask the user only about files whose fate is genuinely ambiguous."
+    echo "  Never run \`git add -A\` blindly. Then re-run: gh ship $PR"
+  } >&2
+  exit 1
+}
+
 # --- local branch sanity (no unpushed/diverged commits; clean worktree) ----------------
 # A branch can be checked out in MORE THAN ONE worktree (git permits it; a stray/leftover
 # tree often lingers). Collect ALL of them: feeding a single $WT that had concatenated two
@@ -1992,8 +2037,7 @@ for wt in ${WTS[@]+"${WTS[@]}"}; do
   # removed. Aborting here, before that fooled check, prevents losing unshipped work.
   abort_if_core_bare "$wt" "PR worktree"
   if [ -n "$(git -C "$wt" status --short 2>/dev/null)" ]; then
-    echo "Refusing: worktree $wt has uncommitted changes. Commit or discard first." >&2
-    git -C "$wt" status --short >&2; exit 1
+    _refuse_dirty_pr_worktree "$wt"
   fi
 done
 git fetch -q origin "$BRANCH" 2>/dev/null || true
@@ -4089,32 +4133,56 @@ fi
 # function whose result is REPORTED, not propagated — `set -e` is relaxed inside it and
 # every step is allowed to fail with a warning.
 
-# Pull the main checkout with --autostash so a dirty-but-clean-merge WIP doesn't block
-# the refresh.  Autostash is a no-op on a clean tree; it only matters when the checkout
-# has uncommitted changes that conflict with the incoming pull.  If the stash-pop
-# produces unmerged files (UU/AA/DD in the index) we print a clear diagnostic and EXIT 1
-# so the broken state doesn't sneak past as a silent "all good".
-# Called only when DRY_RUN != 1, always inside cleanup() where set +e is active.
-_refresh_main_checkout() {
-  local dir="$1" branch="$2" pull_rc unmerged
-  git -C "$dir" pull --ff-only --autostash origin "$branch"; pull_rc=$?
-  # `git pull --autostash` exits 0 even when the stash-pop conflicts — the conflict is
-  # indicated only on stderr.  Check unmerged files unconditionally after every pull so a
-  # silent stash-pop conflict is never left undetected.
-  unmerged=$(git -C "$dir" ls-files --unmerged 2>/dev/null | wc -l | tr -d ' ')
-  if [ "${unmerged:-0}" -gt 0 ]; then
-    echo "[ship] PR #$PR IS merged. However, the stash-pop after the main-checkout" \
-         "refresh conflicted — $unmerged unmerged path(s) in $dir." >&2
-    echo "[ship]   Unmerged files:" >&2
-    git -C "$dir" ls-files --unmerged 2>/dev/null | awk '{print $4}' | sort -u | \
-      sed 's/^/[ship]     /' >&2
-    echo "[ship]   Resolve manually:" \
-         "git -C $(printf '%q' "$dir") add <files> && git -C $(printf '%q' "$dir") stash drop" >&2
-    exit 1
+# Post-merge fast-forward of the PRIMARY checkout (agent-tools#809, tg#17970). The primary often
+# carries the user's unrelated local work, so ship NEVER stashes, resets, cleans, checks out or
+# overwrites it. It fast-forwards only a clean checkout that is already on the default branch;
+# anything else skips ONLY this local sync, with an explicit message — the merge is already done.
+# The one checkout ship may still perform: the primary WAS the PR's own (clean) worktree, which
+# cleanup just detached, so returning it to the default branch restores its pre-PR state.
+# Called inside cleanup() (set +e active).
+_main_checkout_is_pr_tree() {  # $1 = main checkout real path -> rc 0 iff it held the PR branch
+  local w w_real
+  for w in ${WTS[@]+"${WTS[@]}"}; do
+    w_real=$(cd "$w" 2>/dev/null && pwd -P || echo "$w")
+    [ "$w_real" = "$1" ] && return 0
+  done
+  return 1
+}
+
+_report_skipped_main_sync() {  # $1 = dir, $2 = branch, $3 = reason, $4 = 1 to list the dirt
+  local q; q=$(printf '%q' "$1")
+  { echo "[ship] PR #$PR IS merged on the remote, but ship skipped the local sync of the main checkout $1: $3."
+    echo "[ship]   It was NOT stashed, reset, cleaned, checked out or overwritten; your local work there is untouched."
+    [ "$4" = "1" ] && _print_tree_dirt "$1" "[ship]   "
+    echo "[ship]   Sync it yourself once that is safe: git -C $q pull --ff-only origin $2"
+  } >&2
+}
+
+_sync_main_checkout_if_safe() {  # $1 = main checkout dir, $2 = default branch
+  local dir="$1" branch="$2" dir_real cur st st_rc=0
+  [ -d "$dir" ] || return 0
+  echo "[ship] refreshing main checkout at ${dir} ..."
+  run git -C "$dir" fetch origin   # updates remote-tracking refs only; never the work tree
+  dir_real=$(cd "$dir" 2>/dev/null && pwd -P || echo "$dir")
+  st=$(git -C "$dir" status --porcelain 2>/dev/null) || st_rc=$?
+  if [ "$st_rc" -ne 0 ]; then
+    _report_skipped_main_sync "$dir" "$branch" "its git status could not be read" 0; return 0
   fi
-  if [ "$pull_rc" -ne 0 ]; then
-    echo "[ship] WARNING: could not fast-forward $branch — pull manually." >&2
+  if [ -n "$st" ]; then
+    _report_skipped_main_sync "$dir" "$branch" "it has uncommitted changes" 1; return 0
   fi
+  cur=$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || echo)
+  if [ "$cur" != "$branch" ]; then
+    if { [ -z "$cur" ] || [ "$cur" = "$BRANCH" ]; } && _main_checkout_is_pr_tree "$dir_real"; then
+      run git -C "$dir" checkout "$branch" || {
+        _report_skipped_main_sync "$dir" "$branch" "it held the PR branch and could not be switched back to '$branch'" 0; return 0; }
+    else
+      _report_skipped_main_sync "$dir" "$branch" "it is on '${cur:-a detached HEAD}', not '$branch'" 0; return 0
+    fi
+  fi
+  [ "$DRY_RUN" = "1" ] && return 0
+  git -C "$dir" pull --ff-only origin "$branch" \
+    || echo "[ship] WARNING: could not fast-forward $branch in $dir — pull manually." >&2
 }
 
 cleanup() {
@@ -4203,14 +4271,7 @@ cleanup() {
   fi
   run git worktree prune || true
 
-  if [ -d "$MAIN_CHECKOUT" ]; then
-    echo "[ship] refreshing main checkout at ${MAIN_CHECKOUT} ..."
-    [ "$(git -C "$MAIN_CHECKOUT" symbolic-ref --quiet --short HEAD 2>/dev/null || echo)" = "$DEFAULT_BRANCH" ] || run git -C "$MAIN_CHECKOUT" checkout "$DEFAULT_BRANCH"
-    run git -C "$MAIN_CHECKOUT" fetch origin
-    if [ "$DRY_RUN" != "1" ]; then
-      _refresh_main_checkout "$MAIN_CHECKOUT" "$DEFAULT_BRANCH"
-    fi
-  fi
+  _sync_main_checkout_if_safe "$MAIN_CHECKOUT" "$DEFAULT_BRANCH"
 
   # CALLER CONTRACT: if we removed the worktree the SESSION was launched from, the parent
   # shell's cwd now points at a deleted directory (this script re-rooted, the parent did
