@@ -40,8 +40,11 @@ name: dependency-review
 
 on:
   pull_request_target:
+  # Pushes to main only: a PR branch is audited by its pull_request_target run. A push run on
+  # every branch doubled the queue, and on Forgejo a runner heal job cancels such a waiting
+  # duplicate and never replaces its status, leaving the PR head a red "(push)" check.
   push:
-    branches: ["**"]
+    branches: [main]
   workflow_dispatch:
     inputs:
       head_sha:
