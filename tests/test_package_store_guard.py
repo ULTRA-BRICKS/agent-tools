@@ -897,6 +897,9 @@ def test_script_is_executable():
         "nix-shell -p colima",
         "bash -c 'colima start'",
         "ssh mac 'colima start'",
+        "podman machine init",
+        "podman machine start",
+        "podman --log-level debug machine start podman-machine-default",
     ],
 )
 def test_vm_runtime_installs_and_starts_block(command, home, tmp_path, monkeypatch):
@@ -925,7 +928,83 @@ def test_vm_runtime_installs_and_starts_block(command, home, tmp_path, monkeypat
         "mocker compose up -d",
         "echo done # then: colima start",
         "echo hi # $(bun pm cache rm)",
+        "podman machine stop",
+        "podman machine rm -f",
+        "podman machine list",
+        "podman ps",
     ],
 )
 def test_vm_runtime_neighbours_allowed(command, home, tmp_path, monkeypatch):
     _allowed(command, monkeypatch, tmp_path)
+
+
+def test_every_vm_start_verb_head_has_its_subcommand_list():
+    assert set(psg._VM_SUBCOMMANDS) == set(psg._VM_START_VERBS)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <(bun pm cache rm)",
+        "wc -l <(find ~/.bun -delete)",
+        "echo x | tee >(uv cache clean)",
+        "diff <(ls) <(rm -rf ~/.bun/install/cache)",
+    ],
+)
+def test_process_substitution_bodies_are_inspected(command, home, tmp_path, monkeypatch):
+    _blocked(command, monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize("command", ["diff <(ls a) <(ls b)", 'echo "<(bun pm cache rm)"', "sort < input.txt"])
+def test_process_substitution_neighbours_allowed(command, home, tmp_path, monkeypatch):
+    _allowed(command, monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uvx lefthook install",
+        "uvx --from lefthook==1.9 lefthook install",
+        "uv tool run lefthook install",
+        "uv --quiet run lefthook add pre-commit",
+        "bun run lefthook install",
+        "bun lefthook install",
+        "yarn lefthook install",
+        "yarn run husky install",
+        "pnpm run husky",
+        "pnpm husky init",
+        "npm run -- simple-git-hooks",
+    ],
+)
+def test_every_package_runner_reaches_the_hook_manager_check(command, home, tmp_path, monkeypatch):
+    global_hooks = tmp_path / "global-git-hooks"
+    global_hooks.mkdir()
+    _blocked(command, monkeypatch, _repo_with_hooks_path(tmp_path, str(global_hooks)))
+
+
+@pytest.mark.parametrize("command", ["bun run build", "npm run test -- -x", "uv run pytest -q", "yarn add -D lefthook"])
+def test_runner_scripts_that_are_not_hook_managers_stay_allowed(command, home, tmp_path, monkeypatch):
+    global_hooks = tmp_path / "global-git-hooks"
+    global_hooks.mkdir()
+    _allowed(command, monkeypatch, _repo_with_hooks_path(tmp_path, str(global_hooks)))
+
+
+def test_git_is_asked_once_per_query_per_command(home, tmp_path, monkeypatch):
+    """Several hook-manager segments must not multiply git calls past the descriptor timeout."""
+    repo = _repo_with_hooks_path(tmp_path, None)  # repo-local: every segment is checked, all allowed
+    calls: list[list[str]] = []
+    real_run = psg.subprocess.run
+
+    def counting_run(cmd, *a, **k):
+        calls.append(cmd)
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(psg.subprocess, "run", counting_run)
+    assert psg.inspect_command("lefthook install && lefthook add pre-push && npx husky init", str(repo)) is None
+    git_calls = [c for c in calls if c and c[0] == "git"]
+    assert 0 < len(git_calls) <= 2, git_calls
+    # a spent budget asks git nothing: a stalled git cannot outlast the descriptor's timeout
+    monkeypatch.setattr(psg, "_GIT_BUDGET_S", 0.0)
+    calls.clear()
+    psg.inspect_command("lefthook install", str(repo))
+    assert not [c for c in calls if c and c[0] == "git"]

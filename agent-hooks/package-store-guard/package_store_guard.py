@@ -55,6 +55,7 @@ import secrets
 import shlex
 import subprocess
 import sys
+import time
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -170,7 +171,8 @@ _VM_SUBCOMMANDS = {
         "unprotect", "start-at-login", "help", "completion", "tunnel",
     }),
 }
-assert _VM_SUBCOMMANDS.keys() == _VM_START_VERBS.keys(), "every VM runtime needs its subcommand list"
+# every _VM_START_VERBS head needs its _VM_SUBCOMMANDS list (pinned by the tests, not an import-time
+# assert: a failing import would block every shell call through on_error: closed)
 # flags that take NO value; any other flag before the subcommand consumes the next word
 _VM_BOOL_FLAGS = {
     "colima": frozenset({"-v", "--verbose", "--very-verbose", "-h", "--help", "--version", "-f", "--force"}),
@@ -187,8 +189,15 @@ _HOOK_MANAGER_INSTALLS = {
     "husky": frozenset({"", "install", "init"}),
     "simple-git-hooks": frozenset({""}),
 }
-_GIT_TIMEOUT_S = 1.5  # at most two git queries per check: well inside the 5 s descriptor budget
+_GIT_TIMEOUT_S = 1.5  # one query; answers are memoized per inspected command
+_GIT_BUDGET_S = 3.0  # all git queries of one hook run: well inside the 5 s descriptor budget
 _NIX_RUNNERS = frozenset({"run", "shell", "develop", "build"})
+# `uvx` / `uv [tool] run` options that take a value before the launched command
+_UV_RUN_VALUE_FLAGS = frozenset({
+    "--from", "--with", "-w", "--with-editable", "--with-requirements", "--python", "-p", "--package",
+    "--project", "--directory", "--env-file", "--group", "--extra", "--index", "--default-index",
+    "--index-url", "--extra-index-url", "-i", "--constraints", "-c", "--overrides", "--cache-dir",
+})
 
 _STORE_MSG = (
     "[package-store-guard] BLOCKED: this would wipe a shared package store ({what}). "
@@ -354,8 +363,9 @@ def strip_heredoc_bodies(command: str) -> str:
 
 
 def substitution_bodies(text: str) -> list[str]:
-    """The commands inside `$( … )` and backticks (not in single quotes, not `$(( … ))`
-    arithmetic): the shell runs them wherever they appear, so each is inspected on its own."""
+    """The commands inside `$( … )`, backticks and process substitutions `<( … )`/`>( … )` (not in
+    single quotes, not `$(( … ))` arithmetic): the shell runs them wherever they appear, so each is
+    inspected on its own."""
     bodies: list[str] = []
     quote: str | None = None
     i = 0
@@ -377,7 +387,9 @@ def substitution_bodies(text: str) -> list[str]:
             continue
         elif ch == '"':
             quote = None if quote == '"' else '"'
-        elif text.startswith("$(", i) and not text.startswith("$((", i):
+        elif (text.startswith("$(", i) and not text.startswith("$((", i)) or (
+            quote is None and text.startswith(("<(", ">("), i)  # process substitution
+        ):
             depth, j = 1, i + 2
             while j < len(text) and depth:
                 depth += {"(": 1, ")": -1}.get(text[j], 0)
@@ -463,7 +475,9 @@ def _protect_substitutions(text: str) -> tuple[str, list[str]]:
             i += 1
             continue
         end = -1
-        if text.startswith("$(", i) and not text.startswith("$((", i):
+        if (text.startswith("$(", i) and not text.startswith("$((", i)) or (
+            quote is None and text.startswith(("<(", ">("), i)  # `cat <(…)` is not a `<` redirect
+        ):
             depth, j = 1, i + 2
             while j < len(text) and depth:
                 depth += {"(": 1, ")": -1}.get(text[j], 0)
@@ -1081,7 +1095,7 @@ def _vm_verb(head: str, rest: list[str]) -> str | None:
         if tok.startswith("-"):
             i += 1 if ("=" in tok or tok in booleans or tok == "--") else 2
             continue
-        return tok if tok in _VM_SUBCOMMANDS[head] else None
+        return tok if tok in _VM_SUBCOMMANDS.get(head, frozenset()) else None
     return None
 
 
@@ -1093,6 +1107,12 @@ def _check_vm_runtime(argv: list[str]) -> str | None:
     if head in _VM_START_VERBS:
         verb = _vm_verb(head, argv[1:])
         return _VM_MSG.format(what=f"`{head} {verb}`") if verb in _VM_START_VERBS[head] else None
+    if head == "podman" and "machine" in words:
+        # `podman [global flags] machine init|start` creates/boots podman's VM; stop/rm/list stay allowed
+        after = words[words.index("machine") + 1 :]
+        if after and after[0] in {"init", "start"}:
+            return _VM_MSG.format(what=f"`podman machine {after[0]}`")
+        return None
     if head == "brew" and words and words[0] in _BREW_INSTALL_VERBS:
         for pkg in words[1:]:
             name = _vm_package(pkg)
@@ -1117,15 +1137,35 @@ def _check_vm_runtime(argv: list[str]) -> str | None:
     return None
 
 
+_git_memo: dict[tuple[str, ...], str | None] = {}
+_git_deadline = [0.0]  # monotonic deadline for this hook run's git queries (reset per command)
+
+
+def _reset_git_budget() -> None:
+    _git_memo.clear()
+    _git_deadline[0] = time.monotonic() + _GIT_BUDGET_S
+
+
 def _git(cwd: str, *args: str, git_dir: str | None = None) -> str | None:
-    """A read-only git query in ``cwd`` (stdout, stripped), or None when it fails. ``git_dir``
-    mirrors a `GIT_DIR=…` the gated command sets, so the query sees the repo the command will."""
+    """A read-only git query in ``cwd`` (stdout, stripped), or None when it fails or this run's
+    git budget is spent (a stalled git must not outlast the descriptor's timeout, which would
+    block the command with a protocol error). ``git_dir`` mirrors a `GIT_DIR=…` the gated command
+    sets, so the query sees the repo the command will. Answers are memoized per command, so
+    `lefthook install && lefthook add …` asks git once."""
     cmd = ["git", "-C", cwd, *([f"--git-dir={git_dir}"] if git_dir else []), *args]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=_GIT_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError):
+    key = tuple(cmd)
+    if key in _git_memo:
+        return _git_memo[key]
+    remaining = _git_deadline[0] - time.monotonic()
+    if remaining <= 0:
         return None
-    return res.stdout.strip() if res.returncode == 0 else None
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=min(_GIT_TIMEOUT_S, remaining))
+        out = res.stdout.strip() if res.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        out = None
+    _git_memo[key] = out
+    return out
 
 
 def _check_hook_manager(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
@@ -1373,27 +1413,45 @@ def _python_module_argv(argv: list[str]) -> list[str] | None:
 
 def _launched_argv(argv: list[str]) -> list[str] | None:
     """The command a package runner launches: `npx X …`, `bunx X …`, `corepack X …`,
-    `npm exec [--] X …`, `pnpm dlx|exec X …`, `yarn dlx|exec X …` → `X …`."""
+    `npm exec [--] X …`, `pnpm dlx|exec X …`, `yarn dlx|exec X …`, `bun|npm|pnpm|yarn run X …`,
+    `uvx X …`, `uv [tool] run X …`, and a hook manager run bare through yarn/pnpm/bun
+    (`yarn lefthook install`) → `X …`. A `run` of a package.json script yields the script's name,
+    which no rule matches."""
     head = _cmd(argv[0])
     rest = argv[1:]
-    if head in {"npm", "pnpm", "yarn", "bun"}:
+    value_flags = {"-p", "--package"}
+    if head in {"uvx", "uv"}:
         words = [t for t in rest if not t.startswith("-")]
-        runner_verbs = {"x"} if head == "bun" else {"exec", "x", "dlx"}
-        if not words or words[0] not in runner_verbs:
+        if head == "uv":
+            verb = ["tool", "run"] if words[:2] == ["tool", "run"] else ["run"] if words[:1] == ["run"] else None
+            if verb is None:
+                return None
+            rest = rest[rest.index(words[len(verb) - 1]) + 1 :]
+        value_flags = _UV_RUN_VALUE_FLAGS
+    elif head in {"npm", "pnpm", "yarn", "bun"}:
+        words = [t for t in rest if not t.startswith("-")]
+        runner_verbs = {"x", "run"} if head == "bun" else {"exec", "x", "dlx", "run"}
+        if words and head != "npm" and words[0] in _HOOK_MANAGER_INSTALLS:
+            rest = rest[rest.index(words[0]) :]  # `yarn lefthook install` runs the bin
+        elif not words or words[0] not in runner_verbs:
             return None
-        rest = rest[rest.index(words[0]) + 1 :]
+        else:
+            rest = rest[rest.index(words[0]) + 1 :]
     elif head not in {"npx", "bunx", "corepack", "pnpx"}:
         return None
     i = 0
     while i < len(rest) and rest[i].startswith("-"):
         flag, eq, attached = rest[i].partition("=")
-        if flag in {"-c", "--call"}:  # `npx -c '…'` is `sh -c '…'` in the package env
+        if rest[i] == "--":
+            i += 1
+            break
+        if flag in {"-c", "--call"} and head not in {"uvx", "uv"}:  # `npx -c '…'` is `sh -c '…'`
             return ["sh", "-c", attached if eq else (rest[i + 1] if i + 1 < len(rest) else "")]
-        i += 2 if rest[i] in {"-p", "--package"} else 1
+        i += 2 if (rest[i] in value_flags and not eq) else 1
     launched = rest[i:]
     if not launched:
         return None
-    spec = launched[0]
+    spec = launched[0].split("==", 1)[0]  # uvx `pkg==1.2`
     at = spec.rfind("@")
     if at > 0:  # `npm@10`, `@scope/pkg@1.2` → the package's own command name
         spec = spec[:at]
@@ -1431,7 +1489,7 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool, depth: in
         return _check_cp(argv, ctx, cwd)
     if head in {"npm", "pnpm", "yarn"}:
         return _check_pm(argv, ctx, cwd)
-    if head in {"colima", "limactl", "brew", "nix", "nix-env", "nix-shell", "open"}:
+    if head in {"colima", "limactl", "podman", "brew", "nix", "nix-env", "nix-shell", "open"}:
         return _check_vm_runtime(argv)
     if head in _HOOK_MANAGER_INSTALLS:
         return _check_hook_manager(argv, ctx, cwd)
@@ -1440,6 +1498,8 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool, depth: in
 
 def inspect_command(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | None = None) -> str | None:
     """The block message for ``command`` run from ``cwd``, or None to allow."""
+    if _depth == 0:
+        _reset_git_budget()
     command = strip_heredoc_bodies(command)
     ctx = _Ctx(cwd, _vars)
     if _depth < _MAX_DEPTH:
@@ -1494,7 +1554,7 @@ def inspect_command(command: str, cwd: str, _depth: int = 0, _vars: dict[str, st
 # Cheap pre-filter: a command naming none of these cannot hit any rule.
 _HINT = re.compile(
     r"\b(?:bun|bunx|uv|rm|rmdir|unlink|trash|srm|shred|gio|mv|find|ln|cp|npm|pnpm|yarn"
-    r"|colima|limactl|brew|nix|nix-env|nix-shell|open|lefthook|husky|simple-git-hooks)\b",
+    r"|colima|limactl|podman|brew|nix|nix-env|nix-shell|open|lefthook|husky|simple-git-hooks)\b",
     re.IGNORECASE,
 )
 
