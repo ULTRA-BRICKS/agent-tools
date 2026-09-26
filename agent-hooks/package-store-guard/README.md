@@ -1,7 +1,8 @@
 # package-store-guard
 
 A `pre-bash` agent-hook that keeps the machine's shared package stores, and the installs that
-link into them, intact.
+link into them, intact — and keeps banned, disk-filling container VM runtimes (colima & co.) off
+the machine.
 
 ## Why
 
@@ -29,6 +30,11 @@ from `~/.cache/uv`. Four agent habits kept undoing that:
 | uv cache wipe | `uv cache clean`; `uv cache prune --all` / `--ci`; `rm -rf ~/.cache/uv` (also `$UV_CACHE_DIR`, `${UV_CACHE_DIR:-…}`, `$XDG_CACHE_HOME/uv`) | same — plain `uv cache prune` (unused entries only) stays allowed |
 | `node_modules` symlink | `ln -s <main>/node_modules node_modules`, `ln -sfn …`, `ln -s <main>/node_modules .`, `ln -s <main>/node_modules <existing-dir>`, `ln -s <main>/node_modules` | `bun install --frozen-lockfile` in the worktree |
 | foreign PM in a bun project | npm `install`/`i`/`ci`/`add`/`update`/`uninstall`/`rm`/`prune`/`dedupe`, pnpm `install`/`add`/`update`/`remove`/`prune`, bare `yarn`/`yarn install`/`add`/`remove`, where the **nearest** lockfile (cwd, `cd`, `--prefix`, `--dir`, `--cwd`, `pnpm -C`, walking up) is `bun.lock`/`bun.lockb` | `bun install --frozen-lockfile`, `bun add <pkg>`, `bun remove <pkg>` |
+| banned container VM runtime | `colima start`/`restart`/`install`, `limactl start`/`create`, `brew install`/`reinstall`/`upgrade` of `colima`/`lima`/`podman`/`podman-desktop`/`orbstack`/`docker-desktop` (and `--cask docker`), `nix run`/`shell`/`profile install nixpkgs#colima` (conloca's `act-sim.sh` suggests it), `nix-env -iA nixpkgs.colima`, `nix-shell -p colima` | docker compose through Apple `container` / `mocker`; the sme-archiving-gc tests through the native fake-gcs-server backend |
+
+Colima and similar VMs are banned on this machine: their disk images kept filling the Mac's disk,
+and agents kept reinstalling them. `colima status`/`stop`/`delete`, `limactl list`/`stop`, and
+`brew uninstall colima` stay allowed (they only inspect or free space).
 
 Allowed on purpose: `npm i -g <tool>` (global), npm in a subproject whose nearest lockfile is
 `package-lock.json`, `npm run …`/`yarn test`/`npx …`, `rm -rf node_modules` in a worktree,

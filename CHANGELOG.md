@@ -9,8 +9,11 @@
   clean`, `uv cache prune --all`/`--ci`, deleting `~/.cache/uv`), creating a symlink named
   `node_modules`, and `npm install`/`npm ci`/`pnpm install`/`yarn` where the nearest lockfile is
   `bun.lock`/`bun.lockb`. Each block names the replacement (`bun install --frozen-lockfile`,
-  `rig worktree gc`). Its `blurb.md` adds the SessionStart rule that disk cleanup never wipes
-  package-manager caches or stores.
+  `rig worktree gc`). It also blocks installing or starting the banned container VM runtimes
+  (`colima start`, `limactl start`, `brew install colima|lima|podman|orbstack|docker-desktop`,
+  `nix run nixpkgs#colima`), pointing to Apple `container` / `mocker` and the native
+  fake-gcs-server backend. Its `blurb.md` adds the SessionStart rules that disk cleanup never
+  wipes package-manager caches or stores and that colima-style VMs stay off the machine.
 
 - `ci/ship`: Forgejo provider (UB-25). `gh ship` now ships a PR from a checkout whose `origin` is
   a Forgejo host instead of silently reading the wrong remote. A gh-shaped adapter

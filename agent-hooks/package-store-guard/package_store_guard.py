@@ -12,7 +12,7 @@ machine. uv venvs are cloned from ``~/.cache/uv``; wiping it turns every later s
 full-copy download. The hook reads the command string only (plus the lockfiles that decide whether a
 directory is a bun project, and whether an ``ln`` destination is a directory); it never runs it.
 
-Blocks five shapes, each with the command to run instead:
+Blocks six shapes, each with the command to run instead:
 
 1. ``bun pm cache rm`` (the whole global store);
 2. deleting or moving ``~/.bun/install/cache`` (or an ancestor such as ``~/.bun``, or anything
@@ -21,7 +21,11 @@ Blocks five shapes, each with the command to run instead:
 4. creating a symlink named ``node_modules`` (``ln -s``, ``ln -sfn``, ``ln -s <src> .``, ...);
 5. npm/pnpm/yarn install-class verbs (install/ci/add/update/uninstall/remove/prune, bare ``yarn``)
    where the nearest lockfile is ``bun.lock``/``bun.lockb``. A directory whose nearest lockfile is
-   only ``package-lock.json`` (an npm-only subproject) stays allowed, as do global installs.
+   only ``package-lock.json`` (an npm-only subproject) stays allowed, as do global installs;
+6. installing or starting a banned container VM runtime (``colima start``, ``limactl start``,
+   ``brew install colima|lima|podman|orbstack|docker-desktop``, ``nix run nixpkgs#colima``): their
+   disk images filled the Mac's disk and agents kept reinstalling them. Compose goes through Apple
+   ``container`` / ``mocker``, the sme-archiving-gc tests through the native fake-gcs-server backend.
 
 Parsing is best-effort but deliberately wide: ``&&``/``;``/``|`` segments, ``cd``/``pushd``,
 ``NAME=value`` / ``NAME=$(bun pm cache)`` assignments (and the substitutions inside them),
@@ -140,6 +144,12 @@ _FIND_EXPR_START = frozenset({"(", "!", ")", "\\(", "\\!"})
 _STORE_SUBST_RE = re.compile(r"\b(?P<bun>bun\s+pm\s+cache)\s*[)`]|\b(?P<uv>uv\s+cache\s+dir)\s*[)`]")
 _CASE_INSENSITIVE_FS = sys.platform in {"darwin", "win32"}
 
+# ── banned VM runtimes (colima & co. filled the Mac's disk; agents kept reinstalling them) ──
+_VM_RUNTIMES = frozenset({"colima", "lima", "podman", "podman-desktop", "orbstack", "docker-desktop"})
+_VM_START_VERBS = {"colima": frozenset({"start", "restart", "install"}), "limactl": frozenset({"start", "create"})}
+_BREW_INSTALL_VERBS = frozenset({"install", "reinstall", "upgrade"})
+_NIX_RUNNERS = frozenset({"run", "shell", "develop", "build"})
+
 _STORE_MSG = (
     "[package-store-guard] BLOCKED: this would wipe a shared package store ({what}). "
     "The bun global store (~/.bun/install/cache, including links/) is what every worktree's "
@@ -156,6 +166,13 @@ _SYMLINK_MSG = (
     "this worktree instead: with rig's ~/.bunfig.toml (isolated linker + globalStore) it only "
     "creates symlinks into the shared store — a few MB, seconds — unless the repo's own "
     "bunfig.toml asks for a local layout. `rig worktree create` already does this for bun repos."
+)
+_VM_MSG = (
+    "[package-store-guard] BLOCKED: {what} — colima/lima-style container VMs are banned on this "
+    "machine (their disk images kept filling the Mac's disk, and agents kept reinstalling them). "
+    "For docker compose use Apple `container` / `mocker`; for the sme-archiving-gc tests use the "
+    "native fake-gcs-server backend. Do not install or start another VM runtime (colima, lima, "
+    "podman, OrbStack, Docker Desktop) — ask the human if nothing else works."
 )
 _NPM_MSG = (
     "[package-store-guard] BLOCKED: `{tool}` in a bun project ({lockdir} has {lockfile}). "
@@ -283,6 +300,10 @@ def substitution_bodies(text: str) -> list[str]:
             continue
         if ch == "'" and quote is None:
             quote = "'"
+        elif ch == "#" and quote is None and (i == 0 or text[i - 1] in " \t\r\n;&|()"):
+            end = text.find("\n", i)  # a comment: nothing in it runs
+            i = len(text) if end < 0 else end
+            continue
         elif ch == '"':
             quote = None if quote == '"' else '"'
         elif text.startswith("$(", i) and not text.startswith("$((", i):
@@ -304,7 +325,9 @@ def substitution_bodies(text: str) -> list[str]:
 
 
 def _newlines_to_separators(text: str) -> str:
-    """Unquoted newlines separate commands; quoted ones stay inside their token."""
+    """Unquoted newlines separate commands; quoted ones stay inside their token. Comments are
+    dropped here, shell-style: `#` starts one only at the start of a word, so `nixpkgs#colima`
+    stays one word (shlex's own comment handling would cut it)."""
     out: list[str] = []
     quote: str | None = None
     i = 0
@@ -324,8 +347,12 @@ def _newlines_to_separators(text: str) -> str:
                 quote = None
         elif ch in "'\"":
             quote = ch
+        elif ch == "#" and (i == 0 or text[i - 1] in " \t\r\n;&|()"):
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+            continue
         elif ch == "\n":
-            out.append("\n ; ")  # after the newline, so a `#` comment cannot swallow it
+            out.append("\n ; ")
             i += 1
             continue
         out.append(ch)
@@ -352,6 +379,7 @@ def _tokenize(command: str) -> list[str]:
     try:
         lex = shlex.shlex(_newlines_to_separators(command), posix=True, punctuation_chars=True)
         lex.whitespace_split = True
+        lex.commenters = ""  # comments were already dropped, word-start `#` only
         return [
             piece.replace(_ESCAPED_SEMI, "\\;") for tok in lex for piece in _split_operators(tok)
         ]
@@ -832,6 +860,41 @@ def _check_cp(argv: list[str], ctx: _Ctx, cwd: str) -> str | None:
     return None
 
 
+def _vm_package(ref: str) -> str | None:
+    """`colima`, `homebrew/cask/orbstack`, `nixpkgs#colima`, `nixpkgs.lima` → the banned name."""
+    name = ref.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
+    name = name.split(".", 1)[1] if name.startswith(("nixpkgs.", "legacyPackages.")) else name
+    name = name.split("@", 1)[0].lower()
+    return name if name in _VM_RUNTIMES else None
+
+
+def _check_vm_runtime(argv: list[str]) -> str | None:
+    """`colima start`, `limactl start`, `brew install colima`, `nix run nixpkgs#colima`, …"""
+    head = _basename(argv[0])
+    words = [t for t in argv[1:] if not t.startswith("-")]
+    flags = [t for t in argv[1:] if t.startswith("-")]
+    if head in _VM_START_VERBS:
+        # the verb may follow a flag value (`colima --profile x start`)
+        verb = next((w for w in words[:2] if w in _VM_START_VERBS[head]), None)
+        return _VM_MSG.format(what=f"`{head} {verb}`") if verb else None
+    if head == "brew" and words and words[0] in _BREW_INSTALL_VERBS:
+        for pkg in words[1:]:
+            name = _vm_package(pkg)
+            if name or ("--cask" in flags and pkg.rsplit("/", 1)[-1] == "docker"):
+                return _VM_MSG.format(what=f"`brew {words[0]} {pkg}`")
+        return None
+    if head == "nix" and words and (words[0] in _NIX_RUNNERS or words[:2] == ["profile", "install"]):
+        for ref in words[1:]:
+            if _vm_package(ref):
+                return _VM_MSG.format(what=f"`nix {words[0]} {ref}`")
+        return None
+    if head in {"nix-env", "nix-shell"} and any(f.startswith(("-i", "-p", "--install", "--packages")) for f in flags):
+        for ref in words:
+            if _vm_package(ref):
+                return _VM_MSG.format(what=f"`{head} … {ref}`")
+    return None
+
+
 def _nearest_lockfile(start: str) -> tuple[str, str] | None:
     """(dir, lockfile name) of the nearest ancestor-or-self holding any JS lockfile."""
     cur = os.path.abspath(start)
@@ -1026,6 +1089,8 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool) -> str | 
         return _check_cp(argv, ctx, cwd)
     if head in {"npm", "pnpm", "yarn"}:
         return _check_pm(argv, ctx, cwd)
+    if head in {"colima", "limactl", "brew", "nix", "nix-env", "nix-shell"}:
+        return _check_vm_runtime(argv)
     return None
 
 
@@ -1074,7 +1139,8 @@ def inspect(command: str, cwd: str, _depth: int = 0, _vars: dict[str, str] | Non
 
 # Cheap pre-filter: a command naming none of these cannot hit any rule.
 _HINT = re.compile(
-    r"\b(?:bun|bunx|uv|rm|rmdir|unlink|trash|srm|shred|gio|mv|find|ln|cp|npm|pnpm|yarn)\b"
+    r"\b(?:bun|bunx|uv|rm|rmdir|unlink|trash|srm|shred|gio|mv|find|ln|cp|npm|pnpm|yarn"
+    r"|colima|limactl|brew|nix|nix-env|nix-shell)\b"
 )
 
 

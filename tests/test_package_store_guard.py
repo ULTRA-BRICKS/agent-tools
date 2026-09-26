@@ -627,3 +627,66 @@ def test_script_is_executable():
     if os.name == "nt":
         pytest.skip("POSIX mode bits")
     assert os.access(_HOOK, os.X_OK)
+
+
+# ── banned container VM runtimes (colima & co.) ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "colima start",
+        "colima start --cpu 4 --memory 8",
+        "colima --profile ci start",
+        "colima restart",
+        "colima install",
+        "limactl start",
+        "limactl start default",
+        "brew install colima",
+        "brew install lima",
+        "brew install podman",
+        "brew install --cask orbstack",
+        "brew install --cask docker-desktop",
+        "brew install --cask docker",
+        "brew reinstall colima",
+        "HOMEBREW_NO_AUTO_UPDATE=1 brew install colima docker",
+        "nix run nixpkgs#colima",
+        "nix run nixpkgs#colima -- start",
+        "nix shell nixpkgs#lima",
+        "nix profile install nixpkgs#podman",
+        "nix-env -iA nixpkgs.colima",
+        "nix-shell -p colima",
+        "bash -c 'colima start'",
+        "ssh mac 'colima start'",
+    ],
+)
+def test_vm_runtime_installs_and_starts_block(command, home, tmp_path, monkeypatch):
+    msg = _blocked(command, monkeypatch, tmp_path)
+    assert "banned" in msg
+    assert "Apple `container`" in msg and "mocker" in msg
+    assert "fake-gcs-server" in msg
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "colima status",
+        "colima stop",
+        "colima delete --force",
+        "colima list",
+        "limactl list",
+        "limactl stop default",
+        "brew install jq",
+        "brew install docker",
+        "brew uninstall colima",
+        "brew list",
+        "nix run nixpkgs#hello",
+        "nix-shell -p jq",
+        "container system start",
+        "mocker compose up -d",
+        "echo done # then: colima start",
+        "echo hi # $(bun pm cache rm)",
+    ],
+)
+def test_vm_runtime_neighbours_allowed(command, home, tmp_path, monkeypatch):
+    _allowed(command, monkeypatch, tmp_path)
