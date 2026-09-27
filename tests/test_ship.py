@@ -1303,6 +1303,591 @@ def test_ship_version_files_override_locates_nested_manifest(tmp_path):
     assert "version in pkg/pyproject.toml is UNCHANGED" in r.stderr, r.stderr
 
 
+# ---------------------------------------------------------------------------------------
+# Dynamic versions: a pyproject with `[project] dynamic = ["version"]` keeps the real version
+# in a module's `__version__` (setuptools `attr`, hatch `path`). Its own `version = { attr =
+# ... }` line never moves, so the gate must follow it to that module (qa-cli PR #23 bumped
+# qa_cli/__init__.py 0.4.0 -> 0.5.0 and still had to ship with --no-version-bump-ok).
+# ---------------------------------------------------------------------------------------
+
+_PYPROJECT_SETUPTOOLS_ATTR = (
+    '[project]\nname = "mytool"\ndynamic = ["version"]\n\n'
+    '[tool.setuptools.dynamic]\nversion = { attr = "mytool.__version__" }\n'
+)
+_PYPROJECT_HATCH_PATH = (
+    '[project]\nname = "mytool"\ndynamic = ["version"]\n\n'
+    '[tool.hatch.version]\npath = "src/mytool/__about__.py"\n'
+)
+
+# A PR diff that changes source but touches no version line.
+_PATCH_DYNAMIC_SOURCE_ONLY = (
+    "diff --git a/mytool/cli.py b/mytool/cli.py\n"
+    "--- a/mytool/cli.py\n+++ b/mytool/cli.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+)
+
+
+def _version_module_patch(path: str, old: str, new: str) -> str:
+    """A PR diff changing source plus `path`'s `__version__` from `old` to `new`."""
+    return _PATCH_DYNAMIC_SOURCE_ONLY + (
+        f"diff --git a/{path} b/{path}\n"
+        f"--- a/{path}\n+++ b/{path}\n"
+        f'@@ -3 +3 @@\n-__version__ = "{old}"\n+__version__ = "{new}"\n'
+    )
+
+
+def _repo_with_files(tmp_path: Path, files: dict) -> Path:
+    """A repo on `main` holding `files` ({relpath: text}), branch `feat` in a worktree, and an
+    origin remote: the version-gate fixtures above, for an arbitrary layout. Returns main."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    for rel, text in files.items():
+        (main / rel).parent.mkdir(parents=True, exist_ok=True)
+        (main / rel).write_text(text, encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    _git("worktree", "add", "-q", str(tmp_path / "wt-feat"), "feat", cwd=main)
+    return main
+
+
+@pytest.fixture
+def repo_with_dynamic_attr_version(tmp_path):
+    """qa-cli's layout: setuptools reads the version from `mytool.__version__`."""
+    return _repo_with_files(tmp_path, {
+        "README.md": "# x\n",
+        "pyproject.toml": _PYPROJECT_SETUPTOOLS_ATTR,
+        "mytool/__init__.py": '"""mytool."""\n\n__version__ = "0.4.0"\n',
+    })
+
+
+def test_dynamic_attr_version_bump_passes(repo_with_dynamic_attr_version, tmp_path):
+    """A setuptools `attr` version whose `__version__` moved is a bump: the gate follows the
+    pyproject to mytool/__init__.py, reads the value there, and merges."""
+    main = repo_with_dynamic_attr_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="mytool/cli.py\nmytool/__init__.py",
+        patch=_version_module_patch("mytool/__init__.py", "0.4.0", "0.5.0"),
+    )
+
+    assert r.returncode == 0, f"a moved __version__ must pass the gate\n{r.stdout}\n{r.stderr}"
+    assert "version-bump gate OK" in r.stdout, r.stdout
+    assert "mytool/__init__.py version is bumped" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_dynamic_attr_version_unchanged_is_blocked(repo_with_dynamic_attr_version, tmp_path):
+    """A source change that leaves the module's `__version__` alone is refused, and the refusal
+    names the module that holds the version, not pyproject.toml."""
+    main = repo_with_dynamic_attr_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(main, bindir, name_only="mytool/cli.py", patch=_PATCH_DYNAMIC_SOURCE_ONLY)
+
+    assert r.returncode != 0, f"an unchanged __version__ must be refused\n{r.stdout}\n{r.stderr}"
+    assert "version in mytool/__init__.py is UNCHANGED" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_dynamic_attr_version_already_on_base_tip_is_blocked(repo_with_dynamic_attr_version, tmp_path):
+    """The PR moves `__version__` 0.4.0 -> 0.5.0, but origin/main's module already says 0.5.0:
+    the base-tip read must understand `__version__ = "X"` too (agent-tools#592 shape)."""
+    main = repo_with_dynamic_attr_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "mytool" / "__init__.py").write_text(
+        '"""mytool."""\n\n__version__ = "0.5.0"\n', encoding="utf-8"
+    )
+    _git("commit", "-qam", "release 0.5.0 (sibling PR)", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="mytool/cli.py\nmytool/__init__.py",
+        patch=_version_module_patch("mytool/__init__.py", "0.4.0", "0.5.0"),
+    )
+
+    assert r.returncode != 0, f"a bump the base tip already has must be refused\n{r.stdout}\n{r.stderr}"
+    assert "bumps mytool/__init__.py to 0.5.0" in r.stderr, r.stderr
+    assert "base branch tip ALREADY has version 0.5.0" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_dynamic_attr_base_tip_reads_dunder_version_not_code(repo_with_dynamic_attr_version, tmp_path):
+    """In a Python module only `__version__` declares the version: an earlier code line such as
+    `version = "0.0.0"` must not be read as the base tip's version (it would hide a taken 0.5.0)."""
+    main = repo_with_dynamic_attr_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    (main / "mytool" / "__init__.py").write_text(
+        '"""mytool."""\n\n\ndef _fallback():\n    version = "0.0.0"\n    return version\n\n\n'
+        '__version__ = "0.5.0"\n',
+        encoding="utf-8",
+    )
+    _git("commit", "-qam", "release 0.5.0 (sibling PR)", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="mytool/cli.py\nmytool/__init__.py",
+        patch=_version_module_patch("mytool/__init__.py", "0.4.0", "0.5.0"),
+    )
+
+    assert r.returncode != 0, f"a bump the base tip already has must be refused\n{r.stdout}\n{r.stderr}"
+    assert "base branch tip ALREADY has version 0.5.0" in r.stderr, r.stderr
+
+
+def test_hatch_path_version_bump_passes(tmp_path):
+    """Hatch's `[tool.hatch.version] path` names the version module directly (src layout
+    here); a moved `__version__` there is a bump."""
+    main = _repo_with_files(tmp_path, {
+        "README.md": "# x\n",
+        "pyproject.toml": _PYPROJECT_HATCH_PATH,
+        "src/mytool/__about__.py": '__version__ = "1.2.0"\n',
+    })
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="mytool/cli.py\nsrc/mytool/__about__.py",
+        patch=_version_module_patch("src/mytool/__about__.py", "1.2.0", "1.3.0"),
+    )
+
+    assert r.returncode == 0, f"a moved hatch __version__ must pass the gate\n{r.stdout}\n{r.stderr}"
+    assert "src/mytool/__about__.py version is bumped" in r.stdout, r.stdout
+
+
+def test_hatch_path_version_unchanged_is_blocked(tmp_path):
+    """A hatch `path` pyproject has no `version =` line at all, so the gate used to find "no
+    version file" and skip: a source change with an unchanged `__version__` merged unchecked."""
+    main = _repo_with_files(tmp_path, {
+        "README.md": "# x\n",
+        "pyproject.toml": _PYPROJECT_HATCH_PATH,
+        "src/mytool/__about__.py": '__version__ = "1.2.0"\n',
+    })
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(main, bindir, name_only="mytool/cli.py", patch=_PATCH_DYNAMIC_SOURCE_ONLY)
+
+    assert r.returncode != 0, f"an unchanged hatch __version__ must be refused\n{r.stdout}\n{r.stderr}"
+    assert "version in src/mytool/__about__.py is UNCHANGED" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_ship_version_files_pinned_module_reads_dunder_version(tmp_path):
+    """SHIP_VERSION_FILES pinned at a module: its `__version__ = "X"` line is a version
+    declaration, so a moved value passes (the pin used to see no version line at all)."""
+    main = _repo_with_files(tmp_path, {
+        "README.md": "# x\n",
+        "mytool/__init__.py": '"""mytool."""\n\n__version__ = "0.4.0"\n',
+    })
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="mytool/cli.py\nmytool/__init__.py",
+        patch=_version_module_patch("mytool/__init__.py", "0.4.0", "0.5.0"),
+        env_extra={"SHIP_VERSION_FILES": "mytool/__init__.py"},
+    )
+
+    assert r.returncode == 0, f"a pinned module's moved __version__ must pass\n{r.stdout}\n{r.stderr}"
+    assert "mytool/__init__.py version is bumped" in r.stdout, r.stdout
+
+
+def test_dynamic_attr_version_comparison_is_not_a_bump(repo_with_dynamic_attr_version, tmp_path):
+    """An added `__version__ == "9.9.9"` line in the version module is a comparison, not an
+    assignment: with `__version__` itself untouched the gate must refuse (review finding: the
+    `.py` pattern used to match the first `=` of `==`)."""
+    main = repo_with_dynamic_attr_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    patch = _PATCH_DYNAMIC_SOURCE_ONLY + (
+        "diff --git a/mytool/__init__.py b/mytool/__init__.py\n"
+        "--- a/mytool/__init__.py\n+++ b/mytool/__init__.py\n"
+        '@@ -3,0 +4 @@\n+__version__ == "9.9.9"\n'
+    )
+
+    r = _run_ship_vbump(main, bindir, name_only="mytool/cli.py\nmytool/__init__.py", patch=patch)
+
+    assert r.returncode != 0, f"a comparison is not a bump\n{r.stdout}\n{r.stderr}"
+    assert "version in mytool/__init__.py is UNCHANGED" in r.stderr, r.stderr
+
+
+def test_dynamic_attr_annotated_version_bump_passes(tmp_path):
+    """`__version__: T1 = "0.5.0"`: the value is the quoted literal after `=`, not the first
+    digit on the line (the `1` of the annotation would make 0.4.0 -> 0.5.0 read as 1 -> 1)."""
+    main = _repo_with_files(tmp_path, {
+        "README.md": "# x\n",
+        "pyproject.toml": _PYPROJECT_SETUPTOOLS_ATTR,
+        "mytool/__init__.py": '__version__: T1 = "0.4.0"\n',
+    })
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    patch = _PATCH_DYNAMIC_SOURCE_ONLY + (
+        "diff --git a/mytool/__init__.py b/mytool/__init__.py\n"
+        "--- a/mytool/__init__.py\n+++ b/mytool/__init__.py\n"
+        '@@ -1 +1 @@\n-__version__: T1 = "0.4.0"\n+__version__: T1 = "0.5.0"\n'
+    )
+
+    r = _run_ship_vbump(main, bindir, name_only="mytool/cli.py\nmytool/__init__.py", patch=patch)
+
+    assert r.returncode == 0, f"an annotated moved __version__ must pass\n{r.stdout}\n{r.stderr}"
+    assert "mytool/__init__.py version is bumped" in r.stdout, r.stdout
+
+
+def test_dynamic_attr_renamed_version_module_bump_passes(tmp_path):
+    """The PR moves the version module (mytool/__init__.py -> mytool/_version.py) and bumps it:
+    git shows `diff --git a/<old> b/<new>`, so the file's diff section is keyed by its new path
+    (review finding: it used to be found only when both sides named the same path)."""
+    main = _repo_with_files(tmp_path, {
+        "README.md": "# x\n",
+        "pyproject.toml": _PYPROJECT_SETUPTOOLS_ATTR.replace("mytool.__version__", "mytool._version.__version__"),
+        "mytool/_version.py": '__version__ = "0.4.0"\n',
+    })
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    patch = _PATCH_DYNAMIC_SOURCE_ONLY + (
+        "diff --git a/mytool/__init__.py b/mytool/_version.py\n"
+        "similarity index 60%\nrename from mytool/__init__.py\nrename to mytool/_version.py\n"
+        "--- a/mytool/__init__.py\n+++ b/mytool/_version.py\n"
+        '@@ -1 +1 @@\n-__version__ = "0.4.0"\n+__version__ = "0.5.0"\n'
+    )
+
+    r = _run_ship_vbump(main, bindir, name_only="mytool/cli.py\nmytool/_version.py", patch=patch)
+
+    assert r.returncode == 0, f"a moved-and-bumped module must pass\n{r.stdout}\n{r.stderr}"
+    assert "mytool/_version.py version is bumped" in r.stdout, r.stdout
+
+
+def test_version_section_is_not_spoofed_by_a_decoy_path(repo_with_dynamic_attr_version, tmp_path):
+    """A PR-added `weird b/mytool/__init__.py` gets the header `diff --git a/weird b/mytool/
+    __init__.py b/weird b/mytool/__init__.py` (git does not quote a space), which ends in
+    ` b/mytool/__init__.py`. Its hunk must not count as a bump of the real module (review
+    finding against a header-suffix match); git writes that file's `+++` line with a TAB."""
+    main = repo_with_dynamic_attr_version
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    decoy = "weird b/mytool/__init__.py"
+    patch = _PATCH_DYNAMIC_SOURCE_ONLY + (
+        f"diff --git a/{decoy} b/{decoy}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{decoy}\t\n"
+        '@@ -0,0 +1 @@\n+__version__ = "0.5.0"\n'
+    )
+
+    r = _run_ship_vbump(main, bindir, name_only=f"mytool/cli.py\n{decoy}", patch=patch)
+
+    assert r.returncode != 0, f"a decoy path must not satisfy the gate\n{r.stdout}\n{r.stderr}"
+    assert "version in mytool/__init__.py is UNCHANGED" in r.stderr, r.stderr
+
+
+def test_unreadable_dynamic_pyproject_falls_back_to_package_json(tmp_path):
+    """A polyglot repo: the pyproject's dynamic source is unreadable (a hatch path that is not
+    on disk), but package.json declares the version. Auto-detection checks package.json, as
+    it did before dynamic versions were read (review finding), instead of refusing outright."""
+    main = _repo_with_files(tmp_path, {
+        "README.md": "# x\n",
+        "pyproject.toml": _pyproject_dynamic('[tool.hatch.version]\npath = "m/_v.py"\n'),
+        "package.json": '{\n  "name": "mytool",\n  "version": "1.0.0"\n}\n',
+    })
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(main, bindir, name_only="src/a.js\npackage.json", patch=_PATCH_PKGJSON_BUMP)
+
+    assert r.returncode == 0, f"package.json's bump must count\n{r.stdout}\n{r.stderr}"
+    assert "package.json version is bumped" in r.stdout, r.stdout
+
+
+def test_dynamic_version_unreadable_source_refuses(tmp_path):
+    """A declared attr whose module is outside the probed layouts (here apps/mytool/) used to
+    fall back to pyproject's own `version = { attr = ... }` line, so renaming the attr to
+    `mytool2.__version__` read as a bump to `2.__version__` (review finding). Ship must refuse
+    and point at SHIP_VERSION_FILES instead of reading that line."""
+    main = _repo_with_files(tmp_path, {
+        "README.md": "# x\n",
+        "pyproject.toml": _PYPROJECT_SETUPTOOLS_ATTR,
+        "apps/mytool/__init__.py": '__version__ = "0.4.0"\n',
+    })
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    patch = _PATCH_DYNAMIC_SOURCE_ONLY + (
+        "diff --git a/pyproject.toml b/pyproject.toml\n"
+        "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+        '@@ -6 +6 @@\n-version = { attr = "mytool.__version__" }\n'
+        '+version = { attr = "mytool2.__version__" }\n'
+    )
+
+    for env_extra in (None, {"SHIP_VERSION_FILES": "pyproject.toml"}):
+        r = _run_ship_vbump(
+            main, bindir, name_only="mytool/cli.py\npyproject.toml", patch=patch,
+            env_extra=env_extra,
+        )
+
+        assert r.returncode != 0, f"{env_extra}: must refuse\n{r.stdout}\n{r.stderr}"
+        assert "version-bump gate OK" not in r.stdout, f"{env_extra}: attr churn read as a bump\n{r.stdout}"
+        assert 'attr "mytool.__version__"' in r.stderr, r.stderr
+        assert "SHIP_VERSION_FILES" in r.stderr, r.stderr
+        assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_base_tip_version_value_is_empty_not_fatal_without_a_version_line(tmp_path):
+    """The base tip has no such file yet (a PR adding its first version module) or no version
+    value in it: base_tip_version_value must print nothing and succeed. Under ship.sh's
+    `set -euo pipefail` a failing pipeline there killed ship silently with exit 1."""
+    main = _repo_with_files(tmp_path, {"README.md": "# x\n", "mytool/cli.py": "x = 1\n"})
+    script = "\n".join([
+        "set -euo pipefail",
+        'ROOT="$1"; PR=1; DEFAULT_BRANCH=main',
+        "gh() { echo main; }",
+        _ship_bash_functions("version_decl_ere", "version_value", "base_tip_version_value"),
+        'v=$(base_tip_version_value mytool/__init__.py); echo "missing=[$v]"',
+        'v=$(base_tip_version_value mytool/cli.py); echo "no-version=[$v]"',
+    ])
+
+    r = _sh("bash", "-c", script, "btv", str(main), cwd=main)
+
+    assert r.returncode == 0, f"rc {r.returncode}\n{r.stdout}\n{r.stderr}"
+    assert r.stdout == "missing=[]\nno-version=[]\n", r.stdout
+
+
+def _pyproject_dynamic(tool_table: str) -> str:
+    return '[project]\nname = "m"\ndynamic = ["version"]\n\n' + tool_table
+
+
+@pytest.mark.parametrize(
+    ("pyproject_rel", "files", "expected_rc", "expected_out"),
+    [
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": '[project]\nname = "m"\ndynamic = [\n  "readme",\n  \'version\',\n]\n\n'
+                                  "[tool.setuptools.dynamic]\nversion = {attr = 'm.sub.__version__'}\n",
+                "src/m/sub.py": '__version__ = "1.0.0"\n',
+            },
+            0, "src/m/sub.py",
+            id="multiline-dynamic-single-quotes-src-module",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": _PYPROJECT_SETUPTOOLS_ATTR.replace("\n", "\r\n"),
+                "mytool/__init__.py": '__version__ = "1.0.0"\n',
+            },
+            0, "mytool/__init__.py",
+            id="crlf",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": _pyproject_dynamic('[tool.setuptools.dynamic.version]\nattr = "m.__version__"\n'),
+                "m/__init__.py": '__version__ = "1.0.0"\n',
+            },
+            0, "m/__init__.py",
+            id="setuptools-version-subtable",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": _pyproject_dynamic('[tool.setuptools.dynamic]\nversion.attr = "m.__version__"\n'),
+                "m/__init__.py": '__version__ = "1.0.0"\n',
+            },
+            0, "m/__init__.py",
+            id="setuptools-dotted-version-attr",
+        ),
+        pytest.param(
+            "pkg/pyproject.toml",
+            {
+                "pkg/pyproject.toml": _pyproject_dynamic('[tool.hatch.version]\npath = "./m/_version.py"\n'),
+                "pkg/m/_version.py": '__version__ = "1.0.0"\n',
+            },
+            0, "pkg/m/_version.py",
+            id="nested-pyproject-hatch-path",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": '[project]\nname = "m"\nversion = "1.0.0"\n\n'
+                                  '[tool.hatch.version]\npath = "m/__init__.py"\n',
+                "m/__init__.py": '__version__ = "1.0.0"\n',
+            },
+            1, "",
+            id="static-version-wins",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {"pyproject.toml": _pyproject_dynamic('[tool.hatch.version]\nsource = "vcs"\n')},
+            1, "",
+            id="vcs-version-has-no-file",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": _pyproject_dynamic('[tool.setuptools.dynamic]\nversion = { attr = "m.VERSION" }\n'),
+                "m/__init__.py": 'VERSION = "1.0.0"\n',
+            },
+            2, 'pyproject.toml: attr "m.VERSION" (ship reads only __version__)',
+            id="attribute-other-than-dunder-version",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {"pyproject.toml": _PYPROJECT_SETUPTOOLS_ATTR},
+            2, 'pyproject.toml: attr "mytool.__version__" (module not found)',
+            id="module-not-on-disk",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": _pyproject_dynamic('[tool.setuptools.dynamic]\nversion = { attr = "m.__version__" }\n'),
+                "m/__init__.py": '__version_info__ = (1, 2, 4)\n__version__ = ".".join(map(str, __version_info__))\n',
+            },
+            2, 'pyproject.toml: attr "m.__version__" (no literal __version__ = "X" in m/__init__.py)',
+            id="computed-dunder-version",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {"pyproject.toml": _pyproject_dynamic('[tool.hatch.version]\npath = "m/_v.py"\n')},
+            2, 'pyproject.toml: path "m/_v.py" (not a regular file inside the repo)',
+            id="hatch-path-not-on-disk",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": _pyproject_dynamic('[tool.setuptools.dynamic]\nversion = { file = "VERSION" }\n'),
+                "VERSION": "1.0.0\n",
+            },
+            2, "pyproject.toml: [tool.setuptools.dynamic] version (not an attr)",
+            id="setuptools-file-source",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": _pyproject_dynamic('[tool.hatch.version]\npath = "VERSION.txt"\n'),
+                "VERSION.txt": '__version__ = "1.0.0"\n',
+            },
+            2, 'pyproject.toml: path "VERSION.txt" (not a .py module)',
+            id="hatch-path-not-a-py-module",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": _PYPROJECT_SETUPTOOLS_ATTR,
+                "mytool/__init__.py": '__version__: T1 = "1.0.0"\n',
+            },
+            0, "mytool/__init__.py",
+            id="annotated-dunder-version",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": '[project]\nname = "m"\ndynamic = [\n'
+                                  "    # see docs: version[1] mirrors the changelog tag\n"
+                                  '    "version",\n]\n\n'
+                                  '[tool.setuptools.dynamic]\nversion = { attr = "m.__version__" }\n',
+                "m/__init__.py": '__version__ = "1.0.0"\n',
+            },
+            0, "m/__init__.py",
+            id="comment-with-bracket-inside-dynamic-array",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": _pyproject_dynamic('[ tool.hatch.version ]  # spaced header\npath = "m/_v.py"\n'),
+                "m/_v.py": '__version__ = "1.0.0"\n',
+            },
+            0, "m/_v.py",
+            id="spaced-section-header",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": _pyproject_dynamic(
+                    '[tool.hatch.version]\npath = "m/_v.py"\npattern = "VERSION = \'(?P<version>[^\']+)\'"\n'
+                ),
+                "m/_v.py": '__version__ = "0.0.1"\nVERSION = \'1.0.0\'\n',
+            },
+            2, 'pyproject.toml: path "m/_v.py" (custom hatch pattern)',
+            id="hatch-custom-pattern",
+        ),
+        pytest.param(
+            "pyproject.toml",
+            {
+                "pyproject.toml": _pyproject_dynamic(
+                    '[tool.setuptools.dynamic]\nversion = { attr = "m.__version__" }\n\n'
+                    '[tool.hatch.version]\npath = "m/_v.py"\n'
+                ),
+                "m/__init__.py": '__version__ = "1.0.0"\n',
+                "m/_v.py": '__version__ = "2.0.0"\n',
+            },
+            2, "pyproject.toml: both a setuptools attr and a hatch path (ambiguous)",
+            id="setuptools-attr-and-hatch-path",
+        ),
+    ],
+)
+def test_dynamic_version_file_resolution(tmp_path, pyproject_rel, files, expected_rc, expected_out):
+    """dynamic_version_file maps a pyproject's dynamic version to the module holding it (rc 0),
+    resolves nothing for a static or VCS-derived version (rc 1), and names a declared source it
+    cannot read (rc 2) so the gate refuses instead of reading the declaration line itself."""
+    for rel, text in files.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_bytes(text.encode("utf-8"))
+
+    r = _run_dynamic_version_file(tmp_path, pyproject_rel)
+
+    assert r.returncode == expected_rc, f"rc {r.returncode}, stdout {r.stdout!r}\n{r.stderr}"
+    assert r.stdout == expected_out, f"{r.stdout!r} != {expected_out!r}\n{r.stderr}"
+
+
+def _run_dynamic_version_file(root: Path, pyproject_rel: str):
+    script = "\n".join([
+        'ROOT="$2"',
+        _ship_bash_functions("version_decl_ere", "repo_file_inside_root", "dynamic_version_file"),
+        'dynamic_version_file "$1"',
+    ])
+    return _sh("bash", "-c", script, "dvf", pyproject_rel, str(root), cwd=root)
+
+
+@pytest.mark.parametrize("case", ["dotdot", "absolute", "file-symlink", "dir-symlink", "attr-package-symlink"])
+def test_dynamic_version_file_rejects_sources_outside_the_repo(tmp_path, case):
+    """The version source comes from the PR's own pyproject.toml, so a hatch `path` (or a
+    symlink in the PR) must not lead ship to stat or read files outside the checkout: every
+    escape is refused with the same reason, whether or not the outside file exists."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    secret = tmp_path / "secret" / "_version.py"
+    secret.parent.mkdir()
+    secret.write_text('__version__ = "1.0.0"\n', encoding="utf-8")
+    (tmp_path / "secret" / "__init__.py").write_text('__version__ = "1.0.0"\n', encoding="utf-8")
+    try:
+        if case == "file-symlink":
+            (root / "m").mkdir()
+            os.symlink(secret, root / "m" / "_version.py")
+        elif case == "dir-symlink":
+            os.symlink(secret.parent, root / "m", target_is_directory=True)
+        elif case == "attr-package-symlink":
+            os.symlink(secret.parent, root / "pkg", target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    value = {
+        "dotdot": "../secret/_version.py",
+        "absolute": str(secret),
+    }.get(case, "m/_version.py")
+    table = (
+        '[tool.setuptools.dynamic]\nversion = { attr = "pkg.__version__" }\n'
+        if case == "attr-package-symlink"
+        else f'[tool.hatch.version]\npath = "{value}"\n'
+    )
+    (root / "pyproject.toml").write_text(_pyproject_dynamic(table), encoding="utf-8")
+
+    r = _run_dynamic_version_file(root, "pyproject.toml")
+
+    reason = "module not found" if case == "attr-package-symlink" else "not a regular file inside the repo"
+    assert r.returncode == 2, f"rc {r.returncode}, stdout {r.stdout!r}\n{r.stderr}"
+    assert r.stdout.endswith(f"({reason})"), r.stdout
+
+
 def test_dry_run_self_clean_does_not_warn_or_remove(repo_with_pr_worktree, tmp_path):
     """--dry-run from inside the PR worktree must NOT remove the tree and must NOT emit the
     caller-contract 'cwd is now gone' warning (the worktree is still there). Guards against
