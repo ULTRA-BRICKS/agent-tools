@@ -248,7 +248,8 @@ for hook in "$DIR"/*; do
   # Skip non-executables, directories, and dotfiles (README/.keep live here too).
   [ -f "$hook" ] || continue
   [ -x "$hook" ] || continue
-  case "$(basename "$hook")" in .*) continue ;; esac
+  # Rig keeps executable rollback copies beside hooks; never dispatch those old versions.
+  case "$(basename "$hook")" in .*|*.rig-bak-*) continue ;; esac
 
   # DEDUP: skip this fragment if the repo already provides its capability locally.
   hid="$(hook_id "$hook")"

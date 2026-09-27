@@ -778,6 +778,64 @@ def _is_exempt_skip(seg: CommitSegment) -> bool:
     return is_skip_commit_argv(seg.argv)  # inert for git commit; kept for sibling-parser SYNC parity
 
 
+def _effective_git_cwd(seg: CommitSegment, cwd: str) -> str | None:
+    """Resolve the repo a parsed commit targets, or None when unsafe to infer.
+
+    Resolution is: event cwd -> preceding same-shell `cd` -> git's global `-C`.
+    Alternate GIT_DIR/GIT_WORK_TREE targets are deliberately not inferred: both the docs
+    fast-path and empty-repo bootstrap fail closed for those shapes.
+    """
+    if seg.alt_repo:
+        return None
+    effective_cwd = cwd
+    if seg.cd_dir:
+        effective_cwd = (
+            seg.cd_dir if os.path.isabs(seg.cd_dir) else os.path.join(cwd, seg.cd_dir)
+        )
+    git_cwd = effective_cwd
+    if seg.target_dir:
+        git_cwd = (
+            seg.target_dir
+            if os.path.isabs(seg.target_dir)
+            else os.path.join(effective_cwd, seg.target_dir)
+        )
+    return git_cwd
+
+
+def _repo_has_no_refs(seg: CommitSegment, cwd: str) -> bool:
+    """True only for a safely-resolved fresh repo with zero refs.
+
+    SYNC with require-ticket-before-commit._repo_has_no_refs. A missing HEAD is not enough:
+    `git switch --orphan` in a nonempty repo also has no HEAD. Normal repos pay one bounded
+    ref probe; the ref-empty case additionally verifies HEAD is a normal symbolic branch.
+    """
+    git_cwd = _effective_git_cwd(seg, cwd)
+    if git_cwd is None:
+        return False
+    try:
+        refs = subprocess.run(
+            ["git", "-C", git_cwd, "for-each-ref", "--count=1", "--format=%(refname)", "refs"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        if refs.returncode != 0 or refs.stdout.strip():
+            return False
+        head = subprocess.run(
+            ["git", "-C", git_cwd, "symbolic-ref", "-q", "HEAD"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        if head.returncode != 0 or not head.stdout.strip().startswith("refs/heads/"):
+            return False
+        # Deleting the last branch does not make a previously used repository fresh.
+        history = subprocess.run(
+            ["git", "-C", git_cwd, "reflog", "exists", "HEAD"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        return history.returncode == 1  # no HEAD reflog; other errors fail closed
+    except (OSError, subprocess.SubprocessError) as exc:
+        warn(f"could not classify bootstrap repo state: {exc}")
+        return False
+
+
 def _is_docs_only_commit(seg: CommitSegment, cwd: str) -> bool:
     """True when this commit is a TRUSTWORTHY docs-only commit (runs a `git diff` — call only when
     it actually decides the outcome, i.e. no fresh marker).
@@ -800,14 +858,9 @@ def _is_docs_only_commit(seg: CommitSegment, cwd: str) -> bool:
     # 2. The event cwd (if no cd preceded this commit).
     # Then, if `git -C <dir>` is present, it is applied ON TOP of the effective cwd — so a
     # relative `-C sub` after `cd /worktree` targets `/worktree/sub`, not `<event-cwd>/sub`.
-    effective_cwd = cwd
-    if seg.cd_dir:
-        effective_cwd = (seg.cd_dir if os.path.isabs(seg.cd_dir)
-                         else os.path.join(cwd, seg.cd_dir))
-    git_cwd = effective_cwd
-    if seg.target_dir:
-        git_cwd = (seg.target_dir if os.path.isabs(seg.target_dir)
-                   else os.path.join(effective_cwd, seg.target_dir))
+    git_cwd = _effective_git_cwd(seg, cwd)
+    if git_cwd is None:
+        return False
     files = staged_files(git_cwd)
     if files is not None and is_docs_only(files):
         warn("docs-only commit — review not required")
@@ -844,10 +897,16 @@ def main() -> int:
     if not authoring:
         return _allow()  # no segment, or every commit segment is skip-exempt → nothing to gate
 
-    # A fresh marker allows ANY commit → check it (a cheap stat) BEFORE the docs-only `git diff`, so
-    # the common "ran review → commit" path pays no subprocess. None = marker un-stat'able → fail open.
+    # A fresh marker allows ANY commit → check it (a cheap stat) BEFORE every git subprocess, so
+    # the common "ran review → commit" path stays syscall-only. None = marker un-stat'able → fail open.
     fresh = _marker_is_fresh()
     if fresh is None or fresh:
+        return _allow()
+
+    # EMPTY-REPO BOOTSTRAP. A review cannot precede the repository's first root commit.
+    # Exempt exactly one safely-targeted authoring commit when the entire repo has zero refs.
+    # A chain gets no exemption; orphan branches in existing repos still have refs and block.
+    if len(authoring) == 1 and _repo_has_no_refs(authoring[0], cwd):
         return _allow()
 
     # No fresh marker: the only thing that can still exempt a commit is being a trustworthy

@@ -147,6 +147,98 @@ def _run_inproc(command, monkeypatch, tmp_path, *, strict=None, env_extra=None, 
     return {"code": code, "decision": payload["decision"], "message": payload.get("message", "")}
 
 
+
+
+def _run_in_git_repo(command: str, repo: Path) -> dict:
+    import os
+
+    env = dict(os.environ)
+    for k in ("REQUIRE_TICKET_STRICT", "REQUIRE_TICKET_SKIP", "REQUIRE_TICKET_EXEMPT_TYPES", _HATCH_ENV):
+        env.pop(k, None)
+    event = json.dumps({"args": {"command": command}, "cwd": str(repo)})
+    proc = subprocess.run(
+        [sys.executable, str(_HOOK)],
+        input=event,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=repo,
+        timeout=10,
+    )
+    payload = json.loads((proc.stdout or "").strip())
+    return {"code": proc.returncode, "decision": payload["decision"], "message": payload.get("message", "")}
+
+
+def _unborn_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "unborn-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    (repo / "bootstrap.py").write_text("x\n")
+    subprocess.run(["git", "add", "bootstrap.py"], cwd=repo, check=True)
+    return repo
+
+
+
+
+def test_first_commit_in_unborn_repo_allows_without_ticket(tmp_path):
+    repo = _unborn_repo(tmp_path)
+    r = _run_in_git_repo('git commit -m "feat: bootstrap"', repo)
+    assert r["code"] == 0 and r["decision"] == "allow"
+
+
+def test_unborn_repo_does_not_exempt_two_commit_chain(tmp_path):
+    repo = _unborn_repo(tmp_path)
+    r = _run_in_git_repo(
+        'git commit -m "feat: bootstrap" && git commit -m "feat: second"',
+        repo,
+    )
+    assert r["code"] == rt.BLOCK_EXIT_CODE and r["decision"] == "block"
+
+
+def test_second_commit_still_requires_ticket(tmp_path):
+    repo = _unborn_repo(tmp_path)
+    subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "bootstrap"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "bootstrap.py").write_text("y\n")
+    subprocess.run(["git", "add", "bootstrap.py"], cwd=repo, check=True)
+    r = _run_in_git_repo('git commit -m "feat: second"', repo)
+    assert r["code"] == rt.BLOCK_EXIT_CODE and r["decision"] == "block"
+
+
+
+
+def test_orphan_branch_in_nonempty_repo_still_requires_ticket(tmp_path):
+    repo = _unborn_repo(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "bootstrap"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "switch", "--orphan", "orphan"], check=True)
+    subprocess.run(["git", "-C", str(repo), "rm", "-q", "-rf", "--ignore-unmatch", "."], check=True)
+    (repo / "orphan.py").write_text("x\n")
+    subprocess.run(["git", "-C", str(repo), "add", "orphan.py"], check=True)
+    r = _run_in_git_repo('git commit -m "feat: orphan"', repo)
+    assert r["code"] == rt.BLOCK_EXIT_CODE and r["decision"] == "block"
+
+
+@pytest.mark.parametrize("shape", ["dash-c", "cwd"])
+def test_bootstrap_target_resolution_allows_first_ticketless_commit(shape, tmp_path):
+    target = _unborn_repo(tmp_path)
+    if shape == "dash-c":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        command = f'git -C {target} commit -m "feat: bootstrap"'
+        r = _run_in_git_repo(command, outside)
+    else:
+        r = _run_in_git_repo('git commit -m "feat: bootstrap"', target)
+    assert r["code"] == 0 and r["decision"] == "allow"
+
+
 # ── STRICT BY DEFAULT ─────────────────────────────────────────────────────────────────────────
 
 
@@ -676,6 +768,14 @@ def test_dash_F_stdin_on_non_ticket_branch_still_blocks(tmp_path):
     # defeats the gate.
     repo = tmp_path / "repo"
     subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+    (repo / ".baseline").write_text("seed\n")
+    subprocess.run(["git", "-C", str(repo), "add", ".baseline"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "bootstrap"],
+        check=True,
+    )
     r = _run(f"git -C {repo} commit -F -", strict=True)
     assert r["code"] == 10
     assert r["decision"] == "block"
@@ -1016,3 +1116,11 @@ def test_hatch_inline_command_after_separator_allows(tmp_path, monkeypatch):
     )
     r = _run_inproc(command, monkeypatch, tmp_path, tg_ctl=tg_ctl)
     assert r["code"] == 0 and r["decision"] == "allow"
+
+
+def test_deleted_last_ref_still_requires_ticket(tmp_path):
+    repo = _unborn_repo(tmp_path)
+    subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "bootstrap"], cwd=repo, check=True)
+    subprocess.run(["git", "update-ref", "-d", "refs/heads/main"], cwd=repo, check=True)
+    result = _run_in_git_repo('git commit -m "feat: second"', repo)
+    assert result["code"] == rt.BLOCK_EXIT_CODE and result["decision"] == "block"

@@ -25,6 +25,27 @@ case "$repo_root" in
 esac
 unset _tmp_root
 
+# EMPTY-REPO BOOTSTRAP. "HEAD is missing" is NOT enough: an orphan branch in a repo with
+# history also has no HEAD. First prove the repo has literally zero refs. A git error is not
+# bootstrap and fails closed. Only the ref-empty case pays the second symbolic-HEAD probe,
+# which distinguishes a freshly initialized repo from a corrupt/detached HEAD.
+_refs_probe="$(command git for-each-ref --count=1 --format='%(refname)' refs 2>/dev/null)"
+_refs_rc=$?
+if [ "$_refs_rc" -ne 0 ]; then
+  echo "review-before-commit: could not classify repository refs; refusing to skip review." >&2
+  exit 1
+fi
+if [ -z "$_refs_probe" ]; then
+  if _head_ref="$(command git symbolic-ref -q HEAD 2>/dev/null)"; then
+    command git reflog exists HEAD >/dev/null 2>&1
+    _history_rc=$?
+    case "$_head_ref:$_history_rc" in refs/heads/*:1) exit 0 ;; esac
+  fi
+  echo "review-before-commit: repository has no refs but HEAD is not a valid branch; refusing to skip review." >&2
+  exit 1
+fi
+unset _refs_probe _refs_rc _head_ref
+
 if ! files="$(command git -c core.quotepath=false diff --cached --name-only --no-renames)"; then
   echo "review-before-commit: could not list staged files; refusing to skip review." >&2
   exit 1

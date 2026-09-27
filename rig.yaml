@@ -43,6 +43,6 @@ linters:
 task:
   backend: forgejo
   forgejo:
-    host: git.hyperide.ai
+    url: https://git.hyperide.ai
     repo: ultrabricks/agent-tools
     attachment_mode: link

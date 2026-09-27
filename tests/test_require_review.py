@@ -54,25 +54,32 @@ def _git(repo: Path, *argv: str) -> None:
                    capture_output=True, text=True, timeout=30)
 
 
-def _init_repo(repo: Path, *files: str) -> Path:
-    """Init a git repo at `repo` and stage `files`."""
+def _init_repo(repo: Path, *files: str, bootstrapped: bool = True) -> Path:
+    """Init a git repo and stage `files`; normal fixtures include the bootstrap commit."""
     repo.mkdir(parents=True, exist_ok=True)
-    _git(repo, "init", "-q")
+    _git(repo, "init", "-q", "-b", "main")
     _git(repo, "config", "user.email", "t@t")
     _git(repo, "config", "user.name", "t")
-    # Isolate from any global core.hooksPath on the host so fixture commits don't run real hooks.
+    # Isolate fixture commits from the machine's global hooks.
     _git(repo, "config", "core.hooksPath", "/dev/null")
+    if bootstrapped:
+        (repo / ".baseline").write_text("seed\n")
+        _git(repo, "add", ".baseline")
+        _git(repo, "commit", "-q", "-m", "chore: bootstrap")
     for rel in files:
-        p = repo / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("x")
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
         _git(repo, "add", rel)
     return repo
 
 
 def _mk_repo_with_staged(tmp_path: Path, *files: str) -> Path:
-    """Convenience: a repo at `tmp_path/repo` with `files` staged (the common single-repo case)."""
     return _init_repo(tmp_path / "repo", *files)
+
+
+def _mk_unborn_repo_with_staged(tmp_path: Path, *files: str) -> Path:
+    return _init_repo(tmp_path / "unborn", *files, bootstrapped=False)
 
 
 def _run(command, cwd, monkeypatch, *, marker: Path,
@@ -115,6 +122,51 @@ _ALLOW_REPLY_SH = (
 )
 
 
+
+
+def test_allow_first_commit_in_unborn_repo_without_review(tmp_path, monkeypatch):
+    repo = _mk_unborn_repo_with_staged(tmp_path, "src/bootstrap.py")
+    out, _e, c = _run("git commit -m bootstrap", repo, monkeypatch, marker=tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_unborn_repo_does_not_exempt_a_two_commit_chain(tmp_path, monkeypatch):
+    repo = _mk_unborn_repo_with_staged(tmp_path, "src/bootstrap.py")
+    out, _e, c = _run(
+        "git commit -m bootstrap && git commit -m second",
+        repo,
+        monkeypatch,
+        marker=tmp_path / "m",
+    )
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+
+
+def test_orphan_branch_in_nonempty_repo_still_requires_review(tmp_path, monkeypatch):
+    repo = _mk_repo_with_staged(tmp_path, "src/normal.py")
+    _git(repo, "reset", "-q")
+    _git(repo, "switch", "--orphan", "orphan")
+    _git(repo, "rm", "-q", "-rf", "--ignore-unmatch", ".")
+    (repo / "orphan.py").write_text("x\n")
+    _git(repo, "add", "orphan.py")
+    out, _e, c = _run("git commit -m orphan", repo, monkeypatch, marker=tmp_path / "m")
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("shape", ["dash-c", "cd"])
+def test_bootstrap_repo_target_resolution_allows_first_commit(shape, tmp_path, monkeypatch):
+    main_repo = _mk_repo_with_staged(tmp_path, "src/main.py")
+    _git(main_repo, "reset", "-q")
+    unborn = _init_repo(tmp_path / "target-unborn", "src/bootstrap.py", bootstrapped=False)
+    if shape == "dash-c":
+        command = f"git -C {unborn} commit -m bootstrap"
+    else:
+        command = f"cd {unborn} && git commit -m bootstrap"
+    out, _e, c = _run(command, main_repo, monkeypatch, marker=tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow"
+
+
 # ── BLOCK — a real authoring commit with code staged and no marker ───────────────────────
 
 def test_block_code_commit_with_no_marker(tmp_path, monkeypatch):
@@ -143,6 +195,13 @@ def test_fresh_marker_short_circuits_before_git_diff(tmp_path, monkeypatch):
         raise AssertionError("staged_files must NOT run when a fresh marker exists")
 
     monkeypatch.setattr(rr, "staged_files", _boom)
+    monkeypatch.setattr(
+        rr,
+        "_repo_has_no_refs",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("bootstrap git probe must NOT run when a fresh marker exists")
+        ),
+    )
     out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=marker)
     assert c == 0 and _decision(out) == "allow"
 
@@ -1074,3 +1133,10 @@ def test_hatch_justification_exit1_blocks_citing_denied(tmp_path, monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_deleted_last_ref_is_not_fresh_bootstrap(tmp_path, monkeypatch):
+    repo = _mk_repo_with_staged(tmp_path, "src/second.py")
+    _git(repo, "update-ref", "-d", "refs/heads/main")
+    out, _e, c = _run("git commit -m second", repo, monkeypatch, marker=tmp_path / "no-marker")
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
