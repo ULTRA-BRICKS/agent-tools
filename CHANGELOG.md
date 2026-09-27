@@ -4,6 +4,13 @@
 
 ### Added
 
+- Empty-repository bootstrap (#791): the first root commit may be created without a task,
+  separate worktree, feature branch or PR. After it lands on main/master, the post-commit
+  hook explains the normal task/worktree/branch/PR/ship workflow. Subsequent commits and
+  direct pushes remain guarded; orphan branches and deleted-ref history are not bootstrap.
+- The global dispatcher ignores Rig backup files, so an obsolete executable .rig-bak-*
+  hook cannot override the current implementation after an update.
+
 - `agent-hooks/package-store-guard` (pre-bash, every harness): blocks wiping a shared package
   store (`bun pm cache rm`, deleting/moving `~/.bun/install/cache` or an ancestor, `uv cache
   clean`, `uv cache prune --all`/`--ci`, deleting `~/.cache/uv`), creating a symlink named
