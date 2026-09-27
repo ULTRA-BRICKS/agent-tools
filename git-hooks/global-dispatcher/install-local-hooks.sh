@@ -389,10 +389,14 @@ NEUTRALIZED_RE='[|&;]'
 # line, strip leading shell VAR=value env-assignment prefixes (so `GITLEAKS_CONFIG=x
 # gitleaks …` is seen as a gitleaks command), drop neutralized lines; return 0 if an
 # ACTIVE, BLOCKING command invokes the scanner (per SECRET_CMD_RE above).
+# PORTABILITY: one substitution with a repeated group strips every leading assignment. No
+# `:label; …; tlabel` loop: BSD sed (macOS) reads a label to the end of the line, warns
+# "unused label" and passes every line through unchanged, so an env-prefixed scanner
+# (`GITLEAKS_CONFIG=x gitleaks …`) read as "no local secret scan" there.
 scan_text_for_secret() {
   sed 's/#.*$//' \
     | grep -vF "$MARKER" \
-    | sed -E ':a; s/^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+//; ta' \
+    | sed -E 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)+//' \
     | grep -Ev "$NEUTRALIZED_RE" \
     | grep -Eq "$SECRET_CMD_RE"
 }

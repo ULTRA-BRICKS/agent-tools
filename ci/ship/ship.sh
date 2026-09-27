@@ -141,7 +141,9 @@
 #                          genuine no-release ship.
 #   SHIP_VERSION_FILES     space-separated list of version files to check (relative to the repo
 #                          root). Default: auto-detect pyproject.toml then package.json at the
-#                          root. Set it for a non-standard layout (e.g. a nested package).
+#                          root. Set it for a non-standard layout (e.g. a nested package). A
+#                          pyproject.toml with a dynamic version (setuptools `attr`, hatch
+#                          `path`) resolves to the module whose `__version__` it reads.
 #   SHIP_REVIEW_DWELL      minimum seconds since the PR's last code push before a merge is
 #                          allowed, so asynchronous review (multi-model / CI-AI / human) has
 #                          time to FORM its comments. Default 600 (10 min). 0 disables the gate.
@@ -2041,8 +2043,9 @@ fi
 #
 # Repo-agnostic: detection works off the PR's own changed files + diff (no tracker / layout /
 # org hard-coded). A changed path is "shippable source" UNLESS it matches the docs/test/CI
-# exclusion set below; the version file is auto-located (pyproject.toml `version =`, then
-# package.json `"version"`) or pinned via SHIP_VERSION_FILES.
+# exclusion set below; the version file is auto-located (pyproject.toml `version =`, or the
+# module holding a dynamic pyproject version's `__version__`, then package.json `"version"`)
+# or pinned via SHIP_VERSION_FILES.
 
 # A path is NON-shippable (does NOT, on its own, make a ship a release) iff it is docs, a
 # test, or CI/meta. Everything else is treated as shippable source. Kept deliberately broad
@@ -2095,20 +2098,161 @@ any_shippable_source() {  # stdin: changed paths -> rc 0 if any shippable
   return $found
 }
 
-# Locate the repo's version file: the explicit override, else pyproject.toml (with a
-# `[project] version =`), else package.json (with a `"version"`). Prints the path, or nothing.
+# The ERE for a version-declaration line in version file $1. A Python module (the file a
+# dynamic pyproject version resolves to, dynamic_version_file below) declares it only as an
+# assignment of a string literal, `__version__ = "X"` (also `__version__: str = "X"`); a
+# `__version__ == "X"` comparison or any other `version = ...` line there is code.
+# pyproject.toml / package.json use `version = "X"` / `"version": "X"`. The choice is by
+# extension only: a module pinned via SHIP_VERSION_FILES needs its `.py` suffix. These are
+# line patterns, not a parser: a matching line inside a docstring (or, in pyproject, under
+# another table) is read like the real one. The gate catches a forgotten bump, not a staged
+# decoy (parser-based reading: agent-tools#812).
+version_decl_ere() {  # $1 = version file path
+  case "$1" in
+    *.py) printf '%s' "__version__[[:space:]]*(:[^=]*)?=[[:space:]]*[\"']" ;;
+    *) printf '%s' '(version[[:space:]]*=|"version"[[:space:]]*:)' ;;
+  esac
+}
+
+# True iff $1 (relative to $ROOT) is a regular file that physically lives inside $ROOT: not
+# absolute, no `..` segment, not a symlink, no symlinked directory on the way. The path comes
+# from the PR's own pyproject.toml, so without this `path = "../../etc/passwd"` (or a symlink
+# committed in the PR) would make ship stat and read files outside the checkout.
+repo_file_inside_root() {  # $1 = path relative to $ROOT
+  local root dir
+  case "/$1/" in *//*|*/../*) return 1 ;; esac
+  root=$(cd "$ROOT" 2>/dev/null && pwd -P) || return 1
+  dir=$(cd "$ROOT/$(dirname -- "$1")" 2>/dev/null && pwd -P) || return 1
+  case "$dir/" in "$root"/*) ;; *) return 1 ;; esac
+  [ -f "$ROOT/$1" ] && [ ! -L "$ROOT/$1" ]
+}
+
+# The module holding a pyproject's DYNAMIC version: `[project] dynamic = ["version"]` plus
+# setuptools `[tool.setuptools.dynamic] version = { attr = "pkg.__version__" }` or hatch
+# `[tool.hatch.version] path = "pkg/__init__.py"`. A release moves that module's
+# `__version__`, never the pyproject's own `version = { attr = ... }` line (qa-cli PR #23), so
+# the module is the version file. rc 0: prints its path relative to $ROOT. rc 1 (prints
+# nothing): the version is static, or dynamic with no file behind it (VCS-derived). rc 2: the
+# pyproject names a source ship cannot read (an attribute other than `__version__`, a module
+# outside the flat/src layouts, a hatch path that is not a regular file inside the repo
+# (repo_file_inside_root), a module with no literal `__version__ = "X"`, a custom hatch
+# `pattern`, both an attr and a hatch path, a setuptools `file`/other form). It prints
+# `<pyproject>: <source> (<why>)` so the gate refuses with the reason instead of reading the
+# declaration line itself, where renaming `attr = "pkg"` to `"pkg2"` would look like a bump
+# to `2...`.
+dynamic_version_file() {  # $1 = pyproject.toml path relative to $ROOT
+  local dir="" spec val mod cand="" why=""
+  case "$1" in */*) dir="${1%/*}/" ;; esac
+  spec=$(awk -v sq="'" '
+    # The string after the first `=` on the line, in double or single quotes, else "".
+    function strval(s,   q, i) {
+      sub(/^[^=]*=[[:space:]]*/, "", s)
+      q = substr(s, 1, 1)
+      if (q != "\"" && q != sq) return ""
+      s = substr(s, 2); i = index(s, q)
+      return i ? substr(s, 1, i - 1) : ""
+    }
+    /^[[:space:]]*\[\[/ { sec = ""; indyn = 0; next }
+    /^[[:space:]]*\[[A-Za-z0-9_. -]+\][[:space:]]*(#.*)?$/ {
+      sec = $0; sub(/^[[:space:]]*\[[[:space:]]*/, "", sec); sub(/[[:space:]]*\].*$/, "", sec)
+      indyn = 0; next
+    }
+    sec == "project" && /^[[:space:]]*dynamic[[:space:]]*=/ { indyn = 1 }
+    indyn {
+      # Drop a comment first: its `]` would end the array early, its "version" is not one.
+      line = $0; sub(/#.*/, "", line)
+      if (index(line, "\"version\"") || index(line, sq "version" sq)) dyn = 1
+      if (index(line, "]")) indyn = 0
+    }
+    sec == "tool.setuptools.dynamic" && /^[[:space:]]*version[[:space:]]*[.=]/ { declared = 1 }
+    sec == "tool.setuptools.dynamic.version" && /^[[:space:]]*[A-Za-z]/ { declared = 1 }
+    sec == "tool.setuptools.dynamic" && /^[[:space:]]*version[[:space:]]*=[[:space:]]*[{]/ {
+      s = $0; sub(/^[^{]*[{]/, "", s)
+      if (match(s, /(^|[[:space:],])attr[[:space:]]*=/)) attr = strval(substr(s, RSTART))
+    }
+    sec == "tool.setuptools.dynamic" && /^[[:space:]]*version\.attr[[:space:]]*=/ { attr = strval($0) }
+    sec == "tool.setuptools.dynamic.version" && /^[[:space:]]*attr[[:space:]]*=/ { attr = strval($0) }
+    sec == "tool.hatch.version" && /^[[:space:]]*path[[:space:]]*=/ { path = strval($0) }
+    sec == "tool.hatch.version" && /^[[:space:]]*pattern[[:space:]]*=/ { pattern = 1 }
+    END {
+      if (!dyn) exit
+      if (attr != "" && path != "") print "both"
+      else if (attr != "") print "attr " attr
+      else if (path != "") print (pattern ? "pattern " : "path ") path
+      else if (declared) print "setuptools"
+    }
+  ' "$ROOT/$1" 2>/dev/null) || return 1
+  val=${spec#* }
+  case "$spec" in
+    "") return 1 ;;
+    "path "?*)
+      cand="$dir${val#./}"
+      # One reason for every failure, so the refusal says nothing about files outside.
+      repo_file_inside_root "$cand" || why="not a regular file inside the repo" ;;
+    "attr "?*.__version__)
+      mod=$(printf '%s' "${val%.__version__}" | tr . /)
+      why="module not found"
+      # Flat layout first, then the src layout.
+      for cand in "$dir$mod/__init__.py" "$dir$mod.py" "${dir}src/$mod/__init__.py" "${dir}src/$mod.py"; do
+        repo_file_inside_root "$cand" && { why=""; break; }
+      done ;;
+    "attr "*) why="ship reads only __version__" ;;
+    # A hatch `pattern` may name another variable than `__version__`.
+    "pattern "*) printf '%s: path "%s" (custom hatch pattern)' "$1" "$val"; return 2 ;;
+    both) printf '%s: both a setuptools attr and a hatch path (ambiguous)' "$1"; return 2 ;;
+    *) printf '%s: [tool.setuptools.dynamic] version (not an attr)' "$1"; return 2 ;;
+  esac
+  # The module must spell the version out: a computed `__version__` (e.g. joined from a
+  # `__version_info__` tuple) never shows a value in a diff, so every ship would read UNCHANGED.
+  # Only a `.py` file is read as a module (version_decl_ere picks its pattern by extension).
+  if [ -z "$why" ]; then
+    case "$cand" in
+      *.py) grep -Eq "^[[:space:]]*$(version_decl_ere "$cand")v?[0-9]" "$ROOT/$cand" \
+              || why="no literal __version__ = \"X\" in $cand" ;;
+      *) why="not a .py module" ;;
+    esac
+  fi
+  [ -n "$why" ] || { printf '%s' "$cand"; return 0; }
+  printf '%s: %s "%s" (%s)' "$1" "${spec%% *}" "$val" "$why"
+  return 2
+}
+
+# Locate the repo's version file: the explicit override, else pyproject.toml, else
+# package.json (with a `"version"`). A pyproject (pinned or auto-detected) with a dynamic
+# version resolves to the module that holds it; an auto-detected one otherwise counts only
+# with a literal `version = "X"`, never a `version = { ... }` declaration. Prints the path;
+# rc 1 when there is none; rc 2, printing the source, for a dynamic version ship cannot read
+# (auto-detected: only when package.json does not declare the version either).
 locate_version_file() {
-  local f
+  local f rc out unreadable=""
   if [ -n "${SHIP_VERSION_FILES:-}" ]; then
-    for f in $SHIP_VERSION_FILES; do [ -f "$ROOT/$f" ] && { printf '%s' "$f"; return 0; }; done
+    for f in $SHIP_VERSION_FILES; do
+      [ -f "$ROOT/$f" ] || continue
+      case "$f" in
+        pyproject.toml|*/pyproject.toml)
+          # rc 0: the module path; rc 2: the unreadable source (final: the pin is refused, not
+          # skipped for a later entry); rc 1: a static pyproject.
+          rc=0; out=$(dynamic_version_file "$f") || rc=$?
+          [ "$rc" = 1 ] || { printf '%s' "$out"; return "$rc"; } ;;
+      esac
+      printf '%s' "$f"; return 0
+    done
     return 1
   fi
-  if [ -f "$ROOT/pyproject.toml" ] && grep -Eq '^[[:space:]]*version[[:space:]]*=' "$ROOT/pyproject.toml"; then
-    printf 'pyproject.toml'; return 0
+  if [ -f "$ROOT/pyproject.toml" ]; then
+    rc=0; out=$(dynamic_version_file pyproject.toml) || rc=$?
+    case "$rc" in
+      0) printf '%s' "$out"; return 0 ;;
+      2) unreadable=$out ;;  # a polyglot repo may version through package.json instead
+      *) if grep -Eq "^[[:space:]]*version[[:space:]]*=[[:space:]]*[\"']" "$ROOT/pyproject.toml"; then
+           printf 'pyproject.toml'; return 0
+         fi ;;
+    esac
   fi
   if [ -f "$ROOT/package.json" ] && grep -Eq '"version"[[:space:]]*:' "$ROOT/package.json"; then
     printf 'package.json'; return 0
   fi
+  [ -z "$unreadable" ] || { printf '%s' "$unreadable"; return 2; }
   return 1
 }
 
@@ -2120,38 +2264,47 @@ locate_version_file() {
 # (A version DECLARED for the first time — an added `+` with no matching `-` — also counts: a
 # brand-new version field is a move from "no version".)
 version_line_bumped() {  # $1 = version file path; uses $PR_DIFF (full patch text)
-  local file="$1" oldv newv
-  # Restrict to that file's section of the unified diff so an unrelated `version` elsewhere
-  # can't falsely satisfy the gate. A file's section runs from its `diff --git a/.. b/<file>`
-  # header up to the next `diff --git`.
-  local section
-  section=$(printf '%s\n' "$PR_DIFF" \
-    | awk -v f="$file" '
-        /^diff --git / { insec = ($0 == "diff --git a/" f " b/" f) ? 1 : 0; next }
-        insec { print }
-      ')
-  # Extract the quoted value from a version-declaration line (both pyproject `version = "X"`
-  # and package.json `"version": "X"` quote the value). `head -1` guards against multiple
-  # matches (e.g. a workspace member) — take the first, which is the package's own.
-  newv=$(printf '%s\n' "$section" | grep -E '^\+[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
-           | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
-  oldv=$(printf '%s\n' "$section" | grep -E '^-[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
-           | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
+  local file="$1" oldv newv ere section
+  ere=$(version_decl_ere "$file")
+  section=$(diff_section_of "$file")
+  newv=$(printf '%s\n' "$section" | grep -E "^\+[[:space:]]*$ere" | version_value)
+  oldv=$(printf '%s\n' "$section" | grep -E "^-[[:space:]]*$ere" | version_value)
   [ -n "$newv" ] || return 1            # no new version value declared -> not bumped
   [ "$newv" != "$oldv" ] || return 1    # value unchanged (cosmetic-only edit) -> not bumped
   return 0
 }
 
+# $1's hunks in the unified diff in $PR_DIFF, so an unrelated `version` elsewhere can't
+# satisfy the gate. A file is picked by its exact `+++ b/<path>` line in the file header
+# (before the first `@@`): that is the new path, so a PR that moves the version module and
+# bumps it counts. Not by the `diff --git` line: git leaves a space in a path unquoted, so a
+# PR-added `x b/<path>` would end its header with ` b/<path>` too (its `+++` line differs,
+# git appends a TAB there).
+diff_section_of() {  # $1 = file path; uses $PR_DIFF
+  printf '%s\n' "$PR_DIFF" | awk -v f="+++ b/$1" '
+    /^diff --git / { insec = 0; inhdr = 1; next }
+    inhdr && /^\+\+\+ / { insec = ($0 == f); next }
+    inhdr && /^@@/ { inhdr = 0 }
+    insec { print }
+  '
+}
+
+# The value on the first version-declaration line on stdin (all three forms quote it). It is
+# read from the quoted literal after `=` when there is one (pyproject, a module's
+# `__version__`), so a digit in an annotation such as `__version__: T1 = "X"` is never taken
+# for the value; package.json's `"version": "X"` has no `=`. `head -1`: the first declaration
+# is the package's own (e.g. not a workspace member's). Empty, and rc 0, when there is none.
+version_value() {
+  head -1 | sed -E "s/^[^=]*=[[:space:]]*([\"'])/\\1/" \
+    | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1 || true
+}
+
 # The PR's NEW version value (the `+` line of $1's diff section), for the base-tip check
 # below. Same extraction as version_line_bumped; empty when the PR declares none.
 pr_new_version_value() {  # $1 = version file path; uses $PR_DIFF
-  printf '%s\n' "$PR_DIFF" \
-    | awk -v f="$1" '
-        /^diff --git / { insec = ($0 == "diff --git a/" f " b/" f) ? 1 : 0; next }
-        insec { print }
-      ' \
-    | grep -E '^\+[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
-    | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1
+  local ere
+  ere=$(version_decl_ere "$1")
+  diff_section_of "$1" | grep -E "^\+[[:space:]]*$ere" | version_value || true
 }
 
 # The version value at the TIP of the PR's base branch (`origin/<baseRefName>`), or empty
@@ -2164,17 +2317,18 @@ pr_new_version_value() {  # $1 = version file path; uses $PR_DIFF
 # The fetch uses the explicit refspec so a SUCCESSFUL fetch definitely advances
 # `origin/<base>`; offline it falls back to the last-known ref (best-effort, like
 # `_empty_rollup_is_ci_outage`); a missing ref/file yields empty -> the check passes (the
-# PR-diff test above stays the floor).
+# PR-diff test above stays the floor). The trailing `|| true` keeps it that way under
+# `set -o pipefail`: a file absent on the base (a PR adding its first version module) or
+# with no version value fails the pipeline, which used to end ship silently with exit 1.
 base_tip_version_value() {  # $1 = version file path -> prints the value or nothing
-  local base ref
+  local base ref ere
+  ere=$(version_decl_ere "$1")
   base=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null) || base=""
   case "$base" in ''|-*|*[!A-Za-z0-9._/-]*) base="$DEFAULT_BRANCH" ;; esac
   ref="origin/$base"
   git -C "$ROOT" fetch -q origin "$base:refs/remotes/origin/$base" 2>/dev/null || true
   git -C "$ROOT" rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || return 0
-  git -C "$ROOT" show "$ref:$1" 2>/dev/null \
-    | grep -E '^[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
-    | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1
+  git -C "$ROOT" show "$ref:$1" 2>/dev/null | grep -E "^[[:space:]]*$ere" | version_value || true
 }
 
 if [ "${SHIP_SKIP_VERSION_BUMP:-0}" = "1" ] && [ -z "$NO_VBUMP_OK" ]; then
@@ -2186,7 +2340,16 @@ else
   if PR_FILES_VB=$(gh pr diff "$PR" --name-only 2>/dev/null); then
     if printf '%s\n' "$PR_FILES_VB" | any_shippable_source; then
       # Shippable source changed -> this ship is a release. The version field must have moved.
-      if VFILE=$(locate_version_file); then
+      VFILE_RC=0; VFILE=$(locate_version_file) || VFILE_RC=$?
+      if [ "$VFILE_RC" = 2 ]; then
+        # A dynamic version whose source ship cannot read: refuse rather than skip, or a repo
+        # in another layout would merge source changes unchecked.
+        { echo "Refusing: PR #$PR changes shippable source, but ship cannot read its dynamic version: $VFILE."
+          echo "  The gate follows a module's \`__version__ = \"X\"\`: a setuptools attr in a flat or src/ layout, or a hatch path to a .py file inside the repo."
+          echo "  Pin the file that holds __version__: SHIP_VERSION_FILES=<path/to/module.py>, then re-run ship."
+          echo "  If this is genuinely NOT a release (docs-only / pure test or CI / a revert), override: --no-version-bump-ok <reason> (or SHIP_SKIP_VERSION_BUMP=1)."; } >&2
+        exit 1
+      elif [ "$VFILE_RC" = 0 ]; then
         if PR_DIFF=$(gh pr diff "$PR" 2>/dev/null); then
           if ! version_line_bumped "$VFILE"; then
             { echo "Refusing: PR #$PR changes shippable source but the version in $VFILE is UNCHANGED — this ship is a release, so bump the version (skill: bump-version-on-release)."

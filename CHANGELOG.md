@@ -4,6 +4,20 @@
 
 ### Added
 
+- `agent-hooks/package-store-guard` (pre-bash, every harness): blocks wiping a shared package
+  store (`bun pm cache rm`, deleting/moving `~/.bun/install/cache` or an ancestor, `uv cache
+  clean`, `uv cache prune --all`/`--ci`, deleting `~/.cache/uv`), creating a symlink named
+  `node_modules`, and `npm install`/`npm ci`/`pnpm install`/`yarn` where the nearest lockfile is
+  `bun.lock`/`bun.lockb`. Each block names the replacement (`bun install --frozen-lockfile`,
+  `rig worktree gc`). It also blocks installing or starting the banned container VM runtimes
+  (`colima start`, `limactl start`, `brew install colima|lima|podman|orbstack|docker-desktop`,
+  `nix run nixpkgs#colima`), pointing to Apple `container` / `mocker` and the native
+  fake-gcs-server backend, and `lefthook install`/`husky`/`simple-git-hooks` while
+  `core.hooksPath` points outside the repo (a postinstall `lefthook install` replaced the global
+  pre-commit composer on 2026-09-26). Its `blurb.md` adds the SessionStart rules that disk
+  cleanup never wipes package-manager caches or stores, that hook managers stay repo-local, and
+  that colima-style VMs stay off the machine.
+
 - `ci/ship`: Forgejo provider (UB-25). `gh ship` now ships a PR from a checkout whose `origin` is
   a Forgejo host instead of silently reading the wrong remote. A gh-shaped adapter
   (`ci/ship/forgejo_provider.py`) feeds the unchanged gates from the Forgejo API, pins the PR head
@@ -16,6 +30,34 @@
 
 ### Fixed
 
+- `ci/ship`: the version-bump gate reads dynamic Python versions. A `pyproject.toml` with
+  `[project] dynamic = ["version"]` and setuptools `version = { attr = "pkg.__version__" }` or
+  hatch `[tool.hatch.version] path` now resolves to the module that holds `__version__`, and the
+  PR-diff and base-tip reads accept `__version__ = "X"` (also in a module pinned via
+  `SHIP_VERSION_FILES`). Before, the setuptools form was always refused as UNCHANGED (qa-cli
+  PR #23 had to ship with `--no-version-bump-ok`), and the hatch form skipped the gate entirely,
+  so its source PRs merged without a bump. A dynamic source ship cannot read (a module outside
+  the flat/`src/` layouts, an attribute other than `__version__`, a computed `__version__` with
+  no literal `"X"`, a setuptools `file`) now refuses with the reason and a pointer to
+  `SHIP_VERSION_FILES`, instead of reading the pyproject's own `version = { attr = ... }` line,
+  where renaming the attr looked like a bump (auto-detected: a root package.json that declares
+  the version still counts first, for polyglot repos). The resolved file must be a regular
+  file inside the checkout: a PR's `path = "../.."`, absolute path or symlink cannot make ship
+  stat or read files outside it. In a module only an assignment of a string literal counts (a
+  `__version__ == "X"` comparison is not a bump), the value is read from that literal (a digit
+  in an annotation such as `__version__: T1 = "X"` is not the version), and a PR that moves the
+  version module and bumps it is matched by the file's new path. A comment inside the
+  `dynamic = [...]` array (e.g. one holding a `]`) no longer hides the dynamic version and skips
+  the gate. A custom hatch `pattern`, or both a setuptools attr and a hatch path, refuses as
+  unreadable. Known limit: the gate matches lines, not Python, so a `__version__ = "X"` line in
+  a docstring reads like the real one (parser-based reading: agent-tools#812).
+- `ci/ship`: the version-bump gate no longer exits silently (exit 1, no message) when the base
+  branch tip has no version value in the version file, e.g. a PR that adds its first version
+  module; the base-tip check now passes as documented.
+- `git-hooks/global-dispatcher/install-local-hooks.sh`: the dedup scanner strips `VAR=value`
+  prefixes with one portable substitution instead of a GNU-only `sed ':a; …; ta'` loop. BSD sed
+  (macOS) warned "unused label" and stripped nothing, so an env-prefixed local scan such as
+  `GITLEAKS_CONFIG=x gitleaks git --staged` read as "no local secret scan" (agent-tools#810).
 - `omp-hook-bridge`: round-3 hardening of the `eval` tool's write-call secret-scan heuristic
   (agent-tools#614). Four further security-review findings closed:
   - A JS `\u{HEX}` Unicode code-point escape that widens to a literal backslash (e.g. `\u{5c}`)

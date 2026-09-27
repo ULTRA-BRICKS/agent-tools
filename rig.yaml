@@ -45,5 +45,4 @@ task:
   forgejo:
     url: https://git.hyperide.ai
     repo: ultrabricks/agent-tools
-    attachment_mode: link
-    host: git.hyperide.ai
+    attachment_mode: native
