@@ -1,0 +1,150 @@
+{
+  "version": 1,
+  "description": "Russian bureaucratic register and stock phrases (канцелярит) for `rig lint text`. Same rule shape as ~/.claude/DICT.json: `pattern` is a regex over the Markdown-stripped text, `replacement` says what to write instead, `why` explains the ban. `examples.hit` must match and `examples.miss` must not; tests/test_prose_linter_carrier.py checks both. Patterns use Python `re` semantics (Unicode-aware `\\b`). Based on the MIT-licensed Russian pack of hwajongpark/slop-gate, extended; see NOTICE.",
+  "rules": [
+    {
+      "id": "ru-yavlyaetsya",
+      "pattern": "\\bявля\\w*",
+      "flags": "iu",
+      "replacement": "тире или «это»: «Модуль — часть ядра»",
+      "why": "Bureaucratic copula; plain Russian uses a dash or no verb.",
+      "examples": {"hit": ["Модуль является частью ядра.", "Мы являемся частью ядра."], "miss": ["Ошибка появляется при старте.", "Модуль — часть ядра.", "Это явление редкое."]}
+    },
+    {
+      "id": "ru-osushchestvlyat",
+      "pattern": "\\bосуществ(?!им)\\w*",
+      "flags": "iu",
+      "replacement": "прямой глагол: проверяет, отправляет, делает",
+      "why": "Split predicate: «осуществляет проверку» is «проверяет». Every form of the verb and its noun; «осуществимый» (feasible) is not flagged.",
+      "examples": {"hit": ["Сервер осуществляет проверку токена.", "При осуществлении проверки возникла ошибка.", "Осуществлялась проверка."], "miss": ["Сервер проверяет токен.", "Проект осуществим."]}
+    },
+    {
+      "id": "ru-proizvesti-noun",
+      "pattern": "\\bпроизв(?:ести|од(?:ить|ит|ят|ил[аио]?)(?:ся|сь)?|[её]л|ел[аио]?|ед[её]н[аоы]?)\\s+(?:оплат|расч[её]т|регистрац|проверк|настройк|замен|установк|перезапуск)",
+      "flags": "iu",
+      "replacement": "прямой глагол: настроить, заменить, перезапустить",
+      "why": "Split predicate: «произвести настройку» is «настроить».",
+      "examples": {"hit": ["Нужно произвести настройку сервера.", "Производят оплату.", "Производится замена ключа.", "Произвели перезапуск.", "Они производили проверку.", "Служба производила настройку."], "miss": ["Завод производит детали.", "Они производили детали."]}
+    },
+    {
+      "id": "ru-v-tselyah",
+      "pattern": "\\bв\\s+целях\\b",
+      "flags": "iu",
+      "replacement": "«чтобы» + глагол, или «для»",
+      "why": "Bureaucratic purpose construction.",
+      "examples": {"hit": ["Флаг добавлен в целях безопасности."], "miss": ["Цели проекта описаны выше."]}
+    },
+    {
+      "id": "ru-otmetit-filler",
+      "pattern": "\\b(?:следует|стоит|важно|необходимо|нужно)\\s+отметить\\b",
+      "flags": "iu",
+      "replacement": "(удалить и начать с сути)",
+      "why": "Announces a point instead of making it.",
+      "examples": {"hit": ["Стоит отметить, что тест прошёл."], "miss": ["Отметить задачу выполненной."]}
+    },
+    {
+      "id": "ru-nadlezhashchij",
+      "pattern": "\\bнадлежащ(?:ими|им|ий|ая|ее|его|ей|ем|ую|ие|их)\\b",
+      "flags": "iu",
+      "replacement": "правильно, как нужно, или конкретное условие",
+      "why": "Legal register; it hides what exactly is required.",
+      "examples": {"hit": ["Настройте сервер надлежащим образом.", "Проверено надлежащими средствами."], "miss": ["Настройте сервер как в README."]}
+    },
+    {
+      "id": "ru-v-sootvetstvii-s",
+      "pattern": "\\bв\\s+соответствии\\s+с(?:о)?\\b",
+      "flags": "iu",
+      "replacement": "«по»: «по документации»",
+      "why": "Long prepositional chain for a one-word preposition.",
+      "examples": {"hit": ["Сделано в соответствии с документацией."], "miss": ["Соответствие стандарту проверено."]}
+    },
+    {
+      "id": "ru-bylo-prinyato-reshenie",
+      "pattern": "\\bбыло\\s+принято\\s+решение\\b",
+      "flags": "iu",
+      "replacement": "«мы решили», «решили»",
+      "why": "Passive voice that hides who decided.",
+      "examples": {"hit": ["Было принято решение отказаться от кэша."], "miss": ["Мы решили отказаться от кэша."]}
+    },
+    {
+      "id": "ru-dannyj",
+      "pattern": "\\bданн(?:ый|ая|ое|ого|ому|ом|ой|ую)\\b",
+      "flags": "iu",
+      "replacement": "«этот»",
+      "why": "Official-document demonstrative. «данные», «данных», «данными» (data) are not flagged.",
+      "examples": {"hit": ["Данный метод устарел."], "miss": ["Сохраняем данные в базе данных."]}
+    },
+    {
+      "id": "ru-v-ramkah",
+      "pattern": "\\bв\\s+рамках\\b",
+      "flags": "iu",
+      "replacement": "«в», «при», «для» или ничего",
+      "why": "Filler preposition.",
+      "examples": {"hit": ["В рамках задачи обновили парсер."], "miss": ["В задаче обновили парсер."]}
+    },
+    {
+      "id": "ru-igraet-rol",
+      "pattern": "\\bигра(?:ет|ют|л[аио]?)\\s+(?:ключевую|важную|важнейшую|решающую|значительную|большую|огромную)\\s+роль\\b",
+      "flags": "iu",
+      "replacement": "(сказать, что именно делает)",
+      "why": "Inflated claim without content.",
+      "examples": {"hit": ["Кэш играет ключевую роль в скорости."], "miss": ["Кэш сокращает время ответа вдвое."]}
+    },
+    {
+      "id": "ru-besshovnyj",
+      "pattern": "\\bбесшовн\\w*",
+      "flags": "iu",
+      "replacement": "(сказать, что работает без каких шагов)",
+      "why": "Calque of «seamless»; marketing, not a fact.",
+      "examples": {"hit": ["Обеспечивает бесшовную интеграцию."], "miss": ["Работает без перезапуска."]}
+    },
+    {
+      "id": "ru-kompleksnyj-podhod",
+      "pattern": "\\bкомплексн(?:ый|ая|ое|ого|ом|ой|ую|ые|ых|ым|ыми)\\s+(?:подход|решени|анализ)\\w*",
+      "flags": "iu",
+      "replacement": "(перечислить, что входит)",
+      "why": "Marketing adjective with no content.",
+      "examples": {"hit": ["Мы предлагаем комплексный подход."], "miss": ["Мы проверяем вход, выход и логи."]}
+    },
+    {
+      "id": "ru-ne-prosto-a",
+      "pattern": "\\bне\\s+просто\\s+[^.,;:!?]{1,40},\\s*а\\b",
+      "flags": "iu",
+      "replacement": "сказать прямо, что это такое",
+      "why": "«Не просто X, а Y» is a contrast for effect.",
+      "examples": {"hit": ["Это не просто кэш, а полноценное хранилище."], "miss": ["Это просто кэш."]}
+    },
+    {
+      "id": "ru-pogruzhaemsya",
+      "pattern": "\\bпогру(?:жаемся|жаться|зимся|зиться|жаясь|жайтесь)\\b",
+      "flags": "iu",
+      "replacement": "«разберём», «посмотрим»",
+      "why": "Calque of «delve into».",
+      "examples": {"hit": ["Давайте погрузимся в детали.", "Пора погружаться в код.", "Погружаясь в логи, мы нашли ошибку."], "miss": ["Разберём детали."]}
+    },
+    {
+      "id": "ru-v-zaklyuchenie",
+      "pattern": "(?:^|[.!?]\\s+)в\\s+заключение\\b(?!\\s+(?:договор|контракт|сделк|соглашени))|\\bподводя\\s+итоги?\\b",
+      "flags": "iu",
+      "replacement": "(удалить; последний абзац и так последний)",
+      "why": "Closing flourish at the start of a sentence; «в заключение договора» is not flagged.",
+      "examples": {"hit": ["В заключение, всё работает.", "Тесты прошли. В заключение хочу отметить скорость.", "Подводя итог, тесты проходят."], "miss": ["Заключение договора отложено.", "В заключение договора вошли сроки.", "Он сказал это в заключение."]}
+    },
+    {
+      "id": "ru-na-segodnyashnij-den",
+      "pattern": "\\bна\\s+сегодняшний\\s+день\\b",
+      "flags": "iu",
+      "replacement": "«сейчас»",
+      "why": "Wordy time phrase.",
+      "examples": {"hit": ["На сегодняшний день тесты проходят."], "miss": ["Сейчас тесты проходят."]}
+    },
+    {
+      "id": "ru-imeet-mesto",
+      "pattern": "\\bиме(?:ет|ют|л[аио]?)\\s+место\\b",
+      "flags": "iu",
+      "replacement": "«есть», «происходит», «было»",
+      "why": "Bureaucratic stand-in for a plain verb.",
+      "examples": {"hit": ["Имеет место утечка памяти.", "Имел место сбой.", "В журнале имели место ошибки."], "miss": ["Память утекает.", "Здесь есть место для кэша."]}
+    }
+  ]
+}

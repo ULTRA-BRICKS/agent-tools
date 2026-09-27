@@ -56,6 +56,7 @@ in the right place and it becomes a catalog item** — that is the whole registr
 | Git-hook | `git-hooks/<hook>` (`pre-commit`, `commit-msg`, `pre-push`, `no-secrets-scan`, `lefthook.yml`, `global-dispatcher/`) | the copyable hook script |
 | MCP slot | `mcp/<name>/` | the slot's config + `README.md` (see the MCP-vs-CLI policy first — the default is *don't add one*) |
 | Lib module | `lib/<module>/` | an importable Python package (often its own `pyproject.toml` — see below) |
+| Linter carrier | `linters/<name>/` (`oxc/` for code, `prose/` for `rig lint text`) | the config files a Rig command reads + `README.md`; rig-cli's `catalog.py` names the path |
 
 The `<group>` axis for by-type skills is fixed:
 `bot`, `backend`, `frontend`, `cli`, `library`, `infra`, `monorepo`. A skill that applies to

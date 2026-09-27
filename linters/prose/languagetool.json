@@ -1,0 +1,28 @@
+{
+  "description": "LanguageTool settings for `rig lint text`. Rig strips Markdown syntax (code, links, tables, list markers) before the check, so rules about quote style, whitespace and paragraph-final punctuation only produce noise and are disabled here.",
+  "languages": {
+    "en": "en-US",
+    "ru": "ru-RU"
+  },
+  "disable": {
+    "en-US": [
+      "EN_QUOTES",
+      "WHITESPACE_RULE",
+      "SENTENCE_WHITESPACE",
+      "COMMA_PARENTHESIS_WHITESPACE",
+      "UPPERCASE_SENTENCE_START",
+      "PUNCTUATION_PARAGRAPH_END",
+      "EN_UNPAIRED_BRACKETS",
+      "EN_UNPAIRED_QUOTES",
+      "ARROWS"
+    ],
+    "ru-RU": [
+      "WHITESPACE_RULE",
+      "COMMA_PARENTHESIS_WHITESPACE",
+      "UPPERCASE_SENTENCE_START",
+      "PUNCTUATION_PARAGRAPH_END",
+      "UNPAIRED_BRACKETS",
+      "ARROWS"
+    ]
+  }
+}
