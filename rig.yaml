@@ -46,3 +46,4 @@ task:
     url: https://git.hyperide.ai
     repo: ultrabricks/agent-tools
     attachment_mode: link
+    host: git.hyperide.ai
