@@ -100,7 +100,8 @@ fi
 echo "" >&2
 echo "protect-main: BLOCKED — direct push to $blocked." >&2
 echo "  Land it via a PR instead:" >&2
-echo "    git push origin HEAD:refs/heads/<feature-branch>  &&  gh pr create  (merge: gh ship)" >&2
+echo "    git push origin HEAD:refs/heads/<feature-branch>" >&2
+echo "    Open a PR on this repository's forge; merge through the guarded flow (fj ship or gh ship)." >&2
 echo "  Legit exception (e.g. a release script)?" >&2
 echo "    PUSH_MAIN_OK=1 PUSH_MAIN_REASON=\"why\" git push ..." >&2
 echo "  Every override is appended to ~/.cache/agent-tools/overrides.log." >&2
