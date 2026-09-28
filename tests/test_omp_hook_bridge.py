@@ -1765,12 +1765,16 @@ def test_v1_events_for_dispatch_eval_pre_bash_fans_out_commands():
     assert all(e["point"] == "pre-bash" for e in events)
 
 
-def _init_git_repo(repo: Path, rel: str = "src/change.py") -> None:
+def _init_git_repo(repo: Path, rel: str = "src/change.py", *, bootstrapped: bool = True) -> None:
     repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "test"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath", "/dev/null"], check=True, capture_output=True)
+    # Enforcement cases are normal repositories after their first commit.
+    # The fresh-repository exception is covered explicitly below.
+    if bootstrapped:
+        subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty", "-qm", "fixture bootstrap"], check=True, capture_output=True)
     target = repo / rel
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("print('change')\n", encoding="utf-8")
@@ -3808,3 +3812,18 @@ def test_omp_bridge_blocks_secret_write_via_eval_tool_subscript_call_decoy_path(
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout)
     assert out["decision"] == "block"
+
+
+def test_omp_bridge_allows_first_commit_without_review(tmp_path, monkeypatch):
+    """The common bash/eval bridge also honors the one-time fresh-repo exception."""
+    repo = tmp_path / "fresh"
+    _init_git_repo(repo, bootstrapped=False)
+    monkeypatch.setenv("REVIEW_MARKER", str(tmp_path / "no-review-marker"))
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(hooks_dir, hook_id="require-review-before-commit", point="pre-bash",
+                        cmd=REQUIRE_REVIEW_BEFORE_COMMIT, on_error="open")
+    event = {"event": "tool_call", "toolName": "bash",
+             "input": {"command": "git commit -m bootstrap"}, "cwd": str(repo)}
+    proc = _run_dispatch("tool_call", event, hooks_dir=hooks_dir)
+    assert proc.returncode == 0, proc.stderr
+    assert not proc.stdout.strip() or json.loads(proc.stdout).get("decision") != "block"
