@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttools-gpu-slots"
+version = "0.1.0"
+description = "Machine-wide GPU-model slot pool for agents: flock lock files the kernel frees when a holder dies (stdlib-only, POSIX)."
+readme = "README.md"
+# 3.9 to match the lowest floor in the ecosystem (review-cli is >=3.9; rig-cli >=3.10).
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+keywords = ["gpu", "whisper", "llama", "mlx", "semaphore", "flock", "agent-tools"]
+# Stdlib only: heavy-op-memory-gate loads this package by path from the same checkout.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+agenttools-gpu-slot = "agenttools_gpu_slots:main"
+
+[project.urls]
+Homepage = "https://git.hyperide.ai/ultrabricks/agent-tools"
+
+# This pyproject lives INSIDE the package directory (like agenttools_stall_watchdog): map the
+# import package explicitly to ".".
+[tool.setuptools]
+packages = ["agenttools_gpu_slots"]
+
+[tool.setuptools.package-dir]
+agenttools_gpu_slots = "."
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]

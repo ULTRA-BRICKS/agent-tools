@@ -4,6 +4,13 @@
 
 ### Added
 
+- `lib/agenttools_gpu_slots`: a machine-wide GPU-model slot pool shared by every agent and
+  harness (agent-tools#817). `RIG_GPU_SLOTS` (default 2) `flock` lock files in
+  `~/.local/state/agent-tools/gpu-slots`; the kernel frees a slot the instant its holder dies,
+  SIGKILL included. `python3 <agent-tools>/lib/agenttools_gpu_slots run -- <cmd>` waits for a
+  slot (default up to 30 min, exit 75 on timeout) and then execs the model command holding it;
+  `status` lists the holders. stt-cli acquires slots with the same protocol.
+
 - `agent-hooks/package-store-guard` (pre-bash, every harness): blocks wiping a shared package
   store (`bun pm cache rm`, deleting/moving `~/.bun/install/cache` or an ancestor, `uv cache
   clean`, `uv cache prune --all`/`--ci`, deleting `~/.cache/uv`), creating a symlink named
@@ -29,6 +36,18 @@
   refuses the merge.
 
 ### Fixed
+
+- `agent-hooks/heavy-op-memory-gate` now sees wired-memory exhaustion and GPU model loads
+  (agent-tools#817). On 2026-09-29 thirteen concurrent `whisper-cli` runs wired 95.7% of a 24 GB
+  Mac into GPU buffers and kernel-panicked it while the jetsam level, the hook's only signal,
+  stayed "normal". The hook now also blocks when the wired share of RAM is above
+  `RIG_HEAVY_OP_MAX_WIRED_PCT` (default 75) or free + inactive + speculative + purgeable memory
+  is below `RIG_HEAVY_OP_MIN_AVAILABLE_MB` (default 512), read from `vm_stat` (macOS) or
+  `/proc/meminfo` (Linux). `stt`, `whisper-cli`, `whisper-server`, `llama-cli`, `llama-server`,
+  the `mlx_lm`/`mlx_whisper` entry points, and any command handed a `.bin`/`.gguf`/`.ggml`/
+  `.safetensors` model file are heavy, matched per simple command (loop bodies, `bash -c`
+  scripts, and `<(…)`/`$(…)`/backtick substitutions included). Such a load is refused at once
+  while every GPU slot is taken, unless it is queued through the slot wrapper.
 
 - `ci/ship`: the version-bump gate reads dynamic Python versions. A `pyproject.toml` with
   `[project] dynamic = ["version"]` and setuptools `version = { attr = "pkg.__version__" }` or
