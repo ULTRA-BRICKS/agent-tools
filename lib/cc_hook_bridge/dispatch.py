@@ -135,6 +135,31 @@ _WORKFLOW_TOOLS = frozenset({"Workflow"})
 _WORKTREE_ENTER_TOOLS = frozenset({"EnterWorktree"})
 
 
+def _detached_agent_id() -> str:
+    """The launcher identity of a DETACHED Claude Code session (agent-tools#831).
+
+    ``rig-detached-claude-code`` starts ``claude -p`` with ``RIG_AGENT_ID=<name>`` (identity)
+    or ``RIG_DETACHED_AGENT=1`` (anonymous marker) in its process environment, and Claude Code
+    runs every hook command with that environment — so the markers are visible here on every
+    hook invocation of that session. CC itself sends no top-level ``agent_id`` there (the
+    detached process is CC's MAIN thread), so without this the child would be gated as the
+    orchestrator by every ``args.agent_id``-reading hook. Same contract as
+    ``codex_hook_bridge``/``omp_hook_bridge``/``opencode_hook_bridge._detached_agent_id``.
+
+    Trust reasoning (unchanged from agent-tools#476): a running orchestrator cannot
+    retroactively mutate its own process environment — it can only set these vars for a CHILD
+    process it dispatches, which is exactly the sanctioned act of dispatching a subagent.
+    Cooperative-orchestrator threat model, on_error=open. A bare/whitespace value is not a
+    marker; only the exact ``RIG_DETACHED_AGENT=1`` is.
+    """
+    val = os.environ.get("RIG_AGENT_ID", "").strip()
+    if val:
+        return val
+    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
+        return "detached"
+    return ""
+
+
 def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
     """Map a CC (event, tool) pair to a logical v1 point, or None if nothing applies."""
     if hook_event_name == "Stop":
@@ -221,16 +246,24 @@ def to_v1_event(cc_event: dict, *, point: str) -> dict:
     # the cross-session leak it exists to close.
     #
     # PRECEDENCE (T2): CC's TOP-LEVEL agent_id/agent_type/session_id are the ONLY authoritative
-    # source. A value sitting in tool_input is attacker/prompt-controllable — a forged
+    # EVENT source. A value sitting in tool_input is attacker/prompt-controllable — a forged
     # `tool_input.agent_id` (or `.session_id`) must NOT exempt a main-thread dispatch or borrow
     # another session's identity. So: if the signal is present at the top level, it OVERWRITES
     # whatever was in args; if it is ABSENT at the top level, we DROP any copy that rode in via
-    # tool_input. The exemption/identity can only come from CC itself.
+    # tool_input. The exemption/identity comes from CC itself, or — for `agent_id` only — from
+    # the launcher process env below (`_detached_agent_id`), never from the model.
     for key in ("agent_id", "agent_type", "session_id"):
         if cc_event.get(key) is not None:
             args[key] = cc_event[key]
         else:
             args.pop(key, None)
+    # Launcher identity (agent-tools#831): only when CC itself sent no agent_id — a native CC
+    # subagent inside a detached session keeps CC's own, more specific id. Injected AFTER the
+    # drop above, so a forged tool_input copy can never survive in its place.
+    if "agent_id" not in args:
+        detached_id = _detached_agent_id()
+        if detached_id:
+            args["agent_id"] = detached_id
     return {
         "hook_api": HOOK_API,
         "event_id": cc_event.get("session_id", ""),

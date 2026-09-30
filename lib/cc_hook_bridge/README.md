@@ -62,6 +62,24 @@ installed `rtk-rewrite.sh` PreToolUse hook's style.
 > want (`format-on-write` reacts silently; `lint-on-write` uses the feedback channel to
 > put lint findings in front of the agent right after the write).
 
+## Subagent identity (`args.agent_id`)
+
+Subagent-aware hooks (`background-subagent-gate`, `orchestrator-stays-thin`,
+`no-long-inline-process`, `subagent-no-bg-longproc`, `subagent-no-monitor`,
+`skills-read-gate`) read `args.agent_id`. The bridge fills it from, in order:
+
+1. CC's own TOP-LEVEL `agent_id` (present only when the call fires inside a CC-dispatched
+   subagent) — `agent_type`/`session_id` get the same treatment;
+2. otherwise the launcher process env: `RIG_AGENT_ID=<name>`, or `RIG_DETACHED_AGENT=1`
+   (anonymous `detached`), set by `rig-detached-claude-code` for the `claude -p` child it
+   detaches (agent-tools#831). CC runs hook commands with its own process env, so the markers
+   reach the bridge on every call of that session — the same `_detached_agent_id` contract as
+   the codex/omp/opencode bridges.
+
+A copy riding in `tool_input` is always dropped (model-controlled), and a blank/whitespace
+marker is not an identity. Trust model: a running orchestrator cannot retroactively set its own
+process env, only a child's — which is exactly the sanctioned act of dispatching a subagent.
+
 ## Fail policy
 
 - **Dispatcher-level: fail-OPEN.** Any unexpected error in the bridge itself (bad stdin,

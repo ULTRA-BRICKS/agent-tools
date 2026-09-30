@@ -198,7 +198,10 @@ every dispatch — agent-tools#495); the truly-detached opencode path is the
 `rig-detached-opencode` launcher skill. See `background-subagent-gate/README.md` for the
 exact allow list. The bridge maps the point from CC's `PreToolUse` on `Agent`/`Task` and
 forwards CC's `agent_id`/`agent_type` (present only inside a dispatched subagent) into
-`args`, so a subagent-exempt gate can tell the orchestrator's dispatch apart from a worker's.
+`args`, so a subagent-exempt gate can tell the orchestrator's dispatch apart from a worker's;
+when CC sends no `agent_id`, the bridge restores it from the `rig-detached-claude-code`
+launcher's process env (`RIG_AGENT_ID` / `RIG_DETACHED_AGENT`, agent-tools#831), so a
+detached `claude -p` child is a subagent too.
 opencode maps its `task` tool to the same logical point; its plugin payload exposes no
 trusted subagent identity, so forged `agent_id` / `agent_type` values inside tool args are
 stripped, and the ONE trusted source is the process env set by the `rig-detached-opencode`

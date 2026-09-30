@@ -156,7 +156,9 @@ _HARNESS_RECIPES = {
     "claude-code": (
         "Claude Code: subagent_type=\"fork\" or isolation=\"remote\" (both background per CC's "
         "tool contract), or a dynamic Workflow. run_in_background is NOT a real field on CC's "
-        "Agent tool — it does nothing."
+        "Agent tool — it does nothing. For a truly detached child that outlives this session, use\n"
+        "the canonical launcher ~/.agents/skills/rig-detached-claude-code/rig-detached-claude-code\n"
+        "(RIG_AGENT_ID markers make the detached child session subagent-exempt)."
     ),
     "opencode": (
         "opencode: dispatch with subagent_type general or explore — allowed as-is. Its task tool\n"

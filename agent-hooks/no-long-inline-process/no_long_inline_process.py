@@ -813,7 +813,9 @@ def _matched_long_process(command: str, depth: int = 0) -> str | None:
 _HARNESS_RECIPES = {
     "claude-code": (
         "Dispatch it as an Agent with `subagent_type: \"fork\"` or `isolation: \"remote\"` "
-        "(both run in the background)"
+        "(both run in the background), or via the rig-detached-claude-code launcher "
+        "(~/.agents/skills/rig-detached-claude-code/rig-detached-claude-code) for a truly "
+        "detached child"
     ),
     "codex": (
         "Dispatch it via the `rig-detached-codex` launcher skill for a truly detached child, "

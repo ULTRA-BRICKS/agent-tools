@@ -259,6 +259,20 @@ def test_reminder_launcher_reference_matches_the_skill_carrier():
     assert not (repo_root / "bin" / "rig-detached-opencode").exists()
 
 
+def test_every_shipped_launcher_is_named_in_its_harness_reminder():
+    """Each `skills/universal/rig-detached-<harness>` carrier is a harness's sanctioned
+    truly-detached path, so that harness's BLOCK reminder must name the provisioned command —
+    a launcher that ships but is never recommended is invisible to the agent the gate just
+    blocked (agent-tools#831 added claude-code's), and every carrier must map to a harness the
+    gate actually has a recipe for."""
+    universal = Path(__file__).resolve().parents[1] / "skills" / "universal"
+    harnesses = sorted(p.name.removeprefix("rig-detached-") for p in universal.glob("rig-detached-*"))
+    assert harnesses == sorted(gate._HARNESS_RECIPES)
+    for harness in harnesses:
+        path = f"~/.agents/skills/rig-detached-{harness}/rig-detached-{harness}"
+        assert path in gate._reminder_for(harness), harness
+
+
 @pytest.mark.parametrize("kind", ["general", "explore", "General", "Explore"])
 def test_allow_opencode_task_general_explore_without_background(kind, monkeypatch):
     """opencode Task has no background field (schema additionalProperties:false) and a

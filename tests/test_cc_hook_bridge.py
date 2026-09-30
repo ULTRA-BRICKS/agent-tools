@@ -76,6 +76,16 @@ ENTERWORKTREE_CANONICAL_PATH_GRANT = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_host_agent_markers(monkeypatch):
+    """Module-wide: a rig-dispatched test run (this process) may carry RIG_AGENT_ID /
+    RIG_DETACHED_AGENT, which the bridge now honours (agent-tools#831); strip them for every
+    test so in-process `to_v1_event` asserts and `_run_dispatch` subprocesses (which copy
+    os.environ) never see an injected agent_id. Tests that want a marker set it explicitly."""
+    monkeypatch.delenv("RIG_AGENT_ID", raising=False)
+    monkeypatch.delenv("RIG_DETACHED_AGENT", raising=False)
+
+
 def _install_descriptor(hooks_dir: Path, *, hook_id: str, point: str, cmd: Path,
                         on_error: str = "closed", priority: int = 10) -> Path:
     """Write a `<id>.<point>.json` descriptor with an absolute `cmd`, as rig installs it."""
@@ -244,6 +254,59 @@ def test_to_v1_event_forged_tool_input_agent_id_dropped_for_pre_write():
           "cwd": "/repo"}  # ← no top-level agent_id/agent_type
     v1 = dispatch.to_v1_event(cc, point="pre-write")
     assert "agent_id" not in v1["args"]
+    assert "agent_type" not in v1["args"]
+
+
+# ── detached-launcher identity (agent-tools#831): RIG_AGENT_ID / RIG_DETACHED_AGENT ─────────
+# `rig-detached-claude-code` starts `claude -p` with these markers in its process env; CC runs
+# hook commands with that env, so the bridge sees them on every call and must restore
+# `args.agent_id` from them when CC itself sends no top-level agent_id — the same
+# `_detached_agent_id` contract as the codex/omp/opencode bridges.
+
+def test_to_v1_event_injects_agent_id_from_rig_agent_id(monkeypatch):
+    monkeypatch.setenv("RIG_AGENT_ID", "LauncherChild")
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"command": "npm test"}, "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-bash")
+    assert v1["args"]["agent_id"] == "LauncherChild"
+
+
+def test_to_v1_event_anonymous_detached_marker_injects_detached(monkeypatch):
+    monkeypatch.setenv("RIG_DETACHED_AGENT", "1")
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Agent",
+          "tool_input": {"prompt": "do the thing"}, "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-agent")
+    assert v1["args"]["agent_id"] == "detached"
+
+
+def test_to_v1_event_blank_markers_are_not_an_identity(monkeypatch):
+    monkeypatch.setenv("RIG_AGENT_ID", "   ")
+    monkeypatch.setenv("RIG_DETACHED_AGENT", "true")  # only the exact value 1 is a marker
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"command": "npm test"}, "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-bash")
+    assert "agent_id" not in v1["args"]
+
+
+def test_to_v1_event_cc_top_level_agent_id_wins_over_the_launcher_marker(monkeypatch):
+    """A native CC subagent INSIDE a detached session keeps CC's own, more specific id."""
+    monkeypatch.setenv("RIG_AGENT_ID", "LauncherChild")
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"command": "npm test"},
+          "agent_id": "sub-7", "agent_type": "general-purpose", "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-bash")
+    assert v1["args"]["agent_id"] == "sub-7"
+    assert v1["args"]["agent_type"] == "general-purpose"
+
+
+def test_to_v1_event_forged_tool_input_agent_id_never_beats_the_marker(monkeypatch):
+    """The forged copy is still dropped; the injected value is the launcher's, not the model's."""
+    monkeypatch.setenv("RIG_AGENT_ID", "LauncherChild")
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"command": "npm test", "agent_id": "forged", "agent_type": "forged-t"},
+          "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-bash")
+    assert v1["args"]["agent_id"] == "LauncherChild"
     assert "agent_type" not in v1["args"]
 
 
@@ -573,6 +636,54 @@ def test_forged_tool_input_agent_id_does_not_exempt_clean_room(tmp_path):
         "cwd": str(tmp_path),
     }
     proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+
+
+def test_detached_launcher_child_foreground_dispatch_is_subagent_exempt_clean_room(tmp_path):
+    """End-to-end (agent-tools#831): a `claude -p` started by rig-detached-claude-code carries
+    RIG_AGENT_ID in the process env the REAL bridge subprocess inherits, and CC sends no
+    top-level agent_id (it is CC's main thread). The same non-trivial foreground dispatch the
+    forged test above DENIES must be ALLOWED here: the bridge injects the launcher identity and
+    the REAL background-subagent-gate treats the detached child as a subagent, not the
+    orchestrator. Would FAIL before the fix (the bridge ignored the markers)."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="background-subagent-gate", point="pre-agent",
+                        cmd=BACKGROUND_SUBAGENT_GATE, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "implement the feature: " + "x" * 220},
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch_with_env("PreToolUse", cc_event, home=home,
+                                  extra_env={"RIG_AGENT_ID": "sysmon-remediate-x"})
+    assert proc.returncode == 0, proc.stderr
+    if proc.stdout.strip():
+        out = json.loads(proc.stdout)
+        assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
+
+
+def test_detached_launcher_child_monitor_is_denied_like_a_subagent_clean_room(tmp_path):
+    """The inverse direction: subagent-only gates must SEE the detached child as a subagent
+    too. An anonymous `RIG_DETACHED_AGENT=1` child calling Monitor is DENIED by the REAL
+    subagent-no-monitor (a one-shot `claude -p` exits at end of turn, so nothing would ever
+    receive the Monitor notification). Would FAIL before the fix (allowed as orchestrator)."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="subagent-no-monitor", point="pre-monitor",
+                        cmd=SUBAGENT_NO_MONITOR, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Monitor",
+        "tool_input": {"description": "watch my background test run", "timeout_ms": 300000,
+                       "persistent": False},
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch_with_env("PreToolUse", cc_event, home=home,
+                                  extra_env={"RIG_DETACHED_AGENT": "1"})
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out

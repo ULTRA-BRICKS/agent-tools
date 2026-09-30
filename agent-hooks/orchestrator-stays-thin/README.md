@@ -180,10 +180,11 @@ used (agent-tools#476) — so `_is_subagent` alone now correctly exempts a rig-l
 child under EVERY harness, no harness-wide carve-out needed. And the block/warn text now reads
 the bridge-set, unforgeable `event["harness"]` to name the delegation recipe for the ACTUAL
 firing harness (`_delegation_recipe`/`_HARNESS_RECIPES`) instead of a hardcoded Claude-Code-only
-string: Claude Code gets the `Agent` tool, codex gets `rig-detached-codex` (or a native
-`spawn_agent` tool where one exists), opencode gets `rig-detached-opencode`, and omp gets its
-`task` tool or `rig-detached-omp`. A missing/unrecognized `harness` falls back to the Claude
-Code recipe rather than fabricating a fifth harness's advice.
+string: Claude Code gets the `Agent` tool (or `rig-detached-claude-code` for a truly detached
+child, agent-tools#831), codex gets `rig-detached-codex` (or a native `spawn_agent` tool where
+one exists), opencode gets `rig-detached-opencode`, and omp gets its `task` tool or
+`rig-detached-omp`. A missing/unrecognized `harness` falls back to the Claude Code recipe
+rather than fabricating a fifth harness's advice.
 
 `EXEMPT_HARNESSES` and `_is_exempt_harness` are gone entirely — codex/opencode/omp events are
 now judged by exactly the same `_is_code_write`/`_is_implementation_bash` classifiers as Claude

@@ -4,6 +4,18 @@
 
 ### Added
 
+- `skills/universal/rig-detached-claude-code`: the Claude Code member of the detached-agent
+  launcher family (agent-tools#831). `rig-detached-claude-code <name> <brief-file> [workdir]`
+  starts `claude -p --permission-mode bypassPermissions -- <brief>` nohup-detached in its own
+  session with `RIG_AGENT_ID`/`RIG_DETACHED_AGENT=1`, a private log in
+  `$RIG_AGENT_LOG_DIR` (default `/tmp/agent-logs`), and returns at once with the launch line —
+  the same contract as `rig-detached-{omp,codex,opencode}`, provisioned by rig to
+  `~/.agents/skills/rig-detached-claude-code/`. `lib/cc_hook_bridge` now restores
+  `args.agent_id` from those markers when Claude Code sends no top-level `agent_id`, so every
+  subagent-aware hook classifies the detached session as a subagent, and the claude-code
+  delegation recipes in `background-subagent-gate`, `orchestrator-stays-thin` and
+  `no-long-inline-process` name the launcher for a child that must outlive the session.
+
 - `lib/agenttools_gpu_slots`: a machine-wide GPU-model slot pool shared by every agent and
   harness (agent-tools#817). `RIG_GPU_SLOTS` (default 2) `flock` lock files in
   `~/.local/state/agent-tools/gpu-slots`; the kernel frees a slot the instant its holder dies,

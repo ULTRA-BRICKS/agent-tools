@@ -46,7 +46,12 @@ Lets through:
   injects `agent_id` → the detached child session is subagent-exempt
 - a **trivial** one-liner dispatch (prompt/description `< 200` chars and single-line)
 - a dispatch made **by a subagent itself** (subagent-exempt — `agent_id` present): a worker
-  may fan out further, and this gate governs the orchestrator, not the workers
+  may fan out further, and this gate governs the orchestrator, not the workers. This includes
+  a session started by a `rig-detached-<harness>` launcher: for Claude Code that is
+  `~/.agents/skills/rig-detached-claude-code/rig-detached-claude-code` (named in the CC
+  REMINDER for a child that must outlive the calling session), whose
+  `RIG_AGENT_ID`/`RIG_DETACHED_AGENT` markers `cc_hook_bridge` turns into `args.agent_id`
+  when CC itself sends none (agent-tools#831)
 
 `isolation: "worktree"` is deliberately **not** treated as inherently background — worktree
 isolation is about workspace separation, not execution timing, so a `worktree`-isolated
@@ -68,9 +73,11 @@ half of `delegate-work-to-subagents`.
 > `no-long-inline-process`) exempts a tool use when `args.agent_id` is present — so that value must
 > originate from a **trusted, transport-level** subagent signal, never from model-controlled
 > `tool_input`. `cc_hook_bridge` enforces this: it takes `agent_id`/`agent_type` only from CC's
-> top-level event and **drops** any copy a prompt forged inside `tool_input`. A non-CC carrier that
-> wires these hooks MUST replicate that filtering, or a forged `tool_input.agent_id` would let the
-> orchestrator exempt itself from the gate.
+> top-level event and **drops** any copy a prompt forged inside `tool_input`; when CC sends no
+> `agent_id`, the only other source is the launcher process env (`RIG_AGENT_ID` /
+> `RIG_DETACHED_AGENT=1`), which a running orchestrator cannot set for itself. A non-CC carrier
+> that wires these hooks MUST replicate that filtering, or a forged `tool_input.agent_id` would
+> let the orchestrator exempt itself from the gate.
 
 ## Triviality heuristic
 

@@ -214,7 +214,9 @@ HOOK_API = "agents-hooks/v1"
 _HARNESS_RECIPES = {
     "claude-code": (
         "Claude Code: Agent tool with `subagent_type: \"fork\"` or `isolation: \"remote\"` "
-        "(both run in the background)"
+        "(both run in the background), or the rig-detached-claude-code launcher "
+        "(~/.agents/skills/rig-detached-claude-code/rig-detached-claude-code) for a truly "
+        "detached child"
     ),
     "codex": (
         "codex: the `rig-detached-codex` launcher skill for a truly detached child, or the "
