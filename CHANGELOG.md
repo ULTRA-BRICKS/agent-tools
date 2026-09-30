@@ -4,6 +4,30 @@
 
 ### Added
 
+- `lib/agenttools_agent_role`: the single coordinator-vs-subagent role module (stdlib-only, pure;
+  env passed explicitly). `launcher_agent_id` (`RIG_AGENT_ID` / `RIG_DETACHED_AGENT=1` →
+  `detached`), `native_payload_agent` (top-level `agent_id`/`agent_type` of a raw cc/codex hook
+  payload), the omp nested-session helpers (`omp_nested_agent_id`, `nested_id_from_session_file`,
+  `has_omp_session_ancestor`), `opencode_child_agent_id`, and the predicate every hook asks,
+  `is_subagent(args, environ)`. The four bridges' private `_detached_agent_id` copies and omp's
+  nested-session helpers are gone, and `orchestrator-stays-thin` / `no-long-inline-process`
+  replaced their verbatim `_is_subagent` env/`PI_SESSION_FILE` logic with the shared predicate
+  (degrading to the bridge-sanitized `args.agent_id` only if the catalog `lib/` is missing).
+
+- `lib/codex_hook_bridge`: a spawned Codex thread is now recognised from the payload's own
+  TOP-LEVEL `agent_id`/`agent_type` (Codex 0.153.4 `PreToolUse`/`PermissionRequest` schema —
+  optional, absent on the coordinator thread), restored as `args.agent_id`/`args.agent_type`;
+  the launcher env applies only when Codex sent none (same precedence as cc), and a forged
+  `tool_input.agent_id` stays stripped. The fixture is schema-shaped, not a live capture.
+
+- `lib/opencode_hook_bridge`: an opencode `task` subagent (a child session,
+  `session.parentID != null`) is now recognised. `plugin.js` resolves the parent through the
+  plugin client (`ctx.client.session.get({ path: { id } })`, opencode 1.18.x SDK v1), caches per
+  session id, fails OPEN on any lookup error (logged to the debug file), and passes the result to
+  the dispatcher as the trusted top-level `sessionParentID` field — never read from tool args.
+  `dispatch.py` sets `args.agent_id` to the child session id; the launcher env applies otherwise.
+  New knob: `OPENCODE_HOOK_BRIDGE_SESSION_LOOKUP_TIMEOUT_MS` (default 5000).
+
 - `skills/universal/rig-detached-claude-code`: the Claude Code member of the detached-agent
   launcher family (agent-tools#831). `rig-detached-claude-code <name> <brief-file> [workdir]`
   starts `claude -p --permission-mode bypassPermissions -- <brief>` nohup-detached in its own
