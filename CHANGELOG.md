@@ -25,7 +25,7 @@
 
 - `agent-hooks/package-store-guard` (pre-bash, every harness): blocks wiping a shared package
   store (`bun pm cache rm`, deleting/moving `~/.bun/install/cache` or an ancestor, `uv cache
-  clean`, `uv cache prune --all`/`--ci`, deleting `~/.cache/uv`), creating a symlink named
+clean`, `uv cache prune --all`/`--ci`, deleting `~/.cache/uv`), creating a symlink named
   `node_modules`, and `npm install`/`npm ci`/`pnpm install`/`yarn` where the nearest lockfile is
   `bun.lock`/`bun.lockb`. Each block names the replacement (`bun install --frozen-lockfile`,
   `rig worktree gc`). It also blocks installing or starting the banned container VM runtimes
@@ -49,6 +49,9 @@
 
 ### Changed
 
+- Docs: retired the `claude-rotate` launcher and the `claude-p` wrapper. The tg-inbox README now
+  names the out-of-tmux `/agent` refusal as `rig harness run <harness> --name <label>`, and the
+  ROADMAP rollout list marks the `claude-p` repo as archived.
 - `cc_hook_bridge` and `codex_hook_bridge` no longer read the tg-ctl Stop-hook inbox on `Stop`
   (agent-tools#832). Claude Code and Codex are tmux-only (tg-cli#456): tg-ctl stopped queuing
   for them and archived their stranded backlog as `stranded-<stamp>.jsonl`. An unnamed cc/codex
@@ -74,7 +77,7 @@
   (agent-tools#824). It used to send `--no-verify-identity`, so every repository's iterations for
   a task code counted: sme-archiving-gc's `#464` passed with consistency and security roles that
   came from rig-cli and review-cli records stored as `464`. Ship now asks `review task <code>
-  --check -C <repo root> --verify-repo-only` (review-cli#589), which compares the repository
+--check -C <repo root> --verify-repo-only` (review-cli#589), which compares the repository
   alone. The primary checkout's own unrelated diff no longer matters, and reviews recorded before
   a repository moved hosts still count. Ship names the iterations it dropped as another
   repository's (repo and timestamp, the first 50 plus the full count). Three setup errors refuse
@@ -162,7 +165,7 @@
     `Bun.write`/`fs.writeFile*` fallbacks) closes it.
   - `_EVAL_OPEN_WRITE`'s permissive `,[^)]*` mode/tail (round 2) could also swallow a NESTED
     call expression sitting in that tail position — `open("foo.example",
-    open("src/secret.py","w").write("API_KEY=..."))` let the tail consume up to the inner
+open("src/secret.py","w").write("API_KEY=..."))` let the tail consume up to the inner
     `open(...)` call's own closing paren, so the match's `.write(` anchor landed on the nested
     call instead, attributing the real secret to the outer call's allowlist-friendly decoy path
     `foo.example` and never scanning it under its real path (or path-lessly) at all — a genuine
@@ -177,7 +180,7 @@
   - `_EVAL_KWARG_VALUE` (what `_EVAL_OTHER_KWARG` recognizes as another keyword argument's value
     sitting before `data=`) only matched a quoted literal, a bare identifier, or a number — a
     CALL EXPRESSION there (`write_text(encoding=locale.getpreferredencoding(),
-    data="API_KEY=...")`) matched none of its alternatives, so the whole call went entirely
+data="API_KEY=...")`) matched none of its alternatives, so the whole call went entirely
     unrecognized (content silently dropped), contradicting round 3's "`data=` recognized
     regardless of position" fix. A new alternative recognizes a call expression with up to one
     level of nested parens.
@@ -195,7 +198,7 @@
     full 8-digit escape as one unit.
   - Round 5's `_EVAL_OPEN_MODE_TAIL` guard only rejected a tail beginning with the SHAPE
     `identifier(` — a decoy like `open("foo.example", [open][0]("src/secret.py","w").write(
-    "API_KEY=..."))` (subscript-then-call, `[open][0](...)`) begins with `[`, not an identifier
+"API_KEY=..."))` (subscript-then-call, `[open][0](...)`) begins with `[`, not an identifier
     character, so it wasn't rejected and the secret was misattributed to the allowlist-friendly
     decoy path `foo.example` again — the identical bypass class as round 5's own finding, via a
     different call shape. The guard is widened to reject any `(` or `[` in the tail.

@@ -10,10 +10,11 @@ hatch grant notice is **queued to an inbox file**. This package is the other hal
 entries it answers `{"decision":"block","reason":"<the messages>"}` — omp then feeds that
 text to the agent as its next instruction.
 
-**Claude Code and Codex are tmux-only (tg-cli#456).** tg-ctl no longer queues for them (a
-`/agent` to a non-tmux cc/codex gets a one-line refusal pointing at `claude-rotate --tmux
-<name>`; a paneless cc/codex hatch grant notice is not queued), and it archived their
-stranded backlog once (`pending.jsonl` → `stranded-<stamp>.jsonl`). `cc_hook_bridge` and
+**Claude Code and Codex are tmux-only here (tg-cli#456).** tg-ctl no longer queues for them (a
+`/agent` to a cc/codex in no tmux pane and no `rig harness run` session gets a one-line
+refusal naming `rig harness run <harness> --name <label>`; a paneless cc/codex hatch grant
+notice is not queued, and a `rig harness run` session is reached through its PTY instead),
+and it archived their stranded backlog once (`pending.jsonl` → `stranded-<stamp>.jsonl`). `cc_hook_bridge` and
 `codex_hook_bridge` therefore no longer read the inbox: an unnamed cc/codex in an omp's cwd
 shares that omp's `cwd-<hash>` key, so a cc/codex Stop would otherwise steal the omp's grant
 notice.
@@ -24,7 +25,7 @@ notice.
   (waiting at the prompt) receives it when it next finishes a turn — live Telegram→idle
   omp still needs omp-live/ACP.
 - Delivery is **at-most-once**: entries are archived to a `delivered-<pid>-<ns>-<rnd>.jsonl`
-  batch *before* the block is emitted. If the harness ignores the block (it never does
+  batch _before_ the block is emitted. If the harness ignores the block (it never does
   today), the message is not retried — it is on disk in that batch for a human. The omp
   bridge consumes the inbox as the **last** step of a yield, after the v1 stop hooks ran:
   consuming is irreversible, and a hook that raised would otherwise have eaten a message
@@ -50,12 +51,12 @@ inbox dir    = <tg-cli config dir>/inbox/<key>/
                config dir = $TG_CTL_CONFIG_DIR, else ~/.config/tg-cli
 ```
 
-| file | writer | reader |
-| --- | --- | --- |
-| `pending.jsonl` | tg-ctl daemon (append, one JSON object per line) | `omp_hook_bridge` via this package (claims by rename) |
+| file                               | writer                                                                                                | reader                                                                             |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `pending.jsonl`                    | tg-ctl daemon (append, one JSON object per line)                                                      | `omp_hook_bridge` via this package (claims by rename)                              |
 | `delivered-<pid>-<ns>-<rnd>.jsonl` | this package — ONE complete file per consumption, written as `tmp-<pid>-<ns>-<rnd>.jsonl` and renamed | tg-ctl daemon (reacts on the Telegram message, archives to `acked.jsonl`, unlinks) |
-| `acked.jsonl` | tg-ctl daemon | humans |
-| `stranded-<stamp>.jsonl` | tg-ctl daemon — one-time archive of the retired cc/codex backlog (tg-cli#456) | humans |
+| `acked.jsonl`                      | tg-ctl daemon                                                                                         | humans                                                                             |
+| `stranded-<stamp>.jsonl`           | tg-ctl daemon — one-time archive of the retired cc/codex backlog (tg-cli#456)                         | humans                                                                             |
 
 Directories are `0700`, files `0600` — the content is the user's private Telegram text.
 The hook→daemon direction deliberately has **no shared append file**: a shared

@@ -843,8 +843,8 @@ tool migrates to import from the lib.
   INERT in CC until the #18 bridge lands + is live-verified. So the "safe" pillar is bridge-pending —
   #18 is now a HARD blocker for blessing auto-mode, not a nicety. (alex-mextner/rig-cli#6 — reverse it.)
 - 🔮 **Rollout (#3686)**: wave-1 tool repos = PRs open (draw/3d green, tg pending TS fix). **Wave-2 =
-  bots** (ExpenseSyncBot, garage-band, summary-bot, esphome-ir, claude-p, diploma, sme-archiving-gc,
-  talks, upwork) + review-cli/rig-cli/agent-tools themselves. Each: `rig init --yes` + conservative
+  bots** (ExpenseSyncBot, garage-band, summary-bot, esphome-ir, claude-p (archived), diploma,
+  sme-archiving-gc, talks, upwork) + review-cli/rig-cli/agent-tools themselves. Each: `rig init --yes` + conservative
   AGENTS/CLAUDE slim (drop now-self-advertised generic rules, keep project specifics) + harvest report.
   (alex-mextner/rig-cli#7)
   - 🔬 **⚠️ CORRECTED (2026-06-25) — auto-mode is USER-LEVEL `auto`, NOT a committed `.claude/settings.json`.**
