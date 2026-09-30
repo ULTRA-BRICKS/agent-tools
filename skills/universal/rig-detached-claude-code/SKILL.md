@@ -59,7 +59,7 @@ process. Claude Code runs its hook commands with its own process environment, so
 visible to `lib/cc_hook_bridge/dispatch.py` on every hook invocation in that session. The bridge
 keeps Claude Code's own top-level `agent_id` when it sends one (a native subagent inside the
 detached session), drops every model/tool-supplied `agent_id` copy (forged args can never
-self-exempt), and otherwise injects `args.agent_id` from these markers (`_detached_agent_id`,
+self-exempt), and otherwise injects `args.agent_id` from these markers (`agenttools_agent_role.launcher_agent_id`,
 agent-tools#831 — the same mechanism the codex/omp/opencode bridges use), so every
 subagent-exempt delegation gate (`orchestrator-stays-thin`, `background-subagent-gate`,
 `no-long-inline-process`) and every subagent-only gate (`subagent-no-bg-longproc`,

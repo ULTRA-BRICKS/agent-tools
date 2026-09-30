@@ -56,7 +56,7 @@ environment (`extension.ts`'s `spawnSync(..., { env: { ...process.env, ... } })`
 markers set when the child omp process was launched are visible to
 `lib/omp_hook_bridge/dispatch.py` on every tool call in that session. The bridge strips every
 model/tool-supplied `agent_id`-shaped key (forged args can never self-exempt) and injects
-`args.agent_id` from these markers instead (`_detached_agent_id`, agent-tools#573, ported
+`args.agent_id` from these markers instead (`agenttools_agent_role.launcher_agent_id`, agent-tools#573, ported
 unchanged from `opencode_hook_bridge`'s agent-tools#476), so every subagent-exempt delegation
 gate (`orchestrator-stays-thin`, `background-subagent-gate`, `no-long-inline-process`,
 `subagent-no-bg-longproc`) classifies the child session's tool calls as a dispatched

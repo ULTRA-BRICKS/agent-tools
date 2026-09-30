@@ -54,7 +54,7 @@ process. Codex's hook commands inherit that process environment, so `codex_hook_
 (`lib/codex_hook_bridge/dispatch.py`) sees the markers on every hook invocation for that
 session. The bridge strips every model/tool-supplied `agent_id`-shaped key (forged args can
 never self-exempt) and injects `args.agent_id` from these markers instead
-(`_detached_agent_id`, agent-tools#573, ported unchanged from `opencode_hook_bridge`'s
+(`agenttools_agent_role.launcher_agent_id`, agent-tools#573, ported unchanged from `opencode_hook_bridge`'s
 agent-tools#476), so every subagent-exempt delegation gate (`orchestrator-stays-thin`,
 `background-subagent-gate`, `no-long-inline-process`, `subagent-no-bg-longproc`) classifies the
 child session's tool calls as a dispatched subagent's.

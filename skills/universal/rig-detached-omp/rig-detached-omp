@@ -14,7 +14,7 @@
 # Launches a DETACHED `omp -p` (non-interactive, process-and-exit) session carrying
 # the subagent identity markers RIG_AGENT_ID=<name> and RIG_DETACHED_AGENT=1. The omp
 # hook bridge (lib/omp_hook_bridge/dispatch.py) injects args.agent_id from those markers
-# on every tool call (`_detached_agent_id`, agent-tools#573), so every agents-hooks/v1
+# on every tool call (`launcher_agent_id`, agent-tools#573), so every agents-hooks/v1
 # delegation gate (orchestrator-stays-thin, background-subagent-gate,
 # no-long-inline-process, subagent-no-bg-longproc) classifies the child session as a
 # dispatched subagent instead of the orchestrator.
