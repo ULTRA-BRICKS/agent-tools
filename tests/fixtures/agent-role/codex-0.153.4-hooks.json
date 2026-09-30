@@ -1,0 +1,53 @@
+{
+  "_source": "Schema-shaped (NOT live): Codex 0.153.4 binary JSON schemas `pre-tool-use.command.input` / `permission-request.command.input` carry OPTIONAL top-level agent_id/agent_type (required in subagent-start/subagent-stop). Official docs: 'session_id — Subagent hooks use the parent session id', so both payloads share the parent's session_id/transcript_path. Ids below are real recorded thread ids from ~/.codex/sessions rollouts (parent 01a09b1e…, spawned thread 01a09b1f… with thread_source=subagent, agent_nickname Anscombe). Live hook capture blocked by the Codex usage limit — see the tracking ticket.",
+  "coordinatorPreToolUse": {
+    "session_id": "01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3",
+    "transcript_path": "/Users/me/.codex/sessions/2026/09/12/rollout-2026-09-12T10-00-00-01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3.jsonl",
+    "cwd": "/Users/me/work/repo",
+    "hook_event_name": "PreToolUse",
+    "model": "gpt-6-astra",
+    "permission_mode": "default",
+    "turn_id": "turn-main-1",
+    "tool_name": "Bash",
+    "tool_use_id": "call_main_1",
+    "tool_input": { "command": "git status" }
+  },
+  "subagentPreToolUse": {
+    "session_id": "01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3",
+    "transcript_path": "/Users/me/.codex/sessions/2026/09/12/rollout-2026-09-12T10-00-00-01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3.jsonl",
+    "cwd": "/Users/me/work/repo",
+    "hook_event_name": "PreToolUse",
+    "model": "gpt-6-astra",
+    "permission_mode": "default",
+    "turn_id": "turn-sub-1",
+    "agent_id": "01a09b1f-2948-77d1-b8fa-a84b096047ca",
+    "agent_type": "worker",
+    "tool_name": "Bash",
+    "tool_use_id": "call_sub_1",
+    "tool_input": { "command": "git status" }
+  },
+  "coordinatorPermissionRequest": {
+    "session_id": "01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3",
+    "transcript_path": "/Users/me/.codex/sessions/2026/09/12/rollout-2026-09-12T10-00-00-01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3.jsonl",
+    "cwd": "/Users/me/work/repo",
+    "hook_event_name": "PermissionRequest",
+    "model": "gpt-6-astra",
+    "permission_mode": "default",
+    "turn_id": "turn-main-2",
+    "tool_name": "Bash",
+    "tool_input": { "command": "git push origin main" }
+  },
+  "subagentPermissionRequest": {
+    "session_id": "01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3",
+    "transcript_path": "/Users/me/.codex/sessions/2026/09/12/rollout-2026-09-12T10-00-00-01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3.jsonl",
+    "cwd": "/Users/me/work/repo",
+    "hook_event_name": "PermissionRequest",
+    "model": "gpt-6-astra",
+    "permission_mode": "default",
+    "turn_id": "turn-sub-2",
+    "agent_id": "01a09b1f-2948-77d1-b8fa-a84b096047ca",
+    "agent_type": "worker",
+    "tool_name": "Bash",
+    "tool_input": { "command": "git push origin main" }
+  }
+}

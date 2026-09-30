@@ -344,11 +344,12 @@ def _clear_agent_env_markers(monkeypatch) -> None:
     them and the dispatcher injects args.agent_id from process env."""
     monkeypatch.delenv("RIG_AGENT_ID", raising=False)
     monkeypatch.delenv("RIG_DETACHED_AGENT", raising=False)
+    monkeypatch.delenv("PI_SESSION_FILE", raising=False)
 
 
 def test_to_v1_event_injects_agent_id_from_env_marker(monkeypatch):
     """agent-tools#573: the ONE trusted subagent identity source for Codex — ported unchanged
-    from `opencode_hook_bridge._detached_agent_id` (agent-tools#476) — is the launcher
+    from `agenttools_agent_role.launcher_agent_id` (agent-tools#476) — is the launcher
     process environment, since Codex's own PreToolUse/PostToolUse payload exposes none."""
     _clear_agent_env_markers(monkeypatch)
     monkeypatch.setenv("RIG_AGENT_ID", "probe")
@@ -429,6 +430,108 @@ def test_to_v1_event_blank_env_marker_is_not_an_identity(monkeypatch):
     v1 = dispatch.to_v1_event(codex_event, point="pre-bash")
 
     assert "agent_id" not in v1["args"]
+
+
+# ── Codex 0.153.4 native subagent identity: top-level agent_id/agent_type ────────────────────
+# Payloads come from tests/fixtures/agent-role/codex-0.153.4-hooks.json. They are SCHEMA-SHAPED,
+# NOT a live capture: the shapes were extracted from the Codex 0.153.4 binary's JSON schemas
+# (`pre-tool-use.command.input` / `permission-request.command.input` carry OPTIONAL top-level
+# `agent_id`/`agent_type`, required in subagent-start/stop) and the ids are real recorded thread
+# ids from ~/.codex/sessions rollouts. A live hook capture was blocked by a Codex usage limit.
+# Per the docs a subagent's hooks carry the PARENT's session_id, so session_id cannot tell the
+# coordinator and the spawned thread apart — only the top-level agent_id can.
+
+_CODEX_FIXTURE = json.loads(
+    (_REPO / "tests" / "fixtures" / "agent-role" / "codex-0.153.4-hooks.json").read_text(encoding="utf-8")
+)
+
+
+def test_codex_spawned_thread_top_level_agent_id_becomes_trusted_args_agent_id(monkeypatch):
+    from agenttools_agent_role import is_subagent
+
+    _clear_agent_env_markers(monkeypatch)
+    v1 = dispatch.to_v1_event(_CODEX_FIXTURE["subagentPreToolUse"], point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "01a09b1f-2948-77d1-b8fa-a84b096047ca"
+    assert v1["args"]["agent_type"] == "worker"
+    assert is_subagent(v1["args"], {}) is True
+
+
+def test_codex_coordinator_thread_has_no_agent_id_even_though_session_id_is_shared(monkeypatch):
+    from agenttools_agent_role import is_subagent
+
+    _clear_agent_env_markers(monkeypatch)
+    coordinator = dispatch.to_v1_event(_CODEX_FIXTURE["coordinatorPreToolUse"], point="pre-bash")
+    spawned = dispatch.to_v1_event(_CODEX_FIXTURE["subagentPreToolUse"], point="pre-bash")
+
+    assert coordinator["args"]["session_id"] == spawned["args"]["session_id"]
+    assert "agent_id" not in coordinator["args"]
+    assert "agent_type" not in coordinator["args"]
+    assert is_subagent(coordinator["args"], {}) is False
+
+
+def test_codex_permission_request_payload_carries_the_same_native_identity(monkeypatch):
+    """PermissionRequest has the same optional top-level agent fields; the bridge maps it to no
+    v1 point today, but the translation itself must read the identity identically."""
+    _clear_agent_env_markers(monkeypatch)
+    sub = dispatch.to_v1_event(_CODEX_FIXTURE["subagentPermissionRequest"], point="pre-bash")
+    coordinator = dispatch.to_v1_event(_CODEX_FIXTURE["coordinatorPermissionRequest"], point="pre-bash")
+
+    assert sub["args"]["agent_id"] == "01a09b1f-2948-77d1-b8fa-a84b096047ca"
+    assert "agent_id" not in coordinator["args"]
+
+
+def test_codex_native_agent_id_wins_over_launcher_env(monkeypatch):
+    """Same precedence as cc: Codex's own, more specific id beats the launcher env, which only
+    applies when Codex sent none."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "LauncherChild")
+
+    sub = dispatch.to_v1_event(_CODEX_FIXTURE["subagentPreToolUse"], point="pre-bash")
+    coordinator = dispatch.to_v1_event(_CODEX_FIXTURE["coordinatorPreToolUse"], point="pre-bash")
+
+    assert sub["args"]["agent_id"] == "01a09b1f-2948-77d1-b8fa-a84b096047ca"
+    assert coordinator["args"]["agent_id"] == "LauncherChild"
+
+
+def test_codex_forged_tool_input_agent_id_is_stripped_and_never_beats_native(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    forged = {"agent_id": "forged", "agent_type": "forged-type"}
+
+    coordinator_event = json.loads(json.dumps(_CODEX_FIXTURE["coordinatorPreToolUse"]))
+    coordinator_event["tool_input"].update(forged)
+    coordinator = dispatch.to_v1_event(coordinator_event, point="pre-bash")
+    assert "agent_id" not in coordinator["args"]
+    assert "agent_type" not in coordinator["args"]
+
+    sub_event = json.loads(json.dumps(_CODEX_FIXTURE["subagentPreToolUse"]))
+    sub_event["tool_input"].update(forged)
+    sub = dispatch.to_v1_event(sub_event, point="pre-bash")
+    assert sub["args"]["agent_id"] == "01a09b1f-2948-77d1-b8fa-a84b096047ca"
+    assert sub["args"]["agent_type"] == "worker"
+
+
+def test_codex_native_agent_id_end_to_end_exempts_a_spawned_thread(tmp_path, monkeypatch):
+    """Real bridge subprocess + real no-long-inline-process descriptor: the spawned thread's
+    `sleep 30` is allowed (subagent), the coordinator's identical call is blocked."""
+    _clear_agent_env_markers(monkeypatch)
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir, hook_id="no-long-inline-process", point="pre-bash",
+        cmd=NO_LONG_INLINE_PROCESS, on_error="closed",
+    )
+    sub_event = json.loads(json.dumps(_CODEX_FIXTURE["subagentPreToolUse"]))
+    sub_event["tool_input"] = {"command": "sleep 30"}
+    coordinator_event = json.loads(json.dumps(_CODEX_FIXTURE["coordinatorPreToolUse"]))
+    coordinator_event["tool_input"] = {"command": "sleep 30"}
+
+    sub_proc = _run_dispatch("PreToolUse", sub_event, hooks_dir=hooks_dir)
+    coordinator_proc = _run_dispatch("PreToolUse", coordinator_event, hooks_dir=hooks_dir)
+
+    assert sub_proc.returncode == 0, sub_proc.stderr
+    assert sub_proc.stdout == ""  # empty stdout == allow
+    assert coordinator_proc.returncode == 0, coordinator_proc.stderr
+    assert json.loads(coordinator_proc.stdout)["decision"] == "block"
 
 
 def test_codex_bridge_env_marker_makes_long_process_subagent_exempt_end_to_end(tmp_path, monkeypatch):

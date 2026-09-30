@@ -36,14 +36,32 @@ fan out descriptor execution so existing singular-path hooks receive one `args.f
 / `args.path` at a time. That keeps current path-scoped hooks useful without changing the
 v1 event contract.
 
-The bridge strips `agent_id` / `agent_type` from Codex `tool_input` and restores a TRUSTED
-`args.agent_id` from the launcher process environment instead (`RIG_AGENT_ID`/
-`RIG_DETACHED_AGENT`, set by the `rig-detached-codex` launcher skill) via
-`_detached_agent_id` — the same mechanism `opencode_hook_bridge` uses (agent-tools#476,
-ported to codex/omp by agent-tools#573). Codex has no captured, non-forgeable subagent
-identity fixture of its OWN beyond that launcher-env marker (SubagentStart/SubagentStop exist
-but carry no confirmed parent/child linkage in this bridge's payload), so a plain Codex
-session with no launcher marker still looks like a main-thread call to subagent-exempt hooks.
+## Subagent identity (`args.agent_id`)
+
+Role rule and primitives: [`lib/agenttools_agent_role`](../agenttools_agent_role/README.md)
+(`native_payload_agent`, `launcher_agent_id`; hooks ask `is_subagent`).
+
+| Harness            | Hooks (tool-call time)                                                                                                                                                                                                                                                                             | Bash env of the agent (e.g. `tg`)        |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| Codex 0.153.4      | top-level `agent_id`/`agent_type` (optional in PreToolUse/PermissionRequest schema; required in SubagentStart/Stop). Docs: "Subagent hooks use the parent session id" → `session_id` can't tell. A spawned thread's OWN rollout has `session_meta.thread_source=="subagent"` + `parent_thread_id`. | no per-thread env found → explicit label |
+| any detached child | launcher env on the child: `RIG_AGENT_ID=<name>` or `RIG_DETACHED_AGENT=1`                                                                                                                                                                                                                         | inherited into bash                      |
+
+The bridge strips `agent_id` / `agent_type` from Codex `tool_input` (model-controlled) and
+restores a TRUSTED `args.agent_id` (+ `args.agent_type`) from, in order:
+
+1. Codex's own TOP-LEVEL `agent_id` / `agent_type` of the hook payload, present only when
+   the call fires inside a spawned (`spawn_agent` / review / guardian) thread and absent on
+   the coordinator thread;
+2. only when Codex sent none, the launcher process environment (`RIG_AGENT_ID` /
+   `RIG_DETACHED_AGENT=1`, set by the `rig-detached-codex` launcher skill) via
+   `launcher_agent_id` — the mechanism `opencode_hook_bridge` introduced (agent-tools#476,
+   ported to codex/omp by agent-tools#573).
+
+The top-level fields are schema-verified (extracted from the 0.153.4 binary), NOT yet a live
+capture — a live hook capture was blocked by a Codex usage limit; the fixture is
+`tests/fixtures/agent-role/codex-0.153.4-hooks.json` and is labelled schema-shaped. A plain
+Codex coordinator thread carries neither signal and looks like a main-thread call to
+subagent-exempt hooks, as intended.
 
 Every translated v1 event also carries a top-level `harness: "codex"` — a hardcoded module
 constant (`dispatch.HARNESS`), never derived from the Codex event, so it can't be forged via
