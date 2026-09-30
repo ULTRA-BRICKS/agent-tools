@@ -7,7 +7,7 @@ tool writes when it runs (and whose mtime is at least as new as the last change 
 the index/working tree). If no review marker is found, it blocks with a reminder.
 
 Wiring: have your review tool `touch` the marker on a successful run, e.g.
-  review --uncommitted && touch "$REVIEW_MARKER"
+  review --uncommitted && touch "${REVIEW_MARKER:-$HOME/.cache/agent-tools/last-review}"
 The marker path is configurable via the REVIEW_MARKER env var; default below.
 
 What is NOT gated (so the reminder stays honest and unobtrusive):
@@ -37,11 +37,13 @@ discipline reminder, not a security boundary. (Contrast block-no-verify, fail-cl
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
 import re
 import shlex
+import stat
 import subprocess  # noqa: S404 — listing staged files is the whole job
 import sys
 import time
@@ -176,7 +178,11 @@ def warn(msg: str) -> None:
 
 
 def marker_path() -> Path:
-    return Path(os.path.expanduser(os.environ.get("REVIEW_MARKER", DEFAULT_MARKER)))
+    # An empty REVIEW_MARKER means the default, as `${REVIEW_MARKER:-…}` does in the documented
+    # `touch`: `.get(key, default)` alone returns "" for an exported-empty var, which resolves to
+    # Path('.') — the cwd, whose mtime any file write refreshes, so the gate passed with no
+    # review (#825). Any other value, whitespace included, is the literal path the producer touches.
+    return Path(os.path.expanduser(os.environ.get("REVIEW_MARKER") or DEFAULT_MARKER))
 
 
 # ── argv parsing — scope skip/env/message detection to the real `git commit` segment ─────────
@@ -734,16 +740,25 @@ def commit_extends_index(argv: list[str]) -> bool:
 # ── skip resolution + marker freshness ───────────────────────────────────────────────────────
 
 
+# stat() errors meaning "no marker at this path" — the errnos pathlib's exists() ignores: missing,
+# a path component that is not a directory, a bad fd, a symlink loop. They block like a missing
+# marker; any other stat error (permission, I/O) fails open, as the hook's on_error: open design.
+_MARKER_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+
+
 def _marker_is_fresh() -> bool | None:
-    """True/False if the review marker exists-and-is-fresh; None if it could not be stat'd."""
+    """True/False if the review marker is a fresh regular file (an absent path is False); None if
+    stat() failed for another reason (permission, I/O), which fails open."""
     marker = marker_path()
     try:
-        if marker.exists() and (time.time() - marker.stat().st_mtime) <= FRESH_WINDOW_S:
-            return True
+        st = marker.stat()
     except OSError as exc:
+        if exc.errno in _MARKER_ABSENT_ERRNOS:
+            return False
         warn(f"could not stat review marker {marker}: {exc} — allowing (fail-open)")
         return None
-    return False
+    # A review tool touches a file; a directory's mtime moves on any write inside it (#825).
+    return stat.S_ISREG(st.st_mode) and (time.time() - st.st_mtime) <= FRESH_WINDOW_S
 
 
 def _block(prefix: str | None = None) -> int:

@@ -62,6 +62,14 @@
 
 ### Fixed
 
+- `agent-hooks/require-review-before-commit`: an exported-empty `REVIEW_MARKER` no longer passes
+  the commit gate without a review (agent-tools#825). It resolved to `Path('.')`, the current
+  directory, whose mtime any file write refreshes; an empty value now means the default marker,
+  as `${REVIEW_MARKER:-…}` does in the documented `touch`. A marker path naming a directory, a
+  FIFO or anything else but a regular file never counts as a review, and a symlink loop or a
+  path through a regular file blocks like a missing marker. A marker that cannot be stat'd for
+  another reason (permission, I/O) still fails open.
+
 - `agent-hooks/heavy-op-memory-gate` now sees wired-memory exhaustion and GPU model loads
   (agent-tools#817). On 2026-09-29 thirteen concurrent `whisper-cli` runs wired 95.7% of a 24 GB
   Mac into GPU buffers and kernel-panicked it while the jetsam level, the hook's only signal,

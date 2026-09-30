@@ -61,12 +61,14 @@ checks the marker is fresh (within a window, default 1h). Wire it up like:
 ```bash
 review --uncommitted && touch "${REVIEW_MARKER:-$HOME/.cache/agent-tools/last-review}"
 # or
-codex exec review --uncommitted && touch "$REVIEW_MARKER"
+codex exec review --uncommitted && touch "${REVIEW_MARKER:-$HOME/.cache/agent-tools/last-review}"
 ```
 
 Configure via env:
 
-- `REVIEW_MARKER` — marker file path (default `~/.cache/agent-tools/last-review`)
+- `REVIEW_MARKER` — marker file path (default `~/.cache/agent-tools/last-review`; an empty
+  value also means the default, as in `${REVIEW_MARKER:-…}`). It must be a regular file — a
+  directory never counts.
 - `REVIEW_FRESH_WINDOW_S` — how recent the marker must be, in seconds (default `3600`)
 
 ## Why an agent-hook

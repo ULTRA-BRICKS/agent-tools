@@ -30,9 +30,11 @@ import html
 import importlib.util
 import io
 import json
+import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -75,14 +77,17 @@ def _mk_repo_with_staged(tmp_path: Path, *files: str) -> Path:
     return _init_repo(tmp_path / "repo", *files)
 
 
-def _run(command, cwd, monkeypatch, *, marker: Path,
+def _run(command, cwd, monkeypatch, *, marker: Path | None,
          env: dict | None = None) -> tuple[str, str, int]:
     out, err = io.StringIO(), io.StringIO()
     event = {"cwd": str(cwd), "args": {"command": command}}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
-    monkeypatch.setenv("REVIEW_MARKER", str(marker))
+    if marker is None:
+        monkeypatch.delenv("REVIEW_MARKER", raising=False)  # never inherit the developer's
+    else:
+        monkeypatch.setenv("REVIEW_MARKER", str(marker))
     monkeypatch.delenv("REVIEW_SKIP", raising=False)
     monkeypatch.delenv("RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT", raising=False)
     for k, v in (env or {}).items():
@@ -658,15 +663,12 @@ def test_fail_open_when_cwd_is_not_a_git_repo_blocks_only_on_missing_marker(tmp_
 
 
 def test_marker_stat_error_fails_open(tmp_path, monkeypatch):
-    """If the review marker exists but cannot be stat'd (OSError), the gate fails OPEN (allow) —
-    a broken stat must never wedge committing (on_error=open). Covers the `_marker_is_fresh()→None`
-    branch."""
+    """If stat() on the review marker fails for a reason other than absence (here errno None;
+    in life a permission or I/O error), the gate fails OPEN (allow) — a broken stat must never
+    wedge committing (on_error=open). Covers the `_marker_is_fresh()→None` branch."""
     repo = _mk_repo_with_staged(tmp_path, "src/util.py")
 
     class _Boom:
-        def exists(self):
-            return True
-
         def stat(self):
             raise OSError("simulated stat failure")
 
@@ -678,6 +680,98 @@ def test_marker_stat_error_fails_open(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "stderr", err)
     monkeypatch.delenv("REVIEW_SKIP", raising=False)
     assert rr.main() == 0 and _decision(out.getvalue()) == "allow"
+
+
+def test_empty_review_marker_uses_default_not_cwd(tmp_path, monkeypatch):
+    """#825: an exported-empty REVIEW_MARKER means the DEFAULT marker, not Path('.'), matching the
+    documented `touch "${REVIEW_MARKER:-…}"`. The cwd always exists and any file create/delete in
+    it refreshes its mtime, so resolving to it let an unreviewed commit through."""
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")  # repo dir mtime is fresh
+    monkeypatch.chdir(repo)  # a relative marker resolves against the hook's process cwd
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    default_marker = Path(rr.DEFAULT_MARKER).expanduser()  # reads HOME now: inside tmp_path
+    assert default_marker.is_relative_to(home)
+    empty = {"REVIEW_MARKER": ""}
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=None, env=empty)
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+    _touch_marker(default_marker)  # the hook's own default, fresh
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=None, env=empty)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_whitespace_review_marker_is_a_literal_path_not_cwd(tmp_path, monkeypatch):
+    """A whitespace-only REVIEW_MARKER is the file the documented `touch "${REVIEW_MARKER:-…}"`
+    creates (`:-` keeps whitespace), never the cwd: it blocks until that file is touched."""
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")  # repo dir mtime is fresh
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))  # a stray default lookup stays in tmp_path
+    spaces = {"REVIEW_MARKER": "   "}
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=None, env=spaces)
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+    _touch_marker(repo / "   ")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=None, env=spaces)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_symlink_to_fresh_marker_file_allows(tmp_path, monkeypatch):
+    """The marker may be a symlink: its target, a fresh regular file, is what counts."""
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
+    target = tmp_path / "real-marker"
+    _touch_marker(target)
+    link = tmp_path / "marker"
+    link.symlink_to(target)
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=link)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def _make_directory(p: Path) -> Path:
+    p.mkdir()
+    return p
+
+
+def _make_fifo(p: Path) -> Path:
+    os.mkfifo(p)
+    return p
+
+
+def _make_symlink_to_directory(p: Path) -> Path:
+    (p.parent / "real-dir").mkdir()
+    p.symlink_to(p.parent / "real-dir")
+    return p
+
+
+def _make_path_through_a_file(p: Path) -> Path:
+    p.write_text("x")  # fresh regular file, but the marker is a path BELOW it (ENOTDIR)
+    return p / "last-review"
+
+
+def _make_symlink_loop(p: Path) -> Path:
+    p.symlink_to(p)  # stat() raises ELOOP
+    return p
+
+
+def _make_stale_file(p: Path) -> Path:
+    p.write_text("x")  # a regular file, but touched before the freshness window
+    old = time.time() - rr.FRESH_WINDOW_S - 60
+    os.utime(p, (old, old))
+    return p
+
+
+@pytest.mark.parametrize("make_marker", [
+    _make_directory, _make_fifo, _make_symlink_to_directory, _make_path_through_a_file,
+    _make_symlink_loop, _make_stale_file,
+])
+def test_marker_that_is_not_a_fresh_regular_file_blocks(make_marker, tmp_path, monkeypatch):
+    """#825: only a regular file touched by a review counts. A directory's (or FIFO's) mtime
+    moves without any review, and a path that cannot name a file blocks like a missing marker
+    instead of failing open."""
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
+    marker = make_marker(tmp_path / "marker")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=marker)
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
 def test_unparsable_event_fails_open(monkeypatch):
