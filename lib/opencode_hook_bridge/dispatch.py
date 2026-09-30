@@ -16,15 +16,19 @@ import shlex
 import sys
 from pathlib import Path
 
+from agenttools_agent_role import launcher_agent_id, opencode_child_agent_id
+
 HOOK_API = "agents-hooks/v1"
 # The v1 event's `harness` tag for every event this bridge produces — a MODULE LITERAL, not
 # derived from `opencode_event`, so it cannot be forged via tool args the way `args.harness`
-# could be. See `codex_hook_bridge.HARNESS` for the same reasoning: opencode exposes no
-# TRUSTED per-tool-call subagent identity in the plugin payload either (forged
-# agent_id/agent_type keys are stripped below). The ONE trusted identity source is the
-# process environment set by the rig detached launcher (`_detached_agent_id`,
-# agent-tools#476) — and that covers only a rig-launched detached child; a plain opencode
-# session still carries no identity. A hook that wants to tailor a message (or otherwise
+# could be. opencode's `tool.execute.*` payload carries no subagent marker of its own, so
+# forged agent_id/agent_type keys are stripped below and identity is restored ONLY from two
+# trusted sources (shared `agenttools_agent_role`, see its README): (1) `sessionParentID`, a
+# TOP-LEVEL field plugin.js writes after looking the session up via the plugin client — a
+# session with a parent is an opencode `task` child session, i.e. a subagent — and (2) the
+# process environment set by the rig detached launcher (`launcher_agent_id`, agent-tools#476),
+# which covers a detached `opencode run` child. A plain coordinator session carries neither.
+# A hook that wants to tailor a message (or otherwise
 # branch) on the source harness reads `event["harness"]` instead — see
 # `agent-hooks/orchestrator-stays-thin`'s per-harness delegation-recipe text for the first
 # consumer (agent-tools#533; unified into a single subagent-identity story across every
@@ -73,38 +77,6 @@ def point_for_event(hook_name: str, tool_name: str | None) -> str | None:
     return None
 
 
-def _detached_agent_id() -> str:
-    """The ONE authoritative subagent identity source for opencode sessions.
-
-    The forge-strip in ``to_v1_event`` removes any model/tool-supplied agent_id
-    (the same trust boundary as the CC bridge's T2 precedence: an event may carry
-    model-influenced fields, so they can never self-exempt). CC has an
-    authoritative top-level agent field to restore it from; opencode has NONE —
-    which made every opencode session, including a rig-dispatched detached
-    ``opencode run`` agent, look like "the orchestrator" to every gate.
-
-    The sanctioned source here is the opencode PROCESS ENVIRONMENT, read at
-    launch: ``RIG_AGENT_ID=<name>`` (identity) or ``RIG_DETACHED_AGENT=1``
-    (anonymous marker), set by the rig detached-agent launcher. plugin.js spawns
-    this dispatcher with ``{...process.env}``, so the marker set when the child
-    opencode was launched is visible here on every tool call.
-
-    Trust reasoning: a running orchestrator cannot retroactively mutate its own
-    process environment — it can only set these vars for a CHILD process it
-    dispatches, which is exactly the sanctioned act of dispatching a subagent
-    (and the very act the delegation gates exist to encourage). This matches the
-    module family's stated threat model: a cooperative orchestrator, discipline
-    rather than a security boundary, on_error=open. A bare/whitespace value is
-    not a marker.
-    """
-    val = os.environ.get("RIG_AGENT_ID", "").strip()
-    if val:
-        return val
-    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
-        return "detached"
-    return ""
-
-
 def to_v1_event(opencode_event: dict, *, point: str) -> dict:
     """Translate the opencode plugin payload into agents-hooks/v1."""
     tool = _tool_name(opencode_event)
@@ -112,9 +84,20 @@ def to_v1_event(opencode_event: dict, *, point: str) -> dict:
     args = dict(raw_args)
     for key in _FORGED_AGENT_KEYS:
         args.pop(key, None)
-    detached_id = _detached_agent_id()
-    if detached_id:
-        args["agent_id"] = detached_id
+    # Trusted restore, AFTER the forge-strip: a child session (opencode `task` subagent) is
+    # identified by plugin.js's own `client.session.get` lookup — the top-level
+    # `sessionParentID` field it writes — never by anything under input/output args. The
+    # child's own session id is the agent id. A coordinator session (no parent) falls
+    # through to the launcher env of a detached `opencode run` child.
+    child_id = opencode_child_agent_id(
+        _trusted_session_id(opencode_event), opencode_event.get("sessionParentID")
+    )
+    if child_id:
+        args["agent_id"] = child_id
+    else:
+        detached_id = launcher_agent_id()
+        if detached_id:
+            args["agent_id"] = detached_id
     _normalize_task_args(args)
     if tool == _SKILL_TOOL:
         _normalize_skill_args(args)

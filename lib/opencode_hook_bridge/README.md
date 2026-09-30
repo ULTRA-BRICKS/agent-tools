@@ -59,23 +59,44 @@ patches, both the source and destination paths are surfaced for path-based gates
 only the destination receives the added-content payload because the source path is
 not being written.
 
-## Identity contract (subagent exemption)
+## Subagent identity (identity contract)
+
+The role rule and its primitives live in the shared
+[`lib/agenttools_agent_role`](../agenttools_agent_role/README.md) package
+(`opencode_child_agent_id`, `launcher_agent_id`; hooks ask `is_subagent`).
+
+| Harness            | Hooks (tool-call time)                                                                                                            | Bash env of the agent (e.g. `tg`) |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| opencode 1.18.30   | subagent = child session: `session.parentID != null` (the bridge plugin resolves it from `input.sessionID` via the plugin client) | same process → explicit label     |
+| any detached child | launcher env on the child: `RIG_AGENT_ID=<name>` or `RIG_DETACHED_AGENT=1`                                                        | inherited into bash               |
 
 The bridge strips all opencode tool-argument fields that look like agent identity
 (`agent_id`, `agent_type`, camelCase variants, and `agent`) — model-controlled tool args
 can never self-exempt a call, so a forged `agent_id` inside `tool_input` is dropped
-before anything else runs.
+before anything else runs. It then restores a TRUSTED `args.agent_id` from two sources, in
+order:
 
-The one authoritative identity source is the opencode PROCESS ENVIRONMENT, read at
-launch by `_detached_agent_id()`: `RIG_AGENT_ID=<name>` (identity) or
-`RIG_DETACHED_AGENT=1` (anonymous marker). When a marker is present the dispatcher
-injects `args.agent_id`, so every subagent-exempt hook
-(`orchestrator-stays-thin`, `background-subagent-gate`, `no-long-inline-process`,
-`subagent-no-bg-longproc`) treats the session's tool calls as a dispatched subagent's
-instead of the orchestrator's. The markers are set by the canonical detached launcher
-shipped as the `rig-detached-opencode` universal skill (`plugin.js` spawns this
-dispatcher with `{...process.env}`, so the marker set at child launch is visible on
-every tool call).
+1. **Child session** (opencode `task` subagent). opencode's `tool.execute.*` payload carries no
+   subagent marker, so `plugin.js` asks opencode: `ctx.client.session.get({ path: { id } })` with
+   `id = input.sessionID` (the `PluginInput.client` from `@opencode-ai/sdk`, SDK v1 flavor,
+   opencode 1.18.x; it returns `{ data: Session, error }` and `Session.parentID` is set for a
+   child session, absent for a top-level one). The parent id is cached per session id (parentage
+   is fixed at creation; failures are not cached) and sent to `dispatch.py` as the TOP-LEVEL
+   payload field `sessionParentID`, which only the plugin writes — never read from
+   `output.args`/`input.args`, which the model controls. When it is non-blank the dispatcher sets
+   `args.agent_id` to the child's own session id. The lookup **fails open**: a missing client,
+   an HTTP error, or a timeout (`OPENCODE_HOOK_BRIDGE_SESSION_LOOKUP_TIMEOUT_MS`, default 5000) resolves to unknown = coordinator, is logged to the debug file, and never blocks the
+   tool call.
+2. **Launcher env**, only when the session has no parent: the opencode PROCESS ENVIRONMENT,
+   read at launch — `RIG_AGENT_ID=<name>` (identity) or `RIG_DETACHED_AGENT=1` (anonymous
+   marker) via `launcher_agent_id`. When a marker is present the dispatcher injects
+   `args.agent_id`, so every subagent-exempt hook
+   (`orchestrator-stays-thin`, `background-subagent-gate`, `no-long-inline-process`,
+   `subagent-no-bg-longproc`) treats the session's tool calls as a dispatched subagent's
+   instead of the orchestrator's. The markers are set by the canonical detached launcher
+   shipped as the `rig-detached-opencode` universal skill (`plugin.js` spawns this
+   dispatcher with `{...process.env}`, so the marker set at child launch is visible on
+   every tool call).
 
 Trust reasoning: a running orchestrator cannot retroactively mutate its own process
 environment — it can only set these vars for a CHILD process, which is exactly the

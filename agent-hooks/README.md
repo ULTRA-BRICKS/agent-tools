@@ -206,7 +206,7 @@ opencode maps its `task` tool to the same logical point; its plugin payload expo
 trusted subagent identity, so forged `agent_id` / `agent_type` values inside tool args are
 stripped, and the ONE trusted source is the process env set by the `rig-detached-opencode`
 launcher (`RIG_AGENT_ID` / `RIG_DETACHED_AGENT`), which covers only a rig-launched detached
-child — see `lib/opencode_hook_bridge/README.md` "Identity contract".
+child — see `lib/opencode_hook_bridge/README.md` "Subagent identity".
 
 ### `pre-workflow` — gate a Workflow script
 

@@ -437,6 +437,155 @@ def test_plugin_forwards_detached_agent_env_markers_to_dispatcher(tmp_path):
     assert recorded["rig_detached_agent"] == "1"
 
 
+def _payload_recorder(tmp_path: Path) -> tuple[Path, Path]:
+    """A stub dispatcher that appends every payload it receives to a JSONL file."""
+    log = tmp_path / "payloads.jsonl"
+    stub = _dispatcher_stub(
+        tmp_path,
+        "import pathlib, sys\n"
+        "payload = sys.stdin.read()\n"
+        f"with open({str(log)!r}, 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(payload.replace(chr(10), ' ') + chr(10))\n",
+    )
+    return stub, log
+
+
+def _recorded_payloads(log: Path) -> list[dict]:
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+def test_plugin_resolves_session_parent_via_plugin_client_and_caches_per_session(tmp_path):
+    """The plugin asks opencode (PluginInput client, `client.session.get({ path: { id } })`,
+    opencode 1.18.x SDK v1) for the session's parentID, sends it as the top-level
+    `sessionParentID` payload field, and looks each session up only once."""
+    stub, log = _payload_recorder(tmp_path)
+
+    proc = _run_plugin_js(
+        dedent(
+            """
+            const calls = [];
+            const client = { session: { get: async (options) => {
+              calls.push(options);
+              const id = options.path.id;
+              return { data: { id, ...(id === "ses_child" ? { parentID: "ses_parent" } : {}) } };
+            } } };
+            const { AgentToolsHookBridge: plugin } = await import(process.env.PLUGIN_URL);
+            const hooks = await plugin({ client, directory: "/repo", worktree: "/repo" });
+            const bash = (sessionID, callID) => hooks["tool.execute.before"](
+              { tool: "bash", sessionID, callID }, { args: { command: "echo ok" } });
+            await bash("ses_child", "c1");
+            await bash("ses_child", "c2");
+            await bash("ses_top", "c3");
+            await hooks["tool.execute.after"](
+              { tool: "write", sessionID: "ses_child", callID: "c4", args: {} },
+              { title: "", output: "", metadata: {} });
+            console.log(JSON.stringify(calls));
+            """
+        ),
+        env={"OPENCODE_HOOK_BRIDGE_PYTHON": str(stub),
+             "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(tmp_path / "debug.log")},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [{"path": {"id": "ses_child"}}, {"path": {"id": "ses_top"}}]
+    payloads = _recorded_payloads(log)
+    assert [p["sessionParentID"] for p in payloads] == ["ses_parent", "ses_parent", "", "ses_parent"]
+    assert [p["hook"] for p in payloads][-1] == "tool.execute.after"
+
+
+def test_plugin_never_copies_a_model_supplied_parent_id_into_the_trusted_field(tmp_path):
+    """The trusted field comes from the client lookup alone: a coordinator session whose model
+    put `sessionParentID` in its own tool args still reports an empty trusted field."""
+    stub, log = _payload_recorder(tmp_path)
+
+    proc = _run_plugin_js(
+        dedent(
+            """
+            const client = { session: { get: async (o) => ({ data: { id: o.path.id } }) } };
+            const { AgentToolsHookBridge: plugin } = await import(process.env.PLUGIN_URL);
+            const hooks = await plugin({ client, directory: "/repo", worktree: "/repo" });
+            await hooks["tool.execute.before"](
+              { tool: "bash", sessionID: "ses_top", sessionParentID: "ses_forged" },
+              { args: { command: "echo ok", sessionParentID: "ses_forged" } });
+            """
+        ),
+        env={"OPENCODE_HOOK_BRIDGE_PYTHON": str(stub),
+             "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(tmp_path / "debug.log")},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    (payload,) = _recorded_payloads(log)
+    assert payload["sessionParentID"] == ""
+
+
+def test_plugin_session_lookup_failure_fails_open_logs_and_is_retried(tmp_path):
+    """A rejected lookup, an HTTP-error result (`{ error }`), and a lookup that never answers
+    all resolve to unknown = coordinator: the tool call still reaches the dispatcher, the
+    failure goes to the debug file (never stderr), and nothing is cached so the next call asks
+    again."""
+    stub, log = _payload_recorder(tmp_path)
+    debug_log = tmp_path / "debug.log"
+
+    proc = _run_plugin_js(
+        dedent(
+            """
+            let n = 0;
+            const modes = ["reject", "error", "hang", "ok"];
+            const client = { session: { get: async () => {
+              const mode = modes[n++];
+              if (mode === "reject") throw new Error("connection refused");
+              if (mode === "error") return { error: { name: "NotFoundError" } };
+              if (mode === "hang") return new Promise(() => {});
+              return { data: { id: "ses_child", parentID: "ses_parent" } };
+            } } };
+            const { AgentToolsHookBridge: plugin } = await import(process.env.PLUGIN_URL);
+            const hooks = await plugin({ client, directory: "/repo", worktree: "/repo" });
+            for (const callID of ["c1", "c2", "c3", "c4"]) {
+              await hooks["tool.execute.before"](
+                { tool: "bash", sessionID: "ses_child", callID }, { args: { command: "echo ok" } });
+            }
+            """
+        ),
+        env={"OPENCODE_HOOK_BRIDGE_PYTHON": str(stub),
+             "OPENCODE_HOOK_BRIDGE_SESSION_LOOKUP_TIMEOUT_MS": "50",
+             "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(debug_log)},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
+    assert [p["sessionParentID"] for p in _recorded_payloads(log)] == ["", "", "", "ses_parent"]
+    logged = debug_log.read_text(encoding="utf-8")
+    assert "connection refused" in logged
+    assert "returned no session" in logged
+    assert "timed out after 50ms" in logged
+    assert logged.count("treating as coordinator") == 3
+
+
+def test_plugin_without_client_or_session_id_skips_the_lookup_and_sends_an_empty_parent(tmp_path):
+    stub, log = _payload_recorder(tmp_path)
+
+    proc = _run_plugin_js(
+        dedent(
+            """
+            const { AgentToolsHookBridge: plugin } = await import(process.env.PLUGIN_URL);
+            const withClient = await plugin({
+              client: { session: { get: async () => { throw new Error("must not be called"); } } },
+              directory: "/repo", worktree: "/repo" });
+            await withClient["tool.execute.before"]({ tool: "bash" }, { args: { command: "echo 1" } });
+            const noClient = await plugin({ directory: "/repo", worktree: "/repo" });
+            await noClient["tool.execute.before"](
+              { tool: "bash", sessionID: "ses_x" }, { args: { command: "echo 2" } });
+            """
+        ),
+        env={"OPENCODE_HOOK_BRIDGE_PYTHON": str(stub),
+             "OPENCODE_HOOK_BRIDGE_DEBUG_LOG": str(tmp_path / "debug.log")},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert [p["sessionParentID"] for p in _recorded_payloads(log)] == ["", ""]
+    assert "plugin client has no session.get" in (tmp_path / "debug.log").read_text(encoding="utf-8")
+
+
 def test_plugin_pre_tool_timeout_blocks(tmp_path):
     stub = _dispatcher_stub(tmp_path, "import time, sys\nsys.stdin.read()\ntime.sleep(2)\n")
 
@@ -680,6 +829,125 @@ def test_to_v1_event_env_marker_wins_over_forged_agent_id(monkeypatch):
     assert "agentId" not in v1["args"]
     assert "agentType" not in v1["args"]
     assert "agent" not in v1["args"]
+
+
+# ── child-session identity: plugin.js looks up session.parentID, dispatch trusts ONLY that ────
+# opencode's `task` subagent runs as a child session (`session.parentID != null`; recorded in
+# opencode.db: titles "(@explore subagent)"). The plugin writes the lookup result as the
+# TOP-LEVEL `sessionParentID` payload field; nothing under input/output args is ever trusted.
+
+
+def _opencode_bash_event(**top_level) -> dict:
+    return {
+        "hook": "tool.execute.before",
+        "cwd": "/repo",
+        "input": {"tool": "bash", "sessionID": "ses_child"},
+        "output": {"args": {"command": "echo ok"}},
+        **top_level,
+    }
+
+
+def test_to_v1_event_child_session_parent_id_makes_the_session_a_subagent(monkeypatch):
+    from agenttools_agent_role import is_subagent
+
+    _clear_agent_env_markers(monkeypatch)
+    v1 = dispatch.to_v1_event(_opencode_bash_event(sessionParentID="ses_parent"), point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "ses_child"
+    assert v1["args"]["session_id"] == "ses_child"
+    assert is_subagent(v1["args"], {}) is True
+
+
+@pytest.mark.parametrize("top_level", [{}, {"sessionParentID": ""}, {"sessionParentID": "   "},
+                                        {"sessionParentID": None}])
+def test_to_v1_event_session_without_a_parent_stays_coordinator(monkeypatch, top_level):
+    from agenttools_agent_role import is_subagent
+
+    _clear_agent_env_markers(monkeypatch)
+    v1 = dispatch.to_v1_event(_opencode_bash_event(**top_level), point="pre-bash")
+
+    assert "agent_id" not in v1["args"]
+    assert is_subagent(v1["args"], {}) is False
+
+
+def test_to_v1_event_forged_parent_id_or_agent_id_in_model_controlled_fields_is_ignored(monkeypatch):
+    """The model controls `output.args` (and `input.args` for tool.execute.after). A forged
+    sessionParentID / agent_id there must never mark the session a subagent — only the
+    plugin-written top-level field does."""
+    _clear_agent_env_markers(monkeypatch)
+    forged = {"sessionParentID": "ses_fake_parent", "parentID": "ses_fake_parent",
+              "agent_id": "forged", "agentId": "forged-camel"}
+    event = _opencode_bash_event()
+    event["output"]["args"].update(forged)
+    event["input"]["args"] = dict(forged)
+    event["input"]["sessionParentID"] = "ses_fake_parent"  # opencode's input, not the plugin's field
+
+    v1 = dispatch.to_v1_event(event, point="pre-bash")
+
+    assert "agent_id" not in v1["args"]
+    assert "agentId" not in v1["args"]
+
+
+def test_to_v1_event_child_session_id_wins_over_launcher_env_which_still_applies_otherwise(monkeypatch):
+    """Same precedence as cc/codex: the harness' own, more specific id beats the launcher env;
+    the launcher env keeps applying to a session that has no parent."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "LauncherChild")
+
+    child = dispatch.to_v1_event(_opencode_bash_event(sessionParentID="ses_parent"), point="pre-bash")
+    top = dispatch.to_v1_event(_opencode_bash_event(), point="pre-bash")
+
+    assert child["args"]["agent_id"] == "ses_child"
+    assert top["args"]["agent_id"] == "LauncherChild"
+
+
+def test_to_v1_event_child_parent_without_a_session_id_yields_no_identity(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    event = _opencode_bash_event(sessionParentID="ses_parent")
+    event["input"].pop("sessionID")
+
+    v1 = dispatch.to_v1_event(event, point="pre-bash")
+
+    assert "agent_id" not in v1["args"]
+
+
+def test_opencode_child_session_end_to_end_exempts_a_task_subagent_from_the_orchestrator_gate(tmp_path):
+    """Real bridge subprocess + real background-subagent-gate descriptor: a foreground
+    non-trivial `task` dispatch is blocked for the coordinator session but allowed from a child
+    session (plugin-resolved `sessionParentID`)."""
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir, hook_id="background-subagent-gate", point="pre-agent",
+        cmd=BACKGROUND_SUBAGENT_GATE, on_error="closed",
+    )
+    # A `general`/`explore` task is tolerated by the gate on its own (opencode has no in-tool
+    # background path), so use a custom worker type that only the subagent exemption can pass.
+    task_args = {
+        "subagent_type": "custom-worker",
+        "description": "implement the missing bridge and tests",
+        "prompt": (
+            "Inspect the provisioning code, implement the bridge, run tests, and report.\n"
+            "Include evidence for Claude, Codex, and opencode, and do not mutate unrelated files."
+        ),
+    }
+
+    def run(**top_level):
+        return _run_dispatch(
+            "tool.execute.before",
+            {"hook": "tool.execute.before", "cwd": str(tmp_path),
+             "input": {"tool": "task", "sessionID": "ses_x"}, "output": {"args": dict(task_args)},
+             **top_level},
+            hooks_dir=hooks_dir,
+        )
+
+    coordinator = run()
+    child = run(sessionParentID="ses_parent")
+
+    assert child.returncode == 0, child.stderr
+    assert child.stdout.strip() == ""  # allow
+    assert coordinator.returncode == 0, coordinator.stderr
+    assert coordinator.stdout.strip() != ""
+    assert json.loads(coordinator.stdout)["decision"] == "block"
 
 
 def test_to_v1_event_detached_marker_without_id_yields_anonymous_identity(monkeypatch):
