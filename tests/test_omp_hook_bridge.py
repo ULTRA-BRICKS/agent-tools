@@ -619,7 +619,7 @@ def _clear_agent_env_markers(monkeypatch) -> None:
 
 def test_to_v1_event_injects_agent_id_from_env_marker(monkeypatch):
     """agent-tools#573: the ONE trusted subagent identity source for omp — ported unchanged
-    from `opencode_hook_bridge._detached_agent_id` (agent-tools#476) — is the launcher
+    from `agenttools_agent_role.launcher_agent_id` (agent-tools#476) — is the launcher
     process environment, since omp's own tool_call/tool_result events expose none."""
     _clear_agent_env_markers(monkeypatch)
     monkeypatch.setenv("RIG_AGENT_ID", "probe")
@@ -796,6 +796,64 @@ def test_to_v1_event_is_main_session_false_never_overrides_present_main_shaped_f
     }
     v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
     assert "agent_id" not in v1["args"]
+
+
+# ── role model (lib/agenttools_agent_role/README.md): every trusted omp source, pinned once ──
+
+def _omp_bash_event(**extra) -> dict:
+    return {"event": "tool_call", "toolName": "bash",
+            "input": {"command": "git commit -m 'fix: x'"}, "cwd": "/repo", **extra}
+
+
+@pytest.mark.parametrize("source,event_extra,env,expected_agent_id", [
+    ("ctx agentId", {"agentId": "ctx-agent"}, {}, "ctx-agent"),
+    ("nested sessionFile", {"sessionFile": _OMP_NESTED_SESSION}, {}, "ThinNotSub"),
+    ("nested PI_SESSION_FILE env", {}, {"PI_SESSION_FILE": _OMP_NESTED_SESSION}, "ThinNotSub"),
+    ("isMainSession===false marker", {"sessionId": "child-sess", "isMainSession": False}, {},
+     "omp-nested:child-sess"),
+    ("RIG_AGENT_ID", {}, {"RIG_AGENT_ID": "Launched"}, "Launched"),
+    ("RIG_DETACHED_AGENT=1", {}, {"RIG_DETACHED_AGENT": "1"}, "detached"),
+])
+def test_omp_each_trusted_source_makes_a_subagent(monkeypatch, source, event_extra, env, expected_agent_id):
+    from agenttools_agent_role import is_subagent
+
+    _clear_agent_env_markers(monkeypatch)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    v1 = dispatch.to_v1_event(_omp_bash_event(**event_extra), point="pre-bash")
+
+    assert v1["args"]["agent_id"] == expected_agent_id, source
+    assert is_subagent(v1["args"], {}) is True, source
+
+
+@pytest.mark.parametrize("event_extra,env", [
+    ({}, {}),
+    ({"sessionFile": _OMP_MAIN_SESSION}, {}),
+    ({}, {"PI_SESSION_FILE": _OMP_MAIN_SESSION}),
+    ({"sessionId": "root-sess", "isMainSession": True}, {}),
+    ({"sessionFile": _OMP_MAIN_SESSION, "sessionId": "root-sess", "isMainSession": True},
+     {"PI_SESSION_FILE": _OMP_MAIN_SESSION, "CLAUDECODE": "1", "RIG_OMP_SESSION": "omp-abc"}),
+])
+def test_omp_main_session_stays_coordinator_even_with_forged_tool_input_identity(
+    monkeypatch, event_extra, env
+):
+    """A MAIN session (flat sessionFile / flat env file / no signal at all) is the coordinator,
+    session-membership env is not a role signal, and a model-forged tool_input identity is
+    stripped rather than promoted."""
+    from agenttools_agent_role import is_subagent
+
+    _clear_agent_env_markers(monkeypatch)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    event = _omp_bash_event(**event_extra)
+    event["input"].update({"agent_id": "forged", "agentId": "forged-camel", "agent": "forged"})
+
+    v1 = dispatch.to_v1_event(event, point="pre-bash")
+
+    assert "agent_id" not in v1["args"]
+    assert "agentId" not in v1["args"]
+    assert is_subagent(v1["args"], env) is False
 
 
 def test_to_v1_event_env_marker_wins_over_forged_agent_id(monkeypatch):
@@ -2111,7 +2169,7 @@ def test_extension_reads_session_manager_when_toplevel_ctx_identity_is_blank(tmp
     on ctx.sessionManager. For a native Task/eval child that manager is the CHILD's own, so
     getSessionFile() returns the nested transcript; the extension must forward it onto
     payload.sessionFile AND the dispatcher env PI_SESSION_FILE so dispatch.py's
-    _OMP_SESSION_DIR classification sees the child. The resolved session id must ALSO reach
+    nested-session classification sees the child. The resolved session id must ALSO reach
     the dispatcher env as RIG_SESSION_ID (RC-2: orchestrator-stays-thin's per-session
     warn/block markers read it from the hook process env chain)."""
     got = _run_identity_driver(

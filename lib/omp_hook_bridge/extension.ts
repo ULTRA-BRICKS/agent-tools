@@ -269,7 +269,7 @@ function sessionManagerString(ctx: SessionManagerHost | null | undefined, getter
   // The REAL identity source on omp's ExtensionContext (agent-tools#743): for a native
   // Task/eval child, ctx.sessionManager is the CHILD's own session manager, so its
   // getSessionFile() returns the nested transcript .../<session-id>/<ChildName>.jsonl —
-  // the path shape dispatch.py's _OMP_SESSION_DIR classifies as a subagent, and the one
+  // the path shape agenttools_agent_role (nested_id_from_session_file) classifies as a subagent, and the one
   // piece of unforgeable evidence oh-my-pi#11214 leaves available (the harness's own
   // session state, never tool args). A main session returns the flat
   // .../<session-id>.jsonl here, which the dispatcher correctly does NOT classify as a
@@ -379,7 +379,7 @@ function spawnDispatcher(
         ...process.env,
         PYTHONPATH: priorPythonPath ? `${libDir}${delimiter}${priorPythonPath}` : libDir,
         // Nested omp Task/eval transcript (ctx.getSessionFile()). Overrides a parent
-        // PI_SESSION_FILE so _omp_nested_agent_id sees the child, not the main session.
+        // PI_SESSION_FILE so omp_nested_agent_id sees the child, not the main session.
         ...(sessionFile ? { PI_SESSION_FILE: sessionFile } : {}),
         ...(agentId ? { RIG_AGENT_ID: agentId } : {}),
         // Trusted per-session id (ctx/sessionManager, never tool args) so session-keyed

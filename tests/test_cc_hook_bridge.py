@@ -261,7 +261,7 @@ def test_to_v1_event_forged_tool_input_agent_id_dropped_for_pre_write():
 # `rig-detached-claude-code` starts `claude -p` with these markers in its process env; CC runs
 # hook commands with that env, so the bridge sees them on every call and must restore
 # `args.agent_id` from them when CC itself sends no top-level agent_id — the same
-# `_detached_agent_id` contract as the codex/omp/opencode bridges.
+# `launcher_agent_id` contract as the codex/omp/opencode bridges.
 
 def test_to_v1_event_injects_agent_id_from_rig_agent_id(monkeypatch):
     monkeypatch.setenv("RIG_AGENT_ID", "LauncherChild")
@@ -308,6 +308,62 @@ def test_to_v1_event_forged_tool_input_agent_id_never_beats_the_marker(monkeypat
     v1 = dispatch.to_v1_event(cc, point="pre-bash")
     assert v1["args"]["agent_id"] == "LauncherChild"
     assert "agent_type" not in v1["args"]
+
+
+# ── role model (lib/agenttools_agent_role/README.md): which signals make a CC call a subagent ─
+
+def test_cc_top_level_agent_id_is_the_trusted_subagent_signal():
+    """CC writes top-level agent_id ONLY inside a Task/Agent subagent; the shared predicate
+    then classifies the bridge's args as a subagent, and a main-thread call as coordinator."""
+    from agenttools_agent_role import is_subagent
+
+    sub = dispatch.to_v1_event(
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+         "tool_input": {"command": "npm test"}, "agent_id": "ac1ddb6e2e69145c6",
+         "agent_type": "general-purpose", "session_id": "s-parent", "cwd": "/repo"},
+        point="pre-bash",
+    )
+    main = dispatch.to_v1_event(
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+         "tool_input": {"command": "npm test"}, "session_id": "s-parent", "cwd": "/repo"},
+        point="pre-bash",
+    )
+    assert sub["args"]["agent_id"] == "ac1ddb6e2e69145c6"
+    assert is_subagent(sub["args"], {}) is True
+    # same session_id for both: session_id can never tell them apart
+    assert sub["args"]["session_id"] == main["args"]["session_id"]
+    assert "agent_id" not in main["args"]
+    assert is_subagent(main["args"], {}) is False
+
+
+def test_cc_forged_tool_input_identity_never_makes_a_subagent():
+    from agenttools_agent_role import is_subagent
+
+    v1 = dispatch.to_v1_event(
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+         "tool_input": {"command": "npm test", "agent_id": "forged", "agent_type": "forged-t",
+                        "agentId": "forged"},
+         "cwd": "/repo"},
+        point="pre-bash",
+    )
+    assert "agent_id" not in v1["args"]
+    assert "agent_type" not in v1["args"]
+    assert is_subagent(v1["args"], {}) is False
+
+
+def test_cc_child_session_env_flag_alone_is_not_a_subagent_signal(monkeypatch):
+    """`CLAUDE_CODE_CHILD_SESSION=1` is set on the MAIN thread of `claude -p` too (live
+    capture, CC 2.1.285): it says nothing about the role of the tool call."""
+    from agenttools_agent_role import is_subagent
+
+    monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+    v1 = dispatch.to_v1_event(
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+         "tool_input": {"command": "npm test"}, "cwd": "/repo"},
+        point="pre-bash",
+    )
+    assert "agent_id" not in v1["args"]
+    assert is_subagent(v1["args"], {"CLAUDE_CODE_CHILD_SESSION": "1"}) is False
 
 
 def test_to_v1_event_top_level_session_id_overrides_tool_input():

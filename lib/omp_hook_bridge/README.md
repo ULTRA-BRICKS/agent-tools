@@ -122,6 +122,21 @@ nothing: `isMainSession === false` synthesizes `args.agent_id = "omp-nested:<ses
 file-based result is never second-guessed, and an event with no `isMainSession` key at all
 (an older bridge build, or an existing test fixture) falls through unchanged.
 
+## Subagent identity
+
+The resolution above is implemented by the shared, stdlib-only
+[`lib/agenttools_agent_role`](../agenttools_agent_role/README.md) package
+(`launcher_agent_id`, `omp_nested_agent_id`, `nested_id_from_session_file`); this bridge keeps
+no private copy. Agent-hooks ask `agenttools_agent_role.is_subagent(args)`.
+
+| Harness             | Hooks (tool-call time)                                                                                                                                                                                                                     | Bash env of the agent (e.g. `tg`)                                                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| omp (fork, 2026-09) | extension ctx: `ctx.getAgentId()` non-empty ⇒ subagent; endpoint owner = `hasUI && mode=='tui' && !getAgentId()`; agent-tools bridge also trusts nested `sessionFile` (`…/<session-id>/<agent>.jsonl`) and payload `isMainSession===false` | omp sets `RIG_AGENT_ID=<agent>` + nested `PI_SESSION_FILE` on a subagent's bash and `unset -v`s both on the MAIN session's bash (anti-forgery) |
+| any detached child  | launcher env on the child: `RIG_AGENT_ID=<name>` or `RIG_DETACHED_AGENT=1`                                                                                                                                                                 | inherited into bash (cc/codex/opencode). An `omp -p` child's main session unsets it → gap                                                      |
+
+A MAIN session (flat `sessionFile` / flat env `PI_SESSION_FILE` / `isMainSession === true`)
+stays a coordinator, and a forged `tool_input.agent_id` is stripped, never promoted.
+
 ## Hashline content extraction is an approximation
 
 omp's default `edit` mode is `hashline`, not old/new-string pairs or a unified diff

@@ -56,6 +56,8 @@ import os
 import sys
 from pathlib import Path
 
+from agenttools_agent_role import launcher_agent_id, native_payload_agent
+
 HOOK_API = "agents-hooks/v1"
 # The v1 event's `harness` tag for every event this bridge produces. A MODULE LITERAL, not
 # derived from any field of `cc_event` — so it cannot be forged by a model/tool_input value the
@@ -133,31 +135,6 @@ _WORKFLOW_TOOLS = frozenset({"Workflow"})
 # half only maps the point, rig-cli's `hook_bridge_entries` must register an `EnterWorktree`
 # PreToolUse matcher for it to actually fire (rig-cli#298, shipped).
 _WORKTREE_ENTER_TOOLS = frozenset({"EnterWorktree"})
-
-
-def _detached_agent_id() -> str:
-    """The launcher identity of a DETACHED Claude Code session (agent-tools#831).
-
-    ``rig-detached-claude-code`` starts ``claude -p`` with ``RIG_AGENT_ID=<name>`` (identity)
-    or ``RIG_DETACHED_AGENT=1`` (anonymous marker) in its process environment, and Claude Code
-    runs every hook command with that environment — so the markers are visible here on every
-    hook invocation of that session. CC itself sends no top-level ``agent_id`` there (the
-    detached process is CC's MAIN thread), so without this the child would be gated as the
-    orchestrator by every ``args.agent_id``-reading hook. Same contract as
-    ``codex_hook_bridge``/``omp_hook_bridge``/``opencode_hook_bridge._detached_agent_id``.
-
-    Trust reasoning (unchanged from agent-tools#476): a running orchestrator cannot
-    retroactively mutate its own process environment — it can only set these vars for a CHILD
-    process it dispatches, which is exactly the sanctioned act of dispatching a subagent.
-    Cooperative-orchestrator threat model, on_error=open. A bare/whitespace value is not a
-    marker; only the exact ``RIG_DETACHED_AGENT=1`` is.
-    """
-    val = os.environ.get("RIG_AGENT_ID", "").strip()
-    if val:
-        return val
-    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
-        return "detached"
-    return ""
 
 
 def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
@@ -251,17 +228,22 @@ def to_v1_event(cc_event: dict, *, point: str) -> dict:
     # another session's identity. So: if the signal is present at the top level, it OVERWRITES
     # whatever was in args; if it is ABSENT at the top level, we DROP any copy that rode in via
     # tool_input. The exemption/identity comes from CC itself, or — for `agent_id` only — from
-    # the launcher process env below (`_detached_agent_id`), never from the model.
-    for key in ("agent_id", "agent_type", "session_id"):
-        if cc_event.get(key) is not None:
-            args[key] = cc_event[key]
+    # the launcher process env below (`launcher_agent_id`), never from the model.
+    native_id, native_type = native_payload_agent(cc_event)
+    for key, native in (("agent_id", native_id), ("agent_type", native_type)):
+        if native:
+            args[key] = native
         else:
             args.pop(key, None)
+    if cc_event.get("session_id") is not None:
+        args["session_id"] = cc_event["session_id"]
+    else:
+        args.pop("session_id", None)
     # Launcher identity (agent-tools#831): only when CC itself sent no agent_id — a native CC
     # subagent inside a detached session keeps CC's own, more specific id. Injected AFTER the
     # drop above, so a forged tool_input copy can never survive in its place.
     if "agent_id" not in args:
-        detached_id = _detached_agent_id()
+        detached_id = launcher_agent_id()
         if detached_id:
             args["agent_id"] = detached_id
     return {

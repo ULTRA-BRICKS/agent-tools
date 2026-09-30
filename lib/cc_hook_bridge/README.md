@@ -64,6 +64,14 @@ installed `rtk-rewrite.sh` PreToolUse hook's style.
 
 ## Subagent identity (`args.agent_id`)
 
+Role rule and primitives: [`lib/agenttools_agent_role`](../agenttools_agent_role/README.md)
+(`native_payload_agent`, `launcher_agent_id`; hooks ask `is_subagent`).
+
+| Harness             | Hooks (tool-call time)                                                                                                                                           | Bash env of the agent (e.g. `tg`)                                                                    |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Claude Code 2.1.285 | top-level `agent_id` (+`agent_type`) present ONLY inside a Task/Agent subagent; absent on the main thread. `session_id`/`transcript_path` are the SAME for both. | IDENTICAL for main vs subagent (diff empty) → cannot tell; explicit `--subagent`/`TG_AGENT` required |
+| any detached child  | launcher env on the child: `RIG_AGENT_ID=<name>` or `RIG_DETACHED_AGENT=1`                                                                                       | inherited into bash                                                                                  |
+
 Subagent-aware hooks (`background-subagent-gate`, `orchestrator-stays-thin`,
 `no-long-inline-process`, `subagent-no-bg-longproc`, `subagent-no-monitor`,
 `skills-read-gate`) read `args.agent_id`. The bridge fills it from, in order:
@@ -73,11 +81,12 @@ Subagent-aware hooks (`background-subagent-gate`, `orchestrator-stays-thin`,
 2. otherwise the launcher process env: `RIG_AGENT_ID=<name>`, or `RIG_DETACHED_AGENT=1`
    (anonymous `detached`), set by `rig-detached-claude-code` for the `claude -p` child it
    detaches (agent-tools#831). CC runs hook commands with its own process env, so the markers
-   reach the bridge on every call of that session — the same `_detached_agent_id` contract as
+   reach the bridge on every call of that session — the same `launcher_agent_id` contract as
    the codex/omp/opencode bridges.
 
 A copy riding in `tool_input` is always dropped (model-controlled), and a blank/whitespace
-marker is not an identity. Trust model: a running orchestrator cannot retroactively set its own
+marker is not an identity. `CLAUDE_CODE_CHILD_SESSION` is NOT a signal (it is `=1` on the main
+thread of `claude -p` too). Trust model: a running orchestrator cannot retroactively set its own
 process env, only a child's — which is exactly the sanctioned act of dispatching a subagent.
 
 ## Fail policy

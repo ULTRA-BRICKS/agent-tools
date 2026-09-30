@@ -24,6 +24,8 @@ import shlex
 import sys
 from pathlib import Path
 
+from agenttools_agent_role import launcher_agent_id, omp_nested_agent_id
+
 HOOK_API = "agents-hooks/v1"
 # The v1 event's `harness` tag for every event this bridge produces — a MODULE LITERAL,
 # never derived from `omp_event`, so it cannot be forged via tool args. A hook that wants to
@@ -33,10 +35,11 @@ HOOK_API = "agents-hooks/v1"
 # documented `tool_call`/`tool_result` extension event shape (confirmed absent from
 # `extension.ts`'s payload: `toolName`/`input`/`cwd`/`toolCallId` only — no session/task-spawn
 # marker distinguishing a dispatched child from the top-level session), so a forged
-# agent_id/agent_type is stripped below and restored ONLY from the launcher process
-# environment or a nested transcript path via `_detached_agent_id` — the same trust boundary
-# `opencode_hook_bridge._detached_agent_id` uses (agent-tools#476), ported here unchanged
-# (agent-tools#573). The nested path itself reaches this dispatcher from omp's extension ctx:
+# agent_id/agent_type is stripped below and restored ONLY from trusted sources: the launcher
+# process environment or a nested transcript path via `_subagent_identity` (the shared
+# `agenttools_agent_role` primitives — see `lib/agenttools_agent_role/README.md`; the same
+# trust boundary every bridge uses, agent-tools#476/#573), or the extension ctx's own
+# `agentId`. The nested path itself reaches this dispatcher from omp's extension ctx:
 # `ExtensionContext` carries no top-level `getSessionFile()`/`agentId` (oh-my-pi#11214), so
 # `extension.ts` reads `ctx.sessionManager.getSessionFile()` — for a Task/eval child that is
 # the CHILD's own session manager and returns the nested transcript
@@ -80,96 +83,19 @@ _FORGED_AGENT_KEYS = (
 _FORGED_SESSION_KEYS = ("session_id", "sessionId", "sessionID")
 
 
-# omp Task/eval child transcript: .../<session-id>/<agent-id>.jsonl
-# (same shape orchestrator-stays-thin._OMP_SESSION_DIR matches; keep in lockstep).
-_OMP_SESSION_DIR = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-fA-F-]+$"
-)
-
-
-def _has_omp_session_ancestor(path: Path) -> bool:
-    """True when ANY ancestor directory of ``path`` is session-id-shaped, not just the
-    immediate parent (SYNC with orchestrator-stays-thin's / no-long-inline-process's copy of
-    this helper, same rationale, live finding 2026-09-18): a direct Task/eval child's
-    immediate parent is the root session-id directory, but a NESTED child — dispatched via
-    `task` from WITHIN an already-dispatched subagent, task depth >= 2 — nests one MORE
-    directory per additional level (oh-my-pi derives each level's own `artifactsDir` from
-    THAT session's own `sessionManager.getSessionFile().slice(0, -6)`, packages/coding-agent/
-    src/task/workpool.ts + src/vibe/runtime.ts), so its immediate parent is another agent id,
-    never the root session id. Checking only the immediate parent left `_omp_nested_agent_id`
-    empty for every dispatch below the first level, which in turn left `args.agent_id` empty
-    and fell through to `orchestrator-stays-thin`'s own (equally one-level) fallback — the
-    SAME bug, independently present in both places; both are fixed together."""
-    return any(_OMP_SESSION_DIR.match(parent.name) for parent in path.parents)
-
-
-def _nested_id_from_session_file(raw: str) -> str:
-    """Agent id from a nested omp transcript path, or empty. Path shape only."""
-    raw = (raw or "").strip()
-    if not raw:
-        return ""
-    path = Path(raw)
-    if path.suffix.lower() != ".jsonl" or not path.stem.strip():
-        return ""
-    if not _has_omp_session_ancestor(path):
-        return ""
-    return path.stem.strip()
-
-
-# Marker prefix for `_omp_nested_agent_id`'s file-independent fallback (see its docstring and
-# README.md's "isMainSession" section for the full rationale) — a single source of truth so
-# the marker format never drifts between the producer here and any consumer/test asserting it.
-_NESTED_SESSION_MARKER_PREFIX = "omp-nested:"
-
-
-def _omp_nested_agent_id(omp_event: dict | None = None) -> str:
-    """Agent id from a nested omp Task/eval transcript, or empty.
-
-    Main:  .../<session-id>.jsonl          (not a child)
-    Child: .../<session-id>/<agent>.jsonl  (stem is the worker id)
-
-    Prefer ``omp_event["sessionFile"]`` (extension.ts sources it from
-    ``ctx.sessionManager.getSessionFile()`` — omp's ExtensionContext has no top-level
-    session getters, oh-my-pi#11214 / agent-tools#743) over process env
-    ``PI_SESSION_FILE``. The Node hook process inherits the parent session env,
-    so env alone never sees the nested child path. Either source, once PRESENT, is
-    authoritative on its own path shape — a present-but-flat (main-shaped) file is real
-    evidence this is NOT a child, and short-circuits here without falling through further.
-
-    FALLBACK (live finding 2026-09-18, see README.md "isMainSession"): a genuinely nested
-    child's OWN session can still be in-memory — no session file at all yet, not even a
-    main-shaped one — for its first few tool calls. Only in that no-file-evidence-at-all
-    state does ``omp_event["isMainSession"] is False`` synthesize a marker id from the
-    bridge-trusted ``sessionId`` (never model/tool-controlled input), so `_is_subagent`
-    still exempts the call. An event with no ``isMainSession`` key (an older bridge, or an
-    existing test fixture) falls through unchanged.
-    """
-    session_file = str((omp_event or {}).get("sessionFile") or "").strip()
-    if session_file:
-        return _nested_id_from_session_file(session_file)
-    env_file = os.environ.get("PI_SESSION_FILE", "").strip()
-    if env_file:
-        return _nested_id_from_session_file(env_file)
-    if omp_event and omp_event.get("isMainSession") is False:
-        session_id = str(omp_event.get("sessionId") or "").strip()
-        if session_id:
-            return f"{_NESTED_SESSION_MARKER_PREFIX}{session_id}"
-    return ""
-
-
-def _detached_agent_id(omp_event: dict | None = None) -> str:
+def _subagent_identity(omp_event: dict | None = None) -> str:
     """Trusted subagent identity for omp sessions (agent-tools#573 / #634).
 
-    The forge-strip above removes any model/tool-supplied agent_id; omp's own `tool_call`/
-    `tool_result` extension events carry no session/task-spawn marker to restore it from
-    (the event itself is `toolName`/`input`/`cwd`/`toolCallId` only; the payload's
+    The forge-strip in ``to_v1_event`` removes any model/tool-supplied agent_id; omp's own
+    `tool_call`/`tool_result` extension events carry no session/task-spawn marker to restore
+    it from (the event itself is `toolName`/`input`/`cwd`/`toolCallId` only; the payload's
     `sessionFile` is extension.ts-sourced ctx session state, not event data). Identity is
-    restored, in order:
+    restored, in order, through the shared ``agenttools_agent_role`` primitives:
       1. process env ``RIG_AGENT_ID=<name>`` (rig-detached-omp launcher)
       2. process env ``RIG_DETACHED_AGENT=1`` (anonymous ``detached``)
-      3. a nested transcript path — payload ``sessionFile`` (``ctx.sessionManager``
-         of a native omp Task/eval child, agent-tools#743) or process env
-         ``PI_SESSION_FILE`` (agent-tools#634)
+      3. a nested transcript path — payload ``sessionFile`` (``ctx.sessionManager`` of a
+         native omp Task/eval child, agent-tools#743) or process env ``PI_SESSION_FILE``
+         (agent-tools#634), then the payload ``isMainSession is False`` marker
 
     ``extension.ts`` spawns this dispatcher with ``{...process.env}`` plus the ctx-derived
     session file, so a marker set when the child was launched (or omp's own nested session
@@ -177,12 +103,7 @@ def _detached_agent_id(omp_event: dict | None = None) -> str:
     mutate its process environment. Cooperative-orchestrator threat model, on_error=open.
     A bare/whitespace value is not a marker.
     """
-    val = os.environ.get("RIG_AGENT_ID", "").strip()
-    if val:
-        return val
-    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
-        return "detached"
-    return _omp_nested_agent_id(omp_event)
+    return launcher_agent_id() or omp_nested_agent_id(omp_event)
 
 
 # A hashline section header: `[RELATIVE/PATH#TAG]` where TAG is 4 uppercase hex chars.
@@ -224,7 +145,7 @@ def _trusted_session_id(omp_event: dict, detached_id: str | None = None) -> str:
     unset, which collapses `orchestrator-stays-thin`'s marker key to cwd+point alone, the
     same conservative default an anonymous session already got)."""
     if detached_id is None:
-        detached_id = _detached_agent_id(omp_event)
+        detached_id = _subagent_identity(omp_event)
     if detached_id:
         return detached_id
     for key in ("sessionId", "session_id", "agentId", "agent_id"):
@@ -259,7 +180,7 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
     # for `stop`, leaving those two points to leak the raw one through unstripped.
     for key in _FORGED_SESSION_KEYS:
         args.pop(key, None)
-    detached_id = _detached_agent_id(omp_event)
+    detached_id = _subagent_identity(omp_event)
     ctx_id = str(omp_event.get("agentId") or omp_event.get("agent_id") or "")
     trusted_agent_id = detached_id or ctx_id
     if trusted_agent_id:
