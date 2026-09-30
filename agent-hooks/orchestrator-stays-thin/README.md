@@ -175,7 +175,7 @@ CC-only advice (that sibling hook never had a harness exemption in the first pla
 Both problems are fixed at the root instead of carving out a harness. `lib/codex_hook_bridge`
 and `lib/omp_hook_bridge` now restore `args.agent_id` from the launcher process environment
 (`RIG_AGENT_ID`/`RIG_DETACHED_AGENT`, set by the new `rig-detached-codex`/`rig-detached-omp`
-launcher skills) via `_detached_agent_id`, the same mechanism `lib/opencode_hook_bridge` already
+launcher skills) via `agenttools_agent_role.launcher_agent_id`, the same mechanism `lib/opencode_hook_bridge` already
 used (agent-tools#476) — so `_is_subagent` alone now correctly exempts a rig-launched detached
 child under EVERY harness, no harness-wide carve-out needed. And the block/warn text now reads
 the bridge-set, unforgeable `event["harness"]` to name the delegation recipe for the ACTUAL

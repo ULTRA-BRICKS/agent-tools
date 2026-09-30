@@ -423,32 +423,12 @@ def test_unrelated_nested_path_without_session_id_ancestor_still_blocks(tmp_path
     assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-def _load_no_long_inline_process():
-    sib = (
-        Path(__file__).resolve().parents[1]
-        / "agent-hooks"
-        / "no-long-inline-process"
-        / "no_long_inline_process.py"
-    )
-    spec = importlib.util.spec_from_file_location("no_long_inline_process", sib)
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def test_omp_session_dir_ancestor_check_stays_in_lockstep_across_all_three_copies():
-    """The session-id-ancestor-shaped path detector is duplicated three ways by design (each
-    hook is a standalone script with no shared import path; `dispatch.py` is a separate
-    package) — review finding from the nested-subagent-identity fix: nothing but a code
-    comment kept the three regexes/predicates aligned. Pin the regex text AND run every copy
-    over the SAME fixture battery (main / depth-1 / depth-2 / depth-3 / unrelated-deep) so a
-    future edit to any one copy that silently diverges from the other two fails HERE instead
-    of as a live misclassification."""
-    import importlib as _importlib
-    nlip = _load_no_long_inline_process()
-    dispatch = _importlib.import_module("omp_hook_bridge.dispatch")
-    assert ost._OMP_SESSION_DIR.pattern == nlip._OMP_SESSION_DIR.pattern == dispatch._OMP_SESSION_DIR.pattern
+def test_omp_session_dir_ancestor_check_classifies_every_nesting_depth():
+    """The session-id-ancestor path detector is ONE shared implementation
+    (`agenttools_agent_role.has_omp_session_ancestor`; both hooks and the omp bridge import it).
+    Pin it over the main / depth-1 / depth-2 / depth-3 / unrelated-deep battery so a future edit
+    that breaks a nesting depth fails HERE instead of as a live misclassification."""
+    from agenttools_agent_role import has_omp_session_ancestor
 
     main_session = Path(_OMP_MAIN_SESSION)
     depth1 = Path(_OMP_NESTED_SESSION)
@@ -461,9 +441,7 @@ def test_omp_session_dir_ancestor_check_stays_in_lockstep_across_all_three_copie
     unrelated = Path("/repo/notes/archive/transcript.jsonl")
     for path, expected in ((main_session, False), (depth1, True), (depth2, True),
                             (depth3, True), (unrelated, False)):
-        assert ost._has_omp_session_ancestor(path) is expected, path
-        assert nlip._has_omp_session_ancestor(path) is expected, path
-        assert dispatch._has_omp_session_ancestor(path) is expected, path
+        assert has_omp_session_ancestor(path) is expected, path
 
 
 def test_orchestrator_git_commit_still_blocks_with_main_pi_session_file(tmp_path, monkeypatch):
@@ -728,7 +706,7 @@ def test_real_cc_bridge_to_v1_event_output_stays_governed_end_to_end(tmp_path, m
 )
 def test_real_bridge_launcher_env_child_is_subagent_exempt(tmp_path, monkeypatch, bridge_module):
     """agent-tools#573: a session launched by the `rig-detached-<harness>` launcher skill
-    carries `RIG_AGENT_ID` in its process environment. Each bridge's `_detached_agent_id`
+    carries `RIG_AGENT_ID` in its process environment. Each bridge's `launcher_agent_id`
     restores that into `args.agent_id` AFTER the forge-strip, so the resulting v1 event is
     subagent-exempt here — allowed silently on every call, no WARN/BLOCK tier ever primed —
     under EVERY harness, not just opencode (agent-tools#476)."""

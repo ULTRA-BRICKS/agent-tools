@@ -137,6 +137,23 @@ import time
 from pathlib import Path
 from typing import Iterable
 
+# The shared subagent predicate lives in this repo's lib/, two levels above this script.
+# Inserted at index 0 (unconditionally) so the repo copy always wins over any same-named
+# package further along sys.path (same hostile-path concern as the hatch-lib loader below).
+# If the catalog layout is gone (a hook copied without lib/, #547) the import must not crash
+# the hook: it degrades to honoring ONLY the bridge-sanitized ``args.agent_id`` — the bridges
+# already fold launcher env / nested omp sessions into that field, and losing the extra
+# signals errs toward gating (this hook governs the orchestrator only).
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if _LIB_DIR.is_dir() and sys.path[:1] != [str(_LIB_DIR)]:
+    sys.path.insert(0, str(_LIB_DIR))
+try:
+    from agenttools_agent_role import is_subagent  # noqa: E402
+except ImportError:
+    def is_subagent(args, environ=None):  # type: ignore[misc]
+        aid = (args or {}).get("agent_id")
+        return bool(aid and str(aid).strip())
+
 # SYNC: duplicated in every hatch-using hook so each hook does not need
 # a shared helper file under agent-hooks/. Edit every copy together;
 # tests/test_hatch_import_hardening.py guards the shared behavior.
@@ -682,70 +699,13 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"orchestrator-stays-thin: {msg}\n")
 
 
-# omp Task/eval child transcript: .../<session-id>/<agent-id>.jsonl
-# Main session file is .../<session-id>.jsonl (parent dir is the project slug, not the id).
-_OMP_SESSION_DIR = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-fA-F-]+$"
-)
-
-
-def _has_omp_session_ancestor(path: Path) -> bool:
-    """True when ANY ancestor directory of ``path`` is session-id-shaped, not just the
-    immediate parent (live finding, 2026-09-18): a depth-1 Task/eval child's transcript is
-    ``.../<session-id>/<agent-id>.jsonl`` and its immediate parent matches directly. A NESTED
-    child — one dispatched via `task` from WITHIN an already-dispatched subagent, task depth
-    >= 2 — nests one MORE directory per additional level instead of staying flat: oh-my-pi
-    derives each level's own child `artifactsDir` from THAT session's own
-    ``sessionManager.getSessionFile().slice(0, -6)`` (packages/coding-agent/src/task/
-    workpool.ts, src/vibe/runtime.ts), so a depth-2 grandchild's transcript is
-    ``.../<session-id>/<child-agent-id>/<grandchild-agent-id>.jsonl`` — its IMMEDIATE parent
-    is another AGENT id, never the root session id. Checking only ``path.parent.name``
-    therefore misclassified every nested Task/eval subagent below the first dispatch level as
-    the orchestrator. Walking the full ancestor chain finds the root session-id directory at
-    whatever depth it actually sits, for any recursion depth. A bare top-level session file's
-    ancestors are the project-slug/`sessions` directory tree, never session-id-shaped, so a
-    non-nested main session still returns False here (RC-2: anonymous/main sessions keep
-    blocking)."""
-    return any(_OMP_SESSION_DIR.match(parent.name) for parent in path.parents)
-
-
-def _is_omp_nested_session() -> bool:
-    """True when PI_SESSION_FILE is an omp Task/eval child transcript, at any nesting depth.
-
-    Main:            .../<session-id>.jsonl
-    Direct child:     .../<session-id>/<agent-id>.jsonl
-    Nested (depth 2+): .../<session-id>/<agent-id>/<agent-id>/....jsonl
-
-    NOT restricted to ``event["harness"] == "omp"`` (agent-tools#676): omp sets this var on
-    every Task/eval child's process regardless of which model harness backs that omp
-    session. When the backing harness is Claude Code (`rig.yaml` default `harness.kind:
-    claude-code`), the nested child's own tool calls fire through `cc_hook_bridge`, which
-    stamps `event["harness"] == "claude-code"` (it identifies the HOOK TRANSPORT, not
-    whether omp is orchestrating) — so gating this tier on harness=="omp" made the tier
-    unreachable for exactly that default configuration, misclassifying every nested
-    Claude-Code-backed omp subagent as the orchestrator (live incident: CommitReconcile /
-    ThinNotSub, agent-tools#676). `no_long_inline_process._is_omp_nested_session` (the
-    sibling hook with the identical trust tier) never had this restriction; this brings the
-    two back into lockstep. omp sets PI_SESSION_FILE on the process; a running orchestrator
-    cannot retroactively mutate its own process environment (same trust model as
-    RIG_AGENT_ID — cooperative-orchestrator threat model, on_error=open). Path shape only —
-    no filesystem probe, so tests stay hermetic."""
-    raw = os.environ.get("PI_SESSION_FILE", "").strip()
-    if not raw:
-        return False
-    path = Path(raw)
-    if path.suffix.lower() != ".jsonl" or not path.stem.strip():
-        return False
-    return _has_omp_session_ancestor(path)
-
-
 def _is_subagent(event: dict) -> bool:
-    """True when this tool use fires INSIDE a dispatched subagent.
+    """True when this tool use fires INSIDE a dispatched subagent (agent-tools#634).
 
-    Trusted identity sources — any one is enough (agent-tools#634):
-      1. sanitized ``args.agent_id`` — Claude Code child (bridge T2-sanitized)
-      2. process env ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT=1`` — detached launcher
-      3. nested ``PI_SESSION_FILE`` — omp Task/eval child
+    The decision is the catalog-wide shared predicate ``agenttools_agent_role.is_subagent``
+    (sanitized ``args.agent_id``, launcher env ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT=1``, or
+    a nested omp ``PI_SESSION_FILE`` at any depth, agent-tools#676); see
+    ``lib/agenttools_agent_role/README.md``.
 
     TRUST BOUNDARY — these RELAX the gate, so they must not be model-controlled.
     We still do NOT fall back to a top-level ``event.get("agent_id")`` or
@@ -753,15 +713,7 @@ def _is_subagent(event: dict) -> bool:
     ``agent_id``, and tool_input is model-controlled. Process env is the same
     surface the bridges already trust: a running orchestrator cannot retroactively
     mutate it. An empty/whitespace value is not a subagent."""
-    args = event.get("args") or {}
-    aid = args.get("agent_id")
-    if aid and str(aid).strip():
-        return True
-    if os.environ.get("RIG_AGENT_ID", "").strip():
-        return True
-    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
-        return True
-    return _is_omp_nested_session()
+    return is_subagent(event.get("args") or {})
 
 
 # Candidate process-env session ids folded into the marker key (agent-tools#743, RC-2) —

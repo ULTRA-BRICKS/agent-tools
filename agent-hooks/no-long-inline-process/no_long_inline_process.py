@@ -98,6 +98,23 @@ import shlex
 import sys
 from pathlib import Path
 
+# The shared subagent predicate lives in this repo's lib/, two levels above this script.
+# Inserted at index 0 (unconditionally) so the repo copy always wins over any same-named
+# package further along sys.path (same hostile-path concern as the hatch-lib loader below).
+# If the catalog layout is gone (a hook copied without lib/, #547) the import must not crash
+# the hook: it degrades to honoring ONLY the bridge-sanitized ``args.agent_id`` — the bridges
+# already fold launcher env / nested omp sessions into that field, and losing the extra
+# signals errs toward gating (this hook governs the orchestrator only).
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if _LIB_DIR.is_dir() and sys.path[:1] != [str(_LIB_DIR)]:
+    sys.path.insert(0, str(_LIB_DIR))
+try:
+    from agenttools_agent_role import is_subagent  # noqa: E402
+except ImportError:
+    def is_subagent(args, environ=None):  # type: ignore[misc]
+        aid = (args or {}).get("agent_id")
+        return bool(aid and str(aid).strip())
+
 # SYNC: duplicated in every hatch-using hook so each hook does not need
 # a shared helper file under agent-hooks/. Edit every copy together;
 # tests/test_hatch_import_hardening.py guards the shared behavior.
@@ -318,67 +335,18 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"no-long-inline-process: {msg}\n")
 
 
-# omp Task/eval child transcript: .../<session-id>/<agent-id>.jsonl
-# Main session file is .../<session-id>.jsonl (parent dir is the project slug, not the id).
-# Same path-shape detector as the #634 identity work on orchestrator-stays-thin
-# (duplicated: each hook is a standalone script; agent-tools#635).
-_OMP_SESSION_DIR = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-fA-F-]+$"
-)
-
-
-def _has_omp_session_ancestor(path: Path) -> bool:
-    """True when ANY ancestor directory of ``path`` is session-id-shaped, not just the
-    immediate parent (live finding, 2026-09-18; SYNC with orchestrator-stays-thin's copy of
-    this helper, same rationale): a NESTED Task/eval child — dispatched via `task` from
-    WITHIN an already-dispatched subagent, depth >= 2 — nests one directory per additional
-    level (oh-my-pi derives each level's own `artifactsDir` from THAT session's own
-    `sessionManager.getSessionFile().slice(0, -6)`), so its IMMEDIATE parent is another agent
-    id, never the root session id. Walking the full ancestor chain finds the root session-id
-    directory at whatever depth it sits. A bare main session file's ancestors are the
-    project-slug/`sessions` tree and never session-id-shaped, so this stays False for it."""
-    return any(_OMP_SESSION_DIR.match(parent.name) for parent in path.parents)
-
-
-def _is_omp_nested_session() -> bool:
-    """True when PI_SESSION_FILE is an omp Task/eval child transcript, at any nesting depth.
-
-    Main:            .../<session-id>.jsonl
-    Direct child:     .../<session-id>/<agent-id>.jsonl
-    Nested (depth 2+): .../<session-id>/<agent-id>/<agent-id>/....jsonl
-
-    omp sets PI_SESSION_FILE on the process; a running orchestrator cannot retroactively
-    mutate its own process environment (same trust model as RIG_AGENT_ID). Path shape
-    only — no filesystem probe, so tests stay hermetic."""
-    raw = os.environ.get("PI_SESSION_FILE", "").strip()
-    if not raw:
-        return False
-    path = Path(raw)
-    if path.suffix.lower() != ".jsonl" or not path.stem.strip():
-        return False
-    return _has_omp_session_ancestor(path)
-
-
 def _is_subagent(event: dict) -> bool:
-    """True when this tool use fires INSIDE a dispatched subagent.
+    """True when this tool use fires INSIDE a dispatched subagent (agent-tools#635).
 
-    Trusted identity sources — any one is enough (agent-tools#635):
-      1. sanitized ``args.agent_id`` — Claude Code child (bridge T2-sanitized)
-      2. process env ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT=1`` — detached launcher
-      3. nested ``PI_SESSION_FILE`` — omp Task/eval child
+    The decision is the catalog-wide shared predicate ``agenttools_agent_role.is_subagent``
+    (sanitized ``args.agent_id``, launcher env ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT=1``, or
+    a nested omp ``PI_SESSION_FILE``); see ``lib/agenttools_agent_role/README.md``.
 
-    TRUST BOUNDARY — these RELAX the gate, so they must not be model-controlled.
-    Top-level ``event.agent_id`` is also read (same as args). Empty/whitespace is
-    not a subagent."""
+    TRUST BOUNDARY — these RELAX the gate, so they must not be model-controlled. Top-level
+    ``event.agent_id`` is also read (same as args) — this hook's long-standing behavior,
+    folded into the predicate's ``args`` input. Empty/whitespace is not a subagent."""
     args = event.get("args") or {}
-    aid = args.get("agent_id") or event.get("agent_id")
-    if aid and str(aid).strip():
-        return True
-    if os.environ.get("RIG_AGENT_ID", "").strip():
-        return True
-    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
-        return True
-    return _is_omp_nested_session()
+    return is_subagent({"agent_id": args.get("agent_id") or event.get("agent_id")})
 
 
 def _strip_line_comment(line: str) -> str:
