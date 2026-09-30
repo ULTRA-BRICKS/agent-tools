@@ -1,11 +1,12 @@
 """agenttools_tg_inbox — the tg-ctl Stop-hook inbox reader (agent-tools#526, tg-cli#306).
 
-Accessed via: the harness Stop bridges (``cc_hook_bridge``, ``codex_hook_bridge``, and
-``omp_hook_bridge`` on yield→stop) call :func:`consume_pending` at every Stop-equivalent
-and, when it returns entries, block the stop with the messages as the reason — Claude
-Code / Codex / omp then feed that text to the agent as its next instruction. This is the
-tmux-free delivery channel for an agent that tg-ctl cannot reach with ``tmux send-keys``
-(started from a plain terminal tab). pi has no session-end block contract.
+Accessed via: ``omp_hook_bridge`` on yield→stop calls :func:`stop_inbox_text` (which wraps
+:func:`consume_pending`) and, when it returns text, blocks the yield with the messages as
+the reason — omp then feeds that text to the agent as its next instruction. The only
+writer left is tg-ctl's grant-notice fallback for an omp whose omp-live endpoint is
+unreachable. Claude Code and Codex are tmux-only (tg-cli#456): tg-ctl no longer queues for
+them, archives their stranded backlog once as ``stranded-<stamp>.jsonl``, and their bridges
+no longer read the inbox. pi has no session-end block contract.
 
 THE INBOX KEY CONTRACT — shared byte-for-byte with tg-cli ``features/tg-ctl/unreachable.ts``
 (both READMEs document it; the test vectors in ``tests/test_tg_inbox.py`` and tg-cli's
@@ -25,36 +26,32 @@ THE INBOX KEY CONTRACT — shared byte-for-byte with tg-cli ``features/tg-ctl/un
 
 Assumptions: the inbox is a local file written by the user's own tg-ctl daemon; its
 content is DATA for the agent (rendered as the block reason), never executed here. A
-missing, empty or malformed inbox never blocks (fail-open, logged to stderr). Delivery is
+missing, empty or malformed inbox never blocks (fail-open, logged to the hooks debug log). Delivery is
 at-most-once: entries are archived to a delivered-* batch BEFORE the block reason is
-returned, and the bridges consume the inbox as the LAST step of a Stop (after the v1 stop
-hooks ran), so a crashing hook cannot eat a message that was never shown.
+returned, and ``omp_hook_bridge`` consumes the inbox as the LAST step of a yield (after
+the v1 stop hooks ran), so a crashing hook cannot eat a message that was never shown.
 """
 
 from __future__ import annotations
 
 from .core import (
     agent_key,
-    agent_key_for_process,
     combine_stop_parts,
     consume_pending,
     format_block_reason,
     inbox_dir,
     inbox_root,
-    parse_agent_name,
     sanitize_agent_name,
     stop_inbox_text,
 )
 
 __all__ = [
     "agent_key",
-    "agent_key_for_process",
     "combine_stop_parts",
     "consume_pending",
     "format_block_reason",
     "inbox_dir",
     "inbox_root",
-    "parse_agent_name",
     "sanitize_agent_name",
     "stop_inbox_text",
 ]

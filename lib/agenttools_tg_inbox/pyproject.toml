@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agenttools-tg-inbox"
-version = "0.1.0"
-description = "tg-ctl Stop-hook inbox reader: the tmux-free delivery channel for agents outside tmux (stdlib-only)."
+version = "0.2.0"
+description = "tg-ctl Stop-hook inbox reader: omp's yield-time fallback for tg-ctl grant notices (stdlib-only)."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Alex Mextner" }]
 keywords = ["telegram", "tg-ctl", "stop-hook", "inbox", "agent-tools"]
-# Intentionally ZERO runtime dependencies — stdlib only (hashlib + json + subprocess).
+# Intentionally ZERO runtime dependencies — stdlib only (hashlib + json).
 dependencies = []
 
 [project.optional-dependencies]

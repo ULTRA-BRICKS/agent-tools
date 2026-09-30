@@ -364,10 +364,9 @@ def _inbox_text(event_name: str, omp_event: dict) -> str:
     """Pending tg-ctl inbox messages for this omp session, consumed and rendered as
     block-reason text (agent-tools#656); "" when nothing / on any failure (fail-open).
 
-    omp has no ``--name``, so the key is ALWAYS the cwd hash — computed directly with
-    ``agent_key(None, cwd)``, never via ``agent_key_for_process``: an omp started from a
-    Claude-owned shell inherits ``CLAUDE_PID`` and would otherwise key on the Claude
-    session's name. Only yield (the v1 ``stop`` point) consumes the inbox.
+    omp has no ``--name``, so the key is ALWAYS the cwd hash — ``agent_key(None, cwd)``.
+    Only yield (the v1 ``stop`` point) consumes the inbox; omp is its only consumer
+    (cc/codex are tmux-only and no longer read it, tg-cli#456).
     """
     if point_for_event(event_name, _tool_name(omp_event)) != "stop":
         return ""
@@ -386,8 +385,8 @@ def _inbox_text(event_name: str, omp_event: dict) -> str:
 
 def _combine_block(inbox_text: str, hook_reason: str | None) -> dict | None:
     """One block for BOTH the inbox messages and a blocking hook's reason — the rule is
-    `agenttools_tg_inbox.combine_stop_parts`, shared with the Codex bridge (an empty-reason
-    block still blocks); without the lib, a hook block passes through unchanged."""
+    `agenttools_tg_inbox.combine_stop_parts` (an empty-reason block still blocks); without
+    the lib, a hook block passes through unchanged."""
     try:
         from agenttools_tg_inbox import combine_stop_parts
     except Exception:  # noqa: BLE001 - optional lib: no inbox, plain hook semantics

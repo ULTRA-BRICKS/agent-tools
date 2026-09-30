@@ -6,9 +6,10 @@ Two layers:
     channel silently splits);
   - the consuming reader — pending → block reason + archive (at-most-once), and the
     fail-open cases: empty, missing, malformed, unwritable archive.
-The last tests run the real ``cc_hook_bridge`` / ``codex_hook_bridge`` /
-``omp_hook_bridge`` dispatchers as a SUBPROCESS (how the harness invokes them)
-against a temp ``TG_CTL_CONFIG_DIR``.
+The last tests run the real ``omp_hook_bridge`` dispatcher (the inbox's only consumer)
+and the ``cc_hook_bridge`` / ``codex_hook_bridge`` dispatchers (which must NOT consume it:
+cc/codex are tmux-only, tg-cli#456) as a SUBPROCESS (how the harness invokes them) against
+a temp ``TG_CTL_CONFIG_DIR``.
 """
 
 from __future__ import annotations
@@ -28,17 +29,13 @@ if str(_LIB) not in sys.path:
 
 from agenttools_tg_inbox import (  # noqa: E402
     agent_key,
-    agent_key_for_process,
     consume_pending,
     format_block_reason,
     inbox_dir,
-    parse_agent_name,
     sanitize_agent_name,
     stop_inbox_text,
 )
 from agenttools_tg_inbox import core as inbox_core  # noqa: E402
-from cc_hook_bridge import dispatch as cc_dispatch  # noqa: E402
-from codex_hook_bridge import dispatch as codex_dispatch  # noqa: E402
 import omp_hook_bridge.dispatch as omp_dispatch  # noqa: E402
 
 
@@ -49,7 +46,6 @@ def _entry(i: int, wrapped: str) -> str:
 @pytest.fixture
 def cfg(tmp_path, monkeypatch):
     monkeypatch.setenv("TG_CTL_CONFIG_DIR", str(tmp_path))
-    monkeypatch.delenv("CLAUDE_PID", raising=False)
     monkeypatch.setenv("HOOKS_DEBUG_LOG", str(tmp_path / "hooks-debug.log"))
     return tmp_path
 
@@ -82,39 +78,6 @@ def test_sanitize_agent_name_empty_and_dots_only_are_none():
     assert sanitize_agent_name("ok-1") == "ok-1"
     assert agent_key("..", "/") == "cwd-8a5edab282632443"
     assert inbox_dir(agent_key("..", "/")).parent.name == "inbox"
-
-
-def test_parse_agent_name_multi_word_yields_first_word_like_the_ts_side():
-    # ps flattens argv: `--name "my agent/1"` reads as `--name my agent/1` on both sides.
-    assert parse_agent_name("claude --name my agent/1") == "my"
-
-
-def test_parse_agent_name_forms():
-    assert parse_agent_name("claude --permission-mode bypassPermissions --name rig-fable") == "rig-fable"
-    assert parse_agent_name("claude --name=landing --resume") == "landing"
-    assert parse_agent_name("claude --name --resume") is None
-    assert parse_agent_name("claude") is None
-
-
-def test_agent_key_for_process_uses_claude_pid_env(monkeypatch):
-    monkeypatch.setenv("CLAUDE_PID", "4242")
-    monkeypatch.setattr(inbox_core, "_ps_line", lambda pid: (1, "claude --name landing") if pid == 4242 else None)
-    assert agent_key_for_process("/x") == "landing"
-
-
-def test_agent_key_for_process_climbs_ancestry_to_the_agent(monkeypatch):
-    table = {
-        10: (9, "/bin/sh -c PYTHONPATH=/x python3 -m cc_hook_bridge Stop"),
-        9: (8, "/Users/u/.local/bin/claude --name hooked"),
-        8: (1, "-zsh"),
-    }
-    monkeypatch.setattr(inbox_core, "_ps_line", lambda pid: table.get(pid))
-    assert agent_key_for_process("/x", start_pid=10) == "hooked"
-
-
-def test_agent_key_for_process_falls_back_to_cwd_when_no_agent_found(monkeypatch):
-    monkeypatch.setattr(inbox_core, "_ps_line", lambda pid: None)
-    assert agent_key_for_process("/Users/ultra/work/landing", start_pid=10) == "cwd-ccfe64bae2f277d7"
 
 
 # --- the consuming reader ---
@@ -193,10 +156,6 @@ def test_consume_pending_never_overwrites_a_stale_claim(cfg):
 def _run_bridge(module: str, event: dict, *, cfg: Path, home: Path) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if not k.startswith("RIG_HATCH_REQUEST_")}
     env.update({"HOME": str(home), "TG_CTL_CONFIG_DIR": str(cfg), "PYTHONPATH": str(_LIB), "HOOKS_DEBUG_LOG": str(cfg / "hooks-debug.log")})
-    # Pin the "agent process" to pid 1 (launchd/init — never an agent binary) so the key
-    # falls back to the cwd hash. Without this the ancestry walk would climb out of pytest
-    # into the developer's OWN interactive `claude --name …` and key on that name.
-    env["CLAUDE_PID"] = "1"
     return subprocess.run(
         [sys.executable, "-m", module, "Stop"],
         input=json.dumps(event),
@@ -216,7 +175,6 @@ def _run_omp_bridge(event: dict, *, cfg: Path, home: Path) -> subprocess.Complet
         "TG_CTL_CONFIG_DIR": str(cfg),
         "PYTHONPATH": str(_LIB),
         "OMP_HOOKS_DIR": str(hooks),
-        "CLAUDE_PID": "1",
         "HOOKS_DEBUG_LOG": str(cfg / "hooks-debug.log"),
     })
     return subprocess.run(
@@ -229,102 +187,24 @@ def _run_omp_bridge(event: dict, *, cfg: Path, home: Path) -> subprocess.Complet
     )
 
 
-def test_cc_bridge_stop_delivers_pending_inbox_as_block_reason(tmp_path):
+@pytest.mark.parametrize("module", ["cc_hook_bridge", "codex_hook_bridge"])
+def test_cc_codex_stop_leaves_the_omp_inbox_untouched(tmp_path, module):
+    # cc/codex are tmux-only (tg-cli#456): tg-ctl never queues for them, and an unnamed
+    # cc/codex in an omp's cwd shares the omp's cwd-<hash> key — its Stop must not steal
+    # the omp's grant notice.
     cfg = tmp_path / "cfg"
     home = tmp_path / "home"
     home.mkdir()
-    cwd = "/Users/ultra/work/landing"  # the subprocess has no agent ancestor → cwd key
     d = cfg / "inbox" / "cwd-ccfe64bae2f277d7"
     d.mkdir(parents=True)
-    (d / "pending.jsonl").write_text(_entry(42, "[TG from Alex tg#42] deploy now") + "\n")
-    res = _run_bridge("cc_hook_bridge", {"hook_event_name": "Stop", "session_id": "s1", "cwd": cwd}, cfg=cfg, home=home)
+    pending = _entry(42, "[TG from tg-ctl] hatch granted") + "\n"
+    (d / "pending.jsonl").write_text(pending)
+    event = {"hook_event_name": "Stop", "session_id": "s1", "cwd": "/Users/ultra/work/landing"}
+    res = _run_bridge(module, event, cfg=cfg, home=home)
     assert res.returncode == 0, res.stderr
-    assert json.loads(res.stdout) == {"decision": "block", "reason": "[TG from Alex tg#42] deploy now"}
-    assert "delivering 1 queued" in (cfg / "hooks-debug.log").read_text(encoding="utf-8")
-    assert len(list(d.glob("delivered-*.jsonl"))) == 1
-    # idempotent: the next Stop has nothing pending → no block
-    res2 = _run_bridge("cc_hook_bridge", {"hook_event_name": "Stop", "session_id": "s1", "cwd": cwd}, cfg=cfg, home=home)
-    assert res2.stdout == ""
-
-
-def test_cc_bridge_stop_empty_and_malformed_inbox_never_block(tmp_path):
-    cfg = tmp_path / "cfg"
-    home = tmp_path / "home"
-    home.mkdir()
-    cwd = "/Users/ultra/work/landing"
-    res = _run_bridge("cc_hook_bridge", {"hook_event_name": "Stop", "cwd": cwd}, cfg=cfg, home=home)
-    assert res.returncode == 0 and res.stdout == ""
-    d = cfg / "inbox" / "cwd-ccfe64bae2f277d7"
-    d.mkdir(parents=True)
-    (d / "pending.jsonl").write_text("{{{ garbage\n")
-    res = _run_bridge("cc_hook_bridge", {"hook_event_name": "Stop", "cwd": cwd}, cfg=cfg, home=home)
-    assert res.returncode == 0 and res.stdout == ""
-    assert "malformed" in (cfg / "hooks-debug.log").read_text(encoding="utf-8")
-
-
-def test_codex_bridge_stop_delivers_pending_inbox(tmp_path):
-    cfg = tmp_path / "cfg"
-    home = tmp_path / "home"
-    home.mkdir()
-    cwd = "/Users/ultra/work/landing"
-    d = cfg / "inbox" / "cwd-ccfe64bae2f277d7"
-    d.mkdir(parents=True)
-    (d / "pending.jsonl").write_text(_entry(5, "[TG from Alex tg#5] hi codex") + "\n")
-    res = _run_bridge("codex_hook_bridge", {"hook_event_name": "Stop", "cwd": cwd}, cfg=cfg, home=home)
-    assert res.returncode == 0, res.stderr
-    assert json.loads(res.stdout) == {"decision": "block", "reason": "[TG from Alex tg#5] hi codex"}
-
-
-def test_codex_bridge_ignores_inherited_claude_pid_and_keys_on_cwd(tmp_path, monkeypatch):
-    # A Codex started from a Claude-owned shell inherits CLAUDE_PID; its inbox key must
-    # still be the cwd hash, never the Claude session's --name.
-    cfg = tmp_path / "cfg"
-    home = tmp_path / "home"
-    home.mkdir()
-    cwd = "/Users/ultra/work/landing"
-    d = cfg / "inbox" / "cwd-ccfe64bae2f277d7"
-    d.mkdir(parents=True)
-    (d / "pending.jsonl").write_text(_entry(5, "for codex") + "\n")
-    named = cfg / "inbox" / "rig-fable"
-    named.mkdir(parents=True)
-    (named / "pending.jsonl").write_text(_entry(6, "for the claude session") + "\n")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("RIG_HATCH_REQUEST_")}
-    env.update({"HOME": str(home), "TG_CTL_CONFIG_DIR": str(cfg), "PYTHONPATH": str(_LIB), "CLAUDE_PID": str(os.getppid())})
-    res = subprocess.run(
-        [sys.executable, "-m", "codex_hook_bridge", "Stop"],
-        input=json.dumps({"hook_event_name": "Stop", "cwd": cwd}),
-        capture_output=True, text=True, env=env, timeout=30,
-    )
-    assert json.loads(res.stdout) == {"decision": "block", "reason": "for codex"}
-    assert (named / "pending.jsonl").exists()  # untouched
-
-
-def test_cc_bridge_stop_hook_block_and_inbox_ride_in_one_block(tmp_path):
-    # The v1 stop descriptors ALWAYS run; a blocking one is not starved by the inbox — its
-    # reason follows the queued messages in the same block.
-    cfg = tmp_path / "cfg"
-    home = tmp_path / "home"
-    hooks = home / ".claude" / "hooks"
-    hooks.mkdir(parents=True)
-    gate = tmp_path / "gate.py"
-    gate.write_text("#!/usr/bin/env python3\nimport sys, json; print(json.dumps({'message': 'stay: gate says no'})); sys.exit(10)\n")
-    gate.chmod(0o755)
-    (hooks / "gate.stop.json").write_text(json.dumps({
-        "id": "gate", "point": "stop", "cmd": str(gate), "priority": 10, "timeout_ms": 3000, "on_error": "closed",
-    }))
-    cwd = "/Users/ultra/work/landing"
-    d = cfg / "inbox" / "cwd-ccfe64bae2f277d7"
-    d.mkdir(parents=True)
-    (d / "pending.jsonl").write_text(_entry(1, "[TG from Alex tg#1] hi") + "\n")
-    res = _run_bridge("cc_hook_bridge", {"hook_event_name": "Stop", "cwd": cwd}, cfg=cfg, home=home)
-    assert res.returncode == 0, res.stderr
-    out = json.loads(res.stdout)
-    assert out["decision"] == "block"
-    assert out["reason"].startswith("[TG from Alex tg#1] hi\n\n")
-    assert "gate says no" in out["reason"]
-    # empty inbox afterwards: the gate alone still blocks
-    res2 = _run_bridge("cc_hook_bridge", {"hook_event_name": "Stop", "cwd": cwd}, cfg=cfg, home=home)
-    assert json.loads(res2.stdout)["reason"].strip() == "stay: gate says no"
+    assert res.stdout == ""
+    assert (d / "pending.jsonl").read_text() == pending
+    assert sorted(p.name for p in d.iterdir()) == ["pending.jsonl"]
 
 
 def test_omp_bridge_yield_delivers_pending_inbox(tmp_path):
@@ -381,8 +261,9 @@ def test_omp_bridge_yield_empty_and_malformed_never_block(tmp_path):
 
 
 def test_omp_bridge_ignores_inherited_claude_pid_and_keys_on_cwd(tmp_path):
-    # omp has no --name; an omp started from a Claude-owned shell inherits CLAUDE_PID
-    # and must still key on the cwd hash, never the Claude session's --name.
+    # omp has no --name; an omp started from a Claude-owned shell inherits CLAUDE_PID.
+    # Nothing reads CLAUDE_PID today — this pins the cwd-hash key against a reintroduced
+    # process lookup keying the omp on the Claude session's --name.
     cfg = tmp_path / "cfg"
     home = tmp_path / "home"
     home.mkdir()
@@ -460,18 +341,7 @@ def test_consume_pending_blank_wrapped_is_malformed_not_silently_eaten(cfg):
     assert json.loads(batch.read_text())["malformed"] is True
 
 
-def test_looks_like_agent_matches_whole_tokens_only():
-    assert inbox_core._looks_like_agent("claude --name landing")
-    assert inbox_core._looks_like_agent("node /Users/u/.claude/local/claude --name landing")
-    assert inbox_core._looks_like_agent("/opt/homebrew/bin/codex")
-    assert not inbox_core._looks_like_agent("grep -r pattern /Users/u/.claude /Users/u/projects")
-    assert not inbox_core._looks_like_agent("test -d /Users/u/.claude/settings.json")
-    assert not inbox_core._looks_like_agent("sh -c grep claude notes.txt")  # a bare word, not a path
-    assert not inbox_core._looks_like_agent("python foo.py claude")
-    assert not inbox_core._looks_like_agent("")
-
-
-def test_stop_inbox_text_never_locates_the_agent_without_an_inbox_root(cfg):
+def test_stop_inbox_text_never_calls_key_fn_without_an_inbox_root(cfg):
     def boom() -> str:
         raise AssertionError("key lookup must not run when no inbox exists")
 
@@ -484,25 +354,16 @@ def test_stop_inbox_text_is_fail_open_on_a_broken_key_lookup(cfg):
     inbox_dir("x").mkdir(parents=True)
 
     def boom() -> str:
-        raise RuntimeError("ps exploded")
+        raise RuntimeError("key lookup exploded")
 
     warnings: list[str] = []
     assert stop_inbox_text(boom, session_id="", warn=warnings.append) == ""
     assert warnings and "fail-open" in warnings[0]
 
 
-@pytest.mark.parametrize(
-    ("module", "dispatch_event", "event"),
-    [
-        (cc_dispatch, "Stop", {"hook_event_name": "Stop", "cwd": "/Users/ultra/work/landing"}),
-        (codex_dispatch, "Stop", {"hook_event_name": "Stop", "cwd": "/Users/ultra/work/landing", "session_id": "s"}),
-        (omp_dispatch, "tool_call", {"toolName": "yield", "cwd": "/Users/ultra/work/landing", "input": {}, "toolCallId": "y1"}),
-    ],
-)
-def test_dispatch_runs_the_stop_hooks_before_consuming_the_inbox(cfg, monkeypatch, module, dispatch_event, event):
+def test_omp_dispatch_runs_the_stop_hooks_before_consuming_the_inbox(cfg, monkeypatch):
     # Consuming is irreversible; a hook that raises must not eat a message the agent
-    # never saw (all three round-3 reviewers). pid 1 is never an agent → cwd key.
-    monkeypatch.setattr(inbox_core, "_ps_line", lambda pid: None)
+    # never saw (all three round-3 reviewers).
     d = inbox_dir("cwd-ccfe64bae2f277d7")
     d.mkdir(parents=True)
     (d / "pending.jsonl").write_text(_entry(1, "[TG from Alex tg#1] hi") + "\n")
@@ -510,13 +371,10 @@ def test_dispatch_runs_the_stop_hooks_before_consuming_the_inbox(cfg, monkeypatc
     def exploding_hooks(hook_event_name, ev):
         raise RuntimeError("hook discovery crashed")
 
-    # cc_hook_bridge's hook-evaluation entry point was renamed to `_evaluate_point` (agent-tools,
-    # rig-cli#418) when it grew a second verdict ("grant", alongside "block") to aggregate; codex
-    # has no grant concept and still calls it `_first_hook_block`.
-    attr = "_evaluate_point" if module is cc_dispatch else "_first_hook_block"
-    monkeypatch.setattr(module, attr, exploding_hooks)
+    monkeypatch.setattr(omp_dispatch, "_first_hook_block", exploding_hooks)
+    event = {"toolName": "yield", "cwd": "/Users/ultra/work/landing", "input": {}, "toolCallId": "y1"}
     with pytest.raises(RuntimeError):
-        module.dispatch(dispatch_event, event)
+        omp_dispatch.dispatch("tool_call", event)
     assert (d / "pending.jsonl").exists()
     assert not list(d.glob("delivered-*"))
 
@@ -532,12 +390,6 @@ def test_combine_stop_parts_is_the_one_shared_rule():
 
 def test_combine_block_empty_hook_reason_still_blocks():
     # `("block", "")` from a fail-closed gate must not become an allow (round-3 finding).
-    assert cc_dispatch._combine_block("Stop", "", "") == cc_dispatch.cc_block_output("Stop", "")
-    assert cc_dispatch._combine_block("Stop", "", None) is None
-    assert cc_dispatch._combine_block("Stop", "msg", None) == cc_dispatch.cc_block_output("Stop", "msg")
-    assert codex_dispatch._combine_block("", "") == codex_dispatch.codex_block_output("")
-    assert codex_dispatch._combine_block("", None) is None
-    assert codex_dispatch._combine_block("msg", "gate") == codex_dispatch.codex_block_output("msg\n\ngate")
     assert omp_dispatch._combine_block("", "") == omp_dispatch.omp_block_output("")
     assert omp_dispatch._combine_block("", None) is None
     assert omp_dispatch._combine_block("msg", "gate") == omp_dispatch.omp_block_output("msg\n\ngate")

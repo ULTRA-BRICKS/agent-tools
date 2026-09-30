@@ -392,43 +392,6 @@ def _warn(msg: str) -> None:
         pass
 
 
-def _inbox_text(hook_event_name: str, cc_event: dict) -> str:
-    """The tg-ctl Stop-hook inbox (agent-tools#526 / tg-cli#306): the pending Telegram
-    messages for THIS agent, consumed (archived, at-most-once) and rendered as block-
-    reason text, so CC feeds them to the agent as its next instruction — the tmux-free
-    delivery channel for a session tg-ctl cannot reach with send-keys. "" when there is
-    nothing: empty / missing / malformed inbox, the reader lib absent, or any failure
-    locating the agent (never blocks on its own; one file-log line).
-    """
-    if hook_event_name != "Stop":
-        return ""
-    try:
-        from agenttools_tg_inbox import agent_key_for_process, stop_inbox_text
-    except Exception as exc:  # noqa: BLE001 - optional lib; its absence must not block a stop
-        _warn(f"tg inbox reader unavailable, skipping inbox check: {exc}")
-        return ""
-    cwd = cc_event.get("cwd") or os.getcwd()
-    session_id = str(cc_event.get("session_id") or "")
-    return stop_inbox_text(lambda: agent_key_for_process(cwd), session_id=session_id, warn=_warn)
-
-
-def _combine_block(hook_event_name: str, inbox_text: str, hook_reason: str | None) -> dict | None:
-    """One block carrying BOTH the inbox messages and a blocking stop hook's reason.
-
-    The v1 `stop` descriptors always run (a fail-closed gate there must never be starved
-    by a busy inbox); when one blocks, its reason follows the human's messages in the
-    same block, so neither is deferred a turn. The rule itself (incl. "an empty-reason
-    block still blocks") is `agenttools_tg_inbox.combine_stop_parts`, shared with the
-    Codex bridge; without the lib, a hook block passes through unchanged.
-    """
-    try:
-        from agenttools_tg_inbox import combine_stop_parts
-    except Exception:  # noqa: BLE001 - optional lib: no inbox, plain hook semantics
-        return None if hook_reason is None else cc_block_output(hook_event_name, hook_reason)
-    reason = combine_stop_parts(inbox_text, hook_reason)
-    return None if reason is None else cc_block_output(hook_event_name, reason)
-
-
 def dispatch(hook_event_name: str, cc_event: dict) -> dict | None:
     """Run the applicable v1 hooks for this CC event; return the CC JSON to emit, or None.
 
@@ -440,24 +403,22 @@ def dispatch(hook_event_name: str, cc_event: dict) -> dict | None:
     see the module docstring's "PreToolUse grant" note) is translated into CC's own
     ``permissionDecision: "allow"`` to suppress the interactive prompt. Errors here are
     caught by the caller and turned into a fail-OPEN allow (same as today: no hook installed
-    at all, no worse). On Stop, pending tg-ctl inbox messages are delivered alongside a
-    block (see `_inbox_text` / `_combine_block`) — consumed LAST, after the hooks ran:
-    consuming is irreversible, and a hook that raises would otherwise have eaten a message
-    the agent never saw. A grant is never combined with the inbox text — grants only ever
-    arise on PreToolUse (no v1 point on `Stop` emits one today), where there is no inbox to
-    combine with in the first place.
+    at all, no worse). Stop no longer reads the tg-ctl inbox: Claude Code is tmux-only
+    (tg-cli#456), so tg-ctl never queues for it, and an unnamed session in an omp's cwd
+    shares that omp's ``cwd-<hash>`` key — consuming there would steal the omp's grant
+    notice (omp_hook_bridge is the inbox's only consumer).
     """
     result = _evaluate_point(hook_event_name, cc_event)
     if result is not None:
         verdict, reason = result
         if verdict == "block":
-            return _combine_block(hook_event_name, _inbox_text(hook_event_name, cc_event), reason)
+            return cc_block_output(hook_event_name, reason)
         grant_output = cc_grant_output(hook_event_name, reason)
         if grant_output is not None:
             return grant_output
         # a grant on an event with no pre-approve shape (Stop/PostToolUse) — nothing to
         # translate it into; fall through to the ordinary allow/None handling below.
-    return _combine_block(hook_event_name, _inbox_text(hook_event_name, cc_event), None)
+    return None
 
 
 def _evaluate_point(hook_event_name: str, cc_event: dict) -> tuple[str, str] | None:

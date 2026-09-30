@@ -90,27 +90,13 @@ process env, only a child's — which is exactly the sanctioned act of dispatchi
   `on_error`: `closed` → **block** ("I couldn't check" means "don't do it", for security
   gates); `open` (default) → allow (advisory hooks stay out of the way).
 
-## The tg-ctl inbox on `Stop` (agent-tools#526 / tg-cli#306)
+## The tg-ctl inbox on `Stop`: retired (tg-cli#456)
 
-Alongside the `stop` descriptors, the `Stop` dispatch checks the **tg-ctl Stop-hook
-inbox** — the tmux-free channel by which the Telegram bridge reaches an agent that runs
-OUTSIDE tmux (no pane → no `send-keys`). If `<tg-cli config dir>/inbox/<key>/pending.jsonl`
-holds entries for THIS agent, the dispatcher archives them and answers
-`{"decision":"block","reason":"<the queued messages>"}`, so CC feeds the text
-(`[TG from <name> tg#<id>] …`, the same wrap a tmux inject uses) to the agent as its next
-instruction. The daemon then reacts on the Telegram message.
-
-- `<key>` is the agent's `--name` (sanitized), else `cwd-<sha256(cwd)[:16]>` — the exact
-  algorithm, file layout and test vectors live in
-  [`lib/agenttools_tg_inbox/README.md`](../agenttools_tg_inbox/README.md) and are mirrored
-  byte-for-byte in tg-cli (`features/tg-ctl/unreachable.ts`). The agent process is found
-  via `CLAUDE_PID` (CC exports it to hooks), else the parent chain.
-- **Never blocks on an empty, missing or malformed inbox** (fail-open, one stderr line);
-  at-most-once (published as a complete `delivered-…jsonl` batch before the block is
-  emitted). The `stop` descriptors still run on the same `Stop`; a blocking one's reason
-  follows the messages in the same block — neither side is starved or deferred.
-- **Limit:** an idle agent gets the message only at its next turn end. The same check runs
-  in `codex_hook_bridge` (cwd key — Codex has no `--name`); opencode has no Stop point.
+`Stop` no longer reads the tg-ctl Stop-hook inbox (here or in `codex_hook_bridge`): Claude
+Code and Codex are tmux-only, so tg-ctl never queues for them, and an unnamed session in an
+omp's cwd shares that omp's `cwd-<hash>` key — consuming would steal the omp's grant notice.
+`omp_hook_bridge` is the inbox's only consumer; see
+[`lib/agenttools_tg_inbox/README.md`](../agenttools_tg_inbox/README.md).
 
 ## Installation (via rig)
 
@@ -194,8 +180,8 @@ It also covers the pre-write normalization (a secret in a `MultiEdit`'s `edits[]
 is flattened into `args.content` so `block-secrets-write` catches it), fail-open (garbage
 stdin), fail-closed (a crashing security gate, a bad `timeout_ms` on a closed gate, a bad
 `priority` not crashing the dispatch), the Stop `decision:block` path, and first-block-wins
-ordering. `tests/test_tg_inbox.py` covers the tg-ctl inbox delivery on `Stop` (pending →
-block + archive, idempotent; empty/malformed never block) through both bridges.
+ordering. `tests/test_tg_inbox.py` pins that a `Stop` with a pending tg-ctl inbox under the
+session's cwd key neither blocks nor consumes it (through both bridges).
 
 ```
 $ uv run --with pytest python -m pytest tests/test_cc_hook_bridge.py -q

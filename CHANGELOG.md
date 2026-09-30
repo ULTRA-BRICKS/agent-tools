@@ -47,6 +47,19 @@
   from a Forgejo repository). A missing file, and any acceptance result that cannot be evaluated,
   refuses the merge.
 
+### Changed
+
+- `cc_hook_bridge` and `codex_hook_bridge` no longer read the tg-ctl Stop-hook inbox on `Stop`
+  (agent-tools#832). Claude Code and Codex are tmux-only (tg-cli#456): tg-ctl stopped queuing
+  for them and archived their stranded backlog as `stranded-<stamp>.jsonl`. An unnamed cc/codex
+  in an omp's cwd shares that omp's `cwd-<hash>` inbox key, so its `Stop` consumed the omp's
+  hatch grant notice. A blocking stop hook still blocks with its own reason. `omp_hook_bridge`
+  on `yield` is now the inbox's only consumer. `lib/agenttools_tg_inbox` 0.2.0 drops the
+  Claude-only process lookup (`agent_key_for_process`, `parse_agent_name`); the key contract
+  (`agent_key`, `sanitize_agent_name`, the inbox layout, the shared test vectors) is unchanged.
+  Deploy order: apply this only after tg-cli 1.54.26 (tg-cli#456) is deployed. An older tg-ctl
+  still queues for an out-of-tmux cc/codex, and nothing would consume those entries.
+
 ### Fixed
 
 - `agent-hooks/heavy-op-memory-gate` now sees wired-memory exhaustion and GPU model loads

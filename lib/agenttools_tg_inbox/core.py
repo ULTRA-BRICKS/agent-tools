@@ -6,8 +6,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess  # noqa: S404 - reading the agent's argv via `ps` is the point
-import sys
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -25,8 +23,6 @@ DELIVERED_PREFIX = "delivered-"
 TMP_PREFIX = "tmp-"
 DIR_MODE = 0o700
 FILE_MODE = 0o600
-# How many parent hops to climb looking for the agent process (hook -> sh -> agent).
-_ANCESTRY_HOPS = 6
 
 
 def _debug_log_path() -> Path:
@@ -77,107 +73,6 @@ def agent_key(name: str | None, cwd: str) -> str:
         return safe
     digest = hashlib.sha256(_normalize_cwd(cwd).encode("utf-8")).hexdigest()
     return f"cwd-{digest[:16]}"
-
-
-def parse_agent_name(command: str) -> str | None:
-    """The ``--name <v>`` / ``--name=<v>`` value in an agent's argv line, as typed.
-
-    ``ps`` flattens argv into one space-joined string, so a multi-word value
-    (``--name "my agent"``) yields only its FIRST word (``my``). tg-cli's daemon reads the
-    same flattened ``ps`` line and splits the same way, so both sides agree; a name with
-    whitespace is simply not supported as a distinct key (documented in the README).
-    """
-    tokens = command.split()
-    for i, tok in enumerate(tokens):
-        if tok == "--name":
-            nxt = tokens[i + 1] if i + 1 < len(tokens) else None
-            return nxt if nxt and not nxt.startswith("-") else None
-        if tok.startswith("--name="):
-            value = tok[len("--name="):]
-            return value or None
-    return None
-
-
-# --- locating the agent process ---
-
-
-def _ps_line(pid: int) -> tuple[int, str] | None:
-    """``(ppid, args)`` of one process via ``ps``, or ``None`` when it is gone/unreadable."""
-    try:
-        out = subprocess.run(  # noqa: S603 - fixed argv, pid is an int
-            ["ps", "-o", "ppid=,args=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    line = out.strip()
-    if not line:
-        return None
-    parts = line.split(None, 1)
-    try:
-        ppid = int(parts[0])
-    except ValueError:
-        return None
-    return ppid, (parts[1] if len(parts) > 1 else "")
-
-
-_AGENT_BINARIES = {"claude", "codex", "opencode"}
-
-
-def _looks_like_agent(args: str) -> bool:
-    """An interactive agent binary: ``claude``/``codex``/``opencode`` as argv0, OR the
-    Claude Code launcher shape ``node …/.claude/local/claude …`` — a LATER token that is
-    a path whose basename is ``claude``. This mirrors tg-cli's ``matchAgentCommand``
-    (``argv0 basename`` or ``includes('/claude ')``) on purpose: the two matchers must
-    pick the same process or the shared inbox key splits. A bare ``claude`` argument
-    (``grep claude notes``) and a ``…/.claude`` directory are NOT the launcher shape.
-    """
-    tokens = args.split()
-    if not tokens:
-        return False
-    if os.path.basename(tokens[0]) in _AGENT_BINARIES:
-        return True
-    return any("/" in tok and os.path.basename(tok) == "claude" for tok in tokens[1:])
-
-
-def agent_argv(start_pid: int | None = None) -> str:
-    """The argv line of the agent process this hook runs under, or ``""``.
-
-    Claude Code exports ``CLAUDE_PID`` to its children (hooks included) — that is the
-    authoritative pid. Without it we climb the parent chain from ``start_pid`` (default:
-    our own parent) a few hops (the hook usually runs as ``sh -c`` under the agent) and
-    take the first process whose argv looks like an agent binary.
-    """
-    env_pid = os.environ.get("CLAUDE_PID", "")
-    if env_pid.isdigit():
-        found = _ps_line(int(env_pid))
-        if found is not None:
-            return found[1]
-    pid = start_pid if start_pid is not None else os.getppid()
-    seen: set[int] = set()
-    for _ in range(_ANCESTRY_HOPS):
-        if pid <= 1 or pid in seen:
-            break
-        seen.add(pid)
-        found = _ps_line(pid)
-        if found is None:
-            break
-        ppid, args = found
-        if _looks_like_agent(args):
-            return args
-        pid = ppid
-    return ""
-
-
-def agent_key_for_process(cwd: str, *, start_pid: int | None = None) -> str:
-    """The inbox key for the CLAUDE CODE agent this hook runs under: its ``--name``, else
-    the cwd hash. Codex/opencode have no ``--name`` — their bridges call
-    ``agent_key(None, cwd)`` directly and must NOT come here: an inherited ``CLAUDE_PID``
-    (a Codex started from a Claude-owned shell) would key them on the Claude session."""
-    return agent_key(parse_agent_name(agent_argv(start_pid)), cwd)
 
 
 # --- the inbox on disk ---
@@ -326,11 +221,11 @@ def format_block_reason(entries: list[dict]) -> str:
 
 
 def combine_stop_parts(inbox_text: str, hook_reason: str | None) -> str | None:
-    """The ONE combining rule every bridge applies on Stop: the inbox messages first, a
-    blocking hook's reason after, blank-line separated; ``None`` when neither blocks.
-    A blocking hook with an EMPTY reason still blocks (``is not None``, never
+    """The ONE combining rule the omp bridge applies on yield→stop: the inbox messages
+    first, a blocking hook's reason after, blank-line separated; ``None`` when neither
+    blocks. A blocking hook with an EMPTY reason still blocks (``is not None``, never
     truthiness) — a fail-closed gate that died without a message must not become an
-    allow. Shared here so the two bridges cannot drift on the safety-critical half."""
+    allow."""
     if not inbox_text and hook_reason is None:
         return None
     parts = [inbox_text] if inbox_text else []
@@ -340,12 +235,12 @@ def combine_stop_parts(inbox_text: str, hook_reason: str | None) -> str | None:
 
 
 def stop_inbox_text(key_fn: Callable[[], str], *, session_id: str, warn: Callable[[str], None]) -> str:
-    """The fail-open Stop-side wrapper every harness bridge shares: the pending messages
+    """The fail-open Stop-side wrapper (``omp_hook_bridge`` on yield): the pending messages
     for this agent, consumed (at-most-once) and rendered as block-reason text, or ``""``.
 
-    ``key_fn`` is called LAZILY, only when an inbox root exists at all — locating the agent
-    process costs up to a handful of ``ps`` calls, and a machine without tg-cli must not
-    pay that on every Stop. Any failure is one ``warn`` line and ``""`` (never blocks).
+    ``key_fn`` is called LAZILY, only when an inbox root exists at all, so a machine
+    without tg-cli pays nothing on every yield. Any failure is one ``warn`` line and ``""``
+    (never blocks).
     """
     try:
         if not inbox_root().exists():
