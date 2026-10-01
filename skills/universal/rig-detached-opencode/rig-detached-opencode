@@ -99,6 +99,17 @@ brief_text="$(cat -- "$brief")"
 cd "$workdir"
 export RIG_AGENT_ID="$name"
 export RIG_DETACHED_AGENT=1
+# Hand the caller's forum topic to the child (agent-tools#848): the nohup-detached child is
+# reparented to pid 1, so `tg` cannot tie its calls (nor those of tools that shell out to it,
+# e.g. the task-cli `[task created]` notifier) to this session and they would post to General.
+# `tg --session-topic` (tg-cli#553) prints this session's topic id, or nothing; ask it HERE,
+# before detaching, and export only a numeric answer from a SUCCESSFUL call — no session, no
+# `tg`, a failing or older `tg` (usage text instead of an id) sets nothing and leaves the launch
+# unaffected (a TG_TOPIC the caller itself already exports passes through untouched). `</dev/null`
+# so the lookup never reads the caller's harness pipe.
+if tg_topic="$(tg --session-topic </dev/null 2>/dev/null)" && [[ "$tg_topic" =~ ^[0-9]+$ ]]; then
+    export TG_TOPIC="$tg_topic"
+fi
 
 {
     echo "--- $(date -u '+%Y-%m-%dT%H:%M:%SZ') launching detached agent '$name' in '$workdir'"

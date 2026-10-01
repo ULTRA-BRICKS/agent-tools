@@ -4,6 +4,12 @@
 
 ### Added
 
+- `rig-detached-{omp,codex,opencode,claude-code}` hand the caller's forum topic to the detached
+  child (agent-tools#848). Before detaching, each launcher runs `tg --session-topic` (tg-cli#553)
+  and exports a numeric answer as `TG_TOPIC`, so the reparented child's `tg` calls and the
+  task-cli `[task created]` notifier post into the starting session's topic instead of General.
+  No session, no `tg`, a failing or older `tg` sets nothing and the launch is unchanged.
+
 - `skills/universal/rig-detached-claude-code`: the Claude Code member of the detached-agent
   launcher family (agent-tools#831). `rig-detached-claude-code <name> <brief-file> [workdir]`
   starts `claude -p --permission-mode bypassPermissions -- <brief>` nohup-detached in its own

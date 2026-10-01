@@ -65,6 +65,8 @@ subagent-exempt delegation gate (`orchestrator-stays-thin`, `background-subagent
 `no-long-inline-process`) and every subagent-only gate (`subagent-no-bg-longproc`,
 `subagent-no-monitor`) classifies the child session's tool calls as a dispatched subagent's.
 
+The launcher also asks `tg --session-topic` (tg-cli#553) for the calling session's forum topic before detaching and exports a numeric answer as `TG_TOPIC` into the child (agent-tools#848), so the child's `tg` calls — and those of tools that shell out to `tg`, like the task-cli `[task created]` notifier — post into that topic instead of General. No session, no `tg`, or an unusable answer sets nothing (a `TG_TOPIC` the caller already exports passes through) and the launch is unaffected.
+
 Never `export` these markers by hand in an interactive shell (or an rc file): every `claude`
 process that inherits them is treated as a dispatched subagent for its whole session. The
 launcher sets them for the child process only.
