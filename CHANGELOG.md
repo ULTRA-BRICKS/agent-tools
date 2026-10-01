@@ -70,6 +70,22 @@
   path through a regular file blocks like a missing marker. A marker that cannot be stat'd for
   another reason (permission, I/O) still fails open.
 
+- `ci/ship`: the review-quorum gate counts only reviews recorded in the PR's own repository
+  (agent-tools#824). It used to send `--no-verify-identity`, so every repository's iterations for
+  a task code counted: sme-archiving-gc's `#464` passed with consistency and security roles that
+  came from rig-cli and review-cli records stored as `464`. Ship now asks `review task <code>
+  --check -C <repo root> --verify-repo-only` (review-cli#589), which compares the repository
+  alone. The primary checkout's own unrelated diff no longer matters, and reviews recorded before
+  a repository moved hosts still count. Ship names the iterations it dropped as another
+  repository's (repo and timestamp, the first 50 plus the full count). Three setup errors refuse
+  outright, with no capacity-outage auto-proceed and no hatch: review-cli not reporting
+  `identity_verification: repo_only`, a review-cli without `--verify-repo-only` (upgrade it), and
+  a `--repo`/`GH_SHIP_REPO`/`GH_REPO` target other than the checkout's own repository (compared
+  as `owner/repo`, ignoring case, URL or SSH form, an SSH URL's port and `.git`). The old
+  `--min-roles`-less and `--quorum-check` retries are gone.
+  `ci/ship/README.md` no longer says `SHIP_REVIEW_QUORUM=0` disables the gate; that value is
+  rejected at parse (agent-tools#644).
+
 - `agent-hooks/heavy-op-memory-gate` now sees wired-memory exhaustion and GPU model loads
   (agent-tools#817). On 2026-09-29 thirteen concurrent `whisper-cli` runs wired 95.7% of a 24 GB
   Mac into GPU buffers and kernel-panicked it while the jetsam level, the hook's only signal,

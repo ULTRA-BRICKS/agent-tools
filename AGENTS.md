@@ -217,8 +217,10 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token, else a purely descriptive
   ALL-CAPS/hyphenated code (`SME-ROADMAP-WORKTREE-NOTE`-shaped, 3+ segments, no digits) — all
   tried against the branch name or PR
-  body) has ≥ `SHIP_REVIEW_QUORUM_MIN_ROLES` distinct BOARD ROLES (`review task <code> --check`)
-  — role coverage is the DEFAULT/only authorization predicate (agent-tools#644 / review-cli#433
+  body) has ≥ `SHIP_REVIEW_QUORUM_MIN_ROLES` distinct BOARD ROLES (`review task <code> --check
+  -C <repo root> --verify-repo-only`), counting only reviews recorded in THIS checkout's
+  repository (agent-tools#824: task codes are not repo-scoped, so another repository's `464` or
+  `#464` never counts) — role coverage is the DEFAULT/only authorization predicate (agent-tools#644 / review-cli#433
   padding). `distinct_models_passed` and `passed_iterations` are telemetry: one padded model
   filling every role ships even when models=0/1 and iterations are below the old min-iter 3
   (a hollow 0-iteration record still refuses). `SHIP_REVIEW_QUORUM_MIN_MODELS` remains an
@@ -226,8 +228,11 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   the gate that makes self-merge *strictly controlled*; it **fails closed** (a missing task
   code / `review` CLI / unreadable store, OR a quorum reading 0 distinct roles,
   all refuse — ship re-derives the verdict from the role counts, never trusts the subprocess's
-  `passed` boolean alone, #242/#644). An installed `review-cli` too old to report roles gets an
-  explicit "upgrade review-cli" refusal instead of a generic error. There is **NO self-service override flag** — a one-time bypass
+  `passed` boolean alone, #242/#644). Three setup errors refuse with NO hatch and no
+  capacity-outage auto-proceed: an installed `review-cli` without `--verify-repo-only`
+  (review-cli#589; "upgrade review-cli"), a payload whose `identity_verification` is not
+  `repo_only`, and a `--repo`/`GH_SHIP_REPO`/`GH_REPO` target that is not this checkout's
+  github.com origin (run ship from that repository's checkout). There is **NO self-service override flag** — a one-time bypass
   is requested via `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"`, which asks Alex live
   on Telegram (shared `agenttools_hatch_escalation` lib) and proceeds ONLY on his real-time
   approval. `SHIP_REVIEW_QUORUM=0` is forbidden and does not disable the gate. Every non-dry-run gated ship is

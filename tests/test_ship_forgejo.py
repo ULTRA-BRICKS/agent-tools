@@ -719,7 +719,7 @@ def test_github_origin_keeps_the_gh_path(forge):
 _FAKE_REVIEW = """#!/bin/sh
 [ "$1" = task ] || exit 0
 n="${FAKE_REVIEW_PASSED:-0}"; ok=false; [ "$n" -ge 3 ] && ok=true
-printf '{"task_code":"%s","passed_iterations":%s,"total_iterations":%s,"distinct_models_passed":1,"models":["m"],"distinct_roles_passed":%s,"roles":["backend","security","architecture"],"min_roles":3,"min_iter":3,"min_models":3,"passed":%s}\\n' "$2" "$n" "$n" "$n" "$ok"
+printf '{"task_code":"%s","passed_iterations":%s,"total_iterations":%s,"distinct_models_passed":1,"models":["m"],"distinct_roles_passed":%s,"roles":["backend","security","architecture"],"min_roles":3,"min_iter":3,"min_models":3,"passed":%s,"identity_verification":"repo_only"}\\n' "$2" "$n" "$n" "$n" "$ok"
 """
 
 _FAKE_TASK = """#!/bin/sh
