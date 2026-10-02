@@ -60,7 +60,7 @@ from pathlib import Path
 # Claude Code kills this command at its outer settings.json timeout (1200s) and a killed
 # command hook fails OPEN, so the sequential descriptor run must finish well inside it.
 HOOK_BUDGET_S = 1100
-_monotonic = time.monotonic
+_monotonic = time.monotonic  # indirection so tests can inject a fake clock
 # Mirrors agent_hooks_v1.runner.DEFAULT_TIMEOUT_MS; the runner is imported lazily (fail-open).
 _DEFAULT_TIMEOUT_MS = 5000
 _MAX_SKIPPED_IDS = 10
@@ -508,6 +508,7 @@ def _budgeted_spec(spec: dict, remaining_ms: int) -> dict:
     """A copy of ``spec`` whose timeout fits the remaining budget; a hook the budget cuts
     short must deny rather than let CC's outer kill turn into a fail-open."""
     original = _effective_timeout_ms(spec)
+    # None: run_hook rejects this timeout via on_error before starting anything, so no wait.
     if original is None or original <= remaining_ms:
         return spec
     clamped = dict(spec)

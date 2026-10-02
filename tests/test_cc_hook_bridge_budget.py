@@ -85,6 +85,30 @@ def test_default_timeout_mirror_matches_the_runner():
     assert dispatch._DEFAULT_TIMEOUT_MS == runner.DEFAULT_TIMEOUT_MS
 
 
+_ABSENT = object()
+
+
+@pytest.mark.parametrize("raw", [_ABSENT, None, 0, 1, 250, 960000, "1500", -5, True, False, "abc", 2.9])
+def test_effective_timeout_agrees_with_the_real_runner(monkeypatch, raw):
+    """The bridge's clamp is only safe if it reads timeout_ms exactly as run_hook does."""
+    import subprocess
+
+    from agent_hooks_v1 import runner
+
+    seen: dict = {}
+
+    def fake_subprocess_run(argv, **kwargs):
+        seen["timeout_ms"] = round(kwargs["timeout"] * 1000)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_subprocess_run)
+    spec = {"id": "x", "cmd": "/abs/x", "on_error": "open"}
+    if raw is not _ABSENT:
+        spec["timeout_ms"] = raw
+    runner.run_hook(spec, {}, warn=lambda msg: None)
+    assert dispatch._effective_timeout_ms(spec) == seen.get("timeout_ms")
+
+
 def test_two_hatch_waits_second_is_clamped_and_fails_closed(monkeypatch):
     specs = [_spec("hatch-a", cost_s=960), _spec("hatch-b", cost_s=960)]
     calls, _warnings, clock = _install(monkeypatch, specs)
