@@ -3535,6 +3535,76 @@ def test_subprocess_distinct_event_session_ids_have_independent_tiers(tmp_path):
     _assert_warn(*_run_hook_subprocess(marker_dir))
 
 
+@pytest.mark.parametrize(
+    "point,tool,input_extra",
+    [
+        ("pre-bash", "bash", {"command": _FALLBACK_CHAIN}),
+        ("pre-write", "write", {"path": "/repo/src/a.ts", "content": "x"}),
+    ],
+)
+def test_subprocess_rotating_forged_omp_args_session_id_cannot_defeat_block(
+    point, tool, input_extra, tmp_path
+):
+    """RC-1 quorum P1 regression (agent-tools#743): a model-controlled `session_id`
+    riding in omp tool args survived the bridge's `to_v1_event` for pre-bash/pre-write
+    and fell into `_session_id_for_marker`'s event fallback — a rogue main-session
+    orchestrator rotating a fresh forged id per call minted a fresh marker key per
+    offense and the guard WARNed forever, never BLOCKed (the exact silent-guard-removal
+    class this PR exists to fix). The bridge strips every session-id spelling from tool
+    args (same trust boundary as `_FORGED_AGENT_KEYS`), so with no session env and no
+    trusted payload sessionId the marker key is the anonymous sha256(cwd\\0point) —
+    stable across calls: first offense WARNs, second offense (same session, DIFFERENT
+    forged id) BLOCKs, and rotation cannot escape the BLOCK."""
+    import omp_hook_bridge.dispatch as omp_dispatch
+
+    marker_dir = tmp_path / "m"
+
+    def omp_v1(forged: str) -> dict:
+        return omp_dispatch.to_v1_event(
+            {
+                "event": "tool_call",
+                "toolName": tool,
+                "input": {**input_extra, "session_id": forged},
+                "cwd": "/repo",
+                "toolCallId": f"call_{forged}",
+            },
+            point=point,
+        )
+
+    _assert_warn(*_run_hook_subprocess(marker_dir, event=omp_v1("forged-1")))
+    _assert_block(*_run_hook_subprocess(marker_dir, event=omp_v1("forged-2")))
+    _assert_block(*_run_hook_subprocess(marker_dir, event=omp_v1("forged-3")))
+
+
+def test_subprocess_trusted_omp_payload_session_id_keys_tier_not_forged_args(tmp_path):
+    """The fix must not over-strip: the omp bridge's SANITIZED session id (top-level
+    payload `sessionId`, extension.ts ctx/sessionManager-sourced — the cc-T2 tier the
+    identity commit deliberately added) must still reach the marker key, while a forged
+    tool-args value in the SAME calls is ignored: same trusted id twice (different
+    forged ids) shares one tier — WARN then BLOCK — and a DIFFERENT trusted id starts
+    an independent tier."""
+    import omp_hook_bridge.dispatch as omp_dispatch
+
+    marker_dir = tmp_path / "m"
+
+    def omp_v1(trusted: str, forged: str) -> dict:
+        return omp_dispatch.to_v1_event(
+            {
+                "event": "tool_call",
+                "toolName": "bash",
+                "input": {"command": _FALLBACK_CHAIN, "session_id": forged},
+                "cwd": "/repo",
+                "toolCallId": f"call_{forged}",
+                "sessionId": trusted,
+            },
+            point="pre-bash",
+        )
+
+    _assert_warn(*_run_hook_subprocess(marker_dir, event=omp_v1("real-sess", "forged-1")))
+    _assert_block(*_run_hook_subprocess(marker_dir, event=omp_v1("real-sess", "forged-2")))
+    _assert_warn(*_run_hook_subprocess(marker_dir, event=omp_v1("other-sess", "forged-3")))
+
+
 def test_sweep_expired_markers_removes_stale_keeps_fresh(tmp_path, monkeypatch):
     """The per-session key space would otherwise grow without bound (one tiny file per
     session×cwd×point, never deleted). Recording a WARN sweeps markers older than the TTL

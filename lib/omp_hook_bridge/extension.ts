@@ -248,14 +248,15 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
     const agentId = ctxString(ctx, event, "agentId", "getAgentId");
     // Top-level ctx identity is blank under oh-my-pi#11214 (it never existed on
     // ExtensionContext); sessionManagerString is the source that resolves today and is
-    // consulted FIRST: ctxString's last leg reads a same-named field off the raw omp
-    // extension event, and a future event shape carrying model-influenced sessionId/
-    // sessionFile values must not outrank the harness's own session state — session-scoped
-    // hook state keys on these (agent-tools#743 RC-2), so a spoofed value would rotate
-    // marker keys per call (warn forever, never block).
+    // consulted FIRST. Session identity additionally NEVER reads a same-named field off
+    // the raw omp extension event (the third leg ctxString would offer): omp's documented
+    // tool_call/tool_result shape is toolName/input/cwd/toolCallId only, so a top-level
+    // event sessionId has no established provenance to trust, and session-scoped hook
+    // state (agent-tools#743 RC-2 marker tiers) keys on this value — a spoofed value
+    // would rotate marker keys per call (warn forever, never block).
     const sessionId = firstNonBlank(
       sessionManagerString(ctx, "getSessionId"),
-      ctxString(ctx, event, "sessionId", "getSessionId"),
+      ctxString(ctx, undefined, "sessionId", "getSessionId"),
     );
     const sessionFile = firstNonBlank(
       sessionManagerString(ctx, "getSessionFile"),
@@ -331,7 +332,11 @@ function spawnDispatcher(
         // Trusted per-session id (ctx/sessionManager, never tool args) so session-keyed
         // hook state — orchestrator-stays-thin's warn/block marker (agent-tools#743,
         // RC-2) — tiers per omp session instead of per tmux pane or shared cwd+point.
-        ...(sessionId ? { RIG_SESSION_ID: sessionId } : {}),
+        // Set UNCONDITIONALLY, blank included: spawn inherits process.env, and a stale
+        // RIG_SESSION_ID inherited from the launching shell would otherwise keep keying
+        // the marker tier on the LAUNCHER's session whenever this context has none.
+        // Every consumer's blank check (".strip()"-style) treats "" as no identity.
+        RIG_SESSION_ID: sessionId,
       },
     });
     inFlight.add(child);

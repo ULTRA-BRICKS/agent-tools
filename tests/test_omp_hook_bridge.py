@@ -582,6 +582,74 @@ def test_to_v1_event_drops_forged_agent_identity_from_tool_args():
     assert "agent" not in v1["args"]
 
 
+def test_to_v1_event_drops_forged_session_id_from_tool_args():
+    """RC-1 quorum P1 (agent-tools#743): `session_id` on omp tool args is
+    model-controlled. `_FORGED_AGENT_KEYS` stripped agent identity but NOT session
+    identity, and only the `stop` point overwrote it from trusted sources, so a forged
+    `args.session_id` survived onto pre-bash/pre-write — where
+    orchestrator-stays-thin's `_session_id_for_marker` event fallback folded it into
+    the warn/block marker key: a rogue main-session orchestrator rotating a fresh
+    forged id per call minted a fresh marker per offense (WARN forever, never BLOCK).
+    Every session-id spelling is stripped, mirroring the other three bridges."""
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {
+            "command": "git commit -m x",
+            "session_id": "forged",
+            "sessionID": "forged-camel",
+            "sessionId": "forged-lower",
+        },
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert "session_id" not in v1["args"]
+    assert "sessionID" not in v1["args"]
+    assert "sessionId" not in v1["args"]
+
+
+def test_to_v1_event_restores_session_id_only_from_trusted_payload(monkeypatch):
+    """The omp bridge's T2 tier (agent-tools#743 RC-2): when extension.ts puts its
+    ctx/sessionManager-sourced `sessionId` on the TOP-LEVEL payload, that value — never
+    a model-controlled tool-args spelling — is what reaches `args.session_id`
+    (same strip-then-restore boundary as the agent_id handling above)."""
+    _clear_agent_env_markers(monkeypatch)
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "echo ok", "session_id": "forged", "sessionId": "forged-2"},
+        "cwd": "/repo",
+        "sessionId": "trusted-sess",
+    }
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert v1["args"]["session_id"] == "trusted-sess"
+    assert "sessionID" not in v1["args"]
+    assert "sessionId" not in v1["args"]
+
+
+def test_to_v1_event_ignores_undocumented_top_level_session_spellings():
+    """The trusted restore accepts exactly the ONE spelling the carrier (extension.ts)
+    emits — `sessionId`. Any other top-level session-id spelling (a future unvetted
+    caller could forward one) is not part of the trusted-input contract and must not
+    reach `args.session_id` (review finding on the first version of the fix, which also
+    read `session_id`)."""
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "echo ok"},
+        "cwd": "/repo",
+        "session_id": "snake-case-not-a-carrier-spelling",
+    }
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert "session_id" not in v1["args"]
+
+
 def test_to_v1_event_nested_payload_session_file_beats_forged_args_agent_id(monkeypatch):
     """agent-tools#743 (RC-1) trust boundary: with the sessionManager-sourced nested
     sessionFile on the payload, the injected identity is the transcript's child stem — a
@@ -1928,12 +1996,16 @@ def _run_identity_driver(
     env_extra: dict[str, str] | None = None,
     *,
     dump_full_payload: bool = False,
+    raw_event_extra: str = "",
 ) -> dict:
     """Common shape of the identity-forwarding tests below: load the real extension.ts
     under bun with a stub `pi`, a caller-supplied ctx literal (`ctx_ts`), and a dump-style
     stub dispatcher that records either the chosen env/payload fields (`dump_keys`, Python
     dict-literal source reading `payload`/`os.environ`) or the whole payload, then allows
-    the call. Returns the recorded dict."""
+    the call. Returns the recorded dict. `raw_event_extra` splices extra fields into the
+    RAW extension event handed to the handler (bare TS source, e.g. `sessionId: 'x'`;
+    comma-joined automatically) for pinning what the extension must NOT trust from the
+    event."""
     dump = tmp_path / "dump.json"
     stub = tmp_path / "stub_dispatcher.py"
     recorded = "payload" if dump_full_payload else "{" + dump_keys + "}"
@@ -1955,7 +2027,9 @@ def _run_identity_driver(
         "mod.default(pi);\n"
         + ctx_ts
         + "await handlers['tool_call']("
-        "{ toolName: 'bash', input: { command: 'git commit -m x' }, toolCallId: 'c1' }, ctx);\n",
+        "{ toolName: 'bash', input: { command: 'git commit -m x' }, toolCallId: 'c1' "
+        + (f", {raw_event_extra}" if raw_event_extra else "")
+        + "}, ctx);\n",
         encoding="utf-8",
     )
     env = dict(os.environ)
@@ -2045,6 +2119,30 @@ def test_extension_reads_session_manager_when_toplevel_ctx_identity_is_blank(tmp
     assert got["sessionId"] == "sess-child-1"
     assert got["env_rig_session"] == "sess-child-1"  # RC-2: session-keyed hook state needs it in env
     assert got["agentId"] == ""  # omp ctx has no agent id; the dispatcher derives it from the path
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_ignores_raw_event_session_id_and_blanks_stale_env(tmp_path):
+    """RC-1B review findings on the session-id chain, pinned end-to-end through the real
+    extension: (1) a `sessionId` field on the RAW omp extension event is NOT a trusted
+    source — omp's documented event shape is toolName/input/cwd/toolCallId only, and the
+    marker-tier id must come from ctx/sessionManager alone; (2) the dispatcher env's
+    RIG_SESSION_ID is set UNCONDITIONALLY, so a stale inherited value (an omp launched
+    from a shell that still exports one) is blanked — not leaked — when this context has
+    no session id."""
+    got = _run_identity_driver(
+        tmp_path,
+        # No sessionManager at all (in-memory session / ctx without one) — the exact
+        # shape where the raw-event leg used to be the deciding source.
+        "const ctx = { cwd: '/tmp', hasUI: false };\n",
+        "'env_rig_session': os.environ.get('RIG_SESSION_ID'), "
+        "'sessionId': payload.get('sessionId')",
+        # The stale inherited launcher value the blank override must defeat.
+        {"RIG_SESSION_ID": "stale-launcher-session"},
+        raw_event_extra="sessionId: 'forged-event-session'",
+    )
+    assert got["sessionId"] == ""  # raw-event leg is gone
+    assert got["env_rig_session"] == ""  # blanked, not the stale inherited value
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")

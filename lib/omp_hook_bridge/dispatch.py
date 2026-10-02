@@ -67,6 +67,22 @@ _FORGED_AGENT_KEYS = (
     "agent",
 )
 
+# Session identity gets the SAME strip-and-restore treatment as agent identity above
+# (RC-1 quorum P1, agent-tools#743): `session_id` riding in tool args is model-controlled,
+# yet orchestrator-stays-thin's `_session_id_for_marker` event fallback keys its warn/block
+# marker on it when the hook env chain is empty — a forged value rotating per call minted a
+# fresh marker per offense (WARN forever, never BLOCK, the silent-guard-removal class this
+# PR's session identity work exists to fix; session identity is the ONLY marker-key input
+# closed here — the key's cwd leg has its own, separate trust story). omp's real tool
+# schemas carry no session-id parameter, so nothing legitimate is lost. Every spelling is
+# stripped, then restored ONLY from the TOP-LEVEL payload `sessionId` — the one spelling
+# extension.ts emits, sourced from ctx/sessionManager state (never `input`, never any other
+# top-level spelling an unvetted caller might forward) — the same trust boundary the other
+# three bridges already draw: cc overwrites-or-drops via T2 precedence (cc_hook_bridge),
+# opencode strips these exact spellings and restores from its plugin payload, codex strips
+# via `_METADATA_KEYS` and restores from the top-level event.
+_FORGED_SESSION_KEYS = ("session_id", "sessionID", "sessionId")
+
 
 # omp Task/eval child transcript: .../<session-id>/<agent-id>.jsonl
 # (same shape orchestrator-stays-thin._OMP_SESSION_DIR matches; keep in lockstep).
@@ -193,6 +209,16 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
     trusted_id = detached_id or ctx_id
     if trusted_id:
         args["agent_id"] = trusted_id
+
+    for key in _FORGED_SESSION_KEYS:
+        args.pop(key, None)
+    # The carrier (extension.ts) emits exactly `sessionId`; accepting any other top-level
+    # spelling here would silently expand the trusted-input contract beyond the one
+    # documented producer (a review finding on the first version of this fix, which also
+    # read `session_id`). `.strip()`: a whitespace-only payload id is not an identity.
+    trusted_sid = str(omp_event.get("sessionId") or "").strip()
+    if trusted_sid:
+        args["session_id"] = trusted_sid
 
     command = _tool_command(tool, raw_args)
     if command:
