@@ -336,14 +336,113 @@ def test_credential_is_bound_to_the_origin_host(tmp_path, monkeypatch):
     assert fp.resolve_credential(origin).header == "token YOUR_ENV_TOKEN_HERE"
 
 
-def test_expired_oauth_token_fails_closed(tmp_path, monkeypatch):
+# fj stores an OAuth `expires_at` as the Rust time crate's serde tuple
+# [year, ordinal_day, hour, minute, second, nanosecond, offset_h, offset_m, offset_s].
+_PAST = [2020, 1, 0, 0, 0, 0, 0, 0, 0]
+_FUTURE = [2999, 1, 0, 0, 0, 0, 0, 0, 0]
+
+# Stand-in `fj`: logs argv; `refresh` rewrites the key store like the real fj after refreshing,
+# `noop` exits 0 without refreshing, `fail` exits 1.
+_FAKE_FJ = """
+import json, os, sys
+with open(os.environ["FAKE_FJ_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(sys.argv[1:]) + chr(10))
+mode = os.environ["FAKE_FJ_MODE"]
+if mode == "fail":
+    sys.exit(1)
+if mode == "refresh":
+    path = os.environ["SHIP_FORGEJO_KEYS_FILE"]
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    data["hosts"][sys.argv[2]].update(token="YOUR_FRESH_TOKEN_HERE", expires_at=[2999, 1, 0, 0, 0, 0, 0, 0, 0])
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+"""
+
+
+def _oauth_keys(tmp_path, monkeypatch, expires_at, mode=None):
+    """An OAuth entry for git.example.org; PATH holds only a fake fj (mode) or no fj (None)."""
     keys = tmp_path / "keys.json"
-    keys.write_text(json.dumps({"hosts": {"git.example.org": {"type": "OAuth", "name": "x", "token": PLACEHOLDER,
-                                                             "refresh_token": PLACEHOLDER, "expires_at": 1}}}))
+    keys.write_text(json.dumps({"hosts": {"git.example.org": {
+        "type": "OAuth", "token": PLACEHOLDER, "refresh_token": PLACEHOLDER, "expires_at": expires_at}}}))
     monkeypatch.setenv("SHIP_FORGEJO_KEYS_FILE", str(keys))
     monkeypatch.delenv("SHIP_FORGEJO_TOKEN", raising=False)
+    bindir = tmp_path / "fjbin"
+    bindir.mkdir()
+    log = tmp_path / "fj.log"
+    if mode is not None:
+        if os.name == "nt":
+            script = tmp_path / "fake_fj.py"
+            script.write_text(_FAKE_FJ, encoding="utf-8")
+            (bindir / "fj.cmd").write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+        else:
+            exe = bindir / "fj"
+            exe.write_text(f"#!{sys.executable}\n" + _FAKE_FJ, encoding="utf-8")
+            exe.chmod(0o755)
+        monkeypatch.setenv("FAKE_FJ_MODE", mode)
+        monkeypatch.setenv("FAKE_FJ_LOG", str(log))
+    monkeypatch.setenv("PATH", str(bindir))
+    return log
+
+
+def _fj_calls(log):
+    return [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+
+
+@pytest.mark.parametrize("mode", [None, "fail", "noop"])
+def test_expired_oauth_token_that_fj_cannot_refresh_fails_closed(tmp_path, monkeypatch, mode):
+    log = _oauth_keys(tmp_path, monkeypatch, _PAST, mode)
+    with pytest.raises(fp.ProviderError, match="expired") as exc:
+        fp.resolve_credential(fp.parse_origin("https://git.example.org/o/r.git"))
+    assert PLACEHOLDER not in str(exc.value)
+    assert _fj_calls(log) == ([] if mode is None else [["-H", "git.example.org", "whoami"]])
+
+
+def test_expired_oauth_token_is_refreshed_through_fj_for_the_origin_host_only(tmp_path, monkeypatch):
+    log = _oauth_keys(tmp_path, monkeypatch, _PAST, "refresh")
+    cred = fp.resolve_credential(fp.parse_origin("https://git.example.org/o/r.git"))
+    assert cred.header == "Bearer YOUR_FRESH_TOKEN_HERE"
+    assert _fj_calls(log) == [["-H", "git.example.org", "whoami"]]
+
+
+def test_legacy_numeric_expiry_is_still_honoured(tmp_path, monkeypatch):
+    _oauth_keys(tmp_path, monkeypatch, 1)  # unix epoch + 1s: long expired, no fj on PATH
     with pytest.raises(fp.ProviderError, match="expired"):
         fp.resolve_credential(fp.parse_origin("https://git.example.org/o/r.git"))
+
+
+def test_live_oauth_token_is_used_without_running_fj(tmp_path, monkeypatch):
+    log = _oauth_keys(tmp_path, monkeypatch, _FUTURE, "refresh")
+    cred = fp.resolve_credential(fp.parse_origin("https://git.example.org/o/r.git"))
+    assert cred.header == f"Bearer {PLACEHOLDER}"
+    assert _fj_calls(log) == []
+
+
+def test_unrecognised_oauth_expiry_fails_closed(tmp_path, monkeypatch):
+    _oauth_keys(tmp_path, monkeypatch, {"when": "soon"}, "refresh")
+    with pytest.raises(fp.ProviderError, match="unsupported format"):
+        fp.resolve_credential(fp.parse_origin("https://git.example.org/o/r.git"))
+
+
+def test_fj_expires_at_tuple_is_utc_with_offset(tmp_path):
+    from datetime import datetime, timezone
+
+    assert fp._fj_expires_at([2026, 268, 23, 5, 1, 0, 3, 0, 0]) == datetime(2026, 9, 25, 20, 5, 1, tzinfo=timezone.utc)
+    assert fp._fj_expires_at("2026-09-25T20:05:01Z") == datetime(2026, 9, 25, 20, 5, 1, tzinfo=timezone.utc)
+    assert fp._fj_expires_at([1, 2]) is None
+
+
+@pytest.mark.parametrize("platform,parts", [
+    ("win32", ("appdata", "forgejo-cli", "forgejo-cli", "data", "keys.json")),
+    ("darwin", ("Library", "Application Support", "forgejo-cli.forgejo-cli", "keys.json")),
+    ("linux", ("xdg-data", "forgejo-cli", "keys.json")),
+])
+def test_fj_key_store_location_per_platform(tmp_path, monkeypatch, platform, parts):
+    monkeypatch.delenv("SHIP_FORGEJO_KEYS_FILE", raising=False)
+    monkeypatch.setattr(fp.sys, "platform", platform)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    assert fp._fj_keys_path().parts[-len(parts):] == parts
 
 
 def test_redirect_is_refused_and_credential_never_leaves_the_origin():
@@ -907,7 +1006,10 @@ def _threads(fake, tmp_path):
     return sorted(n["isResolved"] for n in payload["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"])
 
 
-def test_older_resolved_conversation_does_not_hide_a_newer_one_on_the_same_line(api_fake, tmp_path):
+def test_a_conversation_spans_reviews_and_commits_on_one_line_like_the_forgejo_ui(api_fake, tmp_path):
+    """Forgejo shows every comment on a path + line as ONE conversation and "Resolve conversation"
+    marks only its first comment. Keying by review/commit split it into groups nobody can resolve
+    (a reply posted in a new review; two reviews on one line, rig-cli#482)."""
     _seed(api_fake)
     api_fake.state["reviews"] = [{"id": 5, "state": "COMMENT", "user": {"login": "r"}, "comments_count": 1},
                                  {"id": 6, "state": "COMMENT", "user": {"login": "r"}, "comments_count": 1}]
@@ -916,7 +1018,9 @@ def test_older_resolved_conversation_does_not_hide_a_newer_one_on_the_same_line(
                                              "original_commit_id": "1" * 40, "resolver": {"login": "x"}}]
     api_fake.state["review_comments"][6] = [{"id": 20, **same_line, "pull_request_review_id": 6,
                                              "original_commit_id": "2" * 40, "resolver": None}]
-    assert _threads(api_fake, tmp_path) == [False, True]
+    assert _threads(api_fake, tmp_path) == [True]
+    api_fake.state["review_comments"][5][0]["resolver"] = None
+    assert _threads(api_fake, tmp_path) == [False]
 
 
 def test_lineless_comments_are_never_merged_into_one_conversation(api_fake, tmp_path):
@@ -1116,6 +1220,25 @@ def test_task_config_missing_file_refuses_before_any_gate(forge):
     assert not [q for q in forge["fake"].requests if q["path"].startswith("/api/")]  # refused before any API call
 
 
+@pytest.mark.parametrize("path", ["C:/nowhere/task.yaml", "C:\\nowhere\\task.yaml", "\\\\srv\\share\\task.yaml"])
+def test_task_config_windows_absolute_path_is_not_rebased_on_cwd(forge, path):
+    r, calls = _ship_with_task_config(forge, path, _UB25_POST_MERGE, 0)
+    assert r.returncode != 0 and f"--task-config '{path}' is not a readable file" in r.stderr, r.stdout + r.stderr
+    assert calls == [] and forge["fake"].merges() == []
+    assert not [q for q in forge["fake"].requests if q["path"].startswith("/api/")]  # refused before any API call
+
+
+def test_task_config_relative_path_resolves_against_the_callers_cwd(forge):
+    """ship cds into the repo root before `task gate`; a relative --task-config still names the
+    file beside the caller (ship's own cwd here is the main checkout)."""
+    cfg = _task_config(forge)
+    (forge["main"] / "routing.yaml").write_text(cfg.read_text())
+    r, calls = _ship_with_task_config(forge, "routing.yaml", _UB25_POST_MERGE, 0)
+    assert r.returncode == 0, r.stdout + r.stderr
+    gate = [c for c in calls if "|gate UB-25" in c]
+    assert gate and all(f"--config {forge['main'] / 'routing.yaml'}" in c for c in gate)
+
+
 def test_task_config_invalid_file_refuses_before_any_gate(forge):
     r, calls = _ship_with_task_config(forge, _task_config(forge, body="backend: [\n"), _UB25_POST_MERGE, 0)
     assert r.returncode != 0 and "routing-only" in r.stderr, r.stdout + r.stderr
@@ -1207,3 +1330,21 @@ def test_call_still_in_flight_at_the_final_preflight_refuses(forge):
     assert r.returncode != 0, r.stdout + r.stderr
     assert "did not complete" in r.stderr, r.stdout + r.stderr
     assert forge["fake"].merges() == []
+
+
+def test_fj_refresh_never_runs_an_fj_from_the_working_directory(tmp_path, monkeypatch):
+    """ship runs inside the checkout being shipped: a PR's own fj (fj.bat on Windows, where
+    shutil.which searches the working directory first) must never be the one refreshed with."""
+    names = ["fj.bat", "fj.cmd", "fj.exe"] if sys.platform == "win32" else ["fj"]
+    repo = tmp_path / "pr-checkout"
+    repo.mkdir()
+    for name in names:
+        (repo / name).write_text("#!/bin/sh\necho pwned\n")
+        (repo / name).chmod(0o755)
+    monkeypatch.chdir(repo)
+    assert fp.find_fj(os.pathsep.join(["", ".", "relative/bin"])) is None
+    real = tmp_path / "bin"
+    real.mkdir()
+    (real / names[-1]).write_text("#!/bin/sh\n")
+    (real / names[-1]).chmod(0o755)
+    assert fp.find_fj(os.pathsep.join([".", str(real)])) == str(real / names[-1])

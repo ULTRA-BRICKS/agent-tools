@@ -273,6 +273,12 @@ def _shq(s: str) -> str:
 
 def _run_gate(bin_dir: Path, *args: str, env_extra: dict[str, str] | None = None):
     env = dict(os.environ)
+    # The provider is auto-picked from the ambient CI server: on a Forgejo/Gitea runner
+    # GITHUB_SERVER_URL is the Forgejo host, which would route these gh-stub tests to the
+    # Forgejo API. Drop the ambient CI context so each test chooses its provider explicitly.
+    for var in ("GITHUB_SERVER_URL", "GITHUB_API_URL", "GITHUB_REPOSITORY", "GH_REPO",
+                "REVIEW_THREADS_PROVIDER", "GH_TOKEN", "GITHUB_TOKEN"):
+        env.pop(var, None)
     env["PATH"] = f"{bin_dir}{os.pathsep}" + env["PATH"]
     if env_extra:
         env.update(env_extra)
@@ -364,3 +370,212 @@ def test_script_jq_ignore_outdated_skips_outdated(tmp_path: Path):
     res2 = _run_gate(tmp_path / "bin", "123", env_extra={"IGNORE_OUTDATED": "1"})
     assert res2.returncode == 0, res2.stdout + res2.stderr
     assert "PASS" in res2.stdout
+
+
+# ---------------------------------------------------------------------------
+# Forgejo provider: on a Forgejo/Gitea Actions runner there is no gh and no GraphQL, so the
+# script reads the Forgejo REST API with stdlib python3 and applies the SAME conversation rule
+# as ci/ship's Forgejo provider (keyed by path + line across reviews and commits, as Forgejo's UI; a
+# conversation is resolved only when its FIRST comment has `resolver`). Driven against a local
+# fake API so the real script control flow and HTTP paths run.
+# ---------------------------------------------------------------------------
+
+
+class _FakeForgejo:
+    """A tiny threaded Forgejo API serving /repos/o/r/pulls/7/reviews[/<id>/comments]."""
+
+    def __init__(self, reviews: list[dict], *, status: int = 0, page_cap: int = 50,
+                 total_header: bool = True, token: str | None = None, redirect: bool = False):
+        import http.server
+        import json
+        import threading
+        from urllib.parse import parse_qs, urlparse
+
+        self.requests: list[str] = []
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_a):  # keep pytest output clean
+                pass
+
+            def _send(self, code: int, body: object = None, headers: dict | None = None):
+                self.send_response(code)
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                if body is not None:
+                    self.wfile.write(json.dumps(body).encode())
+
+            def do_GET(self):  # noqa: N802 - http.server API
+                fake.requests.append(self.path)
+                url = urlparse(self.path)
+                if redirect:
+                    return self._send(302, headers={"Location": "http://example.invalid/"})
+                if status:
+                    return self._send(status, {"message": "boom"})
+                if token is not None and self.headers.get("Authorization") != f"token {token}":
+                    return self._send(401, {"message": "unauthorized"})
+                prefix = "/api/v1/repos/o/r/pulls/7/reviews"
+                if url.path == prefix:
+                    q = parse_qs(url.query)
+                    page = int(q.get("page", ["1"])[0])
+                    limit = min(int(q.get("limit", ["50"])[0]), page_cap)
+                    chunk = reviews[(page - 1) * limit: page * limit]
+                    headers = {"X-Total-Count": str(len(reviews))} if total_header else {}
+                    return self._send(200, [{"id": r["id"], "state": "COMMENT"} for r in chunk], headers)
+                if url.path.startswith(prefix + "/") and url.path.endswith("/comments"):
+                    rid = int(url.path.split("/")[-2])
+                    review = next(r for r in reviews if r["id"] == rid)
+                    return self._send(200, [dict(c, pull_request_review_id=rid) for c in review["comments"]])
+                return self._send(404, {"message": "not found"})
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def forgejo():
+    servers: list[_FakeForgejo] = []
+
+    def start(reviews: list[dict], **kw) -> _FakeForgejo:
+        srv = _FakeForgejo(reviews, **kw)
+        servers.append(srv)
+        return srv
+
+    yield start
+    for srv in servers:
+        srv.close()
+
+
+def _forgejo_env(srv: _FakeForgejo, **extra: str) -> dict[str, str]:
+    env = {
+        "GITHUB_SERVER_URL": srv.url,
+        "GITHUB_API_URL": f"{srv.url}/api/v1",
+        "GITHUB_REPOSITORY": "o/r",
+        "GH_TOKEN": "job-token",
+    }
+    env.update(extra)
+    return env
+
+
+def _c(cid: int, *, path: str = "a.py", pos: int = 3, commit: str = "c1", resolved: bool = False) -> dict:
+    return {"id": cid, "path": path, "position": pos, "original_position": 0,
+            "commit_id": commit, "original_commit_id": commit,
+            "resolver": {"login": "rev"} if resolved else None}
+
+
+needs_python3 = pytest.mark.skipif(shutil.which("python3") is None, reason="python3 not on PATH")
+
+
+@needs_python3
+def test_forgejo_is_auto_selected_off_github_and_needs_no_gh(tmp_path: Path, forgejo):
+    """A Forgejo job (GITHUB_SERVER_URL not github.com) must not need the gh CLI at all."""
+    srv = forgejo([])
+    res = _run_gate(tmp_path / "empty-bin", "7", env_extra=_forgejo_env(srv))
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "PASS" in res.stdout
+    assert "gh CLI not found" not in res.stderr
+    assert any(p.startswith("/api/v1/repos/o/r/pulls/7/reviews") for p in srv.requests)
+
+
+@needs_python3
+def test_forgejo_counts_unresolved_conversations(tmp_path: Path, forgejo):
+    srv = forgejo([
+        {"id": 1, "comments": [_c(10, resolved=True), _c(11, path="b.py")]},
+        {"id": 2, "comments": [_c(20, path="c.py", pos=9)]},
+    ])
+    res = _run_gate(tmp_path / "bin", "7", env_extra=_forgejo_env(srv))
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "2 unresolved" in res.stderr
+
+
+@needs_python3
+def test_forgejo_conversation_is_resolved_through_its_first_comment(tmp_path: Path, forgejo):
+    """A reply after the resolving first comment does not re-open the conversation."""
+    srv = forgejo([{"id": 1, "comments": [_c(10, resolved=True), _c(11)]}])
+    res = _run_gate(tmp_path / "bin", "7", env_extra=_forgejo_env(srv))
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+@needs_python3
+def test_forgejo_groups_a_conversation_by_path_and_line_like_its_ui(tmp_path: Path, forgejo):
+    """Forgejo shows every comment on a path + line as ONE conversation, whatever review or
+    commit it came with, and "Resolve conversation" marks only its first comment. A reply posted
+    inside a new review, or a later comment on the same line, joins that conversation — keying
+    by review/commit left such groups unresolvable forever (two reviews on one line: rig-cli#482)."""
+    srv = forgejo([
+        {"id": 1, "comments": [_c(10, commit="old", resolved=True)]},
+        {"id": 2, "comments": [_c(20, commit="new")]},  # a reply in another review, after a push
+    ])
+    res = _run_gate(tmp_path / "bin", "7", env_extra=_forgejo_env(srv))
+    assert res.returncode == 0, res.stdout + res.stderr
+
+    srv = forgejo([
+        {"id": 1, "comments": [_c(10)]},
+        {"id": 2, "comments": [_c(20)]},  # the rig-cli#482 shape: one line, two reviews
+    ])
+    res = _run_gate(tmp_path / "bin", "7", env_extra=_forgejo_env(srv))
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "1 unresolved" in res.stderr
+
+
+@needs_python3
+def test_forgejo_lineless_comment_is_its_own_conversation(tmp_path: Path, forgejo):
+    srv = forgejo([{"id": 1, "comments": [_c(10, pos=0, resolved=True), _c(11, pos=0)]}])
+    res = _run_gate(tmp_path / "bin", "7", env_extra=_forgejo_env(srv))
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "1 unresolved" in res.stderr
+
+
+@needs_python3
+def test_forgejo_reads_every_page_even_below_the_requested_limit(tmp_path: Path, forgejo):
+    """A server whose page cap is below the requested limit (and sends no X-Total-Count) must
+    not truncate the read: the unresolved thread sits on the LAST page."""
+    reviews = [{"id": i, "comments": []} for i in range(1, 7)]
+    reviews[-1]["comments"] = [_c(60)]
+    srv = forgejo(reviews, page_cap=5, total_header=False)
+    res = _run_gate(tmp_path / "bin", "7", env_extra=_forgejo_env(srv))
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "1 unresolved" in res.stderr
+
+
+@needs_python3
+def test_forgejo_sends_the_job_token(tmp_path: Path, forgejo):
+    srv = forgejo([], token="job-token")
+    ok = _run_gate(tmp_path / "bin", "7", env_extra=_forgejo_env(srv))
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    bad = _run_gate(tmp_path / "bin", "7", env_extra=_forgejo_env(srv, GH_TOKEN="wrong"))
+    assert bad.returncode == 1
+    assert "failing closed" in bad.stderr
+
+
+@needs_python3
+@pytest.mark.parametrize("kw", [{"status": 500}, {"redirect": True}])
+def test_forgejo_api_error_or_redirect_fails_closed(tmp_path: Path, forgejo, kw):
+    srv = forgejo([], **kw)
+    res = _run_gate(tmp_path / "bin", "7", env_extra=_forgejo_env(srv))
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "failing closed" in res.stderr
+
+
+def test_github_server_keeps_the_gh_path(tmp_path: Path):
+    """On github.com (or with no CI context at all) the GraphQL/gh path is unchanged."""
+    _stub_gh(tmp_path / "bin", stdout="0")
+    res = _run_gate(tmp_path / "bin", "7", env_extra={"GITHUB_SERVER_URL": "https://github.com"})
+    assert res.returncode == 0, res.stderr
+    assert "PASS" in res.stdout
+
+
+def test_provider_override_forces_github(tmp_path: Path):
+    """GitHub Enterprise Server: its GITHUB_SERVER_URL is not github.com, so the override pins gh."""
+    _stub_gh(tmp_path / "bin", stdout="1")
+    res = _run_gate(tmp_path / "bin", "7", env_extra={
+        "GITHUB_SERVER_URL": "https://ghe.example.com", "REVIEW_THREADS_PROVIDER": "github"})
+    assert res.returncode == 1
+    assert "1 unresolved" in res.stderr

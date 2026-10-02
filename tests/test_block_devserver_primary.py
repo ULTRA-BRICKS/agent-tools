@@ -630,6 +630,7 @@ def test_hatch_question_shows_full_command_not_just_label(tmp_path, monkeypatch)
         "RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY": "One-off verification, worktree busy.",
     })
     assert code == 0 and _decision(out) == "allow"
+    # the ButtonRequest JSON on stdin; its question is Telegram HTML (&, <, > escaped)
     raw_question = json.loads(capture.read_text())["question"]
     # The human-facing question must carry the FULL original command string, not just the
     # short classifier label for the segment that triggered the block.

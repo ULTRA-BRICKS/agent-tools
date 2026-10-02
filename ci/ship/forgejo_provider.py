@@ -25,13 +25,15 @@ Invariants (fail closed, never silently skip):
   * Credentials are bound to the origin host: fj's key store entry for exactly that host,
     or SHIP_FORGEJO_TOKEN only when SHIP_FORGEJO_TOKEN_HOST names the same host. GH_TOKEN /
     GITHUB_TOKEN are never read. Redirects are refused (no Authorization leaks to another
-    host). Plain http is allowed only for a loopback origin (tests).
+    host). Plain http is allowed only for a loopback origin (tests). An expired fj OAuth
+    token is refreshed by running `fj -H <that host> whoami` once; still expired -> refuse.
   * Tokens are never printed.
 
 Stdlib only; Python 3.9+.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -42,6 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 GITHUB_HOSTS = {"github.com", "www.github.com", "ssh.github.com"}
@@ -138,18 +141,88 @@ class Credential:
 
 
 def _fj_keys_path() -> Path:
+    """fj's key store: ``directories::ProjectDirs("", "forgejo-cli", "forgejo-cli").data_dir()``
+    + ``keys.json`` — ``%APPDATA%\\forgejo-cli\\forgejo-cli\\data`` on Windows, ``~/Library/
+    Application Support/forgejo-cli.forgejo-cli`` on macOS, ``$XDG_DATA_HOME/forgejo-cli``
+    elsewhere. ``SHIP_FORGEJO_KEYS_FILE`` overrides it (tests)."""
     override = os.environ.get("SHIP_FORGEJO_KEYS_FILE")
     if override:
         return Path(override)
     home = Path.home()
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else home / "AppData" / "Roaming"
+        return base / "forgejo-cli" / "forgejo-cli" / "data" / "keys.json"
     if sys.platform == "darwin":
         return home / "Library" / "Application Support" / "forgejo-cli.forgejo-cli" / "keys.json"
     data = os.environ.get("XDG_DATA_HOME") or str(home / ".local" / "share")
     return Path(data) / "forgejo-cli" / "keys.json"
 
 
-def _credential_from_fj(origin: Origin) -> Credential | None:
-    path = _fj_keys_path()
+def _fj_expires_at(value: object) -> datetime | None:
+    """fj's OAuth ``expires_at`` is a Rust ``time::OffsetDateTime`` in the time crate's default
+    serde form, a 9-tuple ``[year, ordinal_day, hour, minute, second, nanosecond, offset_h,
+    offset_m, offset_s]``; an RFC 3339 string or a unix timestamp are accepted too. None when
+    unrecognised (the caller fails closed)."""
+    try:
+        if isinstance(value, list) and len(value) == 9 and all(type(v) is int for v in value):
+            year, ordinal, hour, minute, second, nanos, off_h, off_m, off_s = value
+            local = datetime(year, 1, 1) + timedelta(
+                days=ordinal - 1, hours=hour, minutes=minute, seconds=second, microseconds=nanos // 1000)
+            return (local - timedelta(hours=off_h, minutes=off_m, seconds=off_s)).replace(tzinfo=timezone.utc)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        if isinstance(value, str) and value.strip():
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return None
+
+
+def _fj_oauth_expired(host_key: str, entry: dict) -> bool:
+    expires = _fj_expires_at(entry.get("expires_at"))
+    if expires is None:
+        raise ProviderError(f"fj OAuth entry for {host_key} has an unrecognised expires_at — unsupported format")
+    return datetime.now(timezone.utc) >= expires
+
+
+def find_fj(path_value: str) -> str | None:
+    """The first ``fj`` in the ABSOLUTE directories of ``path_value`` — never the working directory.
+
+    ``shutil.which`` on Windows searches the current directory first, and ship runs inside the
+    checkout being shipped: a PR's own ``fj.bat`` must never run with the merger's credentials.
+    Windows looks for the PATHEXT names (rig's ``fj.cmd`` wrapper, ``fj.exe``); POSIX for ``fj``.
+    """
+    if sys.platform == "win32":
+        names = ["fj" + ext for ext in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if ext]
+    else:
+        names = ["fj"]
+    for directory in path_value.split(os.pathsep):
+        if not directory or not os.path.isabs(directory):  # "" and "." mean the working directory
+            continue
+        for name in names:
+            candidate = os.path.join(directory, name)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
+def _fj_refresh(host_key: str) -> None:
+    """``fj -H <host> whoami`` once: fj refreshes an expired OAuth token itself and rewrites its
+    key store. Output (it names the account) is discarded; the caller re-reads the store either
+    way (a concurrent ship call may have refreshed it) and fails closed if it is still stale."""
+    fj = find_fj(os.environ.get("PATH", ""))
+    if not fj:
+        return
+    try:
+        subprocess.run([fj, "-H", host_key, "whoami"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _fj_entry(path: Path, origin: Origin) -> dict | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -164,11 +237,23 @@ def _credential_from_fj(origin: Origin) -> Credential | None:
         return None
     if not isinstance(entry, dict) or not isinstance(entry.get("token"), str) or not entry["token"]:
         raise ProviderError(f"fj key store entry for {origin.host_key} has no token — unsupported format")
-    kind = entry.get("type")
-    if kind == "OAuth":
-        expires = entry.get("expires_at")
-        if isinstance(expires, (int, float)) and expires <= time.time():
-            raise ProviderError(f"fj OAuth token for {origin.host_key} expired — run `fj -H {origin.host_key} whoami` (refreshes it) or `fj auth login`")
+    return entry
+
+
+def _credential_from_fj(origin: Origin) -> Credential | None:
+    path = _fj_keys_path()
+    entry = _fj_entry(path, origin)
+    if entry is None:
+        return None
+    # `fj auth login` (OAuth) tokens expire after ~1 h and fj refreshes them only when fj runs.
+    if entry.get("type") == "OAuth" and _fj_oauth_expired(origin.host_key, entry):
+        _fj_refresh(origin.host_key)
+        entry = _fj_entry(path, origin)
+        if entry is None or (entry.get("type") == "OAuth" and _fj_oauth_expired(origin.host_key, entry)):
+            raise ProviderError(
+                f"fj OAuth token for {origin.host_key} expired and `fj -H {origin.host_key} whoami` did not "
+                f"refresh it — run `fj -H {origin.host_key} auth login`")
+    if entry.get("type") == "OAuth":
         return Credential(f"Bearer {entry['token']}", "fj key store (OAuth)")
     return Credential(f"token {entry['token']}", "fj key store")
 
@@ -436,7 +521,6 @@ def _pr_status_rollup(pr: PullRequest) -> list:
 
 
 def _glob_match(pattern: str, value: str) -> bool:
-    import fnmatch
     return fnmatch.fnmatchcase(value, pattern)
 
 
@@ -520,19 +604,19 @@ def pr_json(pr: PullRequest, fields: list[str]) -> dict:
 
 
 def _conversation_key(c: dict) -> tuple:
-    """Identity of one Forgejo code conversation.
+    """Identity of one Forgejo code conversation — the one Forgejo's UI shows.
 
-    Forgejo attaches a reply to the review it answers (PullReviewComment.pull_request_review_id)
-    and resolves a conversation through its first comment (`resolver`). Keying on the review,
-    the commit the comment was made against, the path and the signed line keeps an older
-    resolved conversation from hiding a newer unresolved one on the same line after a push. A
-    comment with no line at all (file-level or unmappable) is its own conversation.
+    Forgejo groups a pull request's code comments by path and signed line across ALL reviews
+    and commits, and "Resolve conversation" marks only the first comment (`resolver`). Keying
+    by review or commit as well split one UI conversation into groups whose first comment the
+    button never marks — a reply posted inside a new review, or two reviews on one line
+    (rig-cli#482), stayed unresolved with no way to resolve them. A comment with no line at all
+    (file-level or unmappable) is its own conversation.
     """
     line = (c.get("position") or 0, c.get("original_position") or 0)
     if line == (0, 0):
         return ("single", c.get("id"))
-    return (c.get("pull_request_review_id"), c.get("original_commit_id") or c.get("commit_id") or "",
-            c.get("path") or "", line)
+    return (c.get("path") or "", line)
 
 
 def _review_threads(pr: PullRequest) -> list:
@@ -816,7 +900,7 @@ def run_view_jobs(ctx: "Context", run_id: int) -> list[dict]:
 
 def gh_run(ctx: "Context", action: str, rest: list[str]) -> str:
     if action == "list":
-        pos, o = _take_opts(rest, {"--branch", "--workflow", "--status", "--limit", "--json", "-q", "--jq"}, set())
+        pos, o, _fields = _take_opts(rest, {"--branch", "--workflow", "--status", "--limit", "--json", "-q", "--jq"}, set())
         fields = [f for f in (o.get("--json") or "").split(",") if f]
         limit = o.get("--limit", "20")
         if (pos or not o.get("--branch") or o.get("--status") != "completed" or not fields
@@ -826,7 +910,7 @@ def gh_run(ctx: "Context", action: str, rest: list[str]) -> str:
         rows = run_list(ctx, o["--branch"], o.get("--workflow"), int(limit))
         return _emit([{f: r[f] for f in fields} for r in rows], o.get("-q") or o.get("--jq"))
     if action == "view":
-        pos, o = _take_opts(rest, {"--json", "-q", "--jq"}, set())
+        pos, o, _fields = _take_opts(rest, {"--json", "-q", "--jq"}, set())
         if len(pos) != 1 or not pos[0].isdigit() or o.get("--json") != "jobs":
             raise ProviderError("this `gh run view` shape is unsupported on the Forgejo provider (only `<id> --json jobs`)")
         return _emit({"jobs": run_view_jobs(ctx, int(pos[0]))}, o.get("-q") or o.get("--jq"))
@@ -839,10 +923,12 @@ def _unsupported(argv: list[str]) -> ProviderError:
                          "Forgejo evidence source, so ship refuses rather than guessing")
 
 
-def _take_opts(args: list[str], with_value: set[str], flags: set[str]) -> tuple[list[str], dict]:
-    """Split gh-style args into positionals and options (`--k v`, `--k=v`, `-f k=v` repeated)."""
+def _take_opts(args: list[str], with_value: set[str], flags: set[str]) -> tuple[list[str], dict, list[str]]:
+    """Split gh-style args into positionals, options keyed by their flag (`--k v`, `--k=v`), and
+    the repeated `-f`/`-F` field values (`k=v`, in order) — kept apart from the flag options."""
     pos: list[str] = []
-    opts: dict = {"fields": []}
+    opts: dict = {}
+    fields: list[str] = []
     i = 0
     while i < len(args):
         a = args[i]
@@ -858,7 +944,7 @@ def _take_opts(args: list[str], with_value: set[str], flags: set[str]) -> tuple[
                     raise ProviderError(f"`{name}` needs a value")
                 value = args[i]
             if name in ("-f", "-F", "--raw-field", "--field"):
-                opts["fields"].append(value)
+                fields.append(value)
             else:
                 opts[name] = value
         elif a.startswith("-"):
@@ -866,7 +952,7 @@ def _take_opts(args: list[str], with_value: set[str], flags: set[str]) -> tuple[
         else:
             pos.append(a)
         i += 1
-    return pos, opts
+    return pos, opts, fields
 
 
 def _emit(value: object, jq_expr: str | None) -> str:
@@ -906,30 +992,30 @@ class Context:
 
 def gh_pr(ctx: Context, action: str, rest: list[str]) -> str:
     if action == "view":
-        pos, o = _take_opts(rest, {"--json", "-q", "--jq"}, set())
+        pos, o, _fields = _take_opts(rest, {"--json", "-q", "--jq"}, set())
         if "--json" not in o:
             raise ProviderError("`gh pr view` without --json is unsupported on the Forgejo provider")
         data = pr_json(ctx.pr(_pr_number(pos)), [f for f in o["--json"].split(",") if f])
         return _emit(data, o.get("-q") or o.get("--jq"))
     if action == "diff":
-        pos, o = _take_opts(rest, set(), {"--name-only"})
+        pos, o, _fields = _take_opts(rest, set(), {"--name-only"})
         return diff_pr(ctx.pr(_pr_number(pos)), bool(o.get("--name-only")))
     if action == "merge":
-        pos, o = _take_opts(rest, set(), {"--squash", "--merge", "--rebase", "--admin"})
+        pos, o, _fields = _take_opts(rest, set(), {"--squash", "--merge", "--rebase", "--admin"})
         methods = [m for m in _MERGE_DO if o.get(m)]
         if len(methods) != 1:
             raise ProviderError("`gh pr merge` needs exactly one of --squash/--merge/--rebase")
         sha = merge_pr(ctx.pr(_pr_number(pos)), methods[0], bool(o.get("--admin")))
         return f"[forgejo] merged PR #{pos[0]} (merge commit {sha[:12]})\n"
     if action == "comment":
-        pos, o = _take_opts(rest, {"--body", "-b"}, set())
+        pos, o, _fields = _take_opts(rest, {"--body", "-b"}, set())
         body = o.get("--body", o.get("-b"))
         if body is None:
             raise ProviderError("`gh pr comment` needs --body")
         comment_pr(ctx.pr(_pr_number(pos)), body)
         return ""
     if action == "edit":
-        pos, o = _take_opts(rest, {"--title", "-t", "--body", "-b"}, set())
+        pos, o, _fields = _take_opts(rest, {"--title", "-t", "--body", "-b"}, set())
         edit_pr(ctx.pr(_pr_number(pos)), o.get("--title", o.get("-t")), o.get("--body", o.get("-b")))
         return ""
     raise _unsupported(["pr", action])
@@ -938,8 +1024,8 @@ def gh_pr(ctx: Context, action: str, rest: list[str]) -> str:
 def gh_api(ctx: Context, rest: list[str]) -> str:
     if not rest or rest[0] != "graphql":
         raise _unsupported(["api", *(rest[:1] or [""])])
-    _, o = _take_opts(rest[1:], {"-f", "-F", "--raw-field", "--field", "--jq", "-q"}, {"--paginate"})
-    fields = dict(f.partition("=")[::2] for f in o["fields"])
+    _, o, raw_fields = _take_opts(rest[1:], {"-f", "-F", "--raw-field", "--field", "--jq", "-q"}, {"--paginate"})
+    fields = dict(f.partition("=")[::2] for f in raw_fields)
     query = fields.get("query")
     if not query:
         raise ProviderError("`gh api graphql` without a query is unsupported")
@@ -953,7 +1039,7 @@ def gh_api(ctx: Context, rest: list[str]) -> str:
 def gh_repo(ctx: Context, action: str, rest: list[str]) -> str:
     if action != "view":
         raise _unsupported(["repo", action])
-    pos, o = _take_opts(rest, {"--json", "-q", "--jq"}, set())
+    pos, o, _fields = _take_opts(rest, {"--json", "-q", "--jq"}, set())
     if pos and pos[0] and pos[0] != ctx.origin.slug:
         raise ProviderError(f"`gh repo view {pos[0]}` names a repo other than origin {ctx.origin.slug} — unsupported")
     known = {"nameWithOwner": ctx.origin.slug, "url": f"{ctx.origin.api_base}/{ctx.origin.slug}"}

@@ -77,9 +77,12 @@ miss the PR's deps — never reintroduce it (agent-tools#131).
 ```bash
 cp ci/dependency-review/workflow.yml .github/workflows/dependency-review.yml
 # `setup-bun` ships ENABLED (bot repos use bun.lock; without it a bun.lock repo fail-CLOSES
-# because dep-audit.sh can't find `bun`). Add the toolchain for your other ecosystems (see
-# the comments in workflow.yml); ubuntu-latest already ships node+npm so npm-only repos need
-# nothing extra — trim setup-bun if you have no bun.lock.
+# because dep-audit.sh can't find `bun`). Python is covered too: when the base tree has a
+# pyproject.toml / requirements*.txt / uv.lock / poetry.lock, the workflow sets up Python and a
+# pinned pip-audit in a job-local venv on PATH (no pipx, no root — works on Forgejo / GARM
+# runners too). Add the toolchain for your other ecosystems (see the comments in
+# workflow.yml); ubuntu-latest already ships node+npm so npm-only repos need nothing extra —
+# trim setup-bun if you have no bun.lock.
 
 # Run the same audit locally / in any other CI (optional dir arg, default '.'):
 sh ci/dependency-review/dep-audit.sh           # audit the current tree

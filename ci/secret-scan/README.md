@@ -5,8 +5,8 @@ reinvent it — it's the engine. This slot ships the CI-side pieces that pair wi
 local git-hook (`../../git-hooks/no-secrets-scan`) so the same guard runs in two places:
 
 - **Local** (committer's machine): a `pre-commit` git-hook scans the **staged** diff.
-- **CI** (backstop): scans on every push/PR, catching anyone whose local hook is missing,
-  disabled, or bypassed with `--no-verify`.
+- **CI** (backstop): scans every PR and every push to main, catching anyone whose local hook
+  is missing, disabled, or bypassed with `--no-verify`.
 
 ## What's here
 
