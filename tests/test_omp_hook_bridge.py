@@ -1771,6 +1771,14 @@ def _init_git_repo(repo: Path, rel: str = "src/change.py") -> None:
     subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "test"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath", "/dev/null"], check=True, capture_output=True)
+    baseline = repo / ".baseline"
+    baseline.write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", ".baseline"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "chore: bootstrap"],
+        check=True,
+        capture_output=True,
+    )
     target = repo / rel
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("print('change')\n", encoding="utf-8")

@@ -20,7 +20,7 @@ _SCRATCH_ROOT = _ROOT / ".test-repos"
 
 
 def _scratch_base(tmp_path: Path) -> Path:
-    base = _SCRATCH_ROOT / tmp_path.name
+    base = _SCRATCH_ROOT / hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16]
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -29,16 +29,30 @@ def _run(*args: str, cwd: Path, env: dict[str, str] | None = None) -> subprocess
     return subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, check=False)
 
 
-def _repo_with_staged_change(tmp_path: Path, relpath: str = "x.txt") -> Path:
+def _unborn_repo_with_staged_change(tmp_path: Path, relpath: str = "x.txt") -> Path:
     repo = _scratch_base(tmp_path) / "repo"
     repo.mkdir()
-    assert _run("git", "init", cwd=repo).returncode == 0
+    assert _run("git", "init", "-b", "main", cwd=repo).returncode == 0
     assert _run("git", "config", "user.email", "a@example.com", cwd=repo).returncode == 0
     assert _run("git", "config", "user.name", "A", cwd=repo).returncode == 0
     staged = repo / relpath
     staged.parent.mkdir(parents=True, exist_ok=True)
     staged.write_text("x\n", encoding="utf-8")
     assert _run("git", "add", relpath, cwd=repo).returncode == 0
+    return repo
+
+
+def _repo_with_staged_change(tmp_path: Path, relpath: str = "x.txt") -> Path:
+    repo = _unborn_repo_with_staged_change(tmp_path, ".baseline")
+    assert _run("git", "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "bootstrap", cwd=repo).returncode == 0
+    if relpath != ".baseline":
+        staged = repo / relpath
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text("x\n", encoding="utf-8")
+        assert _run("git", "add", relpath, cwd=repo).returncode == 0
+    else:
+        (repo / relpath).write_text("changed\n", encoding="utf-8")
+        assert _run("git", "add", relpath, cwd=repo).returncode == 0
     return repo
 
 
@@ -52,6 +66,35 @@ def _stage_file(repo: Path, relpath: str) -> None:
 def _staged_diff_hash(repo: Path) -> str:
     diff = _run("git", "diff", "--no-ext-diff", "--cached", cwd=repo).stdout
     return hashlib.sha256(diff.encode()).hexdigest()
+
+
+
+
+def test_review_gate_allows_first_commit_in_unborn_repo_without_stamp(tmp_path):
+    repo = _unborn_repo_with_staged_change(tmp_path, "src/bootstrap.py")
+    proc = _run(str(_REVIEW_GATE), cwd=repo)
+    assert proc.returncode == 0
+
+
+def test_review_gate_blocks_second_commit_without_stamp(tmp_path):
+    repo = _repo_with_staged_change(tmp_path, "src/second.py")
+    proc = _run(str(_REVIEW_GATE), cwd=repo)
+    assert proc.returncode == 1
+    assert "staged changes have not been reviewed" in proc.stderr
+
+
+
+
+def test_review_gate_orphan_branch_in_nonempty_repo_is_not_bootstrap(tmp_path):
+    repo = _repo_with_staged_change(tmp_path, "src/normal.py")
+    assert _run("git", "reset", "-q", cwd=repo).returncode == 0
+    assert _run("git", "switch", "--orphan", "orphan", cwd=repo).returncode == 0
+    assert _run("git", "rm", "-q", "-rf", "--ignore-unmatch", ".", cwd=repo).returncode == 0
+    (repo / "orphan.py").write_text("x\n", encoding="utf-8")
+    assert _run("git", "add", "orphan.py", cwd=repo).returncode == 0
+    proc = _run(str(_REVIEW_GATE), cwd=repo)
+    assert proc.returncode == 1
+    assert "staged changes have not been reviewed" in proc.stderr
 
 
 def test_review_skip_env_does_not_bypass_global_review_gate(tmp_path):

@@ -1,0 +1,19 @@
+#!/bin/sh
+# Composing global post-commit hook (core.hooksPath = ~/.config/git/hooks).
+# Runs a shadowed repo-local post-commit hook, then the global dispatcher exactly once.
+# Advisory event: failures are swallowed because the commit already exists.
+HOOK_DIR="$(dirname "$0")"
+git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || exit 0
+[ -n "$git_dir" ] || exit 0
+
+local_hook="$git_dir/hooks/post-commit"
+dispatch_marker="${TMPDIR:-/tmp}/global-hooks-dispatched.post-commit.$$"
+rm -f "$dispatch_marker"
+trap 'rm -f "$dispatch_marker"' EXIT INT TERM
+if [ -x "$local_hook" ] && [ "$local_hook" != "$0" ]; then
+  GLOBAL_HOOKS_DISPATCH_MARKER="$dispatch_marker" "$local_hook" "$@" < /dev/null || true
+fi
+if [ ! -e "$dispatch_marker" ] && [ -x "$HOOK_DIR/../run-global-hooks" ]; then
+  ( unset GLOBAL_HOOKS_DISPATCH_MARKER; "$HOOK_DIR/../run-global-hooks" post-commit "$@" < /dev/null ) || true
+fi
+exit 0

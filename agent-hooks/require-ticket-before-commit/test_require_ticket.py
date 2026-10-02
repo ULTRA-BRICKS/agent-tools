@@ -839,6 +839,14 @@ class EndToEnd(unittest.TestCase):
         # rescue it), so the block isn't silently defeated by any branch.
         with tempfile.TemporaryDirectory() as repo:
             subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+            subprocess.run(["git", "-C", repo, "config", "user.email", "t@t"], check=True)
+            subprocess.run(["git", "-C", repo, "config", "user.name", "t"], check=True)
+            (Path(repo) / ".baseline").write_text("seed\n", encoding="utf-8")
+            subprocess.run(["git", "-C", repo, "add", ".baseline"], check=True)
+            subprocess.run(
+                ["git", "-C", repo, "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "bootstrap"],
+                check=True,
+            )
             code, decision = run_hook(f"git -C {repo} commit -F -", strict=True, cwd=repo)
         self.assertEqual(code, mod.BLOCK_EXIT_CODE)
         self.assertEqual(decision, "block")

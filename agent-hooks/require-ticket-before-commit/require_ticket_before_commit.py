@@ -1474,6 +1474,51 @@ def effective_cwd(segment: CommitSegment, cwd: str | None) -> str | None:
     return target
 
 
+def _segment_uses_alt_repo(segment: CommitSegment) -> bool:
+    """Whether git globals/env redirect this commit away from its normal worktree."""
+    if any(key in segment.env for key in ("GIT_DIR", "GIT_WORK_TREE")):
+        return True
+    tokens = segment.git_argv
+    i = 1 if tokens and _is_git_executable(tokens[0]) else 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "commit":
+            break
+        if tok in ("--git-dir", "--work-tree"):
+            return True
+        if tok.startswith("--git-dir=") or tok.startswith("--work-tree="):
+            return True
+        i += 1
+    return False
+
+
+def _repo_has_no_refs(cwd: str | None) -> bool:
+    """True only for a valid, freshly initialized repo with no refs at all.
+
+    SYNC with require-review-before-commit._repo_has_no_refs. A missing HEAD alone is
+    insufficient: an orphan branch in a repo with history also has no HEAD. Normal repos
+    pay one bounded `for-each-ref` probe; only the genuinely ref-empty case pays the
+    second `symbolic-ref` check that distinguishes fresh bootstrap from corrupt/detached HEAD.
+    """
+    if not cwd:
+        return False
+    try:
+        refs = subprocess.run(
+            ["git", "-C", cwd, "for-each-ref", "--count=1", "--format=%(refname)", "refs"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        if refs.returncode != 0 or refs.stdout.strip():
+            return False
+        head = subprocess.run(
+            ["git", "-C", cwd, "symbolic-ref", "-q", "HEAD"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        return head.returncode == 0 and head.stdout.strip().startswith("refs/heads/")
+    except (OSError, subprocess.SubprocessError) as exc:
+        warn(f"could not classify bootstrap repo state: {exc}")
+        return False
+
+
 def _takes_following_message_value(tok: str) -> bool:
     """True when a commit flag token consumes the NEXT token as a VALUE — so a skip-flag-looking
     value (`-am '--amend'`, `--author '--amend'`) is NOT misread as a real flag by `is_skip_commit`.
@@ -1567,13 +1612,30 @@ def main() -> int:
     if not segments:
         return _allow()  # no real `git commit` segment → nothing to gate
 
+    # Mark, but do NOT probe, the only segment that may qualify for empty-repo bootstrap.
+    # The actual git probe is delayed until that commit is known to be non-exempt and
+    # ticketless, keeping the common ticketed/chore path subprocess-free beyond its existing
+    # branch lookup. A chain of two authoring commits gets no candidate at all.
+    authoring = [segment for segment in segments if not is_skip_commit(segment.argv)]
+    bootstrap_segment = (
+        authoring[0]
+        if len(authoring) == 1 and not _segment_uses_alt_repo(authoring[0])
+        else None
+    )
+
     # Assign each heredoc its OWN segment index (reusing the real segment parser — see
     # `_assign_heredoc_segment_indices`) so a `-F <path>` in a later segment can only be satisfied
     # by a heredoc whose segment (textually) precedes it, never one written by a LATER command in
     # the chain (agent-tools#570 review).
     _assign_heredoc_segment_indices(parse_command, heredocs)
     for segment in segments:
-        decision = _evaluate_commit_segment(segment, event_cwd, command, heredocs)
+        decision = _evaluate_commit_segment(
+            segment,
+            event_cwd,
+            command,
+            heredocs,
+            allow_empty_repo_bootstrap=segment is bootstrap_segment,
+        )
         if decision is not None:
             return decision  # a non-exempt, ticketless commit → block (or warn-allow)
     return _allow()  # every commit segment is exempt / ticketed
@@ -1623,6 +1685,8 @@ def _evaluate_commit_segment(
     event_cwd: str | None,
     command: str,
     heredocs: list[_Heredoc] | None = None,
+    *,
+    allow_empty_repo_bootstrap: bool = False,
 ) -> int | None:
     """Decide ONE parsed `git commit` segment. Returns an exit code when the gate fires (block, or a
     warn-only allow), or None when this segment is clean (exempt / ticketed) so the caller moves on
@@ -1649,6 +1713,11 @@ def _evaluate_commit_segment(
     branch = current_branch(cwd)
     if has_ticket_reference(message) or has_ticket_reference(branch):
         return None  # a ticket reference is present (in the message or the branch) → proceed
+
+    # The one deliberate taskless bootstrap: a single authoring commit into a valid repo
+    # with literally zero refs. This is checked only after cheaper message/branch exemptions.
+    if allow_empty_repo_bootstrap and _repo_has_no_refs(cwd):
+        return None
 
     return _gate_ticketless_commit(segment, cwd, command)
 

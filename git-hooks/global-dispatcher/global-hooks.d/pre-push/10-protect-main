@@ -1,11 +1,13 @@
 #!/bin/sh
 # global-hook-id: protect-main
 # global-hook-protected: true
-# protect-main — block DIRECT pushes to the default branches (main/master).
+# protect-main — block DIRECT pushes to main/master, except the first root commit to an empty remote.
 #
 # WHY: GitHub branch protection is a paid feature on private free-plan repos (the API
 # returns 403), so the server cannot reject a push to main. This client-side pre-push
-# gate is the enforcement: land changes via a PR (gh ship), never a direct push.
+# gate is the enforcement after bootstrap: land changes via a PR (gh ship), never a direct push.
+# An entirely empty remote has no branch from which a PR can be opened, so one root commit may
+# create main/master. Once ANY remote ref exists, normal PR-only enforcement applies.
 #
 # Refs arrive on stdin, one line per ref: "<local-ref> <local-sha> <remote-ref> <remote-sha>".
 # Non-main refs and branch DELETIONS (local sha = all zeros) pass untouched — this gate
@@ -23,13 +25,49 @@
 # Every use is APPENDED to ~/.cache/agent-tools/overrides.log — auditable, never silent.
 
 ZEROS=0000000000000000000000000000000000000000
+remote_target="${2:-$1}"
+remote_checked=0
+remote_empty=0
+
+is_root_commit() {
+  line="$(git rev-list --parents -n 1 "$1" 2>/dev/null)" || return 1
+  [ -n "$line" ] || return 1
+  case "$line" in
+    *" "*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+remote_is_empty() {
+  if [ "$remote_checked" -eq 0 ]; then
+    remote_checked=1
+    refs="$(git ls-remote "$remote_target" 2>/dev/null)" || return 1
+    [ -z "$refs" ] && remote_empty=1
+  fi
+  [ "$remote_empty" -eq 1 ]
+}
+
 blocked=""
 # `|| [ -n "$remote_ref" ]` — paranoia against fail-open: process a final line even if
 # it somehow lacks the trailing newline (git always sends one; belt and braces).
-while read -r _local_ref local_sha remote_ref _remote_sha || [ -n "$remote_ref" ]; do
+while read -r _local_ref local_sha remote_ref remote_sha || [ -n "$remote_ref" ]; do
   [ -n "$remote_ref" ] || continue
   case "$remote_ref" in refs/heads/main|refs/heads/master) ;; *) continue ;; esac
   case "$local_sha" in "$ZEROS"*) continue ;; esac  # deletion, not a code push
+
+  # Bootstrap exception: a PR cannot exist before an empty repository has its first branch.
+  # Allow exactly one root commit to create main/master, and only when the remote has NO refs.
+  # Any ambiguity (non-root history, another remote ref, or ls-remote failure) stays blocked.
+  case "$remote_sha" in
+    ""|*[!0]*) ;;
+    *)
+      if is_root_commit "$local_sha" && remote_is_empty; then
+        echo "protect-main: bootstrap — allowing first root commit to $remote_ref on an empty remote" >&2
+        continue
+      fi
+      ;;
+  esac
+
   blocked="$blocked $remote_ref"   # accumulate — a push may hit main AND master
 done
 blocked="${blocked# }"
