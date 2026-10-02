@@ -100,6 +100,23 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional
 
+_MEMORY_MODULE = "agenttools_memory_pressure"
+
+
+def _load_memory_pressure():
+    import importlib.util
+    init = Path(__file__).resolve().parents[2] / "lib" / _MEMORY_MODULE / "__init__.py"
+    spec = importlib.util.spec_from_file_location(_MEMORY_MODULE, init)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_MEMORY_MODULE}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_MEMORY_MODULE] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_mp = _load_memory_pressure()
+
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
@@ -346,7 +363,7 @@ def _block_at_level() -> int:
     return value
 
 
-def decide(label: Optional[str], level: Optional[int], block_at: int) -> tuple[str, Optional[str]]:
+def decide(label: Optional[str], level: Optional[int], block_at: int, *, snapshot=None, config=None) -> tuple[str, Optional[str]]:
     """Pure decision core — the seam every test in this suite exercises directly.
 
     Takes the already-computed `classify_heavy_operation` label (not the raw
@@ -355,6 +372,9 @@ def decide(label: Optional[str], level: Optional[int], block_at: int) -> tuple[s
     """
     if label is None:
         return "allow", None
+    if snapshot is not None and config is not None:
+        result = _mp.assess(snapshot, config, action_label=label)
+        return result.decision, result.message
     if level is None:
         return "allow", None  # no reliable pressure signal on this platform — fail open
     if level < block_at:
@@ -407,8 +427,20 @@ def main() -> int:
         emit("allow")
         return 0
 
-    level = read_pressure_level()
-    decision, message = decide(label, level, _block_at_level())
+    cwd = str(event.get("cwd") or os.getcwd())
+    config = _mp.load_config(cwd)
+    snapshot = _mp.read_snapshot(
+        macos_reader=_read_macos_pressure_level,
+        linux_reader=_read_linux_pressure_level,
+        platform_name=platform.system(),
+    )
+    decision, message = decide(
+        label,
+        snapshot.pressure_level,
+        config.block_at_level,
+        snapshot=snapshot,
+        config=config,
+    )
 
     if decision == "block":
         emit("block", message)

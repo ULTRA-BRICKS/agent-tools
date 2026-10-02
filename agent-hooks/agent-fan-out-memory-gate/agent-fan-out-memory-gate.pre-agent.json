@@ -1,0 +1,9 @@
+{
+  "id": "agent-fan-out-memory-gate",
+  "point": "pre-agent",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/agent-fan-out-memory-gate/agent_fan_out_memory_gate.py",
+  "priority": 35,
+  "timeout_ms": 5000,
+  "on_error": "open",
+  "description": "Blocks Agent/Task (and equivalent task-tool) subagent dispatch while the machine is under memory pressure — jetsam level >= agent_hooks.memory_gate.block_at_pressure_level (default 2), free RAM below min_free_mb (default 512), or swap use above max_swap_used_pct (default 85). Complements heavy-op-memory-gate (pre-bash heavy commands). Thresholds live in rig.yaml under agent_hooks.memory_gate or env RIG_MEMORY_* overrides. Stateless, no hatch bypass; fail-open when no reliable signal. Added for agent-tools#519."
+}

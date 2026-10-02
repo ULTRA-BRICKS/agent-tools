@@ -434,3 +434,11 @@ def test_main_non_string_args_does_not_crash(monkeypatch):
     code = hook.main()
     assert code == 0
     assert json.loads(out.getvalue())["decision"] == "allow"
+
+def test_decide_blocks_on_high_swap_when_jetsam_is_normal():
+    snap = hook._mp.MemorySnapshot(pressure_level=1, free_bytes=2 * 1024 ** 3, swap_used_bytes=900, swap_total_bytes=1000)
+    cfg = hook._mp.MemoryGateConfig(max_swap_used_pct=85.0)
+    decision, message = hook.decide("build/test suite", level=1, block_at=2, snapshot=snap, config=cfg)
+    assert decision == "block"
+    assert "swap" in message.lower()
+
