@@ -34,7 +34,7 @@ texts name the provisioned path.
 ## Usage
 
 ```bash
-~/.agents/skills/rig-detached-omp/rig-detached-omp <name> <brief-file> [workdir]
+~/.agents/skills/rig-detached-omp/rig-detached-omp <name> <brief-file> [workdir] [model]
 ```
 
 - `<name>` — agent id (letters, digits, `.`, `_`, `-`; becomes `RIG_AGENT_ID`).
@@ -43,16 +43,23 @@ texts name the provisioned path.
   reads its content BEFORE changing directories, so a relative brief with a different `[workdir]`
   still reaches the child in full.
 - `[workdir]` — where the child runs (default: the caller's cwd).
+- `[model]` — optional model/provider/account to pin this child to (forwarded verbatim as omp's
+  own `--model` flag, e.g. `opus`, `opencode-go/mimo-v2.5`, `anthropic/claude-opus-4-5`; omp
+  fuzzy-matches it). Omit it (or pass `""`) to keep the child on the orchestrator's config.yml
+  `default` role. Use this when a caller needs a SPECIFIC model/account for one dispatch —
+  config.yml routing does not hot-reload into already-dispatched sessions (agent-tools#687), so
+  editing the config after the fact never reaches a live or already-launched child.
 
 The launcher returns immediately (the child is `nohup`-detached); the child's stdout/stderr
 append to `/tmp/agent-logs/<name>.log`. Collect the result by polling the handoff file named in
 the brief — the launcher keeps no registry by design.
 
-The child runs as `omp -p --auto-approve --no-session --cwd <workdir> -- <brief>`:
+The child runs as `omp -p --auto-approve --no-session --cwd <workdir> [--model <model>] -- <brief>`:
 `-p`/`--print` for non-interactive process-and-exit, `--auto-approve` because a detached
-background process has no human present to approve tool calls, and `--no-session` since a
+background process has no human present to approve tool calls, `--no-session` since a
 one-shot detached dispatch doesn't need session persistence (the handoff file named in the
-brief is the actual result contract, not the omp session log).
+brief is the actual result contract, not the omp session log), and `--model` only when the
+optional `[model]` arg is given.
 
 ## Why the process env is the identity source
 

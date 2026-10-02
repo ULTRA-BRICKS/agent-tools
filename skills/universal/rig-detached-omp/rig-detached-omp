@@ -9,7 +9,7 @@
 # and the gate REMINDERs name exactly that path. `bin/` is NOT a rig-discovered
 # carrier: a launcher placed there would not exist on a provisioned machine.
 #
-# Usage: rig-detached-omp <name> <brief-file> [workdir]
+# Usage: rig-detached-omp <name> <brief-file> [workdir] [model]
 #
 # Launches a DETACHED `omp -p` (non-interactive, process-and-exit) session carrying
 # the subagent identity markers RIG_AGENT_ID=<name> and RIG_DETACHED_AGENT=1. The omp
@@ -40,24 +40,31 @@
 #     (default /tmp/agent-logs; dir 0700 + owner-checked, log 0600, symlink refused).
 #   - The launcher RETURNS immediately (child is nohup-detached): dispatching
 #     must not block the calling shell — that is the whole point of detaching.
-#   - The child runs `omp -p --auto-approve --no-session --cwd <workdir>`: -p/--print for
+#   - The child runs `omp -p --auto-approve --no-session --cwd <workdir>` (plus
+#     `--model <model>` when the optional 4th arg is given): -p/--print for
 #     non-interactive process-and-exit, --auto-approve because a detached background
-#     process has no human present to approve tool calls, and --no-session since the
-#     handoff file named in the brief is the real result contract, not the omp session log.
+#     process has no human present to approve tool calls, --no-session since the
+#     handoff file named in the brief is the real result contract (not the omp session
+#     log), and --model to pin the child to a specific logged-in model/provider/account
+#     (fuzzy-matched by omp itself, e.g. "opus", "opencode-go/mimo-v2.5") instead of
+#     always inheriting the orchestrator's config.yml default — config.yml routing does
+#     not hot-reload into already-dispatched sessions (agent-tools#687), so a caller that
+#     needs a specific model for this child MUST pass it here, not edit the config.
 #
 # Minimal by design: no manifest, no registry, no status tracking — the log
 # file and the handoff file named in the brief are the contract.
 
 set -euo pipefail
 
-if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-    echo "usage: $0 <name> <brief-file> [workdir]" >&2
+if [ "$#" -lt 2 ] || [ "$#" -gt 4 ]; then
+    echo "usage: $0 <name> <brief-file> [workdir] [model]" >&2
     exit 2
 fi
 
 name="$1"
 brief="$2"
 workdir="${3:-$PWD}"
+model="${4:-}"
 
 if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
     echo "rig-detached-omp: invalid agent name '$name' (letters, digits, '.', '_', '-' only)" >&2
@@ -125,7 +132,21 @@ export RIG_AGENT_ID="$name"
 export RIG_DETACHED_AGENT=1
 
 {
-    echo "--- $(date -u '+%Y-%m-%dT%H:%M:%SZ') launching detached agent '$name' in '$workdir'"
+    # Record the requested model in the launch header when given: the log is the ONLY
+    # persistent record of this dispatch (--no-session means no omp session log exists
+    # as a fallback), and omp's own --model is a fuzzy match — if it silently resolves
+    # to the wrong model, or the child dies before flushing any of its own output, this
+    # line is the only place "what was actually requested" survives (review finding).
+    # Sanitize for the RECORD ONLY: a $model containing \n or other control chars would
+    # fork this single header line into forged extra log lines (and a reader taking
+    # splitlines()[0] would silently truncate past the fork). The argv path is NOT
+    # affected — the unsanitized $model still reaches omp verbatim, one argv word.
+    if [ -n "$model" ]; then
+        model_log="$(printf '%s' "$model" | tr -d '[:cntrl:]')"
+        echo "--- $(date -u '+%Y-%m-%dT%H:%M:%SZ') launching detached agent '$name' in '$workdir' (model '$model_log')"
+    else
+        echo "--- $(date -u '+%Y-%m-%dT%H:%M:%SZ') launching detached agent '$name' in '$workdir'"
+    fi
 } >>"$log"
 
 # Detach for real (mirrors rig-detached-opencode's launcher, three parts):
@@ -147,8 +168,22 @@ _new_session() {
     exec python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
 }
 export -f _new_session
+
+model_args=()
+if [ -n "$model" ]; then
+    model_args=(--model "$model")
+fi
+
+# `${model_args[@]+"${model_args[@]}"}` (not a bare `"${model_args[@]}"`) — an EMPTY
+# array under `set -u` on bash < 4.4 (incl. macOS /bin/bash 3.2.57, this script's own
+# stock-macOS target per the setsid/python3 fallback above) is the nounset trap: bash
+# aborts word expansion with "model_args[@]: unbound variable" on every DEFAULT
+# (no-model) invocation, and since that abort happens inside the backgrounded `&`
+# subshell, `set -e` never observes it — the launcher still prints "launched" and
+# exits 0 while the child never execs (mirrors the guard this repo already uses at
+# skills/universal/gh-graphql/ghgql:112 for the same empty-optional-array shape).
 nohup bash -c '_new_session "$@"' _ \
-    omp -p --auto-approve --no-session --cwd "$workdir" -- "$brief_text" \
+    omp -p --auto-approve --no-session --cwd "$workdir" "${model_args[@]+"${model_args[@]}"}" -- "$brief_text" \
     </dev/null >>"$log" 2>&1 &
 pid=$!
 
