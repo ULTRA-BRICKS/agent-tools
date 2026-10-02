@@ -173,7 +173,7 @@ These are the *logical* points; map them to your harness's actual tool-use event
 
 | point          | fires when…                                  | hooks                                   |
 | -------------- | -------------------------------------------- | --------------------------------------- |
-| `pre-agent` **(live in Claude Code and opencode when rig provisions their bridges; mapped by the omp bridge too; NOT mapped in Codex yet)** | before a subagent dispatch (Agent/Task/opencode or omp task tool) | background-subagent-gate                 |
+| `pre-agent` **(live in Claude Code and opencode when rig provisions their bridges; mapped by the omp bridge too; NOT mapped in Codex yet)** | before a subagent dispatch (Agent/Task/opencode or omp task tool) | background-subagent-gate, fleet-memory-gate |
 | `pre-bash`     | before a shell command runs                  | block-devserver-primary, block-no-verify, block-raw-pr-merge, block-raw-ticket, block-reset-hard, pin-primary-worktree, pkill-guard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format, heavy-op-memory-gate, agent-browser-session-claim |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, worktree-only-writes |
 | `pre-skill` **(live in Claude Code when rig provisions the bridge; live in opencode via the native `skill` tool; NOT mapped in Codex yet)** | before a Skill-tool invocation | skills-marker-writer |
@@ -204,6 +204,10 @@ trusted subagent identity, so forged `agent_id` / `agent_type` values inside too
 stripped, and the ONE trusted source is the process env set by the `rig-detached-opencode`
 launcher (`RIG_AGENT_ID` / `RIG_DETACHED_AGENT`), which covers only a rig-launched detached
 child — see `lib/opencode_hook_bridge/README.md` "Identity contract".
+
+`fleet-memory-gate` is the other consumer of this point: unlike `background-subagent-gate`,
+it applies identically to the orchestrator's own dispatch and to a subagent's further
+fan-out (no `agent_id` exemption) — see `agent-hooks/fleet-memory-gate/README.md`.
 
 ### `pre-workflow` — gate a Workflow script
 
