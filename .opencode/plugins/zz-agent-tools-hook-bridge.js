@@ -1,0 +1,1 @@
+/Users/ultra/xp/agent-tools/lib/opencode_hook_bridge/plugin.js
