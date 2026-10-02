@@ -201,10 +201,12 @@ function firstNonBlank(...vals: unknown[]): string {
 }
 
 function ctxString(ctx: any, event: any, prop: string, getter: string): string {
-  // omp's tool ctx (oh-my-pi) exposes getSessionFile()/getAgentId()/getSessionId()
-  // as methods; ctx.agentId is empty (oh-my-pi#11214). A blank property must not
-  // shadow the getter (`??` only skips null/undefined). Prefer a non-blank
-  // property, then the getter, then a same-named field on the event — never tool args.
+  // omp's extension ctx exposes NO top-level getSessionFile()/getAgentId()/
+  // sessionFile/agentId (oh-my-pi#11214 — ExtensionContext carries only
+  // `sessionManager`); a blank property must not shadow the getter (`??` only skips
+  // null/undefined). Prefer a non-blank property, then the getter, then a same-named
+  // field on the event — never tool args. The sessionManager fallback below is what
+  // actually resolves today.
   let fromGetter: unknown;
   try {
     fromGetter = typeof ctx?.[getter] === "function" ? ctx[getter]() : undefined;
@@ -214,12 +216,51 @@ function ctxString(ctx: any, event: any, prop: string, getter: string): string {
   return firstNonBlank(ctx?.[prop], fromGetter, event?.[prop]);
 }
 
+interface SessionManagerIdentity {
+  getSessionFile?: () => unknown;
+  getSessionId?: () => unknown;
+}
+
+function sessionManagerString(ctx: unknown, getter: keyof SessionManagerIdentity): string {
+  // The REAL identity source on omp's ExtensionContext (agent-tools#743): for a native
+  // Task/eval child, ctx.sessionManager is the CHILD's own session manager, so its
+  // getSessionFile() returns the nested transcript .../<session-id>/<ChildName>.jsonl —
+  // the path shape dispatch.py's _OMP_SESSION_DIR classifies as a subagent, and the one
+  // piece of unforgeable evidence oh-my-pi#11214 leaves available (the harness's own
+  // session state, never tool args). A main session returns the flat
+  // .../<session-id>.jsonl here, which the dispatcher correctly does NOT classify as a
+  // child. Returns "" for an in-memory session (getSessionFile() → undefined) or any
+  // ctx without a sessionManager — the dispatcher then keeps its conservative default.
+  try {
+    // One structural cast: omp's ctx is untyped at this boundary; the getter call below
+    // is still runtime-guarded (typeof === "function") before it is invoked.
+    const sm = (ctx as { sessionManager?: SessionManagerIdentity } | null)?.sessionManager;
+    const fn = sm?.[getter];
+    return firstNonBlank(typeof fn === "function" ? fn.call(sm) : undefined);
+  } catch {
+    return "";
+  }
+}
+
 async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<BridgeResult | undefined> {
   let outcome: DispatcherOutcome;
   try {
     const agentId = ctxString(ctx, event, "agentId", "getAgentId");
-    const sessionId = ctxString(ctx, event, "sessionId", "getSessionId");
-    const sessionFile = ctxString(ctx, event, "sessionFile", "getSessionFile");
+    // Top-level ctx identity is blank under oh-my-pi#11214 (it never existed on
+    // ExtensionContext); sessionManagerString is the source that resolves today and is
+    // consulted FIRST: ctxString's last leg reads a same-named field off the raw omp
+    // extension event, and a future event shape carrying model-influenced sessionId/
+    // sessionFile values must not outrank the harness's own session state — session-scoped
+    // hook state keys on these (agent-tools#743 RC-2), so a spoofed value would rotate
+    // marker keys per call (warn forever, never block).
+    const sessionId = firstNonBlank(
+      sessionManagerString(ctx, "getSessionId"),
+      ctxString(ctx, event, "sessionId", "getSessionId"),
+    );
+    const sessionFile = firstNonBlank(
+      sessionManagerString(ctx, "getSessionFile"),
+      ctxString(ctx, event, "sessionFile", "getSessionFile"),
+    );
     const payload = JSON.stringify({
       event: eventName,
       toolName: event?.toolName,
@@ -233,7 +274,11 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
       sessionId,
       sessionFile,
     });
-    outcome = await spawnDispatcher(eventName, payload, event?.toolCallId, sessionFile, agentId);
+    outcome = await spawnDispatcher(eventName, payload, event?.toolCallId, {
+      sessionFile,
+      agentId,
+      sessionId,
+    });
   } catch (error: any) {
     logToDebugFile(`omp-hook-bridge: dispatcher setup failed, allowing call: ${error?.message}`);
     return undefined;
@@ -254,13 +299,22 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
 // whose bridge has never serialized them either. Two simultaneous dispatchers interleave
 // their lines in the file log, which is why every captured line is tagged with its event and
 // tool-call id (`stderrForwarder`) — two hatches both explaining a wait stay attributable.
+interface DispatcherIdentity {
+  sessionFile?: string;
+  agentId?: string;
+  sessionId?: string;
+}
+
 function spawnDispatcher(
   eventName: BridgeEvent,
   payload: string,
   toolCallId: unknown,
-  sessionFile: string = "",
-  agentId: string = "",
+  // Grouped object, not positional strings: a transposed agentId/sessionId pair at a call
+  // site would type-check and silently mis-key session-scoped hook state (RIG_AGENT_ID vs
+  // RIG_SESSION_ID).
+  identity: DispatcherIdentity = {},
 ): Promise<DispatcherOutcome> {
+  const { sessionFile = "", agentId = "", sessionId = "" } = identity;
   const python = process.env.OMP_HOOK_BRIDGE_PYTHON || "python3";
   const priorPythonPath = process.env.PYTHONPATH || "";
   return new Promise((resolveOutcome) => {
@@ -274,6 +328,10 @@ function spawnDispatcher(
         // PI_SESSION_FILE so _omp_nested_agent_id sees the child, not the main session.
         ...(sessionFile ? { PI_SESSION_FILE: sessionFile } : {}),
         ...(agentId ? { RIG_AGENT_ID: agentId } : {}),
+        // Trusted per-session id (ctx/sessionManager, never tool args) so session-keyed
+        // hook state — orchestrator-stays-thin's warn/block marker (agent-tools#743,
+        // RC-2) — tiers per omp session instead of per tmux pane or shared cwd+point.
+        ...(sessionId ? { RIG_SESSION_ID: sessionId } : {}),
       },
     });
     inFlight.add(child);
