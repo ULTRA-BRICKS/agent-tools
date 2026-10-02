@@ -1,0 +1,51 @@
+#!/bin/sh
+# Composing global post-commit hook (core.hooksPath = ~/.config/git/hooks).
+#
+# Runs two stages IN ORDER:
+#
+#   1. repo-local post-commit  ($REPO/.git/hooks/post-commit, if executable)
+#        — the repo's own post-commit action, if any. Run FIRST because a global
+#          hooksPath shadows it, and it must still fire.
+#   2. global-hooks dispatcher  (../run-global-hooks post-commit)
+#        — runs EVERY executable in ~/.config/git/global-hooks.d/post-commit/ in
+#          order (10-bootstrap-notice today, more later). Adding a global hook =
+#          drop a file there; no edit to this composer is ever needed again.
+#
+# post-commit fires AFTER the commit already exists — git ignores its exit status
+# (there is nothing left to block). This composer still propagates a non-zero exit for
+# consistency with the other composers, but no caller relies on it aborting anything.
+#
+# This composer only fires for repos that DON'T override core.hooksPath locally
+# (review-cli, conloca). Repos with a local hook manager (lefthook/husky) or raw
+# .git/hooks bypass it — they invoke the SAME dispatcher via a one-line injection
+# instead (see agent-tools git-hooks/global-dispatcher/install-local-hooks.sh).
+HOOK_DIR="$(dirname "$0")"
+# Bail out cleanly if we're somehow not inside a git repo (also our git-dir lookup).
+git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || exit 0
+[ -n "$git_dir" ] || exit 0
+
+# --- 1. repo-local post-commit (run once, here; downstream stages must NOT re-run it).
+# A global core.hooksPath SHADOWS the repo's own post-commit; run it explicitly. See
+# hooks/pre-commit for why this resolves against the absolute git dir, not
+# `git rev-parse --git-path hooks/post-commit` (that would return this very file).
+local_hook="$git_dir/hooks/post-commit"
+# A template-shim (init.templateDir) or retrofit-injected local hook CALLS the
+# dispatcher itself; if we then ran our own dispatcher stage too, every fragment would
+# fire TWICE (a duplicate bootstrap notice). The marker is a POSITIVE runtime signal
+# (the runner touches it when it actually executes) — a shim whose runner path is
+# missing leaves it untouched, so stage 2 still dispatches (fail-safe).
+dispatch_marker="${TMPDIR:-/tmp}/global-hooks-dispatched.post-commit.$$"
+rm -f "$dispatch_marker"
+trap 'rm -f "$dispatch_marker"' EXIT INT TERM
+# Guard: don't recurse into ourselves if hooksPath happens to point at the git dir.
+if [ -x "$local_hook" ] && [ "$local_hook" != "$0" ]; then
+  GLOBAL_HOOKS_DISPATCH_MARKER="$dispatch_marker" "$local_hook" "$@" || exit $?
+fi
+
+# --- 2. global-hooks dispatcher (the extensible set; bootstrap-notice + future hooks)
+# — skipped when stage 1 provably dispatched.
+if [ ! -e "$dispatch_marker" ] && [ -x "$HOOK_DIR/../run-global-hooks" ]; then
+  GLOBAL_HOOKS_DISPATCH_MARKER='' "$HOOK_DIR/../run-global-hooks" post-commit "$@" || exit $?
+fi
+
+exit 0

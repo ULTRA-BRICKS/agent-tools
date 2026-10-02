@@ -1,0 +1,14 @@
+#!/bin/sh
+# Template post-commit hook, copied into a new repo's .git/hooks by
+# `git init` / `git clone` (git config --global init.templateDir
+# ~/.config/git/template). It runs the global-hooks dispatcher so every global
+# post-commit hook fires (e.g. the bootstrap-complete notice) even in a repo that
+# sets its own local core.hooksPath = .git/hooks.
+#
+# A local hook manager (lefthook/husky) may overwrite this file; that's fine —
+# the dispatcher is also injected into the manager's config by
+# install-local-hooks.sh / hooks-sweep. This template is the baseline for
+# raw-git repos that have no manager.
+DISP="${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks"
+[ -x "$DISP" ] && { "$DISP" post-commit "$@" || exit $?; }
+exit 0

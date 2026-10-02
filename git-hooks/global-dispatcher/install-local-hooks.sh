@@ -46,7 +46,7 @@ set -eu
 
 MARKER="global-git-hooks-dispatcher"          # idempotency marker (in injected text)
 DISPATCHER='"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks"'
-EVENTS="pre-commit commit-msg pre-push"
+EVENTS="pre-commit commit-msg pre-push post-commit"
 
 # --- option parsing (flags may appear before the optional REPO_DIR) ---------------
 DO_COMMIT=0
@@ -194,16 +194,18 @@ inject_lefthook() {
       -v run_pc="      run: '$rgh pre-commit'" \
       -v run_cm="      run: '$rgh commit-msg {1}'" \
       -v run_pp="      run: '$rgh pre-push'" \
-      -v stdin_pp="      use_stdin: true" '
+      -v stdin_pp="      use_stdin: true" \
+      -v run_poc="      run: '$rgh post-commit'" '
     function emit(ev) {
       print keyline
       if (ev == "pre-commit") print run_pc
       else if (ev == "commit-msg") print run_cm
       else if (ev == "pre-push") { print run_pp; print stdin_pp }
+      else if (ev == "post-commit") print run_poc
     }
     BEGIN {
-      split("pre-commit commit-msg pre-push", order, " ")
-      for (k = 1; k <= 3; k++) { e = order[k]; hdr[e] = 0; cmds[e] = 0 }
+      split("pre-commit commit-msg pre-push post-commit", order, " ")
+      for (k = 1; k <= 4; k++) { e = order[k]; hdr[e] = 0; cmds[e] = 0 }
     }
     # Record, per event: the header line index (hdr) and its `commands:` line index
     # (cmds, 0 if the block has no commands: key — e.g. a scripts:-only block).
@@ -212,7 +214,7 @@ inject_lefthook() {
       # Event header: `pre-commit:` optionally followed by whitespace and/or a `# comment`.
       # (A trailing comment like `pre-commit: # gate` is valid YAML; without allowing it we
       # would treat the block as absent and append a DUPLICATE top-level key.)
-      if ($0 ~ /^(pre-commit|commit-msg|pre-push):[ \t]*(#.*)?$/) {
+      if ($0 ~ /^(pre-commit|commit-msg|pre-push|post-commit):[ \t]*(#.*)?$/) {
         ev = $0; sub(/:.*/, "", ev); cur_event = ev; hdr[ev] = NR
       } else if ($0 ~ /^[^ \t#]/) {
         cur_event = ""   # left the block (some other top-level key)
@@ -225,7 +227,7 @@ inject_lefthook() {
       # Decide the injection point for each present event.
       #  - has commands:  -> inject right AFTER the commands: line.
       #  - block but no commands: -> inject right AFTER the header, prefixing a commands: line.
-      for (k = 1; k <= 3; k++) {
+      for (k = 1; k <= 4; k++) {
         e = order[k]
         if (cmds[e] > 0)      { after_cmds[cmds[e]] = e }
         else if (hdr[e] > 0)  { after_hdr[hdr[e]]  = e }
@@ -236,7 +238,7 @@ inject_lefthook() {
         if (i in after_hdr)  { print "  commands:"; emit(after_hdr[i]) }
       }
       # Events with no block at all -> append a fresh one.
-      for (k = 1; k <= 3; k++) {
+      for (k = 1; k <= 4; k++) {
         e = order[k]
         if (hdr[e] == 0) { print e ":"; print "  commands:"; emit(e) }
       }
@@ -257,12 +259,14 @@ inject_husky() {
   wired_any=0
   for ev in $EVENTS; do
     f="$REPO/.husky/$ev"
-    # Only wire events that already have a husky script, plus always-create pre-commit
-    # AND pre-push: husky sets core.hooksPath, which bypasses the global composer, so a
-    # husky repo with no .husky/pre-push would never dispatch the protected protect-main
-    # fragment — direct pushes to main would fail open.
+    # Only wire events that already have a husky script, plus always-create pre-commit,
+    # pre-push, AND post-commit: husky sets core.hooksPath, which bypasses the global
+    # composer, so a husky repo with no .husky/pre-push would never dispatch the
+    # protected protect-main fragment (direct pushes to main would fail open), and one
+    # with no .husky/post-commit would never dispatch the bootstrap-notice fragment
+    # (the notice would silently never fire).
     case "$ev" in
-      pre-commit|pre-push) ;;
+      pre-commit|pre-push|post-commit) ;;
       *) [ -f "$f" ] || continue ;;
     esac
     if [ -f "$f" ] && grep -q "$MARKER" "$f"; then

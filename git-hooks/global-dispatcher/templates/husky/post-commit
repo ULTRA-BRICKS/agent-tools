@@ -1,0 +1,6 @@
+#!/bin/sh
+# .husky/post-commit TEMPLATE — preseeded with the global git-hook dispatcher.
+# Put your repo's own post-commit actions above the dispatcher line.
+
+# global-git-hooks-dispatcher — runs every global hook for this event (see agent-tools git-hooks/global-dispatcher)
+"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" post-commit "$@" || exit $?

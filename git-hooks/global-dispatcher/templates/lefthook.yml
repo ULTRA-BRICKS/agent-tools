@@ -39,3 +39,8 @@ pre-push:
       use_stdin: true
     # tests:
     #   run: npm test
+
+post-commit:
+  commands:
+    global-git-hooks-dispatcher:
+      run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" post-commit'

@@ -985,6 +985,109 @@ assert_not hpp_push origin main
 LABEL="husky repo: feature-branch push passes"
 assert hpp_push origin main:feat-h
 
+# --- 37. post-commit bootstrap-notice: fires ONLY on the first root commit to main/master
+# Standalone dispatch-level coverage through the REAL global composer (core.hooksPath),
+# mirroring how section 35 exercises the real pre-push fragment end-to-end.
+GHD_POST="$TMP/ghd-postcommit"
+mkdir -p "$GHD_POST/post-commit"
+cp "$HERE/global-hooks.d/post-commit/10-bootstrap-notice" "$GHD_POST/post-commit/"
+chmod +x "$GHD_POST/post-commit/10-bootstrap-notice"
+
+# mk_unborn_repo <dir> <branch> — an EMPTY repo (no commits yet), on the named branch,
+# wired to the real global composer. Unlike mk_repo() (which commits immediately, on
+# whatever the default branch happens to be), the notice must observe the FIRST commit
+# itself, so hooks must be wired and the branch named BEFORE that commit exists.
+mk_unborn_repo() {
+  mkdir -p "$1"
+  git -C "$1" init -q
+  git -C "$1" branch -M "$2"
+  git -C "$1" config user.email t@t.t
+  git -C "$1" config user.name  t
+  git -C "$1" config core.hooksPath "$HERE/hooks"
+}
+
+RPC="$TMP/rpc-main"; mk_unborn_repo "$RPC" main
+out1="$( cd "$RPC" && echo seed > seed.txt && git add seed.txt \
+    && GLOBAL_HOOKS_DIR="$GHD_POST" git commit -q -m seed 2>&1 )"
+LABEL="post-commit bootstrap notice fires on the first root commit to main"
+assert sh -c 'printf %s "$1" | grep -q "bootstrap complete"' _ "$out1"
+
+out2="$( cd "$RPC" && echo more >> seed.txt && git add seed.txt \
+    && GLOBAL_HOOKS_DIR="$GHD_POST" git commit -q -m more 2>&1 )"
+LABEL="post-commit bootstrap notice does NOT fire on a second commit"
+assert_not sh -c 'printf %s "$1" | grep -q "bootstrap complete"' _ "$out2"
+
+RPC_MASTER="$TMP/rpc-master"; mk_unborn_repo "$RPC_MASTER" master
+out3="$( cd "$RPC_MASTER" && echo seed > seed.txt && git add seed.txt \
+    && GLOBAL_HOOKS_DIR="$GHD_POST" git commit -q -m seed 2>&1 )"
+LABEL="post-commit bootstrap notice fires on the first root commit to master"
+assert sh -c 'printf %s "$1" | grep -q "bootstrap complete"' _ "$out3"
+
+RPC_OTHER="$TMP/rpc-other"; mk_unborn_repo "$RPC_OTHER" wip
+out4="$( cd "$RPC_OTHER" && echo seed > seed.txt && git add seed.txt \
+    && GLOBAL_HOOKS_DIR="$GHD_POST" git commit -q -m seed 2>&1 )"
+LABEL="post-commit bootstrap notice does NOT fire on a root commit to a non-main branch"
+assert_not sh -c 'printf %s "$1" | grep -q "bootstrap complete"' _ "$out4"
+
+# --- 38. install-local-hooks.sh wires post-commit for raw / husky / lefthook managers ---
+# raw: EVENTS now includes post-commit, so the installer must create .git/hooks/post-commit
+# and it must fire end-to-end (and only on the first commit).
+RPCR="$TMP/rpc-raw"; mkdir -p "$RPCR"
+git -C "$RPCR" init -q
+git -C "$RPCR" branch -M main
+git -C "$RPCR" config user.email t@t.t
+git -C "$RPCR" config user.name  t
+"$INSTALLER" "$RPCR" >/dev/null
+LABEL="raw: install-local-hooks.sh wires .git/hooks/post-commit"
+assert grep -q 'global-git-hooks-dispatcher' "$RPCR/.git/hooks/post-commit"
+outr1="$( cd "$RPCR" && echo seed > seed.txt && git add seed.txt \
+    && GLOBAL_HOOKS_DIR="$GHD_POST" git commit -q -m seed 2>&1 )"
+LABEL="raw: post-commit bootstrap notice fires on the first root commit"
+assert sh -c 'printf %s "$1" | grep -q "bootstrap complete"' _ "$outr1"
+outr2="$( cd "$RPCR" && echo more >> seed.txt && git add seed.txt \
+    && GLOBAL_HOOKS_DIR="$GHD_POST" git commit -q -m more 2>&1 )"
+LABEL="raw: post-commit bootstrap notice does NOT fire on the second commit"
+assert_not sh -c 'printf %s "$1" | grep -q "bootstrap complete"' _ "$outr2"
+
+# husky: the installer must ALWAYS create .husky/post-commit (like pre-commit/pre-push),
+# even with no pre-existing file, or the notice would be silently dropped in every fresh
+# husky repo. Prove it fires through the real husky-shim -> dispatcher chain.
+RPCH="$TMP/rpc-husky"; mkdir -p "$RPCH/.husky/_"
+git -C "$RPCH" init -q
+git -C "$RPCH" branch -M main
+git -C "$RPCH" config user.email t@t.t
+git -C "$RPCH" config user.name  t
+git -C "$RPCH" config core.hooksPath .husky/_
+cat > "$RPCH/.husky/_/post-commit" <<'EOF'
+#!/bin/sh
+h="$(dirname "$0")/../post-commit"
+[ -f "$h" ] && exec sh "$h" "$@"
+exit 0
+EOF
+chmod +x "$RPCH/.husky/_/post-commit"
+"$INSTALLER" "$RPCH" >/dev/null
+LABEL="husky: install-local-hooks.sh wires .husky/post-commit even with no pre-existing file"
+assert grep -q 'global-git-hooks-dispatcher' "$RPCH/.husky/post-commit"
+outh1="$( cd "$RPCH" && echo seed > seed.txt && git add seed.txt \
+    && GLOBAL_HOOKS_DIR="$GHD_POST" git commit -q -m seed 2>&1 )"
+LABEL="husky: post-commit bootstrap notice fires end-to-end on the first root commit"
+assert sh -c 'printf %s "$1" | grep -q "bootstrap complete"' _ "$outh1"
+outh2="$( cd "$RPCH" && echo more >> seed.txt && git add seed.txt \
+    && GLOBAL_HOOKS_DIR="$GHD_POST" git commit -q -m more 2>&1 )"
+LABEL="husky: post-commit bootstrap notice does NOT fire on the second commit"
+assert_not sh -c 'printf %s "$1" | grep -q "bootstrap complete"' _ "$outh2"
+
+# lefthook: structural check — the installer merges a post-commit: block carrying the
+# dispatcher command, the same way the pre-commit/pre-push blocks are checked elsewhere
+# in this file (a live `lefthook run` is not exercised anywhere in this suite).
+RPCL="$TMP/rpc-lefthook"; mk_repo "$RPCL"
+printf 'pre-commit:\n  commands:\n    lint:\n      run: echo lint\n' > "$RPCL/lefthook.yml"
+git -C "$RPCL" add lefthook.yml
+git -C "$RPCL" -c core.hooksPath= commit -q --no-verify -m "add lefthook.yml"
+"$INSTALLER" "$RPCL" >/dev/null
+LABEL="lefthook: install-local-hooks.sh adds a post-commit: block with the dispatcher command"
+assert sh -c "grep -A2 '^post-commit:' '$RPCL/lefthook.yml' | grep -q 'global-git-hooks-dispatcher'"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "selfcheck: ALL PASS"

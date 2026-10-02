@@ -1,0 +1,53 @@
+#!/bin/sh
+# global-hook-id: bootstrap-notice
+# bootstrap-notice — print a one-time notice right after the very first commit in a
+# brand-new repo, IF that commit was made directly on main/master.
+#
+# WHY: the pre-push protect-main fragment (global-hooks.d/pre-push/10-protect-main)
+# allows exactly one root commit straight onto an empty remote's main/master — there is
+# no branch yet to open a PR from. Once that bootstrap commit exists, every NORMAL rule
+# applies again: ticket first, a separate worktree/branch, a PR, and merge through the
+# guarded ship flow. This hook fires ONCE, immediately after that bootstrap commit, so
+# the message lands at the moment it is most useful — not buried in a README nobody
+# re-reads afterward.
+#
+# DETECTION is local and commit-only (no remote/network check): HEAD has no parent (a
+# true root commit) AND HEAD sits on a branch literally named main or master. Because a
+# root commit can, by definition, only ever be the very first commit reachable from a
+# ref, this single check already guarantees the notice never re-fires on a later commit.
+#
+# post-commit fires AFTER the commit already exists, so there is nothing left to gate —
+# this fragment only ever prints and exits 0; it never blocks anything.
+#
+# is_root_commit mirrors the SAME helper in the pre-push protect-main fragment
+# (global-hooks.d/pre-push/10-protect-main) verbatim. It is duplicated on purpose, not
+# factored into a shared lib: every global-hook fragment here is a standalone, drop-in
+# executable (see the dispatcher README's "Adding a new global hook"), so there is no
+# sourcing convention to hook into — copying this small, stable primitive keeps that
+# contract intact instead of introducing a new one for a single caller pair.
+is_root_commit() {
+  line="$(git rev-list --parents -n 1 "$1" 2>/dev/null)" || return 1
+  [ -n "$line" ] || return 1
+  case "$line" in
+    *" "*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" || exit 0
+case "$branch" in main|master) ;; *) exit 0 ;; esac
+
+is_root_commit HEAD || exit 0
+
+cat >&2 <<MSG
+
+protect-main: bootstrap complete — the first commit just landed directly on '$branch'.
+From here on, direct commits to main/master are blocked again (protect-main).
+
+Next steps for every future change:
+  1. Create a task first (task new ...).
+  2. Work in a separate worktree/branch — never commit to main/master directly.
+  3. Open a PR and land it through the guarded ship flow (gh ship <PR>).
+
+MSG
+exit 0

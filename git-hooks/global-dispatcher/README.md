@@ -26,12 +26,15 @@ automatically takes effect everywhere, with zero per-repo changes.
 │   ├── pre-commit/
 │   │   └── 10-secret-scan           # gitleaks tiered staged-diff gate (block + warn)
 │   ├── commit-msg/
-│   └── pre-push/
-│       └── 10-protect-main          # block direct main/master pushes after empty-repo bootstrap (audited PUSH_MAIN_OK escape)
+│   ├── pre-push/
+│   │   └── 10-protect-main          # block direct main/master pushes after empty-repo bootstrap (audited PUSH_MAIN_OK escape)
+│   └── post-commit/
+│       └── 10-bootstrap-notice      # one-time notice right after the empty-repo bootstrap commit (ticket → worktree → PR → ship, from here on)
 ├── hooks/                           # the GLOBAL composers (core.hooksPath target)
 │   ├── pre-commit                   # repo-local hook → dispatcher → review-gate
 │   ├── commit-msg                   # repo-local hook → dispatcher
 │   ├── pre-push                     # repo-local hook → dispatcher
+│   ├── post-commit                  # repo-local hook → dispatcher
 │   └── review-gate                  # review-before-commit gate
 ├── template/hooks/                  # init.templateDir → new repos get dispatcher hooks
 ├── install-local-hooks.sh           # per-repo injection (+ --commit, + auto-dedup)
@@ -62,6 +65,28 @@ chmod +x ~/.config/git/global-hooks.d/pre-commit/20-no-todo-in-prod
 That's it. It now runs in EVERY wired repo. No installer, no sweep, no per-repo edit. The
 number prefix controls order (`10-` before `20-`). Mirror the file into this dir in
 agent-tools and commit it to keep the shipped twin current.
+
+## Bootstrap notice — `post-commit/10-bootstrap-notice`
+
+The pre-push `protect-main` fragment allows exactly one root commit straight onto an
+empty remote's main/master (there's no branch yet to open a PR from — see its own
+header comment). Once that bootstrap commit lands, the `post-commit/10-bootstrap-notice`
+global hook prints a short, actionable reminder right away: bootstrap is done, and every
+future change goes through the normal flow (a task first, a separate worktree/branch, a
+PR, and `gh ship`).
+
+Detection is local and commit-only — no network/remote check: it fires only when `HEAD`
+is a true root commit (no parent) **and** sits on a branch literally named `main` or
+`master`. A root commit can, by definition, only ever be the very first commit reachable
+from a ref, so this fires exactly once and never again on that repo. `post-commit` runs
+after the commit already exists, so the hook never blocks anything — it only prints.
+
+Wiring follows the same per-manager pattern as every other event here (dispatcher
+composer for repos with no local override; `install-local-hooks.sh` injects a
+`post-commit:` entry into `lefthook.yml`, a guarded line into `.husky/post-commit`, or a
+raw `.git/hooks/post-commit`). Like `pre-commit`/`pre-push`, `post-commit` is one of the
+events the husky injector **always** creates — even with no pre-existing file — so a
+fresh husky repo doesn't silently miss the notice.
 
 ## Per-repo injection — `install-local-hooks.sh`
 
