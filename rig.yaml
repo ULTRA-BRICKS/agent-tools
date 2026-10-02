@@ -18,3 +18,10 @@ ci:
     # The repo's own test gate (ci/tests/) — the green/red signal gh ship + the ruleset
     # wait on. Everything else in ci/ is governance and stays opt-in.
     tests: { enabled: true, tier: block }
+
+task:
+  backend: forgejo
+  forgejo:
+    url: https://git.hyperide.ai
+    repo: ultrabricks/agent-tools
+    attachment_mode: native
