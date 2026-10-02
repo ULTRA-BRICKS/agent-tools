@@ -508,6 +508,13 @@ abort_if_cwd_core_bare() {  # the cwd may be a subdir of the corrupt checkout �
 abort_if_cwd_core_bare
 
 ROOT=$(git rev-parse --show-toplevel); cd "$ROOT"
+# Local, per-checkout record of commit oids THIS ship.sh has itself authored via a successful
+# Contents/Git-Data API write (see _record_ship_oid below). Lives under .git/ -- a remote PR
+# author cannot write to it by pushing a commit with a spoofed committer email -- so a re-run
+# of ship against the SAME local checkout (e.g. after CI went red) can still recognize its own
+# earlier bump commit for the review-dwell gate without trusting any self-asserted remote field
+# (#672 review finding: the dwell gate's is_bump no longer trusts .commit.committer.email).
+SHIP_KNOWN_OIDS_FILE="$ROOT/.git/ship-auto-bump-known-oids"
 command -v gh >/dev/null 2>&1 || { echo "gh CLI not found" >&2; exit 1; }
 
 # --- cross-repo (--repo) support -------------------------------------------------------
@@ -949,6 +956,7 @@ SHIP_KNOWN_OIDS=""
 _record_ship_oid() {
   case "${1:-}" in ''|*[!0-9a-f]*) return 0 ;; esac
   SHIP_KNOWN_OIDS="${SHIP_KNOWN_OIDS} $1"
+  printf '%s\n' "$1" >> "$SHIP_KNOWN_OIDS_FILE" 2>/dev/null || true
 }
 
 _verify_is_merge_of() {  # $1 = expected first-parent oid, $2 = candidate merge oid
@@ -1048,8 +1056,8 @@ local_branch_sanity_check() {
 
 _pyproject_has_project_version() {  # $1 = path
   awk '
-    /^\[project\]/ { inproj=1; next }
-    /^\[/ { inproj=0 }
+    /^[[:space:]]*\[[[:space:]]*project[[:space:]]*\][[:space:]]*(#.*)?$/ { inproj=1; next }
+    /^[[:space:]]*\[/ { inproj=0 }
     inproj && /^[[:space:]]*version[[:space:]]*=/ { found=1; exit }
     END { exit found ? 0 : 1 }
   ' "$1"
@@ -1084,8 +1092,8 @@ _version_value_of_content() {  # stdin; $1 = filename
   case "$kind" in
     pyproject.toml|*.toml)
       printf '%s' "$c" | awk '
-        /^\[project\]/ { inproj=1; next }
-        /^\[/ { inproj=0 }
+        /^[[:space:]]*\[[[:space:]]*project[[:space:]]*\][[:space:]]*(#.*)?$/ { inproj=1; next }
+        /^[[:space:]]*\[/ { inproj=0 }
         inproj && /^[[:space:]]*version[[:space:]]*=/ {
           if (match($0, /[0-9][0-9A-Za-z.+_-]*/)) { print substr($0, RSTART, RLENGTH); exit }
         }
@@ -1107,8 +1115,8 @@ _version_line_number_of_content() {  # stdin; $1 = filename
   case "$kind" in
     pyproject.toml|*.toml)
       printf '%s' "$c" | awk '
-        /^\[project\]/ { inproj=1 }
-        /^\[/ && $0 !~ /^\[project\]/ { inproj=0 }
+        /^[[:space:]]*\[[[:space:]]*project[[:space:]]*\][[:space:]]*(#.*)?$/ { inproj=1 }
+        /^[[:space:]]*\[/ && $0 !~ /^[[:space:]]*\[[[:space:]]*project[[:space:]]*\][[:space:]]*(#.*)?$/ { inproj=0 }
         { n++ }
         inproj && /^[[:space:]]*version[[:space:]]*=/ { print n; exit }
       '
@@ -1126,8 +1134,8 @@ _bumped_content() {  # $1=old $2=new; stdin content; uses $AUTO_BUMP_FILE
   case "$AUTO_BUMP_FILE" in
     pyproject.toml|*.toml)
       out=$(printf '%s' "$content" | awk -v old="$1" -v new="$2" '
-        /^\[project\]/ { inproj=1 }
-        /^\[/ && $0 !~ /^\[project\]/ { inproj=0 }
+        /^[[:space:]]*\[[[:space:]]*project[[:space:]]*\][[:space:]]*(#.*)?$/ { inproj=1 }
+        /^[[:space:]]*\[/ && $0 !~ /^[[:space:]]*\[[[:space:]]*project[[:space:]]*\][[:space:]]*(#.*)?$/ { inproj=0 }
         inproj && done == 0 && /^[[:space:]]*version[[:space:]]*=/ {
           i = index($0, old)
           if (i > 0) { $0 = substr($0, 1, i-1) new substr($0, i+length(old)); done=1 }
@@ -1135,16 +1143,16 @@ _bumped_content() {  # $1=old $2=new; stdin content; uses $AUTO_BUMP_FILE
         { print }'; printf x); out=${out%x}
       ;;
     package.json|*.json)
-      if command -v jq >/dev/null 2>&1; then
-        out=$(printf '%s' "$content" | jq --arg v "$2" '.version = $v'; printf x); out=${out%x}
-      else
-        out=$(printf '%s' "$content" | awk -v old="$1" -v new="$2" '
-          done == 0 && /^[[:space:]]{0,2}"version"[[:space:]]*:/ {
-            i = index($0, old)
-            if (i > 0) { $0 = substr($0, 1, i-1) new substr($0, i+length(old)); done=1 }
-          }
-          { print }'; printf x); out=${out%x}
-      fi
+      # Rewrite ONLY the top-level version token, never reserialize the whole file (a jq
+      # `.version = $v` round-trip used to repaint a minified/tab-indented package.json into
+      # pretty 2-space JSON, turning a one-field merge-time bump into unrelated whole-file
+      # churn — #672 review finding, P2). Same in-place awk substitution on every platform.
+      out=$(printf '%s' "$content" | awk -v old="$1" -v new="$2" '
+        done == 0 && /^[[:space:]]{0,2}"version"[[:space:]]*:/ {
+          i = index($0, old)
+          if (i > 0) { $0 = substr($0, 1, i-1) new substr($0, i+length(old)); done=1 }
+        }
+        { print }'; printf x); out=${out%x}
       ;;
     *)
       out=$(printf '%s' "$content" | awk -v old="$1" -v new="$2" '
@@ -1157,6 +1165,67 @@ _bumped_content() {  # $1=old $2=new; stdin content; uses $AUTO_BUMP_FILE
   esac
   case "$content" in *$'\n') : ;; *) out=${out%$'\n'} ;; esac
   printf '%s' "$out"
+}
+
+# Locate the pyproject.toml `[project]` table's `name` value (TOML-whitespace tolerant, same
+# entry/exit regex as the version helpers above). Prints the value, or nothing.
+_pyproject_project_name() {  # $1 = path
+  awk '
+    /^[[:space:]]*\[[[:space:]]*project[[:space:]]*\][[:space:]]*(#.*)?$/ { inproj=1; next }
+    /^[[:space:]]*\[/ { inproj=0 }
+    inproj && /^[[:space:]]*name[[:space:]]*=/ {
+      line=$0
+      if (match(line, /"[^"]*"/)) { print substr(line, RSTART+1, RLENGTH-2); exit }
+    }
+  ' "$1"
+}
+
+# Rewrite ONLY the root package's `[[package]] name = "<name>" ... version = "<old>"` entry in
+# a uv.lock's content to <new> -- never a dependency entry that happens to share the searched
+# version string. stdin = uv.lock content; $1=pkgname $2=old $3=new.
+_uv_lock_bumped_content() {
+  local content out
+  content=$(cat; printf x); content=${content%x}
+  out=$(printf '%s' "$content" | awk -v name="$1" -v old="$2" -v new="$3" '
+    /^\[\[package\]\]/ { inpkg=1; pkgname="" }
+    /^\[/ && $0 !~ /^\[\[package\]\]/ { inpkg=0 }
+    inpkg && pkgname == "" && /^name[[:space:]]*=/ {
+      line=$0
+      if (match(line, /"[^"]*"/)) { pkgname = substr(line, RSTART+1, RLENGTH-2) }
+    }
+    inpkg && done == 0 && pkgname == name && /^version[[:space:]]*=/ {
+      i = index($0, old)
+      if (i > 0) { $0 = substr($0, 1, i-1) new substr($0, i+length(old)); done=1 }
+    }
+    { print }'; printf x); out=${out%x}
+  case "$content" in *$'\n') : ;; *) out=${out%$'\n'} ;; esac
+  printf '%s' "$out"
+}
+
+# Decide whether uv.lock needs bumping alongside AUTO_BUMP_FILE, and if so compute its new
+# content into AB_NEW_UVLOCK_CONTENT (#672 review finding: a uv project's lockfile records the
+# root package's version too; bumping only pyproject.toml leaves `uv lock --check` / `uv run
+# --locked` failing CI on ship's own commit). Sets AUTO_BUMP_UVLOCK_NEEDED=1 on success; any
+# miss (no uv.lock, no parseable project name, no matching entry on the remote branch) leaves
+# it 0 and the plain single-file bump proceeds exactly as before -- never a hard failure.
+_uv_lock_prepare() {
+  AUTO_BUMP_UVLOCK_NEEDED=0
+  case "$AUTO_BUMP_FILE" in pyproject.toml) : ;; *) return 0 ;; esac
+  [ -f "$ROOT/uv.lock" ] || return 0
+  local pkgname content
+  pkgname=$(_pyproject_project_name "$ROOT/pyproject.toml") || pkgname=""
+  [ -n "$pkgname" ] || return 0
+  _remote_file_fetch "uv.lock" "$BRANCH" || {
+    echo "[ship] auto-bump: uv.lock exists locally but could not be read on ${BRANCH} — bumping ${AUTO_BUMP_FILE} only." >&2
+    return 0
+  }
+  content=$(printf '%s' "$RF_CONTENT" | _uv_lock_bumped_content "$pkgname" "$AUTO_BUMP_OLD" "$AUTO_BUMP_NEW"; printf x); content=${content%x}
+  if [ -z "$content" ] || [ "$content" = "$RF_CONTENT" ]; then
+    echo "[ship] auto-bump: uv.lock has no matching ${pkgname} ${AUTO_BUMP_OLD} entry on ${BRANCH} — bumping ${AUTO_BUMP_FILE} only." >&2
+    return 0
+  fi
+  AB_NEW_UVLOCK_CONTENT="$content"
+  AUTO_BUMP_UVLOCK_NEEDED=1
 }
 
 _remote_file_fetch() {  # $1 = path, $2 = ref
@@ -1188,7 +1257,11 @@ _auto_bump_update_branch() {  # $1 = current head oid, $2 = base ref
   fi
 }
 
-_auto_bump_push() {  # $1 = blob sha
+_auto_bump_push() {  # $1 = blob sha (single-file path), $2 = head commit oid (uv.lock path)
+  if [ "${AUTO_BUMP_UVLOCK_NEEDED:-0}" = "1" ]; then
+    _auto_bump_push_with_uv_lock "$2"
+    return
+  fi
   local msg b64 out
   msg="chore(release): bump version ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} (ship auto-bump for #${PR})"
   b64=$(printf '%s' "$AB_NEW_CONTENT" | base64 | tr -d '\n')
@@ -1204,6 +1277,48 @@ _auto_bump_push() {  # $1 = blob sha
   fi
   AUTO_BUMP_SHA=$(printf '%s' "$out" | tr -d '[:space:]')
   case "$AUTO_BUMP_SHA" in ''|*[!0-9a-f]*) echo "Refusing: the Contents API returned no commit sha for the version bump (${out}) — nothing was merged." >&2; exit 1 ;; esac
+  _record_ship_oid "$AUTO_BUMP_SHA"
+}
+
+# uv.lock also records the root package's version (#672 review finding): a project that
+# commits uv.lock must have BOTH files land in the SAME remote commit, or `uv lock --check` /
+# `uv run --locked` reports a stale lockfile against ship's own bump and the freshly-triggered
+# CI fails on a commit nobody can fix except by hand. Builds one commit via the Git Data API
+# (tree -> commit -> fast-forward-only ref update) instead of the single-file Contents API.
+_auto_bump_push_with_uv_lock() {  # $1 = head commit oid (parent of the new commit)
+  local msg base_tree tree_sha commit_sha out
+  msg="chore(release): bump version ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} (ship auto-bump for #${PR})"
+  echo "[ship] auto-bump: committing ${AUTO_BUMP_FILE} and uv.lock ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} onto ${BRANCH} via the Git Data API (uv.lock present) ..."
+  base_tree=$(gh api "repos/{owner}/{repo}/commits/$1" --jq '.commit.tree.sha' 2>/dev/null) || base_tree=""
+  [ -n "$base_tree" ] || { echo "Refusing: could not read ${BRANCH}'s current tree (commit $1) to build the uv.lock-consistent bump commit. Nothing was merged." >&2; exit 1; }
+  if ! out=$(gh api -X POST "repos/{owner}/{repo}/git/trees" \
+        -f base_tree="$base_tree" \
+        -f "tree[][path]=${AUTO_BUMP_FILE}" -f "tree[][mode]=100644" -f "tree[][type]=blob" -f "tree[][content]=${AB_NEW_CONTENT}" \
+        -f "tree[][path]=uv.lock" -f "tree[][mode]=100644" -f "tree[][type]=blob" -f "tree[][content]=${AB_NEW_UVLOCK_CONTENT}" \
+        --jq '.sha' 2>&1); then
+    { echo "Refusing: could not build the version-bump tree (Git Data API git/trees on ${BRANCH}): ${out}"
+      echo "  Nothing was merged."; } >&2
+    exit 1
+  fi
+  tree_sha="$out"
+  if ! out=$(gh api -X POST "repos/{owner}/{repo}/git/commits" \
+        -f message="$msg" -f tree="$tree_sha" -f "parents[]=$1" \
+        -f author[name]="ship (auto-bump)" -f author[email]="$SHIP_AUTO_BUMP_COMMITTER_EMAIL" \
+        -f committer[name]="ship (auto-bump)" -f committer[email]="$SHIP_AUTO_BUMP_COMMITTER_EMAIL" \
+        --jq '.sha' 2>&1); then
+    { echo "Refusing: the version-bump commit was REJECTED by GitHub (Git Data API git/commits on ${BRANCH}): ${out}"
+      echo "  Nothing was merged."; } >&2
+    exit 1
+  fi
+  commit_sha="$out"
+  if ! out=$(gh api -X PATCH "repos/{owner}/{repo}/git/refs/heads/${BRANCH}" -f sha="$commit_sha" -F force=false \
+        --jq '.object.sha' 2>&1); then
+    { echo "Refusing: could not fast-forward ${BRANCH} to the version-bump commit (Git Data API git/refs PATCH): ${out}"
+      echo "  ${BRANCH} moved since the bump was computed — re-run ship. Nothing was merged on ${BRANCH} (the bump commit object exists but is unreferenced)."; } >&2
+    exit 1
+  fi
+  AUTO_BUMP_SHA="$commit_sha"
+  case "$AUTO_BUMP_SHA" in ''|*[!0-9a-f]*) echo "Refusing: the Git Data API returned no commit sha for the version bump — nothing was merged." >&2; exit 1 ;; esac
   _record_ship_oid "$AUTO_BUMP_SHA"
 }
 
@@ -1318,11 +1433,12 @@ run_merge_time_auto_bump() {
     echo "[ship] auto-bump: skipped — ${AUTO_BUMP_SKIP_REASON}." >&2; return 0
   fi
   AUTO_BUMP_LINE=$(printf '%s' "$AB_NEW_CONTENT" | _version_line_number_of_content "$AUTO_BUMP_FILE") || true
+  _uv_lock_prepare
   if [ "$DRY_RUN" = "1" ]; then
     echo "[dry-run] would bump ${AUTO_BUMP_FILE} ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} on ${BRANCH} via the GitHub Contents API (commit 'chore(release): bump version ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} (ship auto-bump for #${PR})'); nothing pushed."
     AUTO_BUMP_PLANNED=1; _auto_bump_audit_log "version-bump:auto"; return 0
   fi
-  _auto_bump_push "$AB_HEAD_BLOB"
+  _auto_bump_push "$AB_HEAD_BLOB" "$head_oid"
   _auto_bump_audit_log "version-bump:auto"
   if ! _wait_pr_head_oid eq "$AUTO_BUMP_SHA"; then
     echo "Refusing: the bump commit ${AUTO_BUMP_SHA} was pushed to ${BRANCH} but PR #$PR's head did not reflect it within ${SHIP_AUTO_BUMP_HEAD_WAIT:-90}s — re-run ship once it does (the PR is now bumped; no second bump will be made). Nothing was merged." >&2
@@ -2235,8 +2351,9 @@ if [ "$SKIP_CI" = "0" ]; then
 fi
 
 # --- bot threads on ship's own version-bump line (#518) --------------------------------
-if [ "$AUTO_BUMP_DONE" = "1" ] || [ "$AUTO_BUMP_PLANNED" = "1" ] \
-   || { [ "$AUTO_BUMP_DONE" = "0" ] && locate_version_file >/dev/null && _pr_head_is_ship_bump; }; then
+if [ "${RESOLVE_THREADS:-0}" = "1" ] \
+   && { [ "$AUTO_BUMP_DONE" = "1" ] || [ "$AUTO_BUMP_PLANNED" = "1" ] \
+        || { [ "$AUTO_BUMP_DONE" = "0" ] && locate_version_file >/dev/null && _pr_head_is_ship_bump; }; }; then
   resolve_bump_line_bot_threads
 fi
 
@@ -2304,6 +2421,12 @@ else
   #                      for "PR was force-pushed to an already-on-GitHub commit" that makes
   #                      pushedDate stale. Empty when there has been no force-push.
   # Window start = max(createdAt, pushedDate, committedDate, forcePushedAt).
+  if [ -f "$SHIP_KNOWN_OIDS_FILE" ]; then
+    while IFS= read -r _sk_persisted; do
+      case "$_sk_persisted" in ''|*[!0-9a-f]*) continue ;; esac
+      SHIP_KNOWN_OIDS="${SHIP_KNOWN_OIDS} $_sk_persisted"
+    done < "$SHIP_KNOWN_OIDS_FILE"
+  fi
   SHIP_KNOWN_OIDS_JSON="["; _sk_first=1
   for _sk_oid in $SHIP_KNOWN_OIDS; do
     [ "$_sk_first" = "1" ] || SHIP_KNOWN_OIDS_JSON="${SHIP_KNOWN_OIDS_JSON},"
@@ -2311,7 +2434,7 @@ else
   done
   SHIP_KNOWN_OIDS_JSON="${SHIP_KNOWN_OIDS_JSON}]"
   DWELL_Q='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){createdAt commits(last:15){nodes{commit{oid message committedDate pushedDate committer{email}}}} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt}}}}}}'
-  DWELL_JQ='def is_bump: ((.commit.committer.email // "") == "'"$SHIP_AUTO_BUMP_COMMITTER_EMAIL"'") or ((.commit.oid // "__none__") as $o | ('"$SHIP_KNOWN_OIDS_JSON"' | index($o))) != null;
+  DWELL_JQ='def is_bump: ((.commit.oid // "__none__") as $o | ('"$SHIP_KNOWN_OIDS_JSON"' | index($o))) != null;
     def is_merge: ((.commit.message // "") | test("^Merge (remote-tracking )?branch .+ into "));
     def peel:
       if length == 0 then .

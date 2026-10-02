@@ -107,7 +107,8 @@ case "$sub" in
   api)
     method=GET; endpoint=""; jqexpr=""
     F_message=""; F_content=""; F_sha=""; F_branch=""; F_expected=""; F_query=""; F_id=""; F_oid=""
-    F_committer_email=""; F_committer_name=""
+    F_committer_email=""; F_committer_name=""; F_base_tree=""; F_tree=""
+    F_tree_paths=(); F_tree_contents=(); F_parents=()
     while [ $# -gt 0 ]; do
       case "$1" in
         -X) method="$2"; shift 2 ;;
@@ -116,6 +117,9 @@ case "$sub" in
             message) F_message="$v" ;; content) F_content="$v" ;; sha) F_sha="$v" ;; branch) F_branch="$v" ;;
             expected_head_sha) F_expected="$v" ;; query) F_query="$v" ;; id) F_id="$v" ;; oid) F_oid="$v" ;;
             committer\[email\]) F_committer_email="$v" ;; committer\[name\]) F_committer_name="$v" ;;
+            base_tree) F_base_tree="$v" ;; tree) F_tree="$v" ;;
+            'tree[][path]') F_tree_paths+=("$v") ;; 'tree[][content]') F_tree_contents+=("$v") ;;
+            'parents[]') F_parents+=("$v") ;;
           esac ;;
         --jq) jqexpr="$2"; shift 2 ;;
         -*) shift ;;
@@ -187,6 +191,44 @@ case "$sub" in
           git_c push -q origin "$F_branch"
           jq -n --arg sha "$(git_c rev-parse HEAD)" '{commit:{sha:$sha}}' | jq -r "$jqexpr"
         fi ;;
+      repos/*/git/trees)
+        log "POST git/trees base_tree=$F_base_tree paths=${F_tree_paths[*]:-}"
+        git_c fetch -q origin
+        _wt=$(mktemp -d); _idx=$(mktemp -u)
+        git_c archive "$F_base_tree" | tar -x -C "$_wt"
+        _i=0
+        for _p in "${F_tree_paths[@]}"; do
+          mkdir -p "$(dirname "$_wt/$_p")"
+          printf '%s' "${F_tree_contents[$_i]}" > "$_wt/$_p"
+          _i=$((_i+1))
+        done
+        _tree_sha=$(cd "$_wt" \
+          && GIT_INDEX_FILE="$_idx" GIT_WORK_TREE="$_wt" GIT_DIR="$C/.git" git add -A \
+          && GIT_INDEX_FILE="$_idx" GIT_WORK_TREE="$_wt" GIT_DIR="$C/.git" git write-tree)
+        rm -f "$_idx"; rm -rf "$_wt"
+        jq -n --arg sha "$_tree_sha" '{sha:$sha}' | jq -r "$jqexpr" ;;
+      repos/*/git/commits)
+        log "POST git/commits tree=$F_tree parents=${F_parents[*]:-}"
+        _commit_sha=$(GIT_AUTHOR_NAME="ship (auto-bump)" GIT_AUTHOR_EMAIL="${F_committer_email:-t@t}" \
+          GIT_COMMITTER_NAME="ship (auto-bump)" GIT_COMMITTER_EMAIL="${F_committer_email:-t@t}" \
+          git_c commit-tree "$F_tree" -p "${F_parents[0]}" -m "$F_message")
+        jq -n --arg sha "$_commit_sha" '{sha:$sha}' | jq -r "$jqexpr" ;;
+      repos/*/git/refs/heads/*)
+        _branch="${endpoint##*/git/refs/heads/}"
+        log "PATCH git/refs/heads/$_branch sha=$F_sha"
+        git_c fetch -q origin
+        _cur=$(git_c rev-parse "origin/$_branch" 2>/dev/null || echo "")
+        if [ -n "$_cur" ] && ! git_c merge-base --is-ancestor "$_cur" "$F_sha" 2>/dev/null; then
+          echo "gh: Update is not a fast forward (HTTP 422)" >&2; exit 1
+        fi
+        git_c push -q origin "$F_sha:refs/heads/$_branch"
+        jq -n --arg sha "$F_sha" '{object:{sha:$sha}}' | jq -r "$jqexpr" ;;
+      repos/*/commits/*)
+        _oid="${endpoint##*/commits/}"
+        log "GET commits/$_oid"
+        git_c fetch -q origin
+        _tsha=$(git_c rev-parse "${_oid}^{tree}" 2>/dev/null) || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+        jq -n --arg t "$_tsha" '{commit:{tree:{sha:$t}}}' | jq -r "$jqexpr" ;;
       repos/*/pulls/*/update-branch)
         log "PUT update-branch expected=$F_expected"
         git_c fetch -q origin
@@ -599,16 +641,36 @@ def test_review_dwell_skips_ship_update_branch_merge_before_the_bump(tmp_path):
     assert "review-dwell gate OK" in r.stdout, r.stdout
 
 def test_bot_thread_on_the_bump_line_is_auto_resolved(tmp_path):
+    """Gated behind --resolve-addressed-threads (#672 review finding, P1): this is the ONLY
+    thing that makes ship touch review state on the bump-line bot thread. The general
+    addressed-bot-thread sweep (#268) runs first and is not file/line-scoped, so with the flag
+    on it is the one that actually closes an already-outdated thread anchored on the version
+    line; resolve_bump_line_bot_threads (path/line-scoped to ship's own post-bump line) only
+    ever has work left for a thread the general sweep did not already cover."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+    _write_threads(state, _thread("T_BOT", path="pyproject.toml", line=_VERSION_LINE, login="chatgpt-codex-connector"))
+
+    r = _run_ship(main, bindir, state, "feat", "--resolve-addressed-threads")
+
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "auto-resolve: resolved addressed bot thread T_BOT" in r.stdout, r.stdout
+    assert "resolve T_BOT" in _gh_log(state)
+    assert "[fake gh] merged" in r.stdout
+
+def test_bot_thread_on_the_bump_line_not_resolved_without_opt_in(tmp_path):
+    """P1 (#672 review): without --resolve-addressed-threads, ship must never mutate review
+    state on the PR at all -- not even for its own bump-line bot thread."""
     main, origin, state, bindir = _make_world(tmp_path)
     _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
     _write_threads(state, _thread("T_BOT", path="pyproject.toml", line=_VERSION_LINE, login="chatgpt-codex-connector"))
 
     r = _run_ship(main, bindir, state, "feat")
 
-    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
-    assert "auto-bump threads: resolved bot thread T_BOT on ship's bump line pyproject.toml:3" in r.stdout, r.stdout
-    assert "resolve T_BOT" in _gh_log(state)
-    assert "[fake gh] merged" in r.stdout
+    assert r.returncode != 0, r.stdout
+    assert "resolve T_BOT" not in _gh_log(state)
+    assert "1 unresolved review thread(s)" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
 
 def test_human_thread_on_the_bump_line_still_blocks(tmp_path):
     main, origin, state, bindir = _make_world(tmp_path)
@@ -928,6 +990,17 @@ _PYPROJECT_WITH_TOOL_TABLE = (
     "[project]\nname = \"mytool\"\nversion = \"1.0.0\"\n"
 )
 
+_UV_LOCK = (
+    'version = 1\n'
+    'revision = 2\n'
+    'requires-python = ">=3.11"\n'
+    '\n'
+    '[[package]]\n'
+    'name = "mytool"\n'
+    'version = "1.0.0"\n'
+    'source = { editable = "." }\n'
+)
+
 
 def test_tool_table_version_is_not_bumped(tmp_path):
     """P1-2: version parse/rewrite ONLY the [project] table, never [tool.*] version."""
@@ -1035,3 +1108,76 @@ def test_non_outdated_bot_thread_on_the_bump_line_still_blocks(tmp_path):
     assert "resolve T_CURRENT" not in _gh_log(state)
     assert "1 unresolved review thread(s)" in r.stderr, r.stderr
     assert "[fake gh] merged" not in r.stdout
+
+
+# ---------------------------------------------------------------------------------------
+# #672 review findings: uv.lock consistency, TOML whitespace headers, package.json formatting
+# ---------------------------------------------------------------------------------------
+
+def test_uv_lock_is_bumped_in_the_same_commit(tmp_path):
+    """P1 (#672 review): a uv project's uv.lock records the root package's version too --
+    bumping only pyproject.toml leaves `uv lock --check` failing CI on ship's own commit.
+    Both files must land in ONE remote commit via the Git Data API."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    _commit_file(main, "uv.lock", _UV_LOCK, "chore: add uv.lock")
+    _git("push", "-q", "origin", "main", cwd=main)
+    _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+
+    r = _run_ship(main, bindir, state, "feat")
+
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    log = _gh_log(state)
+    assert "POST git/trees" in log, log
+    assert "POST git/commits" in log, log
+    assert "PATCH git/refs/heads/feat" in log, log
+    assert "PUT contents" not in log, "uv.lock present: must use the Git Data API, not the single-file Contents API"
+    assert 'version = "1.0.1"' in _origin_file(origin, "main", "pyproject.toml")
+    assert 'version = "1.0.1"' in _origin_file(origin, "main", "uv.lock")
+
+def test_uv_lock_without_matching_entry_falls_back_to_pyproject_only(tmp_path):
+    """If uv.lock exists but has no [[package]] entry for the project's own name (a malformed
+    or out-of-sync lockfile), ship still bumps pyproject.toml alone rather than refusing the
+    whole ship over an unrelated lockfile shape."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    _commit_file(main, "uv.lock", _UV_LOCK.replace('name = "mytool"', 'name = "other-pkg"'), "chore: add uv.lock")
+    _git("push", "-q", "origin", "main", cwd=main)
+    _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+
+    r = _run_ship(main, bindir, state, "feat")
+
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "PUT contents file=pyproject.toml branch=feat" in _gh_log(state)
+    assert 'version = "1.0.1"' in _origin_file(origin, "main", "pyproject.toml")
+    assert 'version = "1.0.0"' in _origin_file(origin, "main", "uv.lock"), "unrelated uv.lock entry must be left untouched"
+
+def test_pyproject_with_whitespace_project_header_is_still_bumped(tmp_path):
+    """P1 (#672 review): TOML permits whitespace inside/around a table header (`[ project ]`)
+    -- the version-file locator and rewriter must recognize it, not just the exact `[project]`
+    spelling, or a shippable source change can merge with the version silently unmoved."""
+    main, origin, state, bindir = _make_world(tmp_path, with_version_file=False)
+    _commit_file(main, "pyproject.toml", '[ project ]\nname = "mytool"\nversion = "1.0.0"\n', "chore: whitespace header")
+    _git("push", "-q", "origin", "main", cwd=main)
+    _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+
+    r = _run_ship(main, bindir, state, "feat")
+
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "PUT contents file=pyproject.toml branch=feat" in _gh_log(state)
+    assert 'version = "1.0.1"' in _origin_file(origin, "main", "pyproject.toml")
+
+def test_package_json_formatting_is_preserved_on_bump(tmp_path):
+    """P2 (#672 review): the bump must rewrite only the version token, not reserialize the
+    whole file -- a tab-indented package.json must keep its exact original bytes apart from
+    the version value (a prior jq `.version = $v` round-trip repainted it to 2-space pretty
+    JSON)."""
+    main, origin, state, bindir = _make_world(tmp_path, with_version_file=False)
+    original = '{\n\t"name": "mytool",\n\t"version": "2.3.9",\n\t"private": true\n}\n'
+    _commit_file(main, "package.json", original, "chore: package.json")
+    _git("push", "-q", "origin", "main", cwd=main)
+    _make_pr_branch(main, "feat", "src/a.js", "x = 1\n")
+
+    r = _run_ship(main, bindir, state, "feat")
+
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    bumped = _origin_file(origin, "main", "package.json")
+    assert bumped == original.replace('"version": "2.3.9"', '"version": "2.3.10"'), bumped
