@@ -748,7 +748,11 @@ if [ -n "$_EFFECTIVE_TARGET" ] && [ "$_EFFECTIVE_TARGET" != "$_CWD_ORIGIN_REPO" 
   _FOREIGN_REPO_INVOKE=1
 fi
 
-MAIN_CHECKOUT="${SHIP_MAIN_CHECKOUT:-$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')}"
+# agent-tools#815/#816: an early-exiting awk closes the pipe as soon as it has its match,
+# which SIGPIPEs `git` (exit 141, propagated by `set -euo pipefail`) once a large-worktree
+# repo's porcelain output outlives that early exit; `substr($0,10)` (not `$2`, which splits on
+# whitespace) keeps a main-checkout path containing a space intact.
+MAIN_CHECKOUT="${SHIP_MAIN_CHECKOUT:-$(git worktree list --porcelain | awk '!found && /^worktree /{print substr($0,10); found=1}')}"
 # Guard the MAIN checkout NOW — ship's post-merge refresh runs git ops against it (checkout /
 # fetch / pull), which would fail opaquely under core.bare. Firing before the merge means a
 # hard abort here is safe: nothing is merged yet.
