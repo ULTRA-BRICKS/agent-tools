@@ -116,7 +116,7 @@ never ✅.*
   drifts as they get triaged; run `gh issue list` per repo for the current state rather than trusting a
   number written down at one point in time.
 - 🔬 **`dev-cli` extraction complete** — successfully split out of `agent-tools` into its own standalone
-  public repo, [`alex-mextner/dev-cli`](https://github.com/alex-mextner/dev-cli), earlier in this effort.
+  public repo, [`ultrabricks/dev-cli`](https://git.hyperide.ai/ultrabricks/dev-cli), earlier in this effort.
   Cutover verified.
 - 🔬 **cc-restore mechanism (rig-cli, `riglib/tmux.py`) — investigated, CONFIRMED WORKING, no bug found.**
   It resumes the actual prior Claude Code conversation across a tmux server restart (`claude --resume
@@ -905,7 +905,7 @@ reboot (continuum's last save was 3 weeks old):
   the CORE defers — a `Transport` (reachability via the key cascade + a live call, behind a protocol so the
   engine is network-free in tests) + the single-round panel pass + deterministic synthesis.
   Self-registering commands (`ask`, `board`, `install-skill`), structured exit codes, deterministic tests,
-  README. **Now lives in its own repo: [`alex-mextner/research-cli`](https://github.com/alex-mextner/research-cli)**
+  README. **Now lives in its own repo: [`ultrabricks/research-cli`](https://git.hyperide.ai/ultrabricks/research-cli)**
   — spun out via **strategy B (vendor + drift-guard)**: it vendors `agenttools_providers` +
   `agenttools_errors` + `models.yaml` under `vendor/` with a pinned-SHA drift-guard
   (`scripts/resync_vendored_libs.py --check` + a scheduled CI job against this repo's canonical), the proven

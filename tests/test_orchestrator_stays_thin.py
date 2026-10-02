@@ -118,7 +118,7 @@ def test_blocked_attempts_do_not_refresh_ttl_window(tmp_path, monkeypatch):
     """WARN -> BLOCK -> BLOCK must not bump the marker mtime. After the original
     WARN ages past TTL, the next attempt WARNs again — otherwise a wedged
     orchestrator retrying Edit every few minutes never leaves the BLOCK tier
-    (https://github.com/alex-mextner/agent-tools/issues/495)."""
+    (https://git.hyperide.ai/ultrabricks/agent-tools/issues/495)."""
     import os
 
     event = {"point": "pre-write", "cwd": "/repo", "args": {"file_path": "/repo/src/a.ts"}}

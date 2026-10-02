@@ -2,7 +2,7 @@
 
 - **Status:** research / design (read-only investigation; no tooling changes in this PR)
 - **Date:** 2026-06-15
-- **Tracking issue:** alex-mextner/agent-tools#19
+- **Tracking issue:** ultrabricks/agent-tools#19
 - **ROADMAP:** §10
 - **Author:** triage agent (machine inspection of `~/.claude`, `~/.codex`, `~/.gemini`,
   `~/.config/opencode`, `~/.agents/skills`, `~/.sverklo`, `.serena/`)

@@ -34,7 +34,7 @@ certain. For a *bounded* labeled process under `run_in_background: true` the har
 resume the subagent; whether that specific case should keep being blocked (the labeled runners are
 minutes-long, and "a subagent waiting on its own `review`" is the classic wedge shape regardless
 of mechanism) is a **scope** question deliberately left to a follow-up ticket
-([agent-tools#559](https://github.com/alex-mextner/agent-tools/issues/559)) rather than folded
+([agent-tools#559](https://git.hyperide.ai/ultrabricks/agent-tools/issues/559)) rather than folded
 into this wording fix — the gated scope is unchanged from agent-tools#52.
 
 ## Where it sits in the doctrine (the inverse of two sibling gates)

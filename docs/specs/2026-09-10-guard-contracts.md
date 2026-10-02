@@ -2,8 +2,8 @@
 
 Status: proposed implementation specification; documentation only.
 Date: 2026-09-10.
-Epic: [agent-tools#718](https://github.com/alex-mextner/agent-tools/issues/718).
-Parent: [rig-cli#514](https://github.com/alex-mextner/rig-cli/issues/514).
+Epic: [agent-tools#718](https://git.hyperide.ai/ultrabricks/agent-tools/issues/718).
+Parent: [rig-cli#514](https://git.hyperide.ai/ultrabricks/rig-cli/issues/514).
 
 ## Problem and ownership
 
@@ -13,11 +13,11 @@ Agent-tools remains a portable catalog/library of guard contracts and carriers. 
 
 ### Evidence baseline
 
-[Issue #573](https://github.com/alex-mextner/agent-tools/issues/573) and [PR #620](https://github.com/alex-mextner/agent-tools/pull/620), merge `6194439ea452ffe341683c04da5e787dd34c8ad0`, record delivered detached launchers, argument-forgery stripping and removal of harness-wide exemptions. The previous acceptance text explicitly admitted missing native Codex/OMP child paths and unavailable Codex live proof while checking them complete. This grooming restores those as unfinished work; it does not deny the narrower delivered changes.
+[Issue #573](https://git.hyperide.ai/ultrabricks/agent-tools/issues/573) and [PR #620](https://git.hyperide.ai/ultrabricks/agent-tools/pull/620), merge `6194439ea452ffe341683c04da5e787dd34c8ad0`, record delivered detached launchers, argument-forgery stripping and removal of harness-wide exemptions. The previous acceptance text explicitly admitted missing native Codex/OMP child paths and unavailable Codex live proof while checking them complete. This grooming restores those as unfinished work; it does not deny the narrower delivered changes.
 
-Native OMP remains [#712](https://github.com/alex-mextner/agent-tools/issues/712); native Codex remains [#673](https://github.com/alex-mextner/agent-tools/issues/673). The OMP task records an upstream metadata dependency. A reported upstream gap is a blocker to verify, not permission to fabricate identity variables. Narrow label/path work in [#676](https://github.com/alex-mextner/agent-tools/issues/676) remains distinct from the native payload outcome.
+Native OMP remains [#712](https://git.hyperide.ai/ultrabricks/agent-tools/issues/712); native Codex remains [#673](https://git.hyperide.ai/ultrabricks/agent-tools/issues/673). The OMP task records an upstream metadata dependency. A reported upstream gap is a blocker to verify, not permission to fabricate identity variables. Narrow label/path work in [#676](https://git.hyperide.ai/ultrabricks/agent-tools/issues/676) remains distinct from the native payload outcome.
 
-Execution coverage is [#692](https://github.com/alex-mextner/agent-tools/issues/692), worktree rebinding is [#693](https://github.com/alex-mextner/agent-tools/issues/693), and audit short-circuit behavior is [#713](https://github.com/alex-mextner/agent-tools/issues/713). These are separate failure classes, not duplicates of native identity.
+Execution coverage is [#692](https://git.hyperide.ai/ultrabricks/agent-tools/issues/692), worktree rebinding is [#693](https://git.hyperide.ai/ultrabricks/agent-tools/issues/693), and audit short-circuit behavior is [#713](https://git.hyperide.ai/ultrabricks/agent-tools/issues/713). These are separate failure classes, not duplicates of native identity.
 
 ## Trusted identity
 
@@ -52,15 +52,15 @@ The bridge must strip identity-like tool arguments before normalization and must
 
 For each supported carrier, test main, launcher child, native child, grandchild and concurrent siblings against each subagent-aware hook. Include forged argument, missing metadata, reused PID/session and an unrelated caller's environment. Fixture provenance and harness versions belong in the test documentation. A fake child fixture invented by the bridge author is not evidence of native support.
 
-[#573](https://github.com/alex-mextner/agent-tools/issues/573) closes only when both #712 and #673 meet the shared contract and separately required live checks exist. Quota-blocked live verification remains unchecked. Do not rerun charged or live sessions merely to validate this documentation.
+[#573](https://git.hyperide.ai/ultrabricks/agent-tools/issues/573) closes only when both #712 and #673 meet the shared contract and separately required live checks exist. Quota-blocked live verification remains unchecked. Do not rerun charged or live sessions merely to validate this documentation.
 
 ## Enforcement surfaces and worktree binding
 
-[#692](https://github.com/alex-mextner/agent-tools/issues/692) owns consistent protected-operation enforcement for Bash, Edit/Write and Eval/Workflow where the carrier exposes those surfaces. Classify the operation and target at an enforceable boundary. A few source-code regexes can be a preventive rule, but cannot be claimed as a complete execution sandbox.
+[#692](https://git.hyperide.ai/ultrabricks/agent-tools/issues/692) owns consistent protected-operation enforcement for Bash, Edit/Write and Eval/Workflow where the carrier exposes those surfaces. Classify the operation and target at an enforceable boundary. A few source-code regexes can be a preventive rule, but cannot be claimed as a complete execution sandbox.
 
 The implementation decision must compare the actual available carrier hooks, trusted execution/write wrappers and capability restrictions. Where a surface cannot be intercepted, report that limitation and choose an explicit policy rather than silently allowing it. Preserve legitimate read-only inspection and sanctioned review/reporting flows.
 
-[#693](https://github.com/alex-mextner/agent-tools/issues/693) owns checkout identity after an execution-kernel restart. A process restart must not reset a worktree-bound operation to an unrelated primary checkout. Resolve relative targets against the trusted operation context; canonicalize paths and check protected repository targets consistently. Revalidate on restart and when target context changes. The non-repository target fix [#698](https://github.com/alex-mextner/agent-tools/issues/698) is useful narrow work, not proof that Eval-mediated repository writes are covered.
+[#693](https://git.hyperide.ai/ultrabricks/agent-tools/issues/693) owns checkout identity after an execution-kernel restart. A process restart must not reset a worktree-bound operation to an unrelated primary checkout. Resolve relative targets against the trusted operation context; canonicalize paths and check protected repository targets consistently. Revalidate on restart and when target context changes. The non-repository target fix [#698](https://git.hyperide.ai/ultrabricks/agent-tools/issues/698) is useful narrow work, not proof that Eval-mediated repository writes are covered.
 
 Required negative tests: a main-checkout protected write through every exposed surface is blocked; an authorized worktree operation succeeds; read-only inspection remains possible; restarting the execution kernel cannot change the protected root; a forged worktree argument cannot authorize another checkout. Tests use temporary repositories and do not modify a real user's primary checkout.
 
@@ -68,13 +68,13 @@ Required negative tests: a main-checkout protected write through every exposed s
 
 The producer and Telegram consumer must share a request contract. A approval decision is bound to the reviewed action, not simply the hook name. The action identity includes a stable request ID or agreed fingerprint of exact command/argv, relevant repository/worktree scope, origin session generation and policy. Present an accurate human-readable description of that scope. Do not omit destructive suffixes, truncate the reviewed action silently or accept a blank question.
 
-[agent-tools#702](https://github.com/alex-mextner/agent-tools/issues/702) consumes actual outcomes: posted, not posted/dropped, unanswered/expired, explicit denial, approval and transport failure. These are distinct facts, not a single Boolean decline. Existing [tg-cli#372](https://github.com/alex-mextner/tg-cli/issues/372) is producer-side progress; each hook consumer still needs integration acceptance.
+[agent-tools#702](https://git.hyperide.ai/ultrabricks/agent-tools/issues/702) consumes actual outcomes: posted, not posted/dropped, unanswered/expired, explicit denial, approval and transport failure. These are distinct facts, not a single Boolean decline. Existing [tg-cli#372](https://git.hyperide.ai/ultrabricks/tg-cli/issues/372) is producer-side progress; each hook consumer still needs integration acceptance.
 
-Late decisions may be retained, but a changed command, repository or origin is a new authorization request. Reusing the same hook name must not transfer a one-use decision. The acceptance matrix in [tg-cli#380](https://github.com/alex-mextner/tg-cli/issues/380) covers this producer/consumer boundary. A timeout, unknown outcome or missing record is never approval.
+Late decisions may be retained, but a changed command, repository or origin is a new authorization request. Reusing the same hook name must not transfer a one-use decision. The acceptance matrix in [tg-cli#380](https://git.hyperide.ai/ultrabricks/tg-cli/issues/380) covers this producer/consumer boundary. A timeout, unknown outcome or missing record is never approval.
 
 ## Audit without side effects
 
-[#713](https://github.com/alex-mextner/agent-tools/issues/713) must preserve first-block enforcement semantics while making every requested hatch visible.
+[#713](https://git.hyperide.ai/ultrabricks/agent-tools/issues/713) must preserve first-block enforcement semantics while making every requested hatch visible.
 
 Recommended separation:
 
@@ -89,7 +89,7 @@ Audit records should contain invocation ID, hook ID, scoped request reference, r
 
 ## Review-capacity exception boundary
 
-[#705](https://github.com/alex-mextner/agent-tools/issues/705) consumes [review-cli#472](https://github.com/alex-mextner/review-cli/issues/472). A capacity-related exception is allowed only under the existing authorized policy and fresh, well-formed, complete affirmative evidence. Nonempty candidate coverage is mandatory. Missing CLI, nonzero query exit, malformed JSON, stale data, partial mapping or unknown seats are not proof that every candidate is exhausted.
+[#705](https://git.hyperide.ai/ultrabricks/agent-tools/issues/705) consumes [review-cli#472](https://git.hyperide.ai/ultrabricks/review-cli/issues/472). A capacity-related exception is allowed only under the existing authorized policy and fresh, well-formed, complete affirmative evidence. Nonempty candidate coverage is mandatory. Missing CLI, nonzero query exit, malformed JSON, stale data, partial mapping or unknown seats are not proof that every candidate is exhausted.
 
 The exception must be bound to the attempted repository/review context and recorded in audit. It must not bypass unrelated CI, security, review-thread, protected-branch or version gates. No raw merge, no-verify or blanket environment bypass is part of this specification.
 

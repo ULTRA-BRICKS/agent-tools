@@ -71,7 +71,7 @@ closes that for an arbitrary substring. Making this genuinely safe needs a
 structural marker format (e.g. requiring a numeric worker-id path segment,
 matching this convention's own shape) validated by pattern, not accepted
 as a raw string — real, separate design work, tracked as
-[agent-tools#481](https://github.com/alex-mextner/agent-tools/issues/481)
+[agent-tools#481](https://git.hyperide.ai/ultrabricks/agent-tools/issues/481)
 rather than guessed at under review-round time pressure.
 
 ## Testing

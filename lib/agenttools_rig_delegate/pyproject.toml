@@ -19,7 +19,7 @@ dependencies = []
 test = ["pytest"]
 
 [project.urls]
-Homepage = "https://github.com/alex-mextner/agent-tools"
+Homepage = "https://git.hyperide.ai/ultrabricks/agent-tools"
 
 # The package source lives one directory up (lib/agenttools_rig_delegate, this file's
 # directory is the package itself). Point discovery at the parent so setuptools finds the
