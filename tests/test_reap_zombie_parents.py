@@ -14,6 +14,7 @@ Run from the repo root::
 from __future__ import annotations
 
 import importlib.util
+import signal
 import sys
 import time
 from pathlib import Path
@@ -481,3 +482,55 @@ def test_main_dry_run_reports_without_killing(monkeypatch, capsys):
     assert killed == []
     out = capsys.readouterr().out
     assert "49954" in out
+
+
+def test_default_kill_signals_pid_directly_never_shells_out(monkeypatch):
+    """`_default_kill` is the code path main() uses for a real reap. It must
+    be a raw PID signal (os.kill), never a subprocess call to pkill/killall
+    — the named-kill approach the module docstring documents as out of
+    scope ("this script never calls pkill/killall")."""
+    signalled = []
+    monkeypatch.setattr(reaper.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+
+    def fail_run(*args, **kwargs):
+        raise AssertionError("_default_kill must not shell out; it must call os.kill")
+
+    monkeypatch.setattr(reaper.subprocess, "run", fail_run)
+    reaper._default_kill(49954, signal.SIGTERM)
+    assert signalled == [(49954, signal.SIGTERM)]
+
+
+def test_sweep_never_shells_out_to_a_name_based_kill(monkeypatch):
+    """Every subprocess call sweep() makes while validating and signaling
+    the target pid must be a `ps` identity re-check keyed on that exact
+    pid. A `pkill`/`killall` invocation here would mean the guard fell back
+    to searching by process name — the bug this reaper exists to replace
+    (review follow-up #683)."""
+    helper = _proc(49954, 49498, args=HELPER_ARGS)
+    procs = [helper, _zombie(50084, 49954, age_s=reaper.MIN_ZOMBIE_AGE_S * 10)]
+    commands = []
+    killed = []
+
+    def fake_run(argv, **kwargs):
+        commands.append(list(argv))
+        assert argv[0] == "ps", f"non-ps subprocess call: {argv}"
+        if "args=" in argv:
+            return _FakeCompletedProcess(HELPER_ARGS + "\n")
+        if "lstart=" in argv:
+            return _FakeCompletedProcess(
+                _lstart_for(FIXED_NOW - reaper.MIN_ZOMBIE_AGE_S) + "\n"
+            )
+        raise AssertionError(f"unexpected ps invocation: {argv}")
+
+    monkeypatch.setattr(reaper.time, "time", lambda: FIXED_NOW)
+    monkeypatch.setattr(reaper.subprocess, "run", fake_run)
+    report = reaper.sweep(
+        list_processes=lambda: procs,
+        kill=lambda pid, sig: killed.append((pid, sig)),
+        sleeper=lambda _s: None,
+        pid_alive=lambda _pid: False,
+    )
+    assert report.killed_pids == [49954]
+    assert killed and all(pid == 49954 for pid, _sig in killed)
+    assert commands, "expected identity re-checks via ps"
+    assert all(argv[0] == "ps" for argv in commands)
