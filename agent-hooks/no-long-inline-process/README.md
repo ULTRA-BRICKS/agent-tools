@@ -96,6 +96,8 @@ and denied, the hook prints that deny reason (unreachable / too short / declined
 **not** reprint the "set `RIG_HATCH_REQUEST_…`" usage blurb. An agent can *request*, not
 self-grant — the human taps to approve.
 
+A late approval is not wasted: if the human approves after the ask window expires, the tg-ctl daemon keeps it as a single-use `approved:<id>` grant bound to this exact operation (RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="approved:<id>" inline for pre-bash retries of the SAME command in the SAME directory; for any hook — pre-write included — simply retrying the identical operation lets the shared lib consume the grant automatically via its pull, which requires this session's route identity to match the original ask — if the retry still denies, ask the human via `tg --tag decision`). A changed command/edit or a different directory is denied and does not consume the grant. See the shared lib docstring (`lib/agenttools_hatch_escalation/`) for the full Late-Approval Grant Protocol (agent-tools#742).
+
 The inline prefix is also the **classifier-safe** path ([agent-tools#336](https://github.com/alex-mextner/agent-tools/issues/336)):
 auto-mode may block exporting `RIG_HATCH_REQUEST_*` into the harness environment. The prefix
 lives on the command string, so no export is required. If even the inline command is

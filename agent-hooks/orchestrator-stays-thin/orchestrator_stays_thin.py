@@ -2151,7 +2151,17 @@ def main() -> int:
     # WARN first, BLOCK on repeat within the window. Only a would-be BLOCK consults the hatch —
     # a first-offense WARN is advisory (allow) and needs no escalation.
     if _is_repeat(event):
-        ctx = {"hook": "orchestrator-stays-thin", "point": point, "command": command}
+        ctx: dict = {"hook": "orchestrator-stays-thin", "point": point, "command": command}
+        if point == "pre-write":
+            # Thread the write's tool + exact tool_input fields into the hatch context so a
+            # late-approval grant binds to THIS byte-exact operation via a sha256 fingerprint
+            # computed lib-side (agent-tools#742) — dumb pass-through only, no digesting or
+            # rendering here (SYNC: agent-hooks/worktree-only-writes/worktree_only_writes.py).
+            # getattr-guarded: a NEWER hook against an OLDER lib copy (pre-#742) must degrade
+            # to coarser binding, never crash ahead of the default block.
+            op_fields = getattr(hatch_escalation, "hatch_write_op_fields", None)
+            if op_fields is not None:
+                ctx.update(op_fields(event.get("tool"), args))
         # Resolve the hatch config (rig.yaml / tg_ctl_path) from the GOVERNING repo — for a
         # pre-write that is the TARGET file's repo (`cfg_dir`), which can differ from the shell
         # `cwd`; using `cwd` would route/deny an approval for a cross-repo write via the wrong

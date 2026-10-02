@@ -927,7 +927,9 @@ def _gate_dangerous_segments(
         # bounded by _MAIN_LOOP_BUDGET_S/_APPROVAL_TIMEOUT_CEILING_S — a human approval round-trip
         # legitimately runs up to tg-ctl's 900s cap, which is why this hook's manifest timeout_ms
         # was raised to 960000. It only "stops" (returns should_stop=True) when an actual hatch
-        # request was made; an unset env var falls through to the approval_cmd budget below.
+        # request was made OR a pull verdict surfaced; an unset env var first runs the lib's ONE
+        # bounded grant pull (~15s daemon-local lookup + a git rev-parse for repoRoot,
+        # agent-tools#742 — fail-closed) and then falls through to the approval_cmd budget below.
         hatch = hatch_escalation.request_hatch_approval(
             "block-reset-hard", context, cwd=eff_cwd, command=command
         )

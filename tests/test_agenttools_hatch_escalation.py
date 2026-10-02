@@ -39,8 +39,13 @@ _ALLOW_REPLY_SH = 'printf \'{"hookSpecificOutput":{"hookEventName":"PermissionRe
 
 
 def _allow_body(marker: Path | None = None) -> str:
+    # The late-approval PULL query (`--verify-grant --pull`, agent-tools#742) is a daemon-local
+    # grant-store lookup, NOT a Telegram ask — tests that pin "hatch unset ⇒ the human is never
+    # asked" must not count it as contact. The fake answers it with empty stdout (no grant
+    # matched → the lib fails closed to the unchanged deny) and never touches the marker.
+    guard = 'case "$*" in *--verify-grant*) exit 0;; esac\n'
     prefix = f"touch {marker}\n" if marker is not None else ""
-    return prefix + _ALLOW_REPLY_SH
+    return guard + prefix + _ALLOW_REPLY_SH
 
 
 def _repo_with_tg_ctl(tmp_path: Path, tg_ctl: Path | None = None) -> Path:
@@ -80,7 +85,7 @@ def _hermetic_home(tmp_path, monkeypatch):
     )
 
 
-def test_env_unset_is_not_requested_and_does_not_contact_tg_ctl(tmp_path):
+def test_env_unset_is_not_requested_and_never_posts_a_telegram_card(tmp_path):
     marker = tmp_path / "called"
     tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", _allow_body(marker))
     repo = _repo_with_tg_ctl(tmp_path)

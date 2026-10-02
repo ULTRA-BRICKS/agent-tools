@@ -142,6 +142,31 @@ hatch_escalation = _load_hatch_escalation()
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
+# The hatch env var for this hook, spelled INLINE (NOT via the lib's hatch_env_var): the
+# ruling-2 fail-closed check below must also work when `hatch_escalation` is the
+# `_UnavailableHatch` stub, which has no `hatch_env_var` attribute.
+_HATCH_ENV_VAR = "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE"
+# What counts as dispatch IDENTITY for the ruling-2 weak-binding check (run_in_background is
+# deliberately absent — every dispatch carries it, so it distinguishes nothing). SYNC: the
+# lib's `_DISPATCH_IDENTITY_KEYS` (agent-hooks stay self-contained, no shared import).
+_DISPATCH_IDENTITY_KEYS = (
+    "tool_name",
+    "subagent_type",
+    "agent",
+    "description",
+    "prompt",
+    "task",
+    "isolation",
+)
+
+
+def _usable_dispatch_identity(fields: dict) -> bool:
+    """True when the op-fields enrichment binds a grant to THIS dispatch (ruling 2,
+    2026-09-12). An empty identity means hook-only granularity — a grant minted for one
+    blocked prompt would be consumable by a later, unrelated one behind the same hook_id."""
+
+    return any(fields.get(key) for key in _DISPATCH_IDENTITY_KEYS)
+
 # A prompt is "trivial" (cheap to run inline) only if it is short AND single-line. Kept
 # deliberately conservative: we block only a CLEARLY non-trivial foreground dispatch, so a
 # false negative (a borderline one slipping through) is preferred to nagging on quick tasks.
@@ -315,7 +340,46 @@ def main() -> int:
 
     cwd = str(event.get("cwd") or os.getcwd())
     reminder = _reminder_for(event.get("harness"))
+    # Bind the hatch grant to THIS dispatch (agent-tools#742 P1): without the enrichment the
+    # fingerprint degenerates to hook-only and a grant minted for one blocked prompt could be
+    # consumed by a later, unrelated one. The lib digests these fields; raw prompt/description
+    # never leaves this process.
+    #
+    # RULING 2 (2026-09-12): grant paths FAIL CLOSED on weak binding — NO getattr fallback.
+    # If the lib lacks `hatch_dispatch_op_fields` (an older agent-tools lib, or the
+    # `_UnavailableHatch` import stub) or the enrichment yields no usable dispatch identity,
+    # the hatch is never consulted: with a hatch env value present the tool call DENIES naming
+    # the missing binding (no Telegram ask, nothing consumed); with none present the lib is
+    # skipped entirely so no weak pull fires, and today's default block proceeds (#547 keeps
+    # its fail-open semantics for the gate's NON-hatch behavior only). The shared lib rejects
+    # weak dispatch-bound payloads independently (belt-and-suspenders, ruling 2 refinement).
     ctx = {"hook": "background-subagent-gate"}
+    hatch_denied: str | None = None
+    if not hasattr(hatch_escalation, "hatch_dispatch_op_fields"):
+        hatch_denied = (
+            "the installed agent-tools lib is too old to bind a late-approval grant to this "
+            "dispatch (hatch_dispatch_op_fields is missing) — no Telegram ask was posted and "
+            "no grant can be consumed under weak hook-only binding; update agent-tools "
+            "(agent-tools#742)"
+        )
+    else:
+        op_fields = hatch_escalation.hatch_dispatch_op_fields(event.get("tool"), args)
+        if not _usable_dispatch_identity(op_fields):
+            hatch_denied = (
+                "no usable dispatch identity (tool_name/subagent_type/description/prompt) to "
+                "bind a late-approval grant to THIS dispatch — no Telegram ask was posted and "
+                "no grant can be consumed under weak hook-only binding (agent-tools#742)"
+            )
+        else:
+            ctx.update(op_fields)
+    if hatch_denied is not None:
+        message = reminder
+        if os.environ.get(_HATCH_ENV_VAR):
+            # The moment a hatch value is present, the grant path denies closed naming the
+            # missing binding — never a silent degrade to hook-only granularity.
+            message = f"hatch escalation denied: {hatch_denied}\n{reminder}"
+        emit("block", message)
+        return BLOCK_EXIT_CODE
     hatch = hatch_escalation.request_hatch_approval("background-subagent-gate", ctx, cwd=cwd)
     if hatch.should_stop:
         if hatch.approved:

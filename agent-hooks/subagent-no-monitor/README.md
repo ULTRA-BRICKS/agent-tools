@@ -71,6 +71,8 @@ process-env source applies here, matching how the pre-write hooks read this var.
 Telegram call is made and the call simply blocks. If present but blank/bare (`1`/`true`/`yes`),
 the hook denies without contacting Telegram.
 
+A late approval is not wasted: if the human approves after the ask window expires, the tg-ctl daemon keeps it as a single-use `approved:<id>` grant bound to this exact operation. This hook has no shell command to carry an inline prefix, so the retry form is: simply retry the IDENTICAL operation in the same directory and the shared lib consumes the grant automatically via its pull — which requires this session's route identity to match the original ask; if the retry still denies, ask the human via `tg --tag decision`. A changed edit or a different directory is denied and does not consume the grant. See the shared lib docstring (`lib/agenttools_hatch_escalation/`) for the full Late-Approval Grant Protocol (agent-tools#742).
+
 ## Registration (read before assuming this fires on an unpatched machine)
 
 Mapping `Monitor` → `pre-monitor` in `lib/cc_hook_bridge/dispatch.py` is **not**, on its own,

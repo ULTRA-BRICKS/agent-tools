@@ -117,6 +117,8 @@ without a Telegram call; a real justification runs the trusted `tg-ctl ask` and 
 merge **only on exit 0** (any nonzero exit / error / timeout denies, the block leading with
 `hatch escalation denied: <reason>`).
 
+A late approval is not wasted: if the human approves after the ask window expires, the tg-ctl daemon keeps it as a single-use `approved:<id>` grant bound to this exact operation (RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="approved:<id>" inline for pre-bash retries of the SAME command in the SAME directory; for any hook — pre-write included — simply retrying the identical operation lets the shared lib consume the grant automatically via its pull, which requires this session's route identity to match the original ask — if the retry still denies, ask the human via `tg --tag decision`). A changed command/edit or a different directory is denied and does not consume the grant. See the shared lib docstring (`lib/agenttools_hatch_escalation/`) for the full Late-Approval Grant Protocol (agent-tools#742).
+
 ## Fail-closed
 
 `on_error: "closed"`. If the hook can't inspect the command (a malformed event, a crash),

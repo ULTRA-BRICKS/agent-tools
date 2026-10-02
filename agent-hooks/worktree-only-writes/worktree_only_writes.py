@@ -275,17 +275,29 @@ def worktree_only_enabled(cwd: str) -> bool:
     return _agent_hooks_bool(text, CONFIG_KEY, default=False)
 
 
-def _decide_block(cwd: str, branch: str) -> int:
+def _decide_block(
+    cwd: str, branch: str, tool: str | None = None, args: dict | None = None
+) -> int:
     """The gate has decided this on-default-branch write must be redirected. Consult the Telegram
     hatch: an unset request is the normal BLOCK; a present request allows on the human's approval
     (tg-ctl exit 0) and blocks (leading with the denial reason) otherwise.
 
     A pre-write hook has NO shell command string (the event is an Edit/Write), so the
     justification is read purely from the process environment (`RIG_HATCH_REQUEST_…`); `command`
-    is not passed."""
+    is not passed. The write's tool + exact tool_input fields ARE threaded into the hatch context
+    (`hatch_write_op_fields`) so a late-approval grant binds to THIS byte-exact operation via a
+    sha256 fingerprint computed lib-side (agent-tools#742) — this hook stays a dumb pass-through
+    and never digests or renders the content itself."""
     message = MESSAGE.format(branch=branch)
+    ctx: dict = {"hook": HOOK_ID, "branch": branch}
+    # getattr-guarded: a hook installed from a NEWER checkout can run against an OLDER
+    # lib copy (pre-#742) that lacks the helper — missing fields just mean coarser binding,
+    # never a crash ahead of the default block.
+    op_fields = getattr(hatch_escalation, "hatch_write_op_fields", None)
+    if op_fields is not None:
+        ctx.update(op_fields(tool, args or {}))
     hatch = hatch_escalation.request_hatch_approval(
-        HOOK_ID, {"hook": HOOK_ID, "branch": branch}, cwd=cwd,
+        HOOK_ID, ctx, cwd=cwd,
     )
     if hatch.should_stop:
         if hatch.approved:
@@ -374,7 +386,7 @@ def main() -> int:
         return 0
 
     # 3. On the default branch: BLOCK, unless a one-time Telegram hatch request is approved.
-    return _decide_block(where, branch)
+    return _decide_block(where, branch, tool=event.get("tool"), args=args)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,8 @@ need requests a one-time Telegram approval with a written justification in
 `RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY`; a bare `1`/`true`/`yes`/`on` is rejected outright
 (no Telegram round-trip). Approved → allow; declined, timed out, or unset → block.
 
+A late approval is not wasted: if the human approves after the ask window expires, the tg-ctl daemon keeps it as a single-use `approved:<id>` grant bound to this exact operation (RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY="approved:<id>" inline for a retry of the SAME command in the SAME directory; for any hook — pre-write included — simply retrying the identical operation lets the shared lib consume the grant automatically via its pull, which requires this session's route identity to match the original ask — if the retry still denies, ask the human via `tg --tag decision`). A changed command/edit or a different directory is denied and does not consume the grant. See the shared lib docstring (`lib/agenttools_hatch_escalation/`) for the full Late-Approval Grant Protocol (agent-tools#742).
+
 ## Known scope limits (heuristic, not a sandbox)
 
 - Only a literal leading `cd <dir> &&` prefix in the SAME command is tracked; a `cd` inside a

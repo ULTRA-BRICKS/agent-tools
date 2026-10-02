@@ -105,6 +105,8 @@ prefix, so the value never reaches its `os.environ`). It also works when the com
 first command on the line (`cd repo && RIG_HATCH_REQUEST_…="why" git commit …`). Exporting the var
 into the harness environment works too and takes precedence over an inline value.
 
+A late approval is not wasted: if the human approves after the ask window expires, the tg-ctl daemon keeps it as a single-use `approved:<id>` grant bound to this exact operation (RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="approved:<id>" inline for pre-bash retries of the SAME command in the SAME directory; for any hook — pre-write included — simply retrying the identical operation lets the shared lib consume the grant automatically via its pull, which requires this session's route identity to match the original ask — if the retry still denies, ask the human via `tg --tag decision`). A changed command/edit or a different directory is denied and does not consume the grant. See the shared lib docstring (`lib/agenttools_hatch_escalation/`) for the full Late-Approval Grant Protocol (agent-tools#742).
+
 The request routes to the human over Telegram (`tg-ctl ask`) and the commit is allowed **only**
 on their approval. It is **deny-by-default**: a blank value or a bare `1`/`true` (no real
 justification) is rejected without sending the message, and any nonzero/timeout/error verdict

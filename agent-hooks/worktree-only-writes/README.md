@@ -62,6 +62,8 @@ The request routes to the human via trusted `tg-ctl` and the write is allowed **
 approval tap; a bare `1` (no real justification) is rejected, and an unanswered/denied prompt
 blocks. This mirrors `block-raw-pr-merge` / `block-reset-hard`.
 
+A late approval is not wasted: if the human approves after the ask window expires, the tg-ctl daemon keeps it as a single-use `approved:<id>` grant bound to this exact operation. This hook has no shell command to carry an inline prefix, so the retry form is: simply retry the IDENTICAL operation in the same directory and the shared lib consumes the grant automatically via its pull — which requires this session's route identity to match the original ask; if the retry still denies, ask the human via `tg --tag decision`. A changed edit or a different directory is denied and does not consume the grant. See the shared lib docstring (`lib/agenttools_hatch_escalation/`) for the full Late-Approval Grant Protocol (agent-tools#742).
+
 Because the approval can wait up to `tg-ctl ask`'s 900s window, the descriptor's `timeout_ms`
 is **960000** (900s cap + 30s margin), not the 3s default: a slow/unanswered prompt must resolve
 to the hook's own deny **before** the bridge's descriptor-timeout kill would fire `on_error:
