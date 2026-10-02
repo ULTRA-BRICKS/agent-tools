@@ -2,7 +2,8 @@
 
 **Point:** `pre-bash` · **Fail policy:** `open` · **Priority:** 40
 
-Enforces `<repo-root>/.worktrees/` as the **ONLY** sanctioned worktree location: BLOCKS a
+Enforces direct-child canonical `<repo-root>/.worktrees/<name>` targets as the **ONLY**
+sanctioned worktree locations: BLOCKS a
 `git worktree add` / `remove` / `move` whose target does not resolve there, and points the
 agent at `rig worktree create` / `rig worktree remove` / `rig worktree gc` instead.
 (agent-tools#608, Alex, 2026-09-07.)
@@ -24,7 +25,8 @@ and `.claude/worktrees/agent-*` — the five-conventions problem, unguarded.
 
 ## What's blocked / what's allowed
 
-- `git worktree add <path>` — BLOCKED if `<path>` does not resolve under `<repo-root>/.worktrees/`.
+- `git worktree add <path>` — BLOCKED if `<path>` does not resolve to a direct-child canonical
+  `<repo-root>/.worktrees/<name>` target.
 - `git worktree add -b <branch> <path>` / `git worktree add <path> -b <branch>` — either flag
   order; `-b`/`-B`/`--reason` are recognized as value-taking flags so their argument is never
   mistaken for the target path.
@@ -43,10 +45,11 @@ and `.claude/worktrees/agent-*` — the five-conventions problem, unguarded.
   segment blocks the whole chain. At most ONE segment in a single chained command gets a Telegram
   hatch round-trip (see "No self-service bypass" below) — a second gate-worthy segment in the
   same chain is blocked outright, no hatch call.
-- **Allowed, unaffected:** `git worktree add`/`remove`/`move` targeting anything already under
-  `<repo-root>/.worktrees/` (i.e. what `rig worktree create`/`remove` themselves produce, or a
+- **Allowed, unaffected:** `git worktree add`/`remove`/`move` targeting a direct-child canonical
+  `<repo-root>/.worktrees/<name>` (i.e. what `rig worktree create`/`remove` themselves produce, or a
   destination `.worktrees/<name>` migration lands at — but NOT `.worktrees` itself with no
-  `<name>`, which is not a valid `rig worktree create` shape and is still blocked);
+  `<name>`, or nested paths such as `.worktrees/sub/feat`, which are not valid
+  `rig worktree create` shapes and are still blocked);
   `git worktree list` / `lock` / `unlock` / `repair`; `git worktree prune` (see "Deliberately out
   of scope" below).
 

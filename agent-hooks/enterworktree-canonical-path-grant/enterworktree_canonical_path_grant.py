@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """agents-hooks/v1 pre-worktree-enter hook — GRANT (pre-approve) an EnterWorktree(path=...)
-call whose target resolves under the repo's rig-sanctioned ``<repo-root>/.worktrees/<name>``,
+call whose target resolves to the repo's rig-sanctioned direct-child ``<repo-root>/.worktrees/<name>``,
 suppressing Claude Code's own interactive permission prompt for that one canonical case.
 
 Incident this closes (rig-cli#418, Alex, 2026-09-07/08): PR#298 registered an ``EnterWorktree``
@@ -20,7 +20,7 @@ corrected by Alex before it landed): ``EnterWorktree`` can enter ANY worktree re
 tool would let a caller route around the exact same location-bypass concern
 ``block-raw-worktree-add`` (agent-tools#608) closes for the Bash/``git worktree add`` path. This
 hook is PATH-SCOPED instead: it inspects the actual resolved target and only grants when that
-target is a proper child of ``<repo-root>/.worktrees/`` — the same canonical-path policy, reused
+target is a direct child at ``<repo-root>/.worktrees/<name>`` — the same canonical-path policy, reused
 (not reimplemented) from ``block-raw-worktree-add/block_raw_worktree_add.py`` (SYNC, see below).
 Anything else gets NO opinion from this hook (plain ``allow``, not a grant) and CC's own
 interactive prompt still fires exactly as it does today — this hook only ever REMOVES friction
@@ -40,9 +40,10 @@ BLOCK from either hook win outright, regardless of priority order or whether thi
 granted.
 
 Scope, deliberately narrow:
-  - ``args.path`` present (entering an EXISTING worktree) and it resolves under
-    ``<repo-root>/.worktrees/<name>`` → GRANT.
-  - ``args.path`` present but resolves anywhere else → plain ``allow`` (no opinion; CC's normal
+  - ``args.path`` present (entering an EXISTING worktree) and it resolves to the direct-child
+    ``<repo-root>/.worktrees/<name>`` shape → GRANT.
+  - ``args.path`` present but resolves anywhere else, including nested paths like
+    ``<repo-root>/.worktrees/sub/feat`` → plain ``allow`` (no opinion; CC's normal
     prompt still fires, unchanged from today).
   - ``args.path`` ABSENT (creating a brand-new worktree via ``args.name``) → plain ``allow``.
     CC hardcodes ``name``-mode to land inside ``.claude/worktrees/`` (its own already-trusted
@@ -167,7 +168,7 @@ def repo_root(cwd: str) -> Path | None:
 
 def _worktrees_dir_escapes_repo(root: Path) -> bool:
     """True iff ``<root>/.worktrees`` is itself a symlink resolving OUTSIDE ``root`` — the one
-    way the "target resolves under ``.worktrees/``" check below could be gamed (mirrors
+    way the "target resolves to a direct child of ``.worktrees/``" check below could be gamed (mirrors
     ``riglib/worktree.py::_target_escapes_repo``). A dangling symlink is treated as escaped
     too — not a legitimate ``.worktrees``, don't trust it either way."""
     candidate = root / _WORKTREES_DIR_NAME
@@ -185,9 +186,9 @@ def _worktrees_dir_escapes_repo(root: Path) -> bool:
 
 
 def _target_is_sanctioned(root: Path, resolved_target: Path) -> bool:
-    """True iff ``resolved_target`` resolves to a PROPER child of ``<root>/.worktrees/`` (not
-    ``.worktrees`` itself — an ``EnterWorktree(path=<repo>/.worktrees)`` with no ``<name>``
-    subdirectory at all is not the ``rig worktree create`` shape) AND ``.worktrees`` itself
+    """True iff ``resolved_target`` has the direct-child ``<root>/.worktrees/<name>`` shape
+    (not ``.worktrees`` itself or a nested path like ``.worktrees/sub/feat`` — neither is
+    the ``rig worktree create`` shape) AND ``.worktrees`` itself
     isn't a symlink escaping ``root``."""
     if _worktrees_dir_escapes_repo(root):
         return False
@@ -195,8 +196,8 @@ def _target_is_sanctioned(root: Path, resolved_target: Path) -> bool:
     if resolved_target == allowed_dir:
         return False
     try:
-        resolved_target.relative_to(allowed_dir)
-        return True
+        relative_target = resolved_target.relative_to(allowed_dir)
+        return len(relative_target.parts) == 1
     except ValueError:
         return False
 
@@ -210,8 +211,8 @@ def _resolve_target(cwd: str, target: str) -> Path:
 
 def _grant_message(root: Path, path: str) -> str:
     return (
-        f"EnterWorktree(path={path}) resolves under this repo's rig-sanctioned "
-        f"{root / _WORKTREES_DIR_NAME} — pre-approved (rig-cli#418), no prompt needed. "
+        f"EnterWorktree(path={path}) resolves to this repo's rig-sanctioned direct-child "
+        f"{root / _WORKTREES_DIR_NAME}/<name> shape — pre-approved (rig-cli#418), no prompt needed. "
         "(Entering a DIFFERENT agent's worktree there is a separate check, enforced by the "
         "enterworktree-foreign-guard agent-hook, not this one.)"
     )

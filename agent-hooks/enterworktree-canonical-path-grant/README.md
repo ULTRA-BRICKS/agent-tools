@@ -3,7 +3,7 @@
 **Point:** `pre-worktree-enter` · **Fail policy:** `open` · **Priority:** 40
 
 GRANTs (pre-approves, suppressing Claude Code's own interactive permission prompt) an
-`EnterWorktree(path=...)` call whose target resolves under this repo's rig-sanctioned
+`EnterWorktree(path=...)` call whose target resolves to this repo's rig-sanctioned direct-child
 `<repo-root>/.worktrees/<name>` location — the ONLY sanctioned worktree location per rig-cli's
 own AGENTS.md "Worktree lifecycle" section. Never blocks anything.
 
@@ -27,7 +27,10 @@ blanket grant would let a caller route around the exact same worktree-location-b
 `block-raw-worktree-add` (agent-tools#608) closes for the raw `git worktree add`/`remove`/`move`
 Bash path, just via a different tool. This hook is PATH-SCOPED instead:
 
-- `args.path` resolves under `<repo-root>/.worktrees/<name>` → **GRANT** (suppress the prompt).
+- `args.path` resolves to the direct-child `<repo-root>/.worktrees/<name>` shape → **GRANT**
+  (suppress the prompt).
+- `args.path` resolves to a nested path such as `<repo-root>/.worktrees/sub/feat` → plain
+  `allow` (no grant).
 - `args.path` resolves anywhere else → plain `allow` (no opinion; CC's own interactive prompt
   still fires, exactly as it does today — this hook only ever *removes* friction for the
   sanctioned case, it never adds a new restriction).

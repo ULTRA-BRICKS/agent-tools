@@ -542,7 +542,8 @@ def _worktrees_dir_is_untrusted(root: Path) -> bool:
 
 
 def _target_is_sanctioned(root: Path, raw_target: str, resolved_target: Path) -> bool:
-    """True iff `resolved_target` resolves to a PROPER child of `<root>/.worktrees/` (not
+    """True iff `resolved_target` is a direct-child canonical `<root>/.worktrees/<name>` target
+    (not a nested path such as `.worktrees/sub/feat`, nor
     `.worktrees` itself — `Path.relative_to` on an identical path returns `.` without raising, so
     a bare `git worktree add .worktrees feat/x` — no `<name>` subdirectory at all, not the
     `rig worktree create` shape — must not be waved through as "already sanctioned"), the raw
@@ -557,8 +558,8 @@ def _target_is_sanctioned(root: Path, raw_target: str, resolved_target: Path) ->
     if resolved_target == allowed_dir:
         return False
     try:
-        resolved_target.relative_to(allowed_dir)
-        return True
+        relative_target = resolved_target.relative_to(allowed_dir)
+        return len(relative_target.parts) == 1
     except ValueError:
         return False
 

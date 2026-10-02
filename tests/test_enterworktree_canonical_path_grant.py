@@ -1,8 +1,8 @@
 """Tests for the enterworktree-canonical-path-grant agent-hook (pre-worktree-enter).
 
-Covers the doctrine (rig-cli#418): an EnterWorktree(path=...) call whose target resolves
-under the repo's rig-sanctioned <repo-root>/.worktrees/<name> is GRANTED (pre-approved); any
-other target -- outside .worktrees/, the bare .worktrees/ directory itself, a .worktrees
+Covers the doctrine (rig-cli#418): an EnterWorktree(path=...) call whose target resolves to
+the repo's rig-sanctioned direct-child <repo-root>/.worktrees/<name> is GRANTED (pre-approved); any
+other target -- outside .worktrees/, a nested path, the bare .worktrees/ directory itself, a .worktrees
 symlink escaping the repo, or the `name`-based create path (no `path` at all) -- gets a plain
 allow (no opinion), never a grant and never a block (this hook never blocks anything).
 
@@ -111,6 +111,15 @@ def test_bare_worktrees_dir_itself_is_not_sanctioned(tmp_path, monkeypatch):
     out, code = _run(event, monkeypatch)
     assert code == 0
     assert _decision(out) == "allow"
+
+
+def test_nested_worktrees_path_is_plain_allow(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "sub" / "feat"
+    event = {"cwd": str(repo), "args": {"path": str(target)}}
+    out, code = _run(event, monkeypatch)
+    assert code == 0
+    assert json.loads(out) == {"hook_api": "agents-hooks/v1", "decision": "allow"}
 
 
 def test_worktrees_symlink_escaping_repo_is_not_sanctioned(tmp_path, monkeypatch):

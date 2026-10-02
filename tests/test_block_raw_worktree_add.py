@@ -139,10 +139,10 @@ def test_add_dash_b_before_path_outside_still_blocks(tmp_path, monkeypatch):
     assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-def test_add_nested_under_worktrees_allows(tmp_path, monkeypatch):
+def test_add_nested_under_worktrees_blocks(tmp_path, monkeypatch):
     repo = _make_repo(tmp_path)
     out, code = _run(repo, "git worktree add .worktrees/sub/feat feat/x", monkeypatch)
-    assert code == 0 and _decision(out) == "allow"
+    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
 # ── repo-root resolution from INSIDE a real linked worktree (the whole point of reusing
