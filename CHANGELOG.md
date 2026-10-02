@@ -2,8 +2,44 @@
 
 ## Unreleased
 
+### Added
+
+- `block-raw-ticket`: Forgejo/Gitea and raw-API coverage (UB-25). With task-cli armed, the
+  guard now also blocks `fj issue` / `fj repo labels` writes, `tea issues` / `tea comment` /
+  `tea label` writes, REST writes to `repos/<o>/<r>/(issues|labels)` via curl, wget, HTTPie
+  or `gh api` on any host (github.com included), `gh api graphql` issue/label mutations, and
+  inline Python/Node programs making those writes — through `bash -c`, `eval`, heredocs,
+  `sudo`/`doas`/`xargs` and `uv run`-style runners. Explicit GET/HEAD stays a read; an
+  unresolvable method counts as a write. New deny-by-default
+  `RIG_HATCH_REQUEST_BLOCK_RAW_TICKET` hatch (one ask per command, `timeout_ms` 960000);
+  unparseable writes and junk-title creates are never hatchable. Pre-tool text guard, not a
+  firewall — residuals are listed in the hook README.
+- `agenttools_hatch_escalation`: display-only `redact_for_display` masks credential values in
+  the Telegram approval preview and the `overrides.log` audit line (redacted before
+  truncation). Approval identity stays bound to the original command and cwd.
+
+- `ci/ship`: Forgejo provider (UB-25). `gh ship` now ships a PR from a checkout whose `origin` is
+  a Forgejo host instead of silently reading the wrong remote. A gh-shaped adapter
+  (`ci/ship/forgejo_provider.py`) feeds the unchanged gates from the Forgejo API, pins the PR head
+  and merges with `head_commit_id`, binds credentials to the origin host, and refuses every call
+  it cannot back with Forgejo evidence. See `ci/ship/README.md` "Forgejo provider".
+- `ci/ship`: `--task-config <path>` routes the ship's ticket through task-cli's standard
+  `--config` for the acceptance gate and the post-merge notify (UB-25: a Tasks-app ticket shipped
+  from a Forgejo repository). A missing file, and any acceptance result that cannot be evaluated,
+  refuses the merge.
+- `ci/ship`: `--known-flake` works on Forgejo from read-only Actions evidence (UB-25). A check's
+  identity is the server's workflow id plus job name; base evidence comes only from the exact
+  base branch head, newest run per workflow and newest attempt per job. The predicate and the
+  local gate are unchanged; missing or malformed evidence refuses.
+
 ### Fixed
 
+- `cc-hook-bridge`: one hard wall-clock budget (1100s) for all agent-hooks run on a single
+  Claude Code tool call. Two hatch approval waits (960s each) in one pre-bash call used to
+  exceed Claude Code's outer 1200s hook timeout, and a killed command hook fails OPEN. Each
+  hook's timeout is now clamped to the remaining budget (fail-closed when clamped); once the
+  budget is spent the remaining hooks are skipped and the call is blocked, overriding any
+  earlier grant.
 - `omp-hook-bridge`: round-3 hardening of the `eval` tool's write-call secret-scan heuristic
   (agent-tools#614). Four further security-review findings closed:
   - A JS `\u{HEX}` Unicode code-point escape that widens to a literal backslash (e.g. `\u{5c}`)
