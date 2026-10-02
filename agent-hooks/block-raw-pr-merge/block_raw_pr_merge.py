@@ -1232,47 +1232,123 @@ def _wrapped_command_strings(argv: list[str]) -> list[str]:
     return []
 
 
-def _is_merge_route_for_argv(argv: list[str], strict: bool = False) -> bool:
-    """The merge-route check for ONE resolved invocation candidate — split out of `_is_merge_route`
-    so it can be applied to EVERY candidate `_resolve_invoked_argv_candidates` returns, not just
-    the first (agent-tools#606: a wrapper flag VALUE that happens to be head-shaped, e.g. `env -u
-    gh gh pr merge 1`, could otherwise hijack resolution onto the wrong tail and hide a real merge
-    one token later)."""
-    if os.path.basename(argv[0]) == "gh":
-        sub = _gh_subargs(argv)
-        if len(sub) >= 2 and sub[0] == "pr" and sub[1] == "merge":
-            return True
-        if sub and sub[0] == "api":
-            return _gh_api_is_merge(sub[1:], strict=strict)
-        return False
-    if os.path.basename(argv[0]) == _GHGQL_WRAPPER:
-        # `ghgql` execs `gh api graphql`; inspect the request it would build (see `_ghgql_to_graphql_rest`)
-        # so a merge through the wrapper is blocked exactly like a direct `gh api graphql`.
-        return _gh_api_is_merge(_ghgql_to_graphql_rest(argv), strict=strict)
-    # A shell interpreter / `eval`: re-scan the merge hidden in its `-c` / string arguments. That
-    # string is a NESTED context whose inner quoting the outer shell may already have processed
-    # (`bash -c "…query='$Q'…"` expands `$Q` at the outer level), so scan it strictly.
-    for cmd in _wrapped_command_strings(argv):
-        if _command_contains_gh_pr_merge(cmd, strict=True) is True:
-            return True
-    return False
+# GNU env's `-S`/`--split-string` re-tokenizes a STRING into a command it execs directly, and
+# util-linux `script`'s `-c`/`--command` runs a STRING via the shell — both are ANOTHER "run a
+# command from a string argument" shape, the same blind spot `-c`/`eval` close above, but for a
+# wrapper already in `_WRAPPERS` rather than a head token: `env -S 'gh pr merge 1'` and `script -c
+# 'gh pr merge 1' /dev/null` genuinely exec the merge, yet the whole quoted string is ONE token
+# whose basename is not `gh` — no candidate is generated at all, so the existing token-based scan
+# never sees it (agent-tools#606, Grok review finding). `_wrapper_command_string_values` extracts
+# these; `_is_merge_route` feeds the result into the SAME rescan `_wrapped_command_strings` already
+# uses. This extraction is deliberately NOT clustering-precise against env's other short value flags
+# (`-u`/`-C`/`-P`/`-a`, see `_gh_subargs`'s sibling concern in block-no-verify's `_extract_split_string`
+# for the full precision that would take) — it is purely ADDITIVE on top of the existing candidate
+# scan (never removes or replaces a detection), so an unmodeled clustered combo (`env -uS value gh
+# pr merge 1`) is a documented residual, not a lost detection: ordinary `-S <value>` /
+# `--split-string[=]<value>` / glued `-S<value>` usage — the realistic shape of this bypass — is
+# still caught.
+def _env_split_string_values(argv: list[str]) -> list[str]:
+    """`argv[0]`'s basename is `env`. Return every `-S`/`--split-string` VALUE among `argv[1:]`."""
+    out: list[str] = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-S", "--split-string") and i + 1 < len(argv):
+            out.append(argv[i + 1])
+            i += 2
+            continue
+        if a.startswith("--split-string="):
+            out.append(a[len("--split-string="):])
+            i += 1
+            continue
+        if a.startswith("-S") and not a.startswith("--") and len(a) > 2:
+            out.append(a[2:])
+            i += 1
+            continue
+        i += 1
+    return out
+
+
+def _script_command_values(argv: list[str]) -> list[str]:
+    """`argv[0]`'s basename is `script`. Return every `-c`/`--command` VALUE among `argv[1:]`."""
+    out: list[str] = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-c", "--command") and i + 1 < len(argv):
+            out.append(argv[i + 1])
+            i += 2
+            continue
+        if a.startswith("--command="):
+            out.append(a[len("--command="):])
+            i += 1
+            continue
+        if a.startswith("-c") and not a.startswith("--") and len(a) > 2:
+            out.append(a[2:])
+            i += 1
+            continue
+        i += 1
+    return out
+
+
+def _wrapper_command_string_values(argv: list[str]) -> list[str]:
+    """Scan EVERY position in `argv` (not just `argv[0]`) for an `env`/`script` occurrence and
+    collect its `-S`/`-c` command-string values — the same "scan every position, not just the
+    first" posture `_resolve_invoked_argv_candidates` uses for head tokens, so a nested `sudo env -S
+    '…'` is covered too. Purely additive (see the comment above `_env_split_string_values`)."""
+    out: list[str] = []
+    for j, tok in enumerate(argv):
+        base = os.path.basename(tok)
+        if base == "env":
+            out.extend(_env_split_string_values(argv[j:]))
+        elif base == "script":
+            out.extend(_script_command_values(argv[j:]))
+    return out
 
 
 def _is_merge_route(segment: list[str], strict: bool = False) -> bool:
     """True iff this segment's argv is a direct PR-merge route that skips `gh ship`: `gh pr merge …`
     (incl. behind a `gh -R o/r` global flag, a wrapper like `env`/`sudo`/`timeout`, or a wrapper +
     interpreter like `env bash -c '…'`), or a `gh api` REST/GraphQL merge (see `_gh_api_is_merge`),
-    or a merge inside a shell interpreter's `-c` string / `eval` argument. Anchored on the
-    ACTUALLY-invoked command, so a prose mention in another program's args (`tg "…mergePullRequest…"`,
-    `echo mergePullRequest`) and `git merge main` all pass. `strict` — see `_graphql_query_is_unprovable`.
+    or a merge inside a shell interpreter's `-c` string / `eval` argument / an env `-S`/script `-c`
+    command string. Anchored on the ACTUALLY-invoked command, so a prose mention in another
+    program's args (`tg "…mergePullRequest…"`, `echo mergePullRequest`) and `git merge main` all
+    pass. `strict` — see `_graphql_query_is_unprovable`.
 
     Checks EVERY candidate `_resolve_invoked_argv_candidates` returns, not just one: a wrapper's
     own flag grammar is unmodeled, so more than one token in the segment can look like the wrapped
-    head, and only one of them is real (agent-tools#606)."""
-    return any(
-        _is_merge_route_for_argv(argv, strict=strict)
-        for argv in _resolve_invoked_argv_candidates(_segment_argv(segment))
-    )
+    head, and only one of them is real (agent-tools#606). Every wrapped/split-string command string
+    across ALL candidates is collected into a SET before rescanning (rather than rescanning inline
+    per candidate) so an identical string reachable through more than one candidate — e.g. `env sh
+    sh sh -c 'X'`, where every `sh`-headed candidate resolves to the SAME trailing `-c 'X'` — is only
+    recursively rescanned ONCE, not once per candidate. Without this, nesting the pattern (`X` itself
+    containing another `env sh sh sh -c '…'`) multiplies cost per level instead of adding it — an
+    exponential-blowup regression the multi-candidate scan would otherwise introduce (Opus review
+    finding on this PR, agent-tools#606)."""
+    argv = _segment_argv(segment)
+    wrapped_strings: set[str] = set(_wrapper_command_string_values(argv))
+    for candidate in _resolve_invoked_argv_candidates(argv):
+        base = os.path.basename(candidate[0])
+        if base == "gh":
+            sub = _gh_subargs(candidate)
+            if len(sub) >= 2 and sub[0] == "pr" and sub[1] == "merge":
+                return True
+            if sub and sub[0] == "api" and _gh_api_is_merge(sub[1:], strict=strict):
+                return True
+            continue
+        if base == _GHGQL_WRAPPER:
+            # `ghgql` execs `gh api graphql`; inspect the request it would build (see
+            # `_ghgql_to_graphql_rest`) so a merge through the wrapper is blocked exactly like a
+            # direct `gh api graphql`.
+            if _gh_api_is_merge(_ghgql_to_graphql_rest(candidate), strict=strict):
+                return True
+            continue
+        # A shell interpreter / `eval`: collect the merge hidden in its `-c` / string arguments for
+        # the deduped rescan below. That string is a NESTED context whose inner quoting the outer
+        # shell may already have processed (`bash -c "…query='$Q'…"` expands `$Q` at the outer
+        # level), so it is rescanned strictly.
+        wrapped_strings.update(_wrapped_command_strings(candidate))
+    return any(_command_contains_gh_pr_merge(cmd, strict=True) is True for cmd in wrapped_strings)
 
 
 def _read_paren_substitution(command: str, start: int) -> tuple[str, int]:

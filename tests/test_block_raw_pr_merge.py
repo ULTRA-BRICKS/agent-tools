@@ -1306,6 +1306,38 @@ def test_decoy_head_shaped_wrapper_flag_value_is_blocked(command, monkeypatch):
 @pytest.mark.parametrize(
     "command",
     [
+        # decoy-fronted `gh api` REST merge, not just `gh pr merge`
+        "env -u gh gh api -X PUT repos/o/r/pulls/1/merge",
+        "env -u gh gh api repos/o/r/pulls/1/merge -X PUT",
+        # decoy-fronted `gh api graphql` merge mutation
+        "env -u gh gh api graphql -f query='mutation{mergePullRequest(input:{pullRequestId:\"1\"})"
+        "{pullRequest{merged}}}'",
+        # decoy-fronted expandable (shell-`$`) graphql query — a real behavior change from the old
+        # single-candidate scan: the OLD code's first candidate (['gh','-u','gh','api','graphql',…])
+        # had sub[0]=='gh' (not 'api'), so `_graphql_query_field_is_expandable`'s own candidate loop
+        # would `continue` past it and ALLOW; the fix's multi-candidate loop reaches the real `gh api
+        # graphql` candidate and blocks.
+        'env -u gh gh api graphql -f query="$Q"',
+        # decoy-fronted `ghgql` wrapper merge
+        "env -u ghgql ghgql --allow-mutation 'mutation{mergePullRequest(input:{pullRequestId:\"1\"})"
+        "{pullRequest{merged}}}'",
+    ],
+)
+def test_decoy_head_shaped_wrapper_flag_value_covers_api_and_ghgql_routes(command, monkeypatch):
+    """agent-tools#606 adversarial-audit finding (Grok review, round 1): the decoy-hijack fix and
+    its regression tests originally only exercised the `gh pr merge` route. `_is_merge_route`'s
+    `gh api` branch and `_graphql_query_field_is_expandable`'s own candidate loop share the same
+    multi-candidate logic, so a decoy should close the REST-merge, graphql-mutation, and
+    expandable-query routes too — pinned here so a future edit touching only one call site can't
+    silently reopen a decoy-hijack bypass on the others without a test catching it."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         r"find . -exec gh pr merge {} \;",
         "find . -exec gh pr merge {} +",
         r"find . -maxdepth 1 -exec gh pr merge 1 \;",
@@ -1341,6 +1373,76 @@ def test_find_without_merge_is_still_allowed(command, monkeypatch):
     out, _err, code = _run(command, monkeypatch)
     assert code == 0
     assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env -S 'gh pr merge 1'",
+        "env --split-string='gh pr merge 1'",
+        "env --split-string 'gh pr merge 1'",
+        r'''env -S"gh pr merge 1"''',  # glued short form (double-quoted so the value keeps real
+        # spaces — a single-quoted glued value with escaped spaces, `-S'gh\ pr\ merge\ 1'`, is NOT
+        # equivalent: env's own `-S` splitting treats an escaped space as literal-in-word too, so
+        # that form would try to exec a binary literally named "gh pr merge 1" and fail, not run
+        # `gh pr merge 1` — not a real bypass, so not tested here)
+        "script -c 'gh pr merge 1' /dev/null",
+        "script --command='gh pr merge 1' /dev/null",
+        "sudo env -S 'gh pr merge 1'",  # nested under another wrapper
+        'env -S \'gh api graphql -f query="$Q"\'',  # expandable graphql query inside the split-string
+        "env -u FOO -S 'gh pr merge 1'",  # a real env value-flag ahead of -S, both detached
+    ],
+)
+def test_env_split_string_and_script_command_merge_is_blocked(command, monkeypatch):
+    """agent-tools#606 adversarial-audit finding (Grok review, round 1): GNU env's `-S`/
+    `--split-string` re-tokenizes a STRING into a command it execs directly, and util-linux
+    `script`'s `-c`/`--command` runs a STRING via the shell the same way — both hide a merge behind
+    ONE opaque quoted token no head-token candidate scan can see at all (unlike `env gh pr merge 1`,
+    where `gh` is its own token and the ordinary candidate scan already finds it). Confirmed a real,
+    working, undetected bypass before this fix; `_wrapper_command_string_values` extracts these
+    command strings and `_is_merge_route` rescans them the same way it already rescans a shell `-c`/
+    `eval` string."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env -S 'ls -la'",
+        "script -c 'echo hello' /dev/null",
+    ],
+)
+def test_env_split_string_and_script_command_without_merge_is_allowed(command, monkeypatch):
+    """A benign env `-S`/script `-c` command string with no merge must still ALLOW."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_nested_wrapper_interpreter_decoy_does_not_blow_up(monkeypatch):
+    """agent-tools#606 adversarial-audit finding (Opus review, round 1): the multi-candidate scan
+    yields one candidate per shell-interpreter-basename token after a wrapper, and (before this
+    test's fix) each interpreter candidate's `-c` string was rescanned independently — so `env sh sh
+    sh sh sh -c '<payload>'` produced 5 candidates that each extracted and rescanned the SAME
+    trailing `-c` body, and nesting the pattern inside the payload multiplied cost per level instead
+    of adding it (~5^depth). `_is_merge_route` now collects every wrapped/split-string command
+    string across ALL candidates into a SET before rescanning, so an identical string reached
+    through multiple candidates is rescanned once. This is a regression guard on wall-clock time,
+    not exact complexity, but 10 nested levels finishing in well under a second demonstrates the
+    fix (an unfixed exponential blowup would not)."""
+    import time
+
+    inner = "gh pr merge 1"
+    for _ in range(10):
+        inner = "env " + " ".join(["sh"] * 5) + " -c '" + inner.replace("'", "'\\''") + "'"
+    start = time.monotonic()
+    out, _err, code = _run(inner, monkeypatch)
+    elapsed = time.monotonic() - start
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+    assert elapsed < 5.0, f"nested wrapper scan took {elapsed:.2f}s — possible blowup regression"
 
 
 def test_command_dash_v_gh_is_not_a_merge(monkeypatch):
