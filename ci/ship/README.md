@@ -361,7 +361,7 @@ non-zero with a reason, which every call site treats as refuse or as "no extra e
 | acceptance (task-cli) | `task gate <code> --json` exactly as on GitHub — the ticket is resolved by task-cli, never through the Forgejo issues API. **Difference:** every "could not evaluate" case that is a logged skip on GitHub (task-cli missing, a foreign `task`, unparseable output, `task gate` exit ≥ 2 such as an unroutable ticket) **refuses** on Forgejo. A ticket that lives in another tracker is routed with `--task-config <path>` (see Flags) |
 | magic-close, review-quorum, screenshot, version bump, clean pushed tree | unchanged; they read title / body / commits / files / diff through the adapter, or local git |
 | merge | `POST /pulls/{index}/merge` with `Do` and `head_commit_id` = the head pinned at the first read (Forgejo answers 409 if the head moved); `--skip-ci` maps to `force_merge` after its hatch approval; audited to `SHIP_AUDIT_FILE` as `gate:"merge", provider:"forgejo"` |
-| post-merge | `task mark-shipped` notify as on GitHub (never closes the ticket); remote branch delete via `git push origin --delete` |
+| post-merge | `task mark-shipped` notify as on GitHub (never closes the ticket); head-branch delete through the API (below), not `git push origin --delete` |
 
 **Evidence ledger.** Some `ship.sh` call sites tolerate a failed `gh` (`|| true`, a fallback
 value) because on GitHub that failure only means "no extra evidence". On Forgejo ship creates a
@@ -378,12 +378,38 @@ started / completed / failed, plus each recorded reason) to stderr.
 read refuses if the head moved, CI statuses are read for the pinned sha, and the merge sends that
 sha as `head_commit_id`.
 
+**Head-branch deletion.** After the merge, cleanup runs `forgejo_provider.py delete-head <PR>`. It
+re-reads the PR and deletes the head branch with `DELETE /branches/{name}`, using the same
+credential that merged. A git push credential is not needed. Before tg-cli PR #513 a missing one
+left the branch behind with no record. The branch is **kept**, with the reason printed, when any
+of these holds:
+
+- the PR is not merged;
+- the head is in a fork;
+- the head is the default or base branch;
+- the branch is protected;
+- its tip is not the merged head, because commits were pushed after the merge, or the merged head cannot be read. The merged head is the head pinned before the merge (the `head_commit_id` the merge sent); outside a ship run it is `refs/pull/<n>/head`, which Forgejo stops moving once the PR merges. It is never the PR payload's `head.sha`: while the branch exists, Forgejo reports the branch's live tip there;
+- another open PR uses it as its head or its base. Deleting a stacked PR's base would orphan that PR.
+
+Every outcome (`deleted` / `gone` / `keep` / `failed`) is audited to `SHIP_AUDIT_FILE` as
+`gate:"branch-delete"`, including the fork case. A failure prints a WARNING, but ship still exits
+0 because the merge stands. The branch is re-read immediately before the delete. Forgejo's DELETE
+takes no expected sha, though, so a push landing in that gap is lost, the same race the old
+`git push --delete` had.
+
+**Backlog sweep.** To clean up existing branches, run `python3 <agent-tools>/ci/ship/forgejo_provider.py prune-merged`
+from a checkout. The bare form is a dry run that only lists what it would do. With `--apply` it
+deletes every branch whose tip is **exactly** the merged head (`refs/pull/<n>/head`) of a merged
+same-repo PR, using the same keep rules. It never touches a branch with no merged PR at its tip, such as WIP or rescue
+branches. Branches that came back through a forge migration are typical candidates: a migration
+restores every PR head as a branch.
+
 **Credentials** are bound to the origin host: fj's key store entry for exactly that host
 (`fj auth login` / `fj auth add-token`), or `SHIP_FORGEJO_TOKEN` only together with
 `SHIP_FORGEJO_TOKEN_HOST` naming the same host. `GH_TOKEN`/`GITHUB_TOKEN` are never read. HTTP
 redirects are refused, so a token never reaches another host. Plain `http://` is accepted only
 for a loopback origin (tests). Without a credential, reads are anonymous (public repositories
-only); every write (merge, comment, edit) refuses. fj's key store is `keys.json` in
+only); every write (merge, comment, edit, branch delete) refuses. fj's key store is `keys.json` in
 `~/Library/Application Support/forgejo-cli.forgejo-cli/` (macOS),
 `%APPDATA%\forgejo-cli\forgejo-cli\data\` (Windows) or `$XDG_DATA_HOME/forgejo-cli/`
 (Linux). An `fj auth login` (OAuth) token expires after about an hour and fj refreshes it only

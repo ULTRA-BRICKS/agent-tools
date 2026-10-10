@@ -4330,7 +4330,17 @@ cleanup() {
     echo "[ship] --repo targets ${GH_REPO} (not this checkout's origin${_CWD_ORIGIN_REPO:+ ${_CWD_ORIGIN_REPO}}) — skipping remote branch deletion AND all local branch/worktree cleanup: any local '${BRANCH}' here belongs to this checkout, not ${GH_REPO}. GitHub auto-deletes ${BRANCH} in ${GH_REPO} if auto-delete-head-branch is enabled; otherwise delete it manually."
     return 0
   fi
-  if [ "${CROSS_REPO:-false}" = "true" ]; then
+  if [ "${SHIP_PROVIDER_RESOLVED:-github}" = "forgejo" ]; then
+    # Through the API with the credential that merged, not `git push --delete`: that needs a
+    # separate git credential, and without one the branch silently stayed (tg-cli #513). The
+    # provider re-reads the PR, keeps a fork / protected / moved / still-used branch, and audits
+    # every outcome (so a fork head is routed here too, not to the CROSS_REPO arm below).
+    run python3 -I "$_SHIP_FORGEJO_PY" delete-head "$PR"
+    case $? in
+      0|3) ;;  # deleted / already gone / kept on purpose — the provider printed which
+      *) echo "[ship] WARNING: could not delete remote branch ${BRANCH} through the Forgejo API (see above) — #$PR IS merged. Delete it by hand, or sweep every merged branch: python3 $(printf '%q' "$_SHIP_FORGEJO_PY") prune-merged --apply" >&2 ;;
+    esac
+  elif [ "${CROSS_REPO:-false}" = "true" ]; then
     echo "[ship] PR head is a fork — leaving its branch to the fork owner."
   elif git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
     echo "[ship] deleting remote branch origin/${BRANCH} ..."

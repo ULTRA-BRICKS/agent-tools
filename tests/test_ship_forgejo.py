@@ -19,7 +19,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
@@ -58,6 +58,8 @@ class FakeForgejo:
             "review_comments": {}, "timeline": [], "files": ["docs/x.md"], "commits": [],
             "branch_protection": {"enable_status_check": False, "status_check_contexts": []},
             "merge_head_override": None, "redirect_to": None,
+            "branches": {}, "open_prs": [], "closed_prs": [], "delete_status": None, "pull_refs": {},
+            "branch_listing": None, "branch_get_status": {},
         }
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.port = self.server.server_address[1]
@@ -107,6 +109,9 @@ class FakeForgejo:
             def do_PATCH(self):
                 self._dispatch("PATCH")
 
+            def do_DELETE(self):
+                self._dispatch("DELETE")
+
         return H
 
     def route(self, method, path, query, body):  # noqa: C901 - flat routing table
@@ -128,13 +133,39 @@ class FakeForgejo:
             return 200, (items if page == 1 else []), "application/json"
 
         if sub == "/pulls/1" and method == "GET":
-            return 200, s["pr"], "application/json"
+            return 200, self._live(s["pr"]), "application/json"
         if sub == "/pulls/1" and method == "PATCH":
             s["pr"].update(body)
             return 201, s["pr"], "application/json"
         if sub == "/pulls/1/merge" and method == "POST":
             return self._merge(body)
+        if sub == "" and method == "GET":
+            return 200, {"full_name": "o/r", "default_branch": "main"}, "application/json"
+        if sub == "/pulls" and method == "GET":
+            return listing(s["open_prs"] if query.get("state") == ["open"] else [self._live(p) for p in s["closed_prs"]])
+        m = re.fullmatch(r"/git/refs/pull/(\d+)/head", sub)
+        if m:
+            sha = s["pull_refs"].get(int(m.group(1)))
+            if not sha:
+                return 404, {"message": "ref not found"}, "application/json"
+            return 200, [{"ref": f"refs/pull/{m.group(1)}/head", "object": {"sha": sha}}], "application/json"
+        if sub == "/branches" and method == "GET":
+            s["open_prs"] = s["open_prs"] + s.pop("late_open_prs", [])  # PRs opened while the sweep runs
+            return listing(s["branch_listing"] if s["branch_listing"] is not None else list(s["branches"].values()))
         if sub.startswith("/branches/"):
+            name = unquote(sub[len("/branches/"):])
+            if method == "DELETE":
+                if s["delete_status"]:
+                    return s["delete_status"], {"message": "branch is protected"}, "application/json"
+                if s["branches"].pop(name, None) is None:
+                    return 404, {"message": "branch not found"}, "application/json"
+                return 204, b"", "application/json"
+            if name in s["branch_get_status"]:
+                return s["branch_get_status"][name], {"message": "unavailable"}, "application/json"
+            if name in s["branches"]:
+                return 200, s["branches"][name], "application/json"
+            if name != "main":
+                return 404, {"message": "branch not found"}, "application/json"
             return 200, {"name": "main", "commit": {"id": s["main_sha"]}, **s["branch_protection"]}, "application/json"
         m = re.fullmatch(r"/commits/([0-9a-f]+)/status", sub)
         if m:
@@ -164,6 +195,14 @@ class FakeForgejo:
             return 409, {"message": "head out of date"}, "application/json"
         s["pr"].update({"merged": True, "state": "closed", "merge_commit_sha": "f" * 40})
         return 200, b"", "application/json"
+
+    def _live(self, pr):
+        """Like Forgejo: a merged PR whose head branch still exists reports that branch's LIVE tip
+        as head.sha, so only refs/pull/<n>/head (pull_refs) keeps the head the merge took."""
+        branch = self.state["branches"].get((pr.get("head") or {}).get("ref"))
+        if not pr.get("merged") or branch is None:
+            return pr
+        return {**pr, "head": {**pr["head"], "sha": branch["commit"]["id"]}}
 
     def merges(self):
         return [r for r in self.requests if r["method"] == "POST" and r["path"].endswith("/pulls/1/merge")]
@@ -227,7 +266,12 @@ def _seed_green(fake: FakeForgejo, head: str, main_sha: str) -> None:
         "reviews": [{"id": 7, "state": "APPROVED", "user": {"login": "rev"}, "commit_id": head,
                      "comments_count": 0, "dismissed": False, "submitted_at": "2020-01-01T00:00:00Z"}],
         "commits": [{"sha": head, "commit": {"message": "docs: note\n", "committer": {"date": "2020-01-01T00:00:00Z"}}}],
+        "branches": {"feat": _branch("feat", head)},
     })
+
+
+def _branch(name, sha, protected=False):
+    return {"name": name, "commit": {"id": sha}, "protected": protected}
 
 
 @pytest.fixture
@@ -553,6 +597,240 @@ def test_merge_without_credential_or_with_raced_head_fails(api_fake, tmp_path, m
         fp.run_gh(_ctx_for(api_fake, tmp_path), ["pr", "merge", "1", "--squash"])
 
 
+# --- head-branch deletion after a verified merge -----------------------------------------------
+
+
+def _seed_merged(fake, head="a" * 40):
+    _seed(fake, head)
+    fake.state["pr"].update({"merged": True, "state": "closed", "merge_commit_sha": "f" * 40})
+    fake.state["branches"] = {"feat": _branch("feat", head)}
+    fake.state["pull_refs"] = {1: head}
+    return head
+
+
+def _deletes(fake):
+    return [r["path"] for r in fake.requests if r["method"] == "DELETE"]
+
+
+def _audit_lines(tmp_path):
+    return [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text().splitlines()]
+
+
+def test_delete_head_deletes_a_merged_branch_and_audits(api_fake, tmp_path, capsys):
+    _seed_merged(api_fake)
+    assert fp.delete_head(_ctx_for(api_fake, tmp_path), 1) == 0
+    assert _deletes(api_fake) == ["/api/v1/repos/o/r/branches/feat"]
+    assert "deleted remote branch feat (Forgejo API)" in capsys.readouterr().out
+    last = _audit_lines(tmp_path)[-1]
+    assert (last["gate"], last["decision"], last["branch"], last["pr"]) == ("branch-delete", "deleted", "feat", 1)
+
+
+def test_delete_head_encodes_a_slashed_branch_name(api_fake, tmp_path):
+    head = _seed_merged(api_fake)
+    api_fake.state["pr"]["head"]["ref"] = "fix/545-x"
+    api_fake.state["branches"] = {"fix/545-x": _branch("fix/545-x", head)}
+    assert fp.delete_head(_ctx_for(api_fake, tmp_path), 1) == 0
+    assert _deletes(api_fake) == ["/api/v1/repos/o/r/branches/fix%2F545-x"]
+
+
+def _stacked(fake):
+    fake.state["open_prs"] = [{"number": 9, "base": {"ref": "feat", "repo": {"full_name": "o/r"}},
+                               "head": {"ref": "feat-2", "repo": {"full_name": "o/r"}}}]
+
+
+def _second_pr_from_feat(fake):
+    fake.state["open_prs"] = [{"number": 8, "base": {"ref": "release", "repo": {"full_name": "o/r"}},
+                               "head": {"ref": "feat", "repo": {"full_name": "o/r"}}}]
+
+
+@pytest.mark.parametrize("mutate,reason", [
+    (lambda f: f.state["pr"].update({"merged": False}), "is not merged"),
+    (lambda f: f.state["pr"]["head"].update({"repo": {"full_name": "fork/r"}}), "fork"),
+    (lambda f: f.state["branches"]["feat"].update({"protected": True}), "protected"),
+    (lambda f: f.state["branches"]["feat"].update({"commit": {"id": "c" * 40}}), "commits pushed after the merge"),
+    (lambda f: f.state["pr"]["head"].update({"ref": "main"}), "default or base branch"),
+    (_stacked, "open PR #9 still uses it"),
+    (_second_pr_from_feat, "open PR #8 still uses it"),
+], ids=["unmerged", "fork", "protected", "tip-moved", "default-branch", "stacked-base", "second-head"])
+def test_delete_head_keeps_the_branch_with_a_reason(api_fake, tmp_path, capsys, mutate, reason):
+    _seed_merged(api_fake)
+    mutate(api_fake)
+    assert fp.delete_head(_ctx_for(api_fake, tmp_path), 1) == 3
+    assert _deletes(api_fake) == []
+    assert reason in capsys.readouterr().out
+    assert _audit_lines(tmp_path)[-1]["decision"] == "keep"
+
+
+def test_open_pr_in_a_fork_with_the_same_branch_name_is_not_a_dependent(api_fake, tmp_path):
+    _seed_merged(api_fake)
+    api_fake.state["open_prs"] = [{"number": 8, "base": {"ref": "main", "repo": {"full_name": "o/r"}},
+                                   "head": {"ref": "feat", "repo": {"full_name": "fork/r"}}}]
+    assert fp.delete_head(_ctx_for(api_fake, tmp_path), 1) == 0
+    assert _deletes(api_fake) == ["/api/v1/repos/o/r/branches/feat"]
+
+
+def test_a_push_after_the_merge_is_kept_although_the_pr_reports_the_live_tip(api_fake, tmp_path, capsys):
+    # Forgejo's PR payload then says head.sha == the new tip; only refs/pull/1/head is the merged head.
+    _seed_merged(api_fake)
+    api_fake.state["branches"]["feat"]["commit"]["id"] = "c" * 40
+    assert fp.run_gh(_ctx_for(api_fake, tmp_path, state_dir=False), ["pr", "view", "1", "--json", "headRefOid",
+                                                                     "-q", ".headRefOid"]).strip() == "c" * 40
+    assert fp.delete_head(_ctx_for(api_fake, tmp_path, state_dir=False), 1) == 3
+    assert _deletes(api_fake) == [] and "commits pushed after the merge" in capsys.readouterr().out
+
+
+def test_the_head_pinned_by_the_ship_run_wins_over_refs_pull(api_fake, tmp_path):
+    _seed_merged(api_fake)
+    api_fake.state["pull_refs"] = {1: "c" * 40}           # even a moved ref cannot vouch for the tip
+    api_fake.state["branches"]["feat"]["commit"]["id"] = "c" * 40
+    ctx = _ctx_for(api_fake, tmp_path)
+    Path(ctx.state_dir, "pr-1.head").write_text("a" * 40 + "\n")
+    assert fp.delete_head(ctx, 1) == 3
+    assert _deletes(api_fake) == []
+
+
+def test_an_unreadable_merged_head_keeps_the_branch(api_fake, tmp_path, capsys):
+    _seed_merged(api_fake)
+    api_fake.state["pull_refs"] = {}
+    assert fp.delete_head(_ctx_for(api_fake, tmp_path, state_dir=False), 1) == 3
+    assert _deletes(api_fake) == [] and "could not be read" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("gone", ["pr-ref", "branch-404"])
+def test_delete_head_reports_an_already_gone_branch(api_fake, tmp_path, capsys, gone):
+    _seed_merged(api_fake)
+    if gone == "pr-ref":
+        api_fake.state["pr"]["head"]["ref"] = "refs/pull/1/head"
+    else:
+        api_fake.state["branches"] = {}
+    assert fp.delete_head(_ctx_for(api_fake, tmp_path), 1) == 0
+    assert _deletes(api_fake) == []
+    assert "already gone" in capsys.readouterr().out
+    assert _audit_lines(tmp_path)[-1]["decision"] == "gone"
+
+
+def test_delete_head_failure_raises_and_is_audited(api_fake, tmp_path):
+    _seed_merged(api_fake)
+    api_fake.state["delete_status"] = 403
+    with pytest.raises(fp.ProviderError, match="HTTP 403"):
+        fp.delete_head(_ctx_for(api_fake, tmp_path), 1)
+    assert _audit_lines(tmp_path)[-1]["decision"] == "failed"
+
+
+def test_delete_head_needs_a_bound_credential(api_fake, tmp_path, monkeypatch):
+    _seed_merged(api_fake)
+    monkeypatch.setenv("SHIP_FORGEJO_KEYS_FILE", str(tmp_path / "missing.json"))
+    with pytest.raises(fp.ProviderError, match="credential"):
+        fp.delete_head(_ctx_for(api_fake, tmp_path), 1)
+    assert _deletes(api_fake) == []
+
+
+def _merged_pr(number, ref, merged_head, repo="o/r"):
+    return {"number": number, "merged": True, "head": {"ref": ref, "sha": merged_head, "repo": {"full_name": repo}},
+            "base": {"ref": "main", "repo": {"full_name": "o/r"}}}
+
+
+def _seed_backlog(fake):
+    fake.state["main_sha"] = "b" * 40
+    fake.state["branches"] = {
+        "main": _branch("main", "b" * 40, protected=True),
+        "done": _branch("done", "1" * 40),             # tip == merged head -> delete
+        "moved": _branch("moved", "2" * 40),           # pushed past its merged head -> never touched
+        "stacked": _branch("stacked", "3" * 40),       # an open PR targets it -> keep
+        "wip": _branch("wip", "4" * 40),               # no merged PR at all -> never touched
+        "fix/slash": _branch("fix/slash", "5" * 40),   # slashed name -> delete
+        "reused": _branch("reused", "6" * 40),         # old merged PR, name reused for new WIP -> never touched
+        "twice": _branch("twice", "8" * 40),           # merged twice; tip == the OLDER merged head -> delete
+    }
+    fake.state["closed_prs"] = [
+        _merged_pr(10, "done", "1" * 40), _merged_pr(11, "moved", "9" * 40),
+        _merged_pr(12, "stacked", "3" * 40), _merged_pr(13, "fix/slash", "5" * 40),
+        {"number": 14, "merged": False, "head": {"ref": "wip", "sha": "4" * 40, "repo": {"full_name": "o/r"}}},
+        _merged_pr(15, "reused", "7" * 40), _merged_pr(16, "twice", "8" * 40), _merged_pr(17, "twice", "e" * 40),
+    ]
+    fake.state["pull_refs"] = {p["number"]: p["head"]["sha"] for p in fake.state["closed_prs"]}
+    fake.state["open_prs"] = [{"number": 20, "base": {"ref": "stacked", "repo": {"full_name": "o/r"}},
+                               "head": {"ref": "child", "repo": {"full_name": "o/r"}}}]
+
+
+def test_prune_merged_dry_run_lists_and_never_deletes(api_fake, tmp_path, capsys):
+    _seed_backlog(api_fake)
+    assert fp.prune_merged(_ctx_for(api_fake, tmp_path, state_dir=False), apply=False) == 0
+    out = capsys.readouterr().out
+    assert "delete  done  (merged PR #10)" in out and "delete  fix/slash  (merged PR #13)" in out
+    assert "delete  twice  (merged PR #16)" in out
+    assert "keep    stacked: open PR #20" in out
+    for untouched in ("moved", "wip", "reused", "main  "):
+        assert untouched not in out
+    assert "3 would delete" in out
+    assert _deletes(api_fake) == []
+
+
+def test_prune_merged_apply_deletes_only_the_provably_merged(api_fake, tmp_path, capsys):
+    _seed_backlog(api_fake)
+    assert fp.prune_merged(_ctx_for(api_fake, tmp_path, state_dir=False), apply=True) == 0
+    assert sorted(_deletes(api_fake)) == ["/api/v1/repos/o/r/branches/done", "/api/v1/repos/o/r/branches/fix%2Fslash",
+                                          "/api/v1/repos/o/r/branches/twice"]
+    assert set(api_fake.state["branches"]) == {"main", "moved", "stacked", "wip", "reused"}
+    assert "3 deleted, 1 kept, 0 failed" in capsys.readouterr().out
+    decisions = [(a["branch"], a["decision"], a["source"]) for a in _audit_lines(tmp_path)]
+    assert decisions == [("done", "deleted", "prune-merged"), ("stacked", "keep", "prune-merged"),
+                         ("fix/slash", "deleted", "prune-merged"), ("twice", "deleted", "prune-merged")]
+
+
+def test_prune_merged_dry_run_writes_no_audit(api_fake, tmp_path):
+    _seed_backlog(api_fake)
+    fp.prune_merged(_ctx_for(api_fake, tmp_path, state_dir=False), apply=False)
+    assert not (tmp_path / "audit.jsonl").exists()
+
+
+def test_prune_merged_audits_a_branch_read_failure_and_carries_on(api_fake, tmp_path, capsys):
+    _seed_backlog(api_fake)
+    api_fake.state["branch_get_status"] = {"done": 503}
+    assert fp.prune_merged(_ctx_for(api_fake, tmp_path, state_dir=False), apply=True) == 1
+    captured = capsys.readouterr()
+    assert "FAILED  done" in captured.err and "2 deleted, 1 kept, 1 failed" in captured.out
+    assert "/api/v1/repos/o/r/branches/done" not in _deletes(api_fake)
+    assert ("done", "failed") in [(a["branch"], a["decision"]) for a in _audit_lines(tmp_path)]
+
+
+def test_prune_merged_apply_reports_a_failed_delete(api_fake, tmp_path, capsys):
+    _seed_backlog(api_fake)
+    api_fake.state["delete_status"] = 403
+    assert fp.prune_merged(_ctx_for(api_fake, tmp_path, state_dir=False), apply=True) == 1
+    captured = capsys.readouterr()
+    assert "FAILED  done" in captured.err and "0 deleted, 1 kept, 3 failed" in captured.out
+
+
+def test_prune_merged_rereads_a_branch_that_moved_after_the_listing(api_fake, tmp_path, capsys):
+    _seed_backlog(api_fake)
+    api_fake.state["branch_listing"] = [_branch("done", "1" * 40)]  # stale snapshot: still the merged head
+    api_fake.state["branches"]["done"]["commit"]["id"] = "c" * 40  # a push landed after the listing
+    assert fp.prune_merged(_ctx_for(api_fake, tmp_path, state_dir=False), apply=True) == 0
+    assert _deletes(api_fake) == []
+    assert "keep    done: its tip cccccccccccc is not the merged head" in capsys.readouterr().out
+
+
+def test_prune_merged_keeps_a_branch_a_pr_started_stacking_on_during_the_sweep(api_fake, tmp_path, capsys):
+    _seed_backlog(api_fake)
+    api_fake.state["late_open_prs"] = [{"number": 21, "base": {"ref": "done", "repo": {"full_name": "o/r"}},
+                                        "head": {"ref": "done-2", "repo": {"full_name": "o/r"}}}]
+    assert fp.prune_merged(_ctx_for(api_fake, tmp_path, state_dir=False), apply=True) == 0
+    assert "/api/v1/repos/o/r/branches/done" not in _deletes(api_fake)
+    assert "keep    done: open PR #21 still uses it" in capsys.readouterr().out
+
+
+def test_cli_delete_head_and_prune_merged_entry_points(api_fake, tmp_path, monkeypatch):
+    _seed_merged(api_fake)
+    monkeypatch.setenv("SHIP_FORGEJO_ORIGIN_URL", f"http://127.0.0.1:{api_fake.port}/o/r.git")
+    monkeypatch.delenv("SHIP_FORGEJO_STATE_DIR", raising=False)
+    assert fp.main(["delete-head", "1"]) == 0
+    assert fp.main(["prune-merged"]) == 0
+    assert fp.main(["prune-merged", "--force"]) == 2
+    assert fp.main(["delete-head", "x"]) == 2
+    assert _deletes(api_fake) == ["/api/v1/repos/o/r/branches/feat"]
+
+
 # --- every gh call site in ship.sh is mapped or fails closed ----------------------------------
 
 MAPPED = {("pr", "view"), ("pr", "diff"), ("pr", "merge"), ("pr", "comment"), ("pr", "edit"),
@@ -625,6 +903,44 @@ def test_forgejo_happy_path_merges_with_pinned_head(forge):
     assert _gh_log(forge) == ""  # the real gh is never reached
     assert PLACEHOLDER not in r.stdout + r.stderr
     assert "github-value" not in json.dumps(forge["fake"].requests)
+
+
+def test_forgejo_ship_deletes_the_head_branch_through_the_api(forge):
+    r = _ship(forge)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "[ship] deleted remote branch feat (Forgejo API)" in r.stdout
+    assert _deletes(forge["fake"]) == ["/api/v1/repos/o/r/branches/feat"]
+    deleted = [json.loads(line) for line in (forge["tmp"] / "audit.jsonl").read_text().splitlines()
+               if '"branch-delete"' in line]
+    assert [(a["decision"], a["source"]) for a in deleted] == [("deleted", "ship")]
+
+
+def test_forgejo_ship_failed_branch_delete_warns_but_the_merge_stands(forge):
+    forge["fake"].state["delete_status"] = 403
+    r = _ship(forge)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(forge["fake"].merges()) == 1
+    assert "could not delete remote branch feat through the Forgejo API" in r.stderr
+    assert "prune-merged --apply" in r.stderr
+
+
+def test_forgejo_ship_keeps_a_branch_another_open_pr_builds_on(forge):
+    _stacked(forge["fake"])
+    r = _ship(forge)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "[ship] kept remote branch feat: open PR #9 still uses it as head or base" in r.stdout
+    assert _deletes(forge["fake"]) == [] and "WARNING: could not delete" not in r.stderr
+
+
+def test_forgejo_ship_fork_head_is_kept_and_audited_by_the_provider(forge):
+    forge["fake"].state["pr"]["head"]["repo"] = {"full_name": "fork/r"}
+    r = _ship(forge)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "[ship] kept remote branch feat: the head is a fork" in r.stdout
+    assert _deletes(forge["fake"]) == []
+    kept = [json.loads(line) for line in (forge["tmp"] / "audit.jsonl").read_text().splitlines()
+            if '"branch-delete"' in line]
+    assert [(a["decision"], a["source"]) for a in kept] == [("keep", "ship")]
 
 
 def test_forgejo_dry_run_never_merges(forge):

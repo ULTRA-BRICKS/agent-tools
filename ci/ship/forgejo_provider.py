@@ -12,7 +12,9 @@ review-cli, the hatch helpers) never see it.
 
 How it is reached: `ship.sh` -> provider dispatch (origin host is not github.com and not a
 local path) -> `forgejo_provider.py detect` (Forgejo-only `/api/forgejo/v1/version` probe) ->
-every later `gh ...` inside ship.sh -> `forgejo_provider.py gh ...`.
+every later `gh ...` inside ship.sh -> `forgejo_provider.py gh ...`. After the merge, ship.sh's
+cleanup runs `forgejo_provider.py delete-head <PR>`. `forgejo_provider.py prune-merged
+[--apply]` is the by-hand backlog sweep run from a checkout.
 
 Invariants (fail closed, never silently skip):
   * Only the gh invocations ship.sh actually makes are emulated. Anything else — `gh run`,
@@ -438,8 +440,12 @@ def _pr_mergeable(pr: PullRequest) -> str:
 
 
 def _pr_cross_repo(pr: PullRequest) -> bool:
-    head_repo = (pr.raw.get("head") or {}).get("repo") or {}
-    base_repo = (pr.raw.get("base") or {}).get("repo") or {}
+    return _raw_cross_repo(pr.raw)
+
+
+def _raw_cross_repo(raw: dict) -> bool:
+    head_repo = (raw.get("head") or {}).get("repo") or {}
+    base_repo = (raw.get("base") or {}).get("repo") or {}
     head_name, base_name = head_repo.get("full_name"), base_repo.get("full_name")
     return not head_name or head_name != base_name
 
@@ -715,19 +721,22 @@ def merge_pr(pr: PullRequest, method_flag: str, admin: bool) -> str:
 
 
 def _audit_merge(pr: PullRequest, do: str, admin: bool, merge_sha: str) -> None:
+    _append_audit({
+        "gate": "merge", "provider": "forgejo", "decision": "merged:admin" if admin else "merged",
+        "host": pr.api.origin.host_key, "repo": pr.api.origin.slug, "pr": pr.number, "head": pr.pinned_sha,
+        "method": do, "merge_commit": merge_sha,
+    }, "merged")
+
+
+def _append_audit(line: dict, done: str) -> None:
     path = Path(os.environ.get("SHIP_AUDIT_FILE") or Path.home() / ".config/agent-tools/ship-audit.jsonl")
-    line = {
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "gate": "merge", "provider": "forgejo",
-        "decision": "merged:admin" if admin else "merged", "host": pr.api.origin.host_key,
-        "repo": pr.api.origin.slug, "pr": pr.number, "head": pr.pinned_sha, "method": do,
-        "merge_commit": merge_sha,
-    }
+    line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **line}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(line) + "\n")
-    except OSError as exc:  # the merge already happened; never mask it
-        print(f"[ship] forgejo: merged, but could not write the audit line to {path}: {exc}", file=sys.stderr)
+    except OSError as exc:  # the action already happened; never mask it
+        print(f"[ship] forgejo: {done}, but could not write the audit line to {path}: {exc}", file=sys.stderr)
 
 
 def comment_pr(pr: PullRequest, body: str) -> None:
@@ -749,6 +758,209 @@ def diff_pr(pr: PullRequest, name_only: bool) -> str:
         names = [f.get("filename") for f in files if isinstance(f, dict) and f.get("filename")]
         return "\n".join(names) + ("\n" if names else "")
     return pr.api.text(pr.api.repo_path(f"/pulls/{pr.number}.diff"))
+
+
+# --- head-branch deletion after a verified merge ---------------------------------------------
+# The merge call sends delete_branch_after_merge=false and the branch is deleted here, with the
+# same host-bound credential that merged. ship.sh used to run `git push origin --delete`, which
+# needs a separate git credential: without one it skipped or warned, and the branch stayed with
+# no record (tg-cli PR #513, 2026-10-01). Every outcome is now printed and audited.
+
+
+def _branch_path(api: Api, ref: str) -> str:
+    return api.repo_path(f"/branches/{urllib.parse.quote(ref, safe='')}")
+
+
+def _default_branch(api: Api) -> str:
+    repo = api.call("GET", api.repo_path())
+    name = repo.get("default_branch") if isinstance(repo, dict) else None
+    if not isinstance(name, str) or not name:
+        raise ProviderError("Forgejo repository payload has no default_branch — unsupported response")
+    return name
+
+
+def _open_prs(api: Api) -> list:
+    return [p for p in api.paged(api.repo_path("/pulls?state=open")) if isinstance(p, dict)]
+
+
+def _same_repo(repo: object, slug: str) -> bool:
+    name = repo.get("full_name") if isinstance(repo, dict) else None
+    return isinstance(name, str) and name.lower() == slug.lower()
+
+
+def _merged_head(api: Api, number: int, state_dir: str | None) -> str | None:
+    """The head sha the merge actually took, or None when it cannot be read.
+
+    Not the PR payload's head.sha: while the branch exists Forgejo reports the branch's LIVE tip
+    there, so a push after the merge would look merged (agent-tools PR #764's branch did exactly
+    that). In a ship run it is the head pinned before the merge (the merge's head_commit_id);
+    otherwise refs/pull/<n>/head, which Forgejo stops moving once the PR is merged.
+    """
+    pin = Path(state_dir) / f"pr-{number}.head" if state_dir else None
+    if pin is not None and pin.is_file():
+        return pin.read_text(encoding="utf-8").strip() or None
+    ref = f"refs/pull/{number}/head"
+    status, body = api.request("GET", api.repo_path(f"/git/{ref}"), None, "application/json")
+    if status != 200:
+        return None
+    try:
+        refs = json.loads(body)
+    except ValueError:
+        return None
+    for r in refs if isinstance(refs, list) else [refs]:
+        if isinstance(r, dict) and r.get("ref") == ref:
+            sha = (r.get("object") or {}).get("sha")
+            return sha if isinstance(sha, str) and sha else None
+    return None
+
+
+def head_branch_verdict(api: Api, raw: dict, merged_head: str | None, default_branch: str, open_prs: list,
+                        branch: dict | None = None) -> tuple[str, str, str]:
+    """("delete" | "gone" | "keep", branch name, reason) for a merged PR's head branch.
+
+    Kept: unmerged PR, fork head, the default/base branch, a protected branch, a tip that is not
+    the merged head (commits pushed after the merge are unmerged work) or an unreadable merged
+    head, or a branch another open PR still uses as its head or base (a stacked PR would lose its
+    base).
+    """
+    number = raw.get("number")
+    head = raw.get("head") or {}
+    ref = str(head.get("ref") or "")
+    if not raw.get("merged"):
+        return "keep", ref, f"PR #{number} is not merged"
+    if _raw_cross_repo(raw):
+        return "keep", ref, "the head is a fork; its branch belongs to the fork owner"
+    if not ref or ref.startswith("refs/"):  # Forgejo reports refs/pull/<n>/head once the branch is gone
+        return "gone", ref, "Forgejo no longer reports a head branch"
+    if ref in (default_branch, str((raw.get("base") or {}).get("ref") or "")):
+        return "keep", ref, "it is the default or base branch"
+    if branch is None:
+        status, body = api.request("GET", _branch_path(api, ref), None, "application/json")
+        if status == 404:
+            return "gone", ref, "the branch no longer exists"
+        if status != 200:
+            raise ProviderError(_http_error_text("GET", f"branch '{ref}'", status, body, api.credential))
+        try:
+            branch = json.loads(body)
+        except ValueError:
+            raise ProviderError(f"Forgejo returned non-JSON for branch '{ref}'") from None
+    if not isinstance(branch, dict):
+        raise ProviderError(f"Forgejo returned no branch '{ref}'")
+    if branch.get("protected"):
+        return "keep", ref, "the branch is protected"
+    tip = str((branch.get("commit") or {}).get("id") or "")
+    if not merged_head:
+        return "keep", ref, f"the merged head of PR #{number} could not be read"
+    if tip != merged_head:
+        return "keep", ref, (f"its tip {tip[:12]} is not the merged head {merged_head[:12]}; "
+                             "commits pushed after the merge are not merged")
+    slug = api.origin.slug
+    users = sorted(
+        p.get("number") for p in open_prs
+        if p.get("number") != number and (
+            ((p.get("base") or {}).get("ref") == ref and _same_repo((p.get("base") or {}).get("repo"), slug))
+            or ((p.get("head") or {}).get("ref") == ref and _same_repo((p.get("head") or {}).get("repo"), slug))))
+    if users:
+        return "keep", ref, "open PR " + ", ".join(f"#{n}" for n in users) + " still uses it as head or base"
+    return "delete", ref, ""
+
+
+def _delete_branch(api: Api, ref: str) -> bool:
+    """DELETE the branch; True if deleted, False if it was already gone (a 404 race).
+
+    Callers re-read the branch right before this call (head_branch_verdict with branch=None), but
+    Forgejo's DELETE takes no expected sha. A push that lands between that read and this call is
+    still lost, exactly as with the `git push --delete` this replaced. Only an atomic lease
+    (`git push --force-with-lease=<ref>:<sha> origin :<ref>`) closes that window, and it needs the
+    git credential this path exists to avoid.
+    """
+    status, body = api.request("DELETE", _branch_path(api, ref), None, "application/json")
+    if status == 404:
+        return False
+    if status != 204:
+        raise ProviderError(_http_error_text("DELETE", f"branch '{ref}'", status, body, api.credential))
+    return True
+
+
+def _audit_branch(api: Api, number: object, ref: str, decision: str, reason: str, source: str) -> None:
+    _append_audit({
+        "gate": "branch-delete", "provider": "forgejo", "decision": decision, "host": api.origin.host_key,
+        "repo": api.origin.slug, "pr": number, "branch": ref, "reason": reason, "source": source,
+    }, f"branch {decision}")
+
+
+def delete_head(ctx: Context, number: int) -> int:
+    """ship.sh's post-merge step: 0 deleted or already gone, 3 kept on purpose, 1 failed."""
+    api = ctx.api
+    ref = ""
+    try:
+        _require_write_credential(api, "deleting the head branch")
+        raw = api.call("GET", api.repo_path(f"/pulls/{number}"))
+        if not isinstance(raw, dict):
+            raise ProviderError(f"Forgejo returned no pull request #{number}")
+        ref = str((raw.get("head") or {}).get("ref") or "")
+        verdict, ref, reason = head_branch_verdict(api, raw, _merged_head(api, number, ctx.state_dir),
+                                                   _default_branch(api), _open_prs(api))
+        if verdict == "delete":
+            verdict = "deleted" if _delete_branch(api, ref) else "gone"
+    except ProviderError as exc:
+        _audit_branch(api, number, ref, "failed", str(exc), "ship")
+        raise
+    _audit_branch(api, number, ref, verdict, reason, "ship")
+    if verdict == "deleted":
+        print(f"[ship] deleted remote branch {ref} (Forgejo API)")
+    elif verdict == "gone":
+        print(f"[ship] remote branch {ref or '(head)'} is already gone")
+    else:
+        print(f"[ship] kept remote branch {ref}: {reason}")
+    return 3 if verdict == "keep" else 0
+
+
+def prune_merged(ctx: Context, apply: bool) -> int:
+    """List (dry run) or delete every branch whose tip is exactly a merged same-repo PR's merged head."""
+    api = ctx.api
+    if apply:
+        _require_write_credential(api, "deleting branches")
+    default = _default_branch(api)
+    merged: dict[str, list] = {}
+    for p in api.paged(api.repo_path("/pulls?state=closed")):
+        if isinstance(p, dict) and p.get("merged"):
+            merged.setdefault(str((p.get("head") or {}).get("ref") or ""), []).append(p)
+    counts = {"delete": 0, "keep": 0, "failed": 0}
+    for b in api.paged(api.repo_path("/branches")):
+        name = b.get("name") if isinstance(b, dict) else None
+        if not name or name not in merged:
+            continue
+        tip = str((b.get("commit") or {}).get("id") or "")
+        raw = next((p for p in sorted(merged[name], key=lambda p: -(p.get("number") or 0))
+                    if _merged_head(api, p.get("number"), None) == tip), None)
+        if raw is None:
+            continue  # no merged PR's merged head is this tip: not provably merged, never touched
+        number = raw.get("number")
+        try:
+            # Re-read the branch (branch=None) and the open PRs right before deciding: the listing and
+            # any earlier open-PR read may be minutes old, and a stacked PR opened since must keep it.
+            verdict, _, reason = head_branch_verdict(api, raw, tip, default, _open_prs(api))
+            if verdict == "delete" and apply:
+                verdict = "deleted" if _delete_branch(api, name) else "gone"
+        except ProviderError as exc:
+            counts["failed"] += 1
+            if apply:
+                _audit_branch(api, number, name, "failed", str(exc), "prune-merged")
+            print(f"FAILED  {name}: {exc}", file=sys.stderr)
+            continue
+        if apply:  # a dry run changes nothing, so it writes no audit line
+            _audit_branch(api, number, name, verdict, reason, "prune-merged")
+        if verdict == "keep":
+            counts["keep"] += 1
+            print(f"keep    {name}: {reason}")
+            continue
+        counts["delete"] += 1
+        print(f"{verdict:<7} {name}  (merged PR #{number})")
+    action = "deleted" if apply else "would delete (dry run; --apply deletes)"
+    print(f"[prune-merged] {api.origin.slug}: {counts['delete']} {action}, "
+          f"{counts['keep']} kept, {counts['failed']} failed")
+    return 1 if counts["failed"] else 0
 
 
 # --- gh-shaped CLI --------------------------------------------------------------------------
@@ -947,7 +1159,12 @@ def main(argv: list[str]) -> int:
         if argv[:1] == ["gh"]:
             sys.stdout.write(run_gh(Context(origin, state_dir), argv[1:]))
             return 0
-        print("usage: forgejo_provider.py detect | gh <pr|api|repo> ...", file=sys.stderr)
+        if argv[:1] == ["delete-head"] and len(argv) == 2 and argv[1].isdigit():
+            return delete_head(Context(origin, state_dir), int(argv[1]))
+        if argv[:1] == ["prune-merged"] and argv[1:] in ([], ["--apply"]):
+            return prune_merged(Context(origin, state_dir), apply=argv[1:] == ["--apply"])
+        print("usage: forgejo_provider.py detect | gh <pr|api|repo> ... | delete-head <PR> | prune-merged [--apply]",
+              file=sys.stderr)
         return 2
     except ProviderError as exc:
         reason = str(exc)

@@ -68,6 +68,19 @@
 
 ### Fixed
 
+- On Forgejo, `ship` deletes a merged PR's head branch through the API, with the same credential
+  that merged it (agent-tools#860). It used to run `git push origin --delete`, which needs a
+  separate git credential. Without one the branch stayed behind silently, with no audit line
+  (tg-cli PR #513). The branch is now kept, with the reason printed, if it is a fork head, the
+  default/base branch, protected, has a tip that is not the merged head, or is still the head or
+  base of another open PR. The merged head is the head the merge actually took: the pinned
+  `head_commit_id`, or `refs/pull/<n>/head`. It is never the PR payload's `head.sha`, which Forgejo
+  keeps at the branch's live tip. Every outcome goes to `SHIP_AUDIT_FILE` as `gate:"branch-delete"`.
+  `python3 ci/ship/forgejo_provider.py prune-merged [--apply]` sweeps the existing backlog. It is a
+  dry run unless `--apply` is given, and it only deletes branches whose tip is exactly a merged
+  PR's merged head. Before each decision it re-reads the branch and the open PRs. Under `--apply`
+  every outcome is audited with `source:"prune-merged"`.
+
 - `worktree-only-writes` no longer refuses omp harness URIs or write-free `eval` cells from a
   main-checkout session (agent-tools#828). `write agent://<id>` / `agent://all`, `local://…`,
   `proc://<id>/kill`, `xd://report_issue`, `artifact://`, `skill://`, `history://` and `mcp://`
