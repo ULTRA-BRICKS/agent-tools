@@ -10,6 +10,11 @@ One script binds two points via two descriptors; it branches on `event["point"]`
 
 - **`pre-write`** — a **code** Edit/Write (non-docs) by the main thread → warn-then-block.
   Docs are exempt: a path matching `\.(md|mdx|txt|rst)$` or under `docs/` is always allowed.
+  So are omp harness URIs (agent-tools#828) — `agent://<id>`/`agent://all` (messaging
+  subagents), `proc://<id>/kill`, `xd://report_issue`, `local://`, `artifact://`, `skill://`,
+  `history://`, `mcp://` — which are orchestration, not files. The file-rewriting
+  `xd://ast_edit`/`xd://resolve` and any URI with a `..` segment still count as code writes,
+  also when percent-encoded (same rules as `worktree-only-writes`).
 - **`pre-bash`** — a clearly **multi-step / implementation-shaped** Bash by the main thread →
   warn-then-block. Implementation-shaped = chained `> 2` steps (`&&`/`;`/`||`/`|`/newline), OR a
   heredoc, OR an obvious build/edit (`sed -i`, `tee`, `npm`/`cargo`/`make` build, **`git commit`/

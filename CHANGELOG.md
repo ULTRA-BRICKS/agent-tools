@@ -68,6 +68,19 @@
 
 ### Fixed
 
+- `worktree-only-writes` no longer refuses omp harness URIs or write-free `eval` cells from a
+  main-checkout session (agent-tools#828). `write agent://<id>` / `agent://all`, `local://…`,
+  `proc://<id>/kill`, `xd://report_issue`, `artifact://`, `skill://`, `history://` and `mcp://`
+  were joined onto cwd as relative paths (`<main>/agent:/all`) and refused as main-branch
+  writes, so agents started in a main checkout could not message peers, save reports or stop
+  their own background jobs; every `eval` cell with no scraped file write was refused the same
+  way. Both are now allowed. Real file writes stay blocked, including a relative path that
+  contains a colon, any other or mis-cased scheme, a URI with a `..` segment, the
+  file-rewriting `xd://ast_edit`/`xd://resolve`, and an `eval` write to a main path or to an
+  unresolved target. `orchestrator-stays-thin` stops counting the same harness URIs as code
+  writes, so an orchestrator messaging its subagents (`write agent://all`) is no longer
+  warned and then blocked.
+
 - Telegram hatches (`agenttools_hatch_escalation`, every hook and every `ship` gate) find tg-ctl
   on Linux and Cygwin, not only on the owner's Mac (agent-tools#852). The trusted list was three hardcoded paths
   (`/Users/ultra/.files/bin`, `/usr/local/bin`, `/opt/homebrew/bin`), so a `~/.local/bin/tg-ctl`

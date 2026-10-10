@@ -13,6 +13,7 @@ Run from the repo root::
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import io
 import json
@@ -409,6 +410,153 @@ def test_target_dir_dot_path_stays_at_cwd_not_its_parent():
     """Unit-level pin: `_target_dir("/some/dir", {"file_path": "."})` must return `/some/dir`
     itself (an existing directory), never `/some/dir`'s parent."""
     assert wow._target_dir("/tmp", {"file_path": "."}) == "/tmp"
+
+
+# ── omp internal URIs and path-less eval cells are not file writes (agent-tools#828) ───────
+
+def _run_event(cwd: Path, monkeypatch, tool: str, args: dict) -> tuple[str, int]:
+    """Feed one bridge-shaped pre-write event (enrolled via env) and return (stdout, exit)."""
+    event = {"tool": tool, "cwd": str(cwd), "args": args}
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    for k in _ENV_KEYS:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("RIG_WORKTREE_ONLY", "1")
+    code = wow.main()
+    return out.getvalue(), code
+
+
+_HARNESS_URIS = (
+    "agent://Main",
+    "agent://all",
+    "xd://report_issue",
+    "xd://mcp__runpod_get_pod",
+    "proc://bg_388/kill",
+    "artifact://3155",
+    "local://report.md",
+    "local://notes/scout-findings.md",
+    "skill://tdd-red-first",
+    "history://Main",
+    "mcp://runpod/guides/runpod-mcp",
+    "local://%252561b",         # decodes in exactly _MAX_UNQUOTE_ROUNDS (3) rounds → `ab`
+)
+# Not harness channels: still judged as a path (each one resolves into the main checkout).
+_NON_HARNESS_TARGETS = (
+    "foo:bar/baz.txt",          # a real relative path that merely contains a colon
+    "agent:/Main",              # one slash: a real `agent:` directory, not a URI
+    "AGENT://Main",             # scheme match is exact; an unknown spelling is a real path
+    "myagent://Main",           # a recognized scheme only as a SUFFIX of the prefix
+    "file://seed.txt",          # not an omp harness scheme
+    "ssh://localhost/seed.txt", # ssh:// writes real files (possibly on this host)
+    "local://../../seed.txt",   # a `..` segment could climb out of the session dir
+    "local://%2e%2e/seed.txt",  # … also percent-encoded
+    "local://%252e%252e/seed.txt",  # … also doubly encoded
+    "local://a\\..\\..\\seed.txt",  # … also with backslash separators
+    "xd://ast_edit",            # file-rewriting tool devices stay judged as writes
+    "xd://ast_edit/x",
+    "xd://ast_edit?x",
+    "xd://%61st_edit",          # … also percent-encoded
+    "xd://AST_EDIT",            # … also upper-cased
+    "xd://resolve",
+    "xd://resolve%3Fq",
+    " xd://ast_edit ",          # surrounding whitespace is stripped before matching
+    "local://%25252561b",       # still changing after 3 rounds → refused as a channel
+)
+
+
+@pytest.mark.parametrize("uri", _HARNESS_URIS)
+def test_internal_uri_write_on_enrolled_main_allows(tmp_path, monkeypatch, uri):
+    """`write <scheme>://…` is a harness channel (peer message, QA report, job control, session
+    artifact), not a file in the checkout. The omp bridge sets both `path` and `file_path` to
+    the raw URI; joined onto cwd it used to resolve to `<main>/agent:/Main` → main → BLOCK."""
+    repo = _make_repo(tmp_path, branch="main")
+    out, code = _run_event(repo, monkeypatch, "write", {"path": uri, "file_path": uri, "content": "hi"})
+    assert code == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("target", _NON_HARNESS_TARGETS)
+def test_non_harness_or_file_mutating_uri_on_enrolled_main_still_blocks(tmp_path, monkeypatch, target):
+    """Only the exact allowlisted harness schemes are exempt; anything else is still a path
+    judged against cwd, and the xd:// devices that rewrite files keep the cwd verdict."""
+    repo = _make_repo(tmp_path, branch="main")
+    out, code = _run_event(repo, monkeypatch, "write", {"path": target, "file_path": target, "content": "x"})
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_internal_uri_in_secondary_key_does_not_mask_a_real_main_path(tmp_path, monkeypatch):
+    """The verdict keys on the SAME first usable path `_target_dir` judges: a harness URI in a
+    later key must not exempt a real `file_path` into the main checkout."""
+    repo = _make_repo(tmp_path, branch="main")
+    out, code = _run_event(repo, monkeypatch, "write",
+                           {"file_path": str(repo / "a.txt"), "path": "agent://Main", "content": "x"})
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_eval_without_scraped_write_on_enrolled_main_allows(tmp_path, monkeypatch):
+    """A read-only eval cell (here: an HTTP GET plus regex filtering) carries no path and an
+    empty scraped `content` — the bridge found no file write, so there is nothing to redirect."""
+    repo = _make_repo(tmp_path, branch="main")
+    code_text = "import re, urllib.request\nprint(re.findall('x', urllib.request.urlopen(u).read().decode()))"
+    out, code = _run_event(repo, monkeypatch, "eval", {"language": "py", "code": code_text, "content": ""})
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_eval_writing_a_scraped_main_path_still_blocks(tmp_path, monkeypatch):
+    """An eval cell whose scraped write target lands in the main checkout is judged like `write`."""
+    repo = _make_repo(tmp_path, branch="main")
+    out, code = _run_event(repo, monkeypatch, "eval", {
+        "language": "py", "code": "open('x.txt','w').write('a')",
+        "file_path": "x.txt", "path": "x.txt", "content": "a",
+    })
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_eval_with_unresolved_write_target_on_enrolled_main_still_blocks(tmp_path, monkeypatch):
+    """A recognized write call whose target could not be resolved (the bridge's path-less
+    bucket: content scraped, no path) keeps the #615 cwd fallback — it IS a file write, the
+    target is just unknown, the eval analogue of codex's apply_patch parse miss."""
+    repo = _make_repo(tmp_path, branch="main")
+    out, code = _run_event(repo, monkeypatch, "eval", {
+        "language": "py", "code": "with open(p, 'w') as f: f.write('a')", "content": "a",
+    })
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_pathless_non_eval_write_still_blocks(tmp_path, monkeypatch):
+    """The eval exemption is tool-scoped: a path-less `apply_patch` (codex parse miss) with
+    empty content still takes the #615 cwd fallback and BLOCKs on main."""
+    repo = _make_repo(tmp_path, branch="main")
+    out, code = _run_event(repo, monkeypatch, "apply_patch", {"content": ""})
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_harness_uri_rules_match_orchestrator_stays_thin_copy():
+    """SYNC guard: orchestrator-stays-thin carries a standalone copy of `_is_harness_uri`."""
+    ost_path = _HOOK.parents[1] / "orchestrator-stays-thin" / "orchestrator_stays_thin.py"
+    spec = importlib.util.spec_from_file_location("orchestrator_stays_thin_sync", ost_path)
+    assert spec and spec.loader
+    ost = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ost)
+    assert ost._HARNESS_URI_SCHEMES == wow._HARNESS_URI_SCHEMES
+    assert ost._FILE_MUTATING_XD_DEVICES == wow._FILE_MUTATING_XD_DEVICES
+    assert ost._HARNESS_URI_RE.pattern == wow._HARNESS_URI_RE.pattern
+    assert ost._MAX_UNQUOTE_ROUNDS == wow._MAX_UNQUOTE_ROUNDS
+    assert _function_body_dump(ost_path, "_is_harness_uri") == _function_body_dump(_HOOK, "_is_harness_uri")
+    for raw in _HARNESS_URIS:
+        assert ost._is_harness_uri(raw) and wow._is_harness_uri(raw), raw
+    for raw in _NON_HARNESS_TARGETS:
+        assert not ost._is_harness_uri(raw) and not wow._is_harness_uri(raw), raw
+
+
+def _function_body_dump(path: Path, name: str) -> str:
+    """`ast.dump` of a top-level function's body without its docstring (the copies' differ)."""
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            body = node.body[1:] if ast.get_docstring(node) is not None else node.body
+            return ast.dump(ast.Module(body=body, type_ignores=[]))
+    raise AssertionError(f"{name} not found in {path}")
 
 
 # ── unit: the minimal rig.yaml boolean parse ──────────────────────────────────────────────

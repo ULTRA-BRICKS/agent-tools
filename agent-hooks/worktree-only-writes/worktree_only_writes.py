@@ -33,7 +33,10 @@ Contract (agents-hooks/v1):
            The verdict is keyed to the checkout the TARGET FILE lives in (its directory), not the
            shell cwd — they can differ (cwd in a worktree, an absolute write into the main checkout).
            See `_target_dir`'s docstring for the no-path-key and relative-path resolution rules
-           (agent-tools#615).
+           (agent-tools#615). Two event shapes are not file writes and are ALLOWED outright
+           (agent-tools#828): a target that is an omp harness URI (`agent://`, `local://`,
+           `proc://`, … — see `_is_harness_uri`), and an omp `eval` cell in which the bridge
+           scraped no file write at all (no path, empty `content`).
   stdout : protocol JSON only       exit 0 : allow   exit 10 : BLOCK   other : error
 
 on_error is "open": workflow discipline, not a security boundary — a git/parse failure must
@@ -45,9 +48,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import subprocess  # noqa: S404 — a few read-only `git` queries are the whole job
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 # SYNC: duplicated in every hatch-using hook so each hook does not need
 # a shared helper file under agent-hooks/. Edit every copy together;
@@ -123,6 +128,21 @@ CONFIG_KEY = "worktree_only"
 # Fallback default branch when neither origin/HEAD nor a local main/master branch is resolvable.
 _FALLBACK_DEFAULT_BRANCH = "main"
 _GIT_TIMEOUT_S = 3.0
+
+# omp harness URI schemes (agent-tools#828). A `write` to one of these is a harness channel —
+# a peer message (`agent://`), a session artifact outside the checkout (`local://`), job
+# control (`proc://<id>/kill`), a tool device (`xd://`), … — not a file in the checkout.
+# Joined onto cwd as a relative path, `agent://Main` used to resolve to `<main>/agent:/Main`
+# and was refused as a main-branch write. Exact lowercase match only: any other spelling
+# (`AGENT://`, `file://`, `ssh://`) is not recognized and stays judged as a real path. SYNC with
+# orchestrator-stays-thin `_is_harness_uri` (same set and exclusions; no shared import by design).
+_HARNESS_URI_SCHEMES = frozenset({"agent", "xd", "proc", "artifact", "local", "skill", "history", "mcp"})
+# `xd://` devices that stage or apply rewrites of real files keep the normal (cwd) verdict.
+_FILE_MUTATING_XD_DEVICES = frozenset({"ast_edit", "resolve"})
+_HARNESS_URI_RE = re.compile(r"([a-z]+)://(.*)", re.DOTALL)
+# Percent-decoding rounds accepted (`%252e` → `%2e` → `.` is two); a remainder that still
+# changes after this many is refused as a channel.
+_MAX_UNQUOTE_ROUNDS = 3
 
 MESSAGE = (
     "You are on the default branch ({branch}) — the worktree-only workflow forbids authoring "
@@ -311,6 +331,40 @@ def _existing_ancestor(start: Path, base: str) -> str:
     return base
 
 
+def _is_harness_uri(raw: str) -> bool:
+    """Whether ``raw`` names an omp harness channel rather than a file (agent-tools#828).
+
+    Both disqualifiers are judged on the fully percent-decoded remainder, so an encoded form
+    cannot slip past either: a `..` segment (`local://../../x` could climb out of the session
+    directory into a checkout) and a file-rewriting xd device (`xd://%61st_edit`, and
+    `xd://AST_EDIT` — the device name is compared case-insensitively)."""
+    match = _HARNESS_URI_RE.fullmatch(raw.strip())
+    if match is None or match.group(1) not in _HARNESS_URI_SCHEMES:
+        return False
+    scheme, rest = match.group(1), match.group(2)
+    for _ in range(_MAX_UNQUOTE_ROUNDS + 1):  # the extra pass only confirms stability
+        decoded = unquote(rest)
+        if decoded == rest:
+            break
+        rest = decoded
+    else:
+        return False  # still changing after the last round → refuse to call it a channel
+    if ".." in rest.replace("\\", "/").split("/"):
+        return False
+    device = re.split(r"[/?#]", rest, maxsplit=1)[0].lower()
+    return not (scheme == "xd" and device in _FILE_MUTATING_XD_DEVICES)
+
+
+def _target_path(args: dict) -> str | None:
+    """The first usable file_path/path/notebook_path value — the one `_target_dir` judges —
+    or None when no key carries a non-blank string (agent-tools#615)."""
+    for key in ("file_path", "path", "notebook_path"):
+        raw = args.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw
+    return None
+
+
 def _target_dir(cwd: str, args: dict) -> str:
     """The directory whose branch decides the verdict: the WRITE TARGET's dir, else `cwd`.
 
@@ -352,15 +406,14 @@ def _target_dir(cwd: str, args: dict) -> str:
     absolute path, or the `RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES` escape hatch, for that case.
     """
     base = cwd or os.getcwd()
-    for key in ("file_path", "path", "notebook_path"):
-        raw = args.get(key)
-        if isinstance(raw, str) and raw.strip():
-            target = Path(raw).expanduser()
-            if not target.is_absolute():
-                target = Path(base) / target
-            start = target if target.is_dir() else target.parent
-            return _existing_ancestor(start, base)
-    return base
+    raw = _target_path(args)
+    if raw is None:
+        return base
+    target = Path(raw).expanduser()
+    if not target.is_absolute():
+        target = Path(base) / target
+    start = target if target.is_dir() else target.parent
+    return _existing_ancestor(start, base)
 
 
 def main() -> int:
@@ -373,6 +426,16 @@ def main() -> int:
 
     cwd = str(event.get("cwd") or os.getcwd())
     args = event.get("args") if isinstance(event.get("args"), dict) else {}
+    raw_target = _target_path(args)
+    # agent-tools#828: a harness URI is not a file in any checkout, and an omp `eval` cell in
+    # which the bridge scraped no write (no path, empty content) authors nothing. A path-less
+    # eval WITH scraped content is a write to an unresolved target → the #615 cwd fallback.
+    if raw_target is not None and _is_harness_uri(raw_target):
+        emit("allow")
+        return 0
+    if raw_target is None and event.get("tool") == "eval" and not args.get("content"):
+        emit("allow")
+        return 0
     # Judge the checkout the TARGET FILE lives in, not the shell cwd (they can differ).
     where = _target_dir(cwd, args)
 

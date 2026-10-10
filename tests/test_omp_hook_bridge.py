@@ -1958,6 +1958,42 @@ def test_worktree_only_writes_relative_hashline_path_blocks_despite_sibling_work
     assert proc.returncode == 10
 
 
+@pytest.mark.parametrize("omp_input,tool,expected", [
+    ({"path": "agent://all", "content": "serialize bun test runs"}, "write", "allow"),
+    ({"path": "local://report.md", "content": "# findings"}, "write", "allow"),
+    ({"path": "proc://bg_388/kill"}, "write", "allow"),
+    ({"language": "py", "code": "import urllib.request\nprint(urllib.request.urlopen(u).read())"}, "eval", "allow"),
+    ({"path": "notes.md", "content": "x"}, "write", "block"),
+    ({"language": "py", "code": "open('x.txt', 'w').write('a')"}, "eval", "block"),
+])
+def test_worktree_only_writes_omp_internal_uris_and_eval_end_to_end(tmp_path, omp_input, tool, expected):
+    """agent-tools#828: through the real bridge → hook chain from an enrolled main checkout,
+    harness URIs and a write-free eval cell are allowed; a real file write is still blocked."""
+    import subprocess as sp
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sp.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    (repo / "rig.yaml").write_text("agent_hooks:\n  worktree_only: true\n", encoding="utf-8")
+    sp.run(["git", "add", "."], cwd=repo, check=True)
+    sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+    omp_event = {"event": "tool_call", "toolName": tool, "input": omp_input, "cwd": str(repo)}
+    events = dispatch._v1_events_for_dispatch(omp_event, point="pre-write")
+    assert len(events) == 1
+    proc = sp.run(
+        [sys.executable, str(WORKTREE_ONLY_WRITES)],
+        input=json.dumps(events[0]),
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**{k: v for k, v in os.environ.items() if k != "RIG_WORKTREE_ONLY"}, "HOME": str(tmp_path)},
+        timeout=10,
+    )
+    assert json.loads(proc.stdout)["decision"] == expected
+    assert proc.returncode == (0 if expected == "allow" else 10)
+
+
 # --- extension.ts loads without a syntax error --------------------------------------------------
 
 

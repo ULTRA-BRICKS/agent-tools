@@ -136,6 +136,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import unquote
 
 # SYNC: duplicated in every hatch-using hook so each hook does not need
 # a shared helper file under agent-hooks/. Edit every copy together;
@@ -245,6 +246,40 @@ TTL_S = int(os.environ.get("ORCH_THIN_TTL_S", "900"))
 # A write to one of these is documentation, never implementation → always allow.
 DOCS_PATH = re.compile(r"\.(?:md|mdx|txt|rst)$", re.IGNORECASE)
 DOCS_DIR = re.compile(r"(?:^|/)docs/", re.IGNORECASE)
+
+# omp harness URI schemes (agent-tools#828): a write to `agent://<id>`/`agent://all` messages a
+# subagent, `proc://<id>/kill` stops a job, `xd://report_issue` files a QA report — orchestration,
+# not implementation. SYNC with worktree-only-writes `_is_harness_uri` (each agent-hook is a
+# standalone script, no shared import); keep the scheme set and exclusions identical.
+_HARNESS_URI_SCHEMES = frozenset({"agent", "xd", "proc", "artifact", "local", "skill", "history", "mcp"})
+# `xd://` devices that stage or apply rewrites of real files are implementation.
+_FILE_MUTATING_XD_DEVICES = frozenset({"ast_edit", "resolve"})
+_HARNESS_URI_RE = re.compile(r"([a-z]+)://(.*)", re.DOTALL)
+# Percent-decoding rounds accepted (`%252e` → `%2e` → `.` is two); a remainder that still
+# changes after this many is refused as a channel.
+_MAX_UNQUOTE_ROUNDS = 3
+
+
+def _is_harness_uri(raw: str) -> bool:
+    """Whether ``raw`` names an omp harness channel rather than a file (SYNC, agent-tools#828).
+    A `..` segment or a file-rewriting xd device, judged on the fully percent-decoded
+    remainder, disqualifies it."""
+    match = _HARNESS_URI_RE.fullmatch(raw.strip())
+    if match is None or match.group(1) not in _HARNESS_URI_SCHEMES:
+        return False
+    scheme, rest = match.group(1), match.group(2)
+    for _ in range(_MAX_UNQUOTE_ROUNDS + 1):  # the extra pass only confirms stability
+        decoded = unquote(rest)
+        if decoded == rest:
+            break
+        rest = decoded
+    else:
+        return False  # still changing after the last round → refuse to call it a channel
+    if ".." in rest.replace("\\", "/").split("/"):
+        return False
+    device = re.split(r"[/?#]", rest, maxsplit=1)[0].lower()
+    return not (scheme == "xd" and device in _FILE_MUTATING_XD_DEVICES)
+
 
 # Inspection / read-only one-liners that the orchestrator legitimately runs itself.
 # `sed` is DELIBERATELY ABSENT from this head-only regex (agent-tools#541): a plain `sed\b` would
@@ -855,6 +890,8 @@ def _is_code_write(args: dict) -> bool:
     path = args.get("file_path") or args.get("path") or args.get("notebook_path") or ""
     if not isinstance(path, str) or not path.strip():
         return False  # no path to judge → don't claim it's a code write
+    if _is_harness_uri(path):
+        return False  # a harness channel (peer message, job control), not a file
     if DOCS_PATH.search(path) or DOCS_DIR.search(path):
         return False  # docs are not implementation
     return True

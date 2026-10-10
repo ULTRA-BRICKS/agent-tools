@@ -23,6 +23,28 @@ the sibling `pin-primary-worktree` (a `pre-bash` gate) for that half: it blocks 
 PRIMARY worktree itself off the default branch. (Alex tg#6462/tg#6477 — the incident that
 surfaced this gap.)
 
+## Not file writes: omp harness URIs and write-free `eval` cells (agent-tools#828)
+
+The omp bridge routes `write` and `eval` to `pre-write`, but two shapes author nothing in a
+checkout, so they are **allowed** even on an enrolled default branch:
+
+- **Harness URIs.** A target whose first usable `file_path`/`path`/`notebook_path` value is
+  `agent://`, `xd://`, `proc://`, `artifact://`, `local://`, `skill://`, `history://` or
+  `mcp://` — peer messages (`agent://<id>`, `agent://all`), session artifacts
+  (`local://<name>.md`), job control (`proc://<id>/kill`), tool devices (`xd://report_issue`).
+  The scheme must match exactly in lowercase. Still judged as a path (so still blocked on
+  main): any other spelling or scheme (`AGENT://`, `file://`, `ssh://`), a relative path that
+  merely contains a colon (`foo:bar/baz.txt`), a URI with a `..` segment (`local://../x`), and
+  the file-rewriting devices `xd://ast_edit` and `xd://resolve`. The `..` and device checks run
+  on the fully percent-decoded remainder, case-insensitively for the device name, so
+  `local://%2e%2e/x` and `xd://%61st_edit` are still blocked.
+- **`eval` with no scraped write.** An omp `eval` cell where the bridge found no file write
+  (no path, empty `content`) — a read-only HTTP GET, a computation — is allowed. A scraped
+  write is judged like `write`: a path in the main checkout blocks, and a recognized write to
+  an unresolved target (path-less bucket with content) keeps the cwd fallback and blocks.
+  The scrape is best-effort (see `lib/omp_hook_bridge/dispatch.py`), so this stays a workflow
+  nudge, not a sandbox.
+
 ## Default-branch detection (not hardcoded, never machine-derived)
 
 1. `git symbolic-ref --short refs/remotes/origin/HEAD` → `origin/main` → `main` (authoritative)

@@ -155,6 +155,28 @@ def test_allow_docs_dir_write(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
 
 
+@pytest.mark.parametrize("uri", [
+    "agent://all", "agent://FixHook828", "xd://report_issue", "proc://bg_388/kill",
+    "artifact://12", "local://plan.json", "skill://x", "history://Main", "mcp://srv/res",
+])
+def test_allow_harness_uri_write_even_on_repeat(tmp_path, monkeypatch, uri):
+    """agent-tools#828: messaging subagents (`agent://`), stopping a job (`proc://`) and
+    filing a QA report (`xd://`) ARE orchestration — never a code write, never WARNed."""
+    event = {"point": "pre-write", "cwd": "/repo", "args": {"path": uri, "file_path": uri, "content": "x"}}
+    for _ in range(2):
+        out, err, c = _run(event, monkeypatch, tmp_path / "m")
+        assert c == 0 and _decision(out) == "allow" and err == ""
+
+
+@pytest.mark.parametrize("target", ["xd://ast_edit", "xd://resolve", "local://../../src/a.ts", "foo:bar/a.ts"])
+def test_file_rewriting_device_or_non_harness_uri_is_still_a_code_write(tmp_path, monkeypatch, target):
+    event = {"point": "pre-write", "cwd": "/repo", "args": {"path": target, "file_path": target}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
 def test_allow_read_only_bash(tmp_path, monkeypatch):
     event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": "git status && ls -la"}}
     out, _e, c = _run(event, monkeypatch, tmp_path / "m")
