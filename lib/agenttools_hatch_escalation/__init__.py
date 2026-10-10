@@ -5,6 +5,12 @@ agent-tools checkout, before package installation can be assumed. It turns a per
 (`RIG_HATCH_REQUEST_<HOOK_ID>`) into a one-time `tg-ctl ask` call through a trusted absolute
 path. It never consults ambient PATH.
 
+It also owns the machine-trust primitives other `python3 -I` gate helpers load by fixed path
+(`ci/ship/rig_external_review_policy.py`): `path_trust_problem` / `resolve_trusted_file` (is a
+path owned by you or root and writable by nobody else, on macOS, Linux and Cygwin alike) and
+`machine_config_mapping` (a PyYAML-free reader for the machine-global rig config, because an
+isolated `python3 -I` interpreter never sees a user-site PyYAML).
+
 Every attempt where the hatch env var carried ANY value is also appended, best-effort, as one
 JSON line to `overrides.log` (retrospective 2026-07-01, section 5.2.3 item 3 / gap G-8: "escape
 hatches have no audit sink"). See `_append_overrides_log` for the record shape and trust model.
@@ -12,6 +18,8 @@ hatches have no audit sink"). See `_append_overrides_log` for the record shape a
 
 from __future__ import annotations
 
+import functools
+import grp
 import hashlib
 import html
 import json
@@ -20,7 +28,9 @@ import pwd
 import re
 import shlex
 import signal
+import stat
 import subprocess  # noqa: S404 - runs an already-resolved absolute tg-ctl path
+import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -48,7 +58,6 @@ _DETAIL_CAP = 500
 # rather than spelling the string twice (a silent mismatch between the two channels is exactly the
 # protocol-drift class the stdin-JSON contract below was rewritten to close).
 _ASK_AGENT = "claude"
-_RIG_TG_CTL_KEY = "tg_ctl_path"
 _BARE_FLAG_VALUES = frozenset({"1", "true", "yes", "on"})
 # Long enough to reject a command name used as the value (`pytest`) and
 # short enough that a real phrase still qualifies.
@@ -74,11 +83,44 @@ def _is_written_justification(text: str) -> bool:
     return len(text) >= _MIN_JUSTIFICATION_CHARS
 
 
-_TRUSTED_TG_CTL_PATHS = (
-    Path("/Users/ultra/.files/bin/tg-ctl"),
-    Path("/usr/local/bin/tg-ctl"),
-    Path("/opt/homebrew/bin/tg-ctl"),
+# tg-ctl install locations searched when the machine-global rig config names no explicit
+# `tg_ctl.tg_ctl_path`. Home-relative dirs are joined onto the account's REAL home
+# (`resolve_home`), never `$HOME`: `~/.local/bin` (XDG user bin, the tg-cli installer's target on
+# Linux), `~/bin`, `~/.files/bin` (rig's own `DEFAULT_TG_CTL_PATH`), `~/.linuxbrew/bin`
+# (per-user Linuxbrew).
+_HOME_TG_CTL_DIRS = (
+    Path(".local") / "bin",
+    Path("bin"),
+    Path(".files") / "bin",
+    Path(".linuxbrew") / "bin",
 )
+# System-wide prefixes: Apple-silicon Homebrew, Intel Homebrew / manual installs (also Cygwin's
+# `/usr/local/bin`), shared Linuxbrew, distro packages.
+_TRUSTED_TG_CTL_PATHS = (
+    Path("/opt/homebrew/bin/tg-ctl"),
+    Path("/usr/local/bin/tg-ctl"),
+    Path("/home/linuxbrew/.linuxbrew/bin/tg-ctl"),
+    Path("/usr/bin/tg-ctl"),
+)
+_TG_CTL_NAME = "tg-ctl"
+# The machine-global rig config, joined onto the REAL home. `$XDG_CONFIG_HOME` is deliberately NOT
+# honored here (unlike rig itself): it is an environment variable the guarded agent can export, so
+# it would let the agent point the approval binary at a config it wrote.
+_RIG_GLOBAL_CONFIG_RELATIVE = Path(".config") / "rig" / "config.yaml"
+# rig's own key for "where tg-ctl lives" (riglib/tg_ctl.py) — the same value rig installs the
+# tg-ctl daemon from, so the hatch and the daemon can never disagree on which binary is tg-ctl.
+_RIG_TG_CTL_BLOCK = "tg_ctl"
+_RIG_TG_CTL_KEY = "tg_ctl_path"
+_MAX_SYMLINK_HOPS = 40
+_IS_CYGWIN = sys.platform == "cygwin"
+_IS_DARWIN = sys.platform == "darwin"
+# Cygwin maps the Windows SYSTEM (S-1-5-18) and Administrators (S-1-5-32-544) principals to these
+# ids; files installed by an elevated installer are owned by / group-writable for them.
+_CYGWIN_TRUSTED_IDS = frozenset({18, 544})
+# macOS `admin`: every member can already sudo, so its group-write grants nothing new.
+_DARWIN_ADMIN_GID = 80
+_DEFAULT_CYGDRIVE_PREFIX = "/cygdrive"
+_WINDOWS_DRIVE_PATH_RE = re.compile(r"^([A-Za-z]):[\\/]")
 
 # Default location of the escape-hatch audit sink, relative to the account's REAL home
 # (`resolve_home()`) — see `_resolve_overrides_log_path` for why it is rooted there and not at
@@ -225,10 +267,15 @@ def request_hatch_approval(
     """Request Telegram approval when this hook's hatch env var carries a real justification.
 
     SECURITY: the approval binary (`tg-ctl`) is resolved from the account's REAL home
-    (`resolve_home`) plus a hardcoded trusted-path list — NEVER from `cwd`, which the guarded
-    agent controls. `cwd` here is used ONLY for the human-facing question context (the "CWD:"
-    line). This is what stops a guarded agent from committing a repo-local `rig.yaml` with
-    `agent_hooks.tg_ctl_path: /tmp/always-exit-0` and self-approving.
+    (`resolve_home`: the machine-global rig config's `tg_ctl.tg_ctl_path`, then the home-relative
+    and system install dirs) — NEVER from `cwd`, `$HOME`, `$XDG_CONFIG_HOME` or PATH, and every
+    candidate must pass `resolve_trusted_file` (owned by you or root, writable by nobody else)
+    and lie outside the git checkout the guarded agent works in. `cwd` is otherwise used ONLY for
+    the human-facing question context (the "CWD:" line). This is what stops a guarded agent from
+    committing a repo-local config or binary and self-approving. The boundary is REPO content
+    and OTHER accounts: an agent running as the same uid whose writes are not confined to its
+    worktree can overwrite a home-dir tg-ctl like any other file it owns — confining those writes
+    is the job of the write hooks (`worktree-only-writes`, `no-shell-file-edit`), not this lookup.
 
     The justification is read from EITHER of two sources, checked in this precedence order:
 
@@ -560,7 +607,8 @@ def _verify_hatch_grant(
     tg_ctl_candidates: Sequence[Path | str] | None,
     critical: bool,
 ) -> HatchApprovalResult:
-    tg_ctl = _find_tg_ctl(tg_ctl_candidates)
+    lookup = _find_tg_ctl(tg_ctl_candidates, cwd)
+    tg_ctl = lookup.path
 
     def deny(reason: str) -> HatchApprovalResult:
         return HatchApprovalResult(
@@ -574,7 +622,9 @@ def _verify_hatch_grant(
         )
 
     if tg_ctl is None:
-        return deny("tg-ctl is not available; late-approval grant cannot be verified")
+        return deny(
+            lookup.unavailable_reason("tg-ctl is not available; late-approval grant cannot be verified")
+        )
 
     payload = _grant_payload(
         hook_id, env_var, context, cwd, command, env_map,
@@ -629,7 +679,7 @@ def _pull_late_grant(
 ) -> HatchApprovalResult | None:
     if tg_ctl_candidates is None and os.environ.get("AGENTTOOLS_TEST_HERMETIC_HOME"):
         return None
-    tg_ctl = _find_tg_ctl(tg_ctl_candidates)
+    tg_ctl = _find_tg_ctl(tg_ctl_candidates, cwd).path
     if tg_ctl is None:
         return None
     payload = _grant_payload(
@@ -728,12 +778,13 @@ def _request_present_hatch_approval(
         )
 
 
-    tg_ctl = _find_tg_ctl(tg_ctl_candidates)
+    lookup = _find_tg_ctl(tg_ctl_candidates, cwd)
+    tg_ctl = lookup.path
     if tg_ctl is None:
         return HatchApprovalResult(
             requested=True,
             approved=False,
-            reason="tg-ctl is not available at a trusted executable path",
+            reason=lookup.unavailable_reason("tg-ctl is not available at a trusted executable path"),
             env_var=env_var,
             env_present=True,
             critical=critical,
@@ -1153,19 +1204,21 @@ def resolve_home() -> str | None:
     NOT `$HOME` and NOT the repo the guarded agent is acting in. Returns None when the OS account
     home cannot be resolved (e.g. a no-passwd container).
 
-    This is the trust anchor for resolving the approval binary (see `_candidate_paths`): a
-    `rig.yaml agent_hooks.tg_ctl_path` override is honored ONLY from this home, never from the
-    agent-controlled working directory. Keying off `getpwuid` (not the environment) means a
-    guarded agent cannot redirect the approval binary by committing a repo-local `rig.yaml`, by
-    running the hook from a doctored `cwd`, or by exporting `HOME` — which would otherwise
-    reopen the exact self-service bypass this hatch exists to close (mirrors the ship
-    review-quorum gate's `resolve_home`, PR #225).
+    This is the trust anchor for resolving the approval binary (see `_candidate_paths`): the
+    machine-global rig config (`<home>/.config/rig/config.yaml`, `tg_ctl.tg_ctl_path`) and the
+    home-relative install dirs are read ONLY from this home, never from the agent-controlled
+    working directory. Keying off `getpwuid` (not the environment) means a guarded agent cannot
+    redirect the approval binary by committing a repo-local config, by running the hook from a
+    doctored `cwd`, or by exporting `HOME` — which would otherwise reopen the exact self-service
+    bypass this hatch exists to close (mirrors the ship review-quorum gate's `resolve_home`,
+    PR #225).
 
     It deliberately does NOT fall back to `os.path.expanduser("~")` on failure: that would read
     `$HOME` (agent-exportable) or, if `$HOME` is unset, resolve `~` relative to the (agent-
     controlled) cwd and walk up into the repo — exactly the untrusted anchors this exists to
-    exclude. Returning None makes the caller SKIP the rig.yaml override entirely (fail closed to
-    the hardcoded trusted paths). Overridable in tests via monkeypatch (never via the environment)."""
+    exclude. Returning None makes the caller SKIP the rig config and home dirs entirely (fail
+    closed to the system install dirs). Overridable in tests via monkeypatch (never via the
+    environment)."""
 
     try:
         return pwd.getpwuid(os.getuid()).pw_dir
@@ -1173,90 +1226,575 @@ def resolve_home() -> str | None:
         return None
 
 
-def _find_tg_ctl(candidates: Sequence[Path | str] | None) -> Path | None:
-    seen: set[Path] = set()
-    for candidate in _candidate_paths(candidates):
-        resolved = _resolve_executable(candidate)
-        if resolved is None or resolved in seen:
-            continue
-        seen.add(resolved)
-        return resolved
+@dataclass(frozen=True)
+class _TgCtlLookup:
+    """The trusted tg-ctl (or None) plus every candidate passed over and why, so a denial can
+    tell the human exactly which path to fix instead of a bare "not available"."""
+
+    path: Path | None
+    rejected: tuple[str, ...] = ()
+
+    def unavailable_reason(self, summary: str) -> str:
+        if not self.rejected:
+            return summary
+        return f"{summary} (searched: {'; '.join(self.rejected)})"
+
+
+def _find_tg_ctl(candidates: Sequence[Path | str] | None, cwd: str | None) -> _TgCtlLookup:
+    """The first candidate that `resolve_trusted_file` accepts AND that lies outside every git
+    checkout the guarded agent is working in (the hook's `cwd` and this process's own cwd) — a
+    binary inside that checkout is something the agent's own PR could rewrite to auto-approve."""
+
+    sandbox = _test_sandbox()
+    home = resolve_home()
+    if home and sandbox is not None and not _is_within(Path(os.path.realpath(home)), sandbox):
+        home = None
+    rejected: list[str] = []
+    checkouts = _checkout_roots(_working_dirs(cwd), home)
+    for candidate in _candidate_paths(candidates, home, rejected):
+        links: list[Path] = []
+        resolved, problem = resolve_trusted_file(candidate, executable=True, links=links)
+        if resolved is not None:
+            visited = [Path(_native_path(str(candidate))), *links, resolved]
+            problem = _placement_problem(visited, checkouts, sandbox)
+            if problem is None:
+                return _TgCtlLookup(resolved, tuple(rejected))
+        rejected.append(f"{candidate}: {problem}")
+    return _TgCtlLookup(None, tuple(rejected))
+
+
+def _placement_problem(
+    visited: Sequence[Path], checkouts: Sequence[Path], sandbox: Path | None
+) -> str | None:
+    """`visited` is the candidate, every symlink its resolution passed through, then the final
+    binary: a link inside the agent's checkout is as rewritable by its PR as the binary itself."""
+
+    resolved = visited[-1]
+    for root in checkouts:
+        inside = next((path for path in visited if _is_within(path, root)), None)
+        if inside is not None:
+            return f"{inside} is inside the git checkout {root} the guarded agent works in"
+    if sandbox is not None and not _is_within(resolved, sandbox):
+        return f"{resolved} is outside the test sandbox {sandbox}"
     return None
 
 
-def _candidate_paths(candidates: Sequence[Path | str] | None) -> list[Path | str]:
+def _test_sandbox() -> Path | None:
+    """Test-suite safety net: tests/conftest.py exports `AGENTTOOLS_TEST_HERMETIC_HOME` (a dir in
+    pytest's basetemp) and every hook SUBPROCESS a test spawns inherits it, while the in-process
+    `resolve_home` monkeypatch does not reach those subprocesses. Under it, only a tg-ctl inside
+    that basetemp may run, so no test can ever message the human through the machine's real
+    tg-ctl. It can only REMOVE candidates, so an agent exporting it merely denies itself."""
+
+    hermetic = os.environ.get("AGENTTOOLS_TEST_HERMETIC_HOME")
+    return Path(os.path.realpath(hermetic)).parent if hermetic else None
+
+
+def _candidate_paths(
+    candidates: Sequence[Path | str] | None, home: str | None, rejected: list[str]
+) -> list[Path | str]:
+    """Search order: the machine-global rig config's explicit `tg_ctl.tg_ctl_path` (ALWAYS first,
+    even when `candidates` is given), then the caller's explicit `candidates` or, when None, the
+    default home-relative + system install paths.
+
+    SECURITY: every home-anchored entry hangs off the account's REAL home (`resolve_home`), NEVER
+    `$HOME`/`$XDG_CONFIG_HOME`/cwd — otherwise a guarded agent could commit or export a config
+    pointing `tg_ctl_path` at `/tmp/always-exit-0` and self-approve. When the home can't be
+    resolved the home-anchored entries are SKIPPED (fail closed to the system dirs)."""
+
     out: list[Path | str] = []
-    # SECURITY: the rig.yaml `tg_ctl_path` override is read from the account's REAL home, NEVER
-    # from the (agent-controlled) working directory the hook was invoked in — otherwise a guarded
-    # agent could commit `rig.yaml` with `tg_ctl_path: /tmp/always-exit-0` and self-approve. When
-    # the home can't be resolved (`resolve_home()` is None) the override is SKIPPED entirely (fail
-    # closed to the hardcoded trusted paths) rather than falling back to an $HOME/cwd anchor.
-    home = resolve_home()
-    rig_path = _rig_tg_ctl_path(home) if home else None
-    if rig_path is not None:
-        out.append(rig_path)
-    out.extend(_TRUSTED_TG_CTL_PATHS if candidates is None else candidates)
+    if home:
+        override, problem = _rig_tg_ctl_path(home)
+        if override is not None:
+            out.append(override)
+        elif problem is not None:
+            rejected.append(problem)
+    if candidates is not None:
+        out.extend(candidates)
+        return out
+    if home:
+        out.extend(Path(home) / directory / _TG_CTL_NAME for directory in _HOME_TG_CTL_DIRS)
+    out.extend(_TRUSTED_TG_CTL_PATHS)
     return out
 
 
-def _resolve_executable(candidate: Path | str) -> Path | None:
-    # SECURITY: a candidate MUST be a genuine absolute path. Do NOT `expanduser()` it — that would
-    # expand a `~/…` value (e.g. a home rig.yaml `tg_ctl_path: "~/bin/tg-ctl"`) against the
-    # agent-exportable `$HOME`, reintroducing an agent-controllable anchor. A `~`-prefixed or
-    # otherwise non-absolute path is rejected outright.
-    path = Path(str(candidate))
-    if not path.is_absolute():
-        return None
+def _rig_tg_ctl_path(home: str) -> tuple[str | None, str | None]:
+    """`(override, problem)` for `tg_ctl.tg_ctl_path` in EXACTLY `<home>/.config/rig/config.yaml`.
+
+    `(None, None)` when the config or the key is absent. The config itself must pass
+    `resolve_trusted_file` — a config another account can rewrite is no authority. A `~/` value is
+    expanded against the REAL `home` (rig's own `_expand_home` semantics), never `$HOME`; a Cygwin
+    `C:\\...` value is translated later by `resolve_trusted_file`."""
+
+    config = Path(home) / _RIG_GLOBAL_CONFIG_RELATIVE
+    if not os.path.lexists(config):
+        return None, None
+    resolved, problem = resolve_trusted_file(config, executable=False)
+    if resolved is None:
+        return None, f"{config}: ignored ({problem})"
     try:
-        resolved = path.resolve(strict=True)
-    except OSError:
-        return None
-    if not resolved.is_file() or not os.access(resolved, os.X_OK):
-        return None
-    return resolved
-
-
-def _rig_tg_ctl_path(home: str) -> str | None:
-    """The `agent_hooks.tg_ctl_path` override read from EXACTLY `<home>/rig.yaml`.
-
-    SECURITY: this reads only the home dir's own rig.yaml — it deliberately does NOT walk UP into
-    parent directories. If the account home is nested under a workspace (or any other
-    agent-controlled dir), a parent `rig.yaml` must NOT be able to redirect the approval binary.
-    """
-
-    try:
-        text = (Path(home) / "rig.yaml").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    value = _agent_hooks_raw(text, _RIG_TG_CTL_KEY)
+        block = machine_config_mapping(_read_trusted_text(resolved), (_RIG_TG_CTL_BLOCK,))
+    except (OSError, UnicodeDecodeError, MachineConfigError) as exc:
+        return None, f"{config}: ignored ({exc})"
+    value = (block or {}).get(_RIG_TG_CTL_KEY)
     if value is None:
-        return None
+        return None, None
+    if not isinstance(value, str) or not value.strip():
+        return None, f"{config}: ignored (tg_ctl.tg_ctl_path must be a path string)"
     value = value.strip()
-    return value or None
+    if value.startswith("~/"):
+        value = str(Path(home) / value[2:])
+    return value, None
 
 
-def _agent_hooks_raw(rig_yaml_text: str, key: str) -> str | None:
-    in_block = False
-    child_indent: int | None = None
-    for raw in rig_yaml_text.splitlines():
-        line = raw.split("#", 1)[0].rstrip()
-        if not line.strip():
-            continue
-        indent = len(line) - len(line.lstrip())
-        head = line.strip().split(":", 1)[0].strip()
-        if indent == 0:
-            in_block = head == "agent_hooks"
-            child_indent = None
-            continue
-        if not in_block:
-            continue
-        if child_indent is None:
-            child_indent = indent
-        if indent != child_indent:
-            continue
-        if head == key and ":" in line.strip():
-            return line.strip().split(":", 1)[1].strip().strip("\"'")
+def _read_trusted_text(path: Path) -> str:
+    """Re-check `path` on the opened descriptor (O_NOFOLLOW + fstat) so a swap between
+    `resolve_trusted_file` and the read cannot substitute another file."""
+
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        problem = None if stat.S_ISREG(info.st_mode) else f"{path} is not a regular file"
+        problem = problem or path_trust_problem(path, info)
+        if problem:
+            raise OSError(problem)
+        return stream.read().decode("utf-8")
+
+
+def _working_dirs(cwd: str | None) -> list[str]:
+    dirs = [cwd] if cwd else []
+    try:
+        dirs.append(os.getcwd())
+    except OSError:
+        pass
+    return dirs
+
+
+def _checkout_roots(start_dirs: Sequence[str], home: str | None) -> list[Path]:
+    """Every git worktree root at or above each of `start_dirs`, plus the main worktree a linked
+    worktree belongs to (an agent in `.worktrees/x` can still edit the primary checkout). Pure
+    filesystem walk — no `git` subprocess, so ambient PATH plays no part in this decision.
+
+    The walk stops at the real home: a dotfiles repo rooted AT `~` (yadm-style) would otherwise
+    swallow `~/.local/bin` and every other home install dir."""
+
+    stop = Path(os.path.realpath(home)) if home else None
+    roots: list[Path] = []
+    for start in start_dirs:
+        current = Path(os.path.realpath(start))
+        for directory in (current, *current.parents):
+            if stop is not None and (directory == stop or directory in stop.parents):
+                break
+            dotgit = directory / ".git"
+            if dotgit.is_dir():
+                roots.append(directory)
+            elif dotgit.is_file():
+                roots.append(directory)
+                main = _main_worktree(dotgit)
+                if main is not None:
+                    roots.append(main)
+    return roots
+
+
+def _main_worktree(dotgit_file: Path) -> Path | None:
+    """The primary checkout behind a linked worktree's `.git` file (`gitdir: <common>/worktrees/x`
+    whose `commondir` names `<main>/.git`), or None for a submodule / unreadable pointer."""
+
+    try:
+        pointer = dotgit_file.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not pointer.startswith("gitdir:"):
+        return None
+    gitdir = Path(pointer[len("gitdir:"):].strip())
+    if not gitdir.is_absolute():
+        gitdir = dotgit_file.parent / gitdir
+    try:
+        common = (gitdir / "commondir").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    common_dir = Path(os.path.realpath(gitdir / common))
+    return common_dir.parent if common_dir.name == ".git" else None
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def path_trust_problem(path: Path | str, info: os.stat_result) -> str | None:
+    """Why `path` (whose own, non-followed stat is `info`) cannot anchor a security decision, or
+    None when it can: owned by you or root (plus Cygwin's SYSTEM/Administrators), and writable by
+    nobody else.
+
+    Group-write is accepted only for a group whose members are already as trusted as the owner:
+    your user-private group (Debian/Ubuntu/Fedora's default umask 002 leaves `~/.local/bin` and
+    friends group-writable for exactly that group), root's gid 0, macOS `admin`, Cygwin
+    Administrators/SYSTEM. A sticky directory (`/tmp`) is fine to traverse: nobody else can
+    rename or replace an entry we own in it, and every entry below it is checked on its own."""
+
+    if info.st_uid not in _trusted_owner_ids():
+        return f"{path} is owned by uid {info.st_uid}, not by you or root"
+    mode = info.st_mode
+    sticky_dir = stat.S_ISDIR(mode) and bool(mode & stat.S_ISVTX)
+    if stat.S_ISLNK(mode) or sticky_dir:
+        return None
+    if mode & stat.S_IWOTH:
+        return f"{path} is world-writable"
+    if mode & stat.S_IWGRP and not _group_is_trusted(info.st_gid):
+        return f"{path} is group-writable by gid {info.st_gid}, which is not your private group"
     return None
+
+
+def _trusted_owner_ids() -> frozenset[int]:
+    owners = {os.geteuid(), 0}
+    if _IS_CYGWIN:
+        owners |= _CYGWIN_TRUSTED_IDS
+    return frozenset(owners)
+
+
+def _group_is_trusted(gid: int) -> bool:
+    if gid == 0:
+        return True
+    if _IS_DARWIN and gid == _DARWIN_ADMIN_GID:
+        return True
+    if _IS_CYGWIN and gid in _CYGWIN_TRUSTED_IDS:
+        return True
+    return _is_private_group(gid)
+
+
+@functools.lru_cache(maxsize=None)
+def _is_private_group(gid: int) -> bool:
+    """True for a user-private group: named after you, your primary group, no other member and
+    no other account's primary group. Looked up by group NAME (`getpwnam`), not `getpwuid`.
+
+    Cached per process (the euid and account database do not change under a hook): one lookup
+    visits several group-writable dirs of the same gid, and `getpwall` can be a full directory
+    enumeration on an LDAP/SSSD host, so it only runs after the cheap checks pass, once.
+
+    `gr_mem` lists only the members the NSS backend reports; a directory service that resolves
+    membership elsewhere could hide one. The target is a developer machine's local accounts."""
+
+    uid = os.geteuid()
+    try:
+        group = grp.getgrgid(gid)
+        owner = pwd.getpwnam(group.gr_name)
+    except (KeyError, OSError):
+        return False
+    if owner.pw_uid != uid or owner.pw_gid != gid:
+        return False
+    if any(member != group.gr_name for member in group.gr_mem):
+        return False
+    try:
+        accounts = pwd.getpwall()
+    except OSError:
+        return False
+    return not any(account.pw_gid == gid and account.pw_uid != uid for account in accounts)
+
+
+def resolve_trusted_file(
+    path: Path | str, *, executable: bool, links: list[Path] | None = None
+) -> tuple[Path | None, str]:
+    """Resolve absolute `path` to a regular file one component at a time, following symlinks by
+    hand, so EVERY directory the lookup traverses (each symlink's own directory, each target's
+    directories) and the final file pass `path_trust_problem`. Returns `(real_path, "")` or
+    `(None, why)`; every symlink followed on the way is appended to `links` when given.
+
+    `os.path.realpath` + a check of the final file alone is not enough: a world-writable
+    directory anywhere on the way, or a symlink planted in one, lets another account swap the
+    binary after the check. On Cygwin a missing final `name` is retried as `name.exe`, and a
+    Windows drive path (`C:\\...`) is translated to its cygdrive form first."""
+
+    raw = Path(_native_path(str(path)))
+    if not raw.is_absolute():
+        return None, f"{path} is not an absolute path"
+    current = Path(raw.anchor)
+    try:
+        problem = path_trust_problem(current, os.lstat(current))
+    except OSError as exc:
+        return None, f"{current} cannot be inspected ({exc.strerror or exc})"
+    if problem:
+        return None, problem
+    pending = list(raw.parts[1:])
+    hops = 0
+    while pending:
+        part = pending.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        entry = current / part
+        try:
+            info = os.lstat(entry)
+        except FileNotFoundError:
+            if pending or not _IS_CYGWIN or part.lower().endswith(".exe"):
+                return None, f"{entry} does not exist"
+            entry = current / f"{part}.exe"
+            try:
+                info = os.lstat(entry)
+            except OSError:
+                return None, f"{current / part} (or {entry.name}) does not exist"
+        except OSError as exc:
+            return None, f"{entry} cannot be inspected ({exc.strerror or exc})"
+        problem = path_trust_problem(entry, info)
+        if problem:
+            return None, problem
+        if stat.S_ISLNK(info.st_mode):
+            if links is not None:
+                links.append(entry)
+            hops += 1
+            if hops > _MAX_SYMLINK_HOPS:
+                return None, f"{path} has more than {_MAX_SYMLINK_HOPS} levels of symlinks"
+            target = Path(os.readlink(entry))
+            if target.is_absolute():
+                current = Path(target.anchor)
+                pending = list(target.parts[1:]) + pending
+            else:
+                pending = list(target.parts) + pending
+            continue
+        if pending and not stat.S_ISDIR(info.st_mode):
+            return None, f"{entry} is not a directory"
+        current = entry
+    try:
+        final = os.lstat(current)
+    except OSError as exc:
+        return None, f"{current} cannot be inspected ({exc.strerror or exc})"
+    if not stat.S_ISREG(final.st_mode):
+        return None, f"{current} is not a regular file"
+    if executable and not os.access(current, os.X_OK):
+        return None, f"{current} is not executable"
+    return current, ""
+
+
+def _native_path(value: str) -> str:
+    """On Cygwin, `C:\\Users\\me\\bin\\tg-ctl.exe` -> `<cygdrive>/c/Users/me/bin/tg-ctl.exe`;
+    anything else unchanged (a POSIX interpreter cannot open a drive path directly)."""
+
+    match = _WINDOWS_DRIVE_PATH_RE.match(value) if _IS_CYGWIN else None
+    if match is None:
+        return value
+    rest = value[3:].replace("\\", "/")
+    return f"{_cygdrive_prefix()}/{match.group(1).lower()}/{rest}"
+
+
+def _cygdrive_prefix() -> str:
+    # Cygwin exposes the configured cygdrive prefix (default `/cygdrive`, often `/`) as a symlink.
+    try:
+        return os.readlink("/proc/cygdrive").rstrip("/")
+    except OSError:
+        return _DEFAULT_CYGDRIVE_PREFIX
+
+
+class MachineConfigError(ValueError):
+    """The machine config cannot be read unambiguously — callers treat it as absent authority."""
+
+
+class _Unparsed:
+    """A value this reader deliberately does not interpret (anchors, tags, block scalars,
+    numbers, nested collections, YAML-1.1-only booleans). Never equal to any real setting, so a
+    caller's type check rejects it — fail closed rather than guess."""
+
+    def __repr__(self) -> str:
+        return "<unparsed>"
+
+
+UNPARSED = _Unparsed()
+_YAML_KEY_RE = re.compile(
+    r"""(?:"([^"\\]*)"|'((?:[^']|'')*)'|([A-Za-z0-9_][A-Za-z0-9_.\-/]*))[ ]*:(?:[ ]+(.*))?$"""
+)
+_YAML_TRUE = frozenset({"true", "True", "TRUE"})
+_YAML_FALSE = frozenset({"false", "False", "FALSE"})
+_YAML_NULL = frozenset({"null", "Null", "NULL", "~"})
+# Plain words YAML 1.1 (PyYAML) reads as booleans but YAML 1.2 reads as strings: ambiguous.
+_YAML_11_BOOLS = frozenset({"yes", "no", "on", "off", "y", "n"})
+_YAML_NUMBER_RE = re.compile(
+    r"[-+]?(?:\.?[0-9][0-9_.]*(?:[eE][-+]?[0-9]+)?|0x[0-9a-fA-F_]+|0o[0-7_]+|\.(?:inf|Inf|INF))"
+    r"|\.(?:nan|NaN|NAN)"
+)
+_YAML_PLAIN_FORBIDDEN_START = frozenset("&*!|>%@`{}[],#'\"?:")
+
+
+def machine_config_mapping(text: str, path: Sequence[str]) -> dict[str, object] | None:
+    """The mapping at `path` (e.g. `("ci", "items", "ship")`) in a machine config, without PyYAML.
+
+    Gate helpers run under `python3 -I`, which hides user-site packages — on most machines that
+    is where PyYAML lives, so an `import yaml` there silently fails (and fails CLOSED, which made
+    every owner's config inert). rig writes a plain block-style subset, so this reads exactly that:
+    JSON documents, or block mappings with plain/quoted scalar values and scalar lists (block or
+    one-line `[a, b]`). Subtrees off `path` are skipped by indentation without being interpreted.
+
+    Returns None when a key on `path` is absent. Raises `MachineConfigError` when the structure ON
+    `path` is ambiguous (duplicate key, flow mapping, anchor, odd indentation, multiple documents);
+    a value it will not interpret comes back as `UNPARSED`."""
+
+    if text.lstrip().startswith(("{", "[")):
+        return _json_mapping(text, path)
+    lines = _yaml_lines(text)
+    start, end = 0, len(lines)
+    for depth, key in enumerate(path):
+        entry = _yaml_block_entries(lines, start, end).get(key)
+        if entry is None:
+            return None
+        rest, start, end, number = entry
+        if rest:
+            dotted = ".".join(path[: depth + 1])
+            raise MachineConfigError(f"line {number}: {dotted} must be a block mapping")
+    return {key: _yaml_value(lines, entry) for key, entry in _yaml_block_entries(lines, start, end).items()}
+
+
+def _json_mapping(text: str, path: Sequence[str]) -> dict[str, object] | None:
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        out: dict[str, object] = {}
+        for key, value in pairs:
+            if key in out:
+                raise MachineConfigError(f"duplicate key {key!r}")
+            out[key] = value
+        return out
+
+    try:
+        data = json.loads(text, object_pairs_hook=unique)
+    except MachineConfigError:
+        raise
+    except ValueError as exc:
+        raise MachineConfigError(f"invalid JSON ({exc.msg})") from None
+    for depth, key in enumerate(path):
+        if not isinstance(data, dict):
+            raise MachineConfigError(f"{'.'.join(path[:depth]) or 'document'} is not a mapping")
+        data = data.get(key)
+        if data is None:
+            return None
+    if not isinstance(data, dict):
+        raise MachineConfigError(f"{'.'.join(path)} is not a mapping")
+    return data
+
+
+def _yaml_lines(text: str) -> list[tuple[int, str, int]]:
+    """`(indent, content, line_number)` for every line that is not blank or a whole-line comment."""
+
+    out: list[tuple[int, str, int]] = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        body = raw.rstrip()
+        content = body.lstrip(" ")
+        if not content or content.startswith("#"):
+            continue
+        if content.startswith("\t"):
+            raise MachineConfigError(f"line {number}: tab indentation")
+        indent = len(body) - len(content)
+        if indent == 0 and (content in ("---", "...") or content.startswith(("--- ", "%"))):
+            if not out and content == "---":
+                continue
+            raise MachineConfigError(f"line {number}: multiple documents or directives")
+        out.append((indent, content, number))
+    return out
+
+
+def _yaml_block_entries(
+    lines: list[tuple[int, str, int]], start: int, end: int
+) -> dict[str, tuple[str, int, int, int]]:
+    """`key -> (inline_value, child_start, child_end, line_number)` for the block mapping that
+    occupies `lines[start:end]`. A value-less key owns every following deeper-indented line, plus
+    an indentless `- item` sequence at its own indent."""
+
+    entries: dict[str, tuple[str, int, int, int]] = {}
+    if start >= end:
+        return entries
+    indent = lines[start][0]
+    i = start
+    while i < end:
+        line_indent, content, number = lines[i]
+        if line_indent != indent:
+            raise MachineConfigError(f"line {number}: inconsistent indentation")
+        match = _YAML_KEY_RE.match(content)
+        if match is None:
+            raise MachineConfigError(f"line {number}: expected `key: value`")
+        double, single, plain, rest = match.groups()
+        key = double if double is not None else single.replace("''", "'") if single is not None else plain
+        if key in entries:
+            raise MachineConfigError(f"line {number}: duplicate key {key!r}")
+        rest = _strip_yaml_comment(rest or "")
+        j = i + 1
+        while j < end and (
+            lines[j][0] > indent or (not rest and lines[j][0] == indent and _is_yaml_item(lines[j][1]))
+        ):
+            j += 1
+        entries[key] = (rest, i + 1, j, number)
+        i = j
+    return entries
+
+
+def _yaml_value(lines: list[tuple[int, str, int]], entry: tuple[str, int, int, int]) -> object:
+    rest, start, end, _number = entry
+    if rest:
+        return _yaml_scalar(rest)
+    if start == end:
+        return None
+    indent = lines[start][0]
+    items: list[object] = []
+    for line_indent, content, _ in lines[start:end]:
+        if line_indent != indent or not _is_yaml_item(content):
+            return UNPARSED
+        item = _yaml_scalar(content[1:])
+        if item is UNPARSED:
+            return UNPARSED
+        items.append(item)
+    return items
+
+
+def _is_yaml_item(content: str) -> bool:
+    return content == "-" or content.startswith("- ")
+
+
+def _strip_yaml_comment(text: str) -> str:
+    """`text` without a trailing ` # comment` that sits outside quotes."""
+
+    quote = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == quote == "'" and text[index + 1:index + 2] == "'":
+                index += 1  # `''` is an escaped quote inside a single-quoted scalar
+            elif char == quote:
+                quote = ""
+        elif char in "\"'" and (index == 0 or text[index - 1] in " [,"):
+            quote = char
+        elif char == "#" and (index == 0 or text[index - 1] == " "):
+            return text[:index].rstrip()
+        index += 1
+    return text.strip()
+
+
+def _yaml_scalar(text: str) -> object:
+    text = _strip_yaml_comment(text)
+    if not text:
+        return None
+    if text[0] == '"':
+        close = text.find('"', 1)
+        if close < 0 or "\\" in text[1:close] or text[close + 1:].strip():
+            return UNPARSED
+        return text[1:close]
+    if text[0] == "'":
+        match = re.fullmatch(r"'((?:[^']|'')*)'", text)
+        return match.group(1).replace("''", "'") if match else UNPARSED
+    if text[0] == "[":
+        if not text.endswith("]") or any(char in text[1:-1] for char in "[]{}"):
+            return UNPARSED
+        inner = text[1:-1].strip()
+        if not inner:
+            return []
+        items = [_yaml_scalar(part) for part in inner.split(",")]
+        return UNPARSED if any(item is UNPARSED or item is None for item in items) else items
+    if text[0] in _YAML_PLAIN_FORBIDDEN_START or text.startswith("- ") or ": " in text or text.endswith(":"):
+        return UNPARSED
+    if text in _YAML_TRUE:
+        return True
+    if text in _YAML_FALSE:
+        return False
+    if text in _YAML_NULL:
+        return None
+    if text.lower() in _YAML_11_BOOLS or _YAML_NUMBER_RE.fullmatch(text):
+        return UNPARSED
+    return text
 
 
 def _git_branch(cwd: str) -> str:

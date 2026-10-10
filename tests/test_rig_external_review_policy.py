@@ -173,3 +173,70 @@ def test_machine_branch_emits_distinct_audit_event():
     assert 'AUDIT:external-review:disabled:rig-policy:alex-mextner/project' in result.stdout
     assert source.index('_external_review_audit_log()') < source.index('# BEGIN RIG MACHINE EXTERNAL REVIEW POLICY')
     assert source.index('_EFFECTIVE_TARGET="${REPO_FLAG:') < source.index('# BEGIN RIG MACHINE EXTERNAL REVIEW POLICY')
+
+
+RIG_BLOCK_YAML = """\
+version: 1
+agent_hooks:
+  enabled: true
+ci:
+  items:
+    ship:
+      external_review_owners:
+      - alex-mextner
+      require_external_review: false
+"""
+
+
+def test_block_yaml_policy_applies_without_pyyaml(policy, config_path, tmp_path, monkeypatch):
+    """ship runs this under `python3 -I`, which hides the user-site PyYAML most machines have —
+    the rig-written block YAML must still apply with no `yaml` module importable at all."""
+    monkeypatch.setitem(sys.modules, 'yaml', None)
+    config_path.write_text(RIG_BLOCK_YAML)
+    config_path.chmod(0o600)
+    decision = policy.resolve(config_path, 'alex-mextner/project', tmp_path / 'checkout')
+    assert decision['required'] is False, decision
+
+
+def test_group_writable_parent_is_trusted_only_for_a_private_group(policy, config_path, tmp_path, monkeypatch):
+    """Ubuntu's default umask 002 leaves ~/.config/rig group-writable for the user's PRIVATE group."""
+    write(config_path)
+    config_path.parent.chmod(0o770)
+    trust = policy.machine_trust()
+    monkeypatch.setattr(trust, '_is_private_group', lambda gid: True)
+    assert policy.resolve(config_path, 'alex-mextner/project', tmp_path / 'checkout')['required'] is False
+    monkeypatch.setattr(trust, '_is_private_group', lambda gid: False)
+    decision = policy.resolve(config_path, 'alex-mextner/project', tmp_path / 'checkout')
+    assert decision['required'] is True
+    assert decision['reason'] == 'unsafe_parent'
+    assert 'group-writable' in decision['detail']
+
+
+def test_cli_names_why_an_existing_policy_was_not_applied(config_path, tmp_path):
+    write(config_path)
+    config_path.chmod(0o666)
+    env = dict(os.environ, XDG_CONFIG_HOME=str(config_path.parent.parent))
+    command = [sys.executable, '-I', str(MODULE), 'alex-mextner/project', str(tmp_path / 'checkout')]
+    result = subprocess.run(command, capture_output=True, text=True, env=env)
+    assert result.stdout.strip() == 'enabled'
+    assert f'Rig machine policy {config_path} not applied (unsafe_config: {config_path} is world-writable)' in result.stderr
+
+
+def test_cli_is_quiet_when_no_policy_exists(config_path, tmp_path):
+    env = dict(os.environ, XDG_CONFIG_HOME=str(config_path.parent.parent))
+    command = [sys.executable, '-I', str(MODULE), 'alex-mextner/project', str(tmp_path / 'checkout')]
+    result = subprocess.run(command, capture_output=True, text=True, env=env)
+    assert (result.stdout.strip(), result.stderr) == ('enabled', '')
+
+
+def test_ship_block_passes_the_rejection_reason_through(config_path, tmp_path):
+    write(config_path)
+    config_path.chmod(0o666)
+    source = MODULE.with_name('ship.sh').read_text()
+    block = source.split('# BEGIN RIG MACHINE EXTERNAL REVIEW POLICY', 1)[1].split('# END RIG MACHINE EXTERNAL REVIEW POLICY', 1)[0]
+    env = dict(os.environ, XDG_CONFIG_HOME=str(config_path.parent.parent), ROOT=str(tmp_path / 'checkout'), _SHIP_SELF_DIR=str(MODULE.parent))
+    script = 'set -eu\nEXTREV_ENABLED=1\ngh() { echo alex-mextner/project; }\n' + block + '\necho "$EXTREV_ENABLED"'
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == '1'
+    assert 'not applied (unsafe_config' in result.stderr

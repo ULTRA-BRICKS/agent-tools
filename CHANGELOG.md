@@ -68,6 +68,26 @@
 
 ### Fixed
 
+- Telegram hatches (`agenttools_hatch_escalation`, every hook and every `ship` gate) find tg-ctl
+  on Linux and Cygwin, not only on the owner's Mac (agent-tools#852). The trusted list was three hardcoded paths
+  (`/Users/ultra/.files/bin`, `/usr/local/bin`, `/opt/homebrew/bin`), so a `~/.local/bin/tg-ctl`
+  install was refused with "tg-ctl is not available at a trusted executable path". Now: the
+  machine-global rig config's `tg_ctl.tg_ctl_path` (`~/.config/rig/config.yaml` under the
+  `getpwuid` home; replaces `agent_hooks.tg_ctl_path` in `~/rig.yaml`, which rig's schema
+  rejects), then `~/.local/bin`, `~/bin`, `~/.files/bin`, `~/.linuxbrew/bin`,
+  `/opt/homebrew/bin`, `/usr/local/bin`, `/home/linuxbrew/.linuxbrew/bin`, `/usr/bin`
+  (`tg-ctl.exe` and `C:\…` config paths on Cygwin). Each hop is followed by hand and every
+  directory and the binary must be owned by you or root and writable by nobody else
+  (group-write only for your user-private group, gid 0, macOS `admin`, Cygwin
+  Administrators/SYSTEM); a binary inside the checkout the agent works in (or its primary
+  worktree) is refused. A denial now lists every path searched and why it was passed over.
+
+- `ship`'s Rig machine external-review policy works under `python3 -I` (agent-tools#852). It imported PyYAML,
+  which `-I` hides when it lives in user site-packages, so the policy silently stayed
+  "enabled"; it now reads the config with the hatch lib's PyYAML-free `machine_config_mapping`.
+  A `~/.config/rig` left group-writable by umask 002 is accepted when the group is your private
+  group, and when an existing policy is not applied ship prints why instead of discarding it.
+
 - `agent-hooks/require-review-before-commit`: an exported-empty `REVIEW_MARKER` no longer passes
   the commit gate without a review (agent-tools#825). It resolved to `Path('.')`, the current
   directory, whose mtime any file write refreshes; an empty value now means the default marker,

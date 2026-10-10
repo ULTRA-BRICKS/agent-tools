@@ -3409,7 +3409,10 @@ if [ "$EXTREV_ENABLED" = "1" ]; then
   else
     EXTREV_RIG_TARGET=$(gh repo view "${_EFFECTIVE_TARGET:-${_CWD_ORIGIN_REPO:-}}" --json nameWithOwner,url -q 'select(.url | startswith("https://github.com/")) | .nameWithOwner' 2>/dev/null) || EXTREV_RIG_TARGET=""
   fi
-  EXTREV_RIG_DECISION=$(python3 -I "$_SHIP_SELF_DIR/rig_external_review_policy.py" "$EXTREV_RIG_TARGET" "$ROOT" 2>/dev/null) || EXTREV_RIG_DECISION=enabled
+  # stderr is NOT discarded: when a policy file exists but is rejected (unsafe permissions,
+  # malformed YAML, ...) the reader prints one line naming why, instead of the gate silently
+  # staying enabled with no hint of what to fix.
+  EXTREV_RIG_DECISION=$(python3 -I "$_SHIP_SELF_DIR/rig_external_review_policy.py" "$EXTREV_RIG_TARGET" "$ROOT") || EXTREV_RIG_DECISION=enabled
   if [ "$EXTREV_RIG_DECISION" = "disabled" ]; then
     EXTREV_ENABLED=0
     EXTREV_RIG_SOURCE=1

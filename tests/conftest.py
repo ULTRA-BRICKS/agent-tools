@@ -1,13 +1,15 @@
 """Shared pytest fixtures for the agent-tools suite.
 
 The single most important one is `_hermetic_hatch_home`: it guarantees hatch approval tests cannot
-reach the real `tg-ctl` (and message the human) via a developer's real `~/rig.yaml`. Since the
-shared hatch lib now resolves the approval binary from the account's REAL home (`resolve_home`), a
-machine that happens to have `~/rig.yaml` with `agent_hooks.tg_ctl_path` would let any hatch test
-that patches only `_TRUSTED_TG_CTL_PATHS` invoke the real binary. Pointing `resolve_home` at a
-clean temp home for tests closes that hole centrally. The two explicit real-OS-home tests below are
-exempt from the home patch; they only assert `resolve_home()`'s source of truth and do not resolve
-or execute `tg-ctl`.
+reach the real `tg-ctl` (and message the human) via a developer's real home. Since the shared
+hatch lib resolves the approval binary from the account's REAL home (`resolve_home`: the
+machine-global rig config's `tg_ctl.tg_ctl_path`, then `~/.local/bin`, `~/bin`, ...), any hatch
+test that patches only `_TRUSTED_TG_CTL_PATHS` would otherwise invoke the developer's real binary.
+Pointing `resolve_home` at a clean temp home for tests closes that hole centrally; the exported
+`AGENTTOOLS_TEST_HERMETIC_HOME` additionally makes the lib refuse any tg-ctl outside pytest's
+basetemp, which covers hook SUBPROCESSES the in-process patch never reaches. The two explicit
+real-OS-home tests below are exempt from the home patch; they only assert `resolve_home()`'s
+source of truth and do not resolve or execute `tg-ctl`.
 
 It also exports `AGENT_TOOLS_OVERRIDES_LOG` (a full file path under the same clean temp home) for
 every test. That env var is the escape-hatch audit sink's subprocess-reachable override (see
@@ -80,9 +82,9 @@ def pytest_configure(config):
 
 @pytest.fixture(autouse=True)
 def _hermetic_hatch_home(tmp_path_factory, monkeypatch, request):
-    """Point the hatch helper's `resolve_home` at a clean temp home (no rig.yaml) for every test,
-    so tg-ctl resolves via each test's own patched candidates / `_TRUSTED_TG_CTL_PATHS` and NEVER
-    reads the developer's real `~/rig.yaml`. Tests that deliberately exercise a home rig.yaml
+    """Point the hatch helper's `resolve_home` at a clean temp home (no rig config) for every
+    test, so tg-ctl resolves via each test's own patched candidates / `_TRUSTED_TG_CTL_PATHS` and
+    NEVER reads the developer's real home. Tests that deliberately exercise a home rig config
     override re-monkeypatch `resolve_home` in their own body (applied later, so it wins). All hook
     modules may load fresh hatch helper objects by explicit file path, so this fixture also patches
     the process-wide pwd module that newly loaded helpers call and any hook-local helper objects

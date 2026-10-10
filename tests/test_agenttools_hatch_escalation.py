@@ -57,16 +57,23 @@ def _repo_with_tg_ctl(tmp_path: Path, tg_ctl: Path | None = None) -> Path:
 def _home_with_tg_ctl(
     tmp_path: Path, tg_ctl: Path | None = None, *, name: str = "home"
 ) -> Path:
-    """A fake account home dir carrying a rig.yaml whose `agent_hooks.tg_ctl_path` points at the
-    fake tg-ctl. Tests monkeypatch `resolve_home` to return this — the only legitimate rig.yaml
-    source for the approval binary (the agent-controlled repo `cwd` must NOT be honored)."""
+    """A fake account home dir whose machine-global rig config (`.config/rig/config.yaml`) sets
+    `tg_ctl.tg_ctl_path` to the fake tg-ctl. Tests monkeypatch `resolve_home` to return this — the
+    only legitimate config source for the approval binary (the agent-controlled repo `cwd` must
+    NOT be honored)."""
     home = tmp_path / name
-    home.mkdir()
-    lines = ["agent_hooks:"]
+    _write_rig_config(home, tg_ctl)
+    return home
+
+
+def _write_rig_config(home: Path, tg_ctl: Path | str | None) -> Path:
+    config = home / ".config" / "rig" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["version: 1", "tg_ctl:"]
     if tg_ctl is not None:
         lines.append(f'  tg_ctl_path: "{tg_ctl}"')
-    (home / "rig.yaml").write_text("\n".join(lines) + "\n")
-    return home
+    config.write_text("\n".join(lines) + "\n")
+    return config
 
 
 @pytest.fixture(autouse=True)
@@ -636,9 +643,10 @@ def test_path_shadowing_does_not_choose_fake_tg_ctl(tmp_path, monkeypatch):
     assert result.tg_ctl_path == str(real.resolve())
 
 
-def test_home_rig_yaml_tg_ctl_path_override_is_used(tmp_path, monkeypatch):
-    """A `tg_ctl_path` in the ACCOUNT HOME's rig.yaml is the legitimate approval-binary config
-    path and IS honored (home is not agent-controlled; resolve_home keys off the OS identity)."""
+def test_home_rig_config_tg_ctl_path_override_is_used(tmp_path, monkeypatch):
+    """`tg_ctl.tg_ctl_path` in the ACCOUNT HOME's machine-global rig config is the legitimate
+    approval-binary config path and IS honored (home is not agent-controlled; resolve_home keys
+    off the OS identity)."""
     marker = tmp_path / "called"
     tg_ctl = _write_tg_ctl(tmp_path / "reviewed-config" / "tg-ctl", _allow_body(marker))
     home = _home_with_tg_ctl(tmp_path, tg_ctl)
@@ -690,14 +698,21 @@ def test_repo_local_rig_yaml_tg_ctl_path_is_ignored(tmp_path):
     assert "not available" in result.reason
 
 
-def test_default_tg_ctl_candidates_are_hardcoded_absolute_paths():
-    assert (
-        Path("/Users/ultra/.files/bin/tg-ctl")
-        in agenttools_hatch_escalation._TRUSTED_TG_CTL_PATHS
-    )
-    assert all(
-        path.is_absolute() for path in agenttools_hatch_escalation._TRUSTED_TG_CTL_PATHS
-    )
+def test_default_tg_ctl_candidates_cover_every_supported_install_layout(tmp_path):
+    """Defaults span macOS (both Homebrew prefixes), Linux (~/.local/bin, Linuxbrew, distro) and
+    the per-user dirs; home-relative ones hang off the REAL home passed in, never `$HOME`."""
+    home = tmp_path / "account"
+    defaults = [Path(p) for p in agenttools_hatch_escalation._candidate_paths(None, str(home), [])]
+    for expected in (
+        home / ".local" / "bin" / "tg-ctl",
+        home / "bin" / "tg-ctl",
+        home / ".files" / "bin" / "tg-ctl",
+        Path("/opt/homebrew/bin/tg-ctl"),
+        Path("/usr/local/bin/tg-ctl"),
+        Path("/home/linuxbrew/.linuxbrew/bin/tg-ctl"),
+    ):
+        assert expected in defaults
+    assert all(path.is_absolute() for path in defaults)
 
 
 _AGENT_HOOKS_DIR = Path(__file__).resolve().parents[1] / "agent-hooks"
@@ -1235,20 +1250,20 @@ def test_unresolvable_home_does_not_fall_back_to_env_or_cwd(tmp_path, monkeypatc
 
 
 def test_home_rig_tilde_tg_ctl_path_is_not_expanded_via_env_home(tmp_path, monkeypatch):
-    """SECURITY (P1 follow-up): a `~`-prefixed `tg_ctl_path` in the (trusted) home rig.yaml must
+    """SECURITY (P1 follow-up): a `~`-prefixed `tg_ctl_path` in the (trusted) home rig config must
     NOT be expanded against `$HOME` — that is agent-exportable, so `expanduser("~/bin/tg-ctl")`
-    would resolve to an attacker binary under a doctored `$HOME`. Non-absolute candidates are
-    rejected outright: an approving binary reachable only via `$HOME` must never be executed."""
+    would resolve to an attacker binary under a doctored `$HOME`. `~/` is expanded against the
+    REAL home only, which here holds no binary: an approving binary reachable only via `$HOME`
+    must never be executed."""
     evil_marker = tmp_path / "evil-called"
     attacker = tmp_path / "attacker"
     _write_tg_ctl(
         attacker / "bin" / "tg-ctl", f"touch {evil_marker}\nexit 0\n"
     )  # would approve
     monkeypatch.setenv("HOME", str(attacker))  # $HOME points at the attacker tree
-    # The REAL home's rig.yaml carries a ~-relative override (would expand via $HOME if allowed).
+    # The REAL home's rig config carries a ~-relative override (would expand via $HOME if allowed).
     home = tmp_path / "real-home"
-    home.mkdir()
-    (home / "rig.yaml").write_text('agent_hooks:\n  tg_ctl_path: "~/bin/tg-ctl"\n')
+    _write_rig_config(home, "~/bin/tg-ctl")
     monkeypatch.setattr(agenttools_hatch_escalation, "resolve_home", lambda: str(home))
     env_var = hatch_env_var("pin-primary-worktree")
 
@@ -1268,20 +1283,17 @@ def test_home_rig_tilde_tg_ctl_path_is_not_expanded_via_env_home(tmp_path, monke
 
 def test_home_rig_lookup_does_not_walk_up_to_parent(tmp_path, monkeypatch):
     """SECURITY (P1 follow-up): the home `tg_ctl_path` override is read EXACTLY from
-    resolve_home()/rig.yaml and must NOT walk up into a parent directory. If the account home is
-    nested under a workspace (or any agent-controlled dir) whose parent carries an attacker
-    rig.yaml, that parent override must be ignored."""
+    resolve_home()/.config/rig/config.yaml and must NOT walk up into a parent directory. If the
+    account home is nested under a workspace (or any agent-controlled dir) whose parent carries an
+    attacker rig config, that parent override must be ignored."""
     evil_marker = tmp_path / "evil-called"
     evil = _write_tg_ctl(
         tmp_path / "evil" / "tg-ctl", f"touch {evil_marker}\nexit 0\n"
     )  # would approve
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "rig.yaml").write_text(
-        f'agent_hooks:\n  tg_ctl_path: "{evil}"\n'
-    )  # PARENT attacker
+    _write_rig_config(workspace, evil)  # PARENT attacker
     home = workspace / "home"
-    home.mkdir()  # the real home itself carries NO rig.yaml
+    home.mkdir()  # the real home itself carries NO rig config
     monkeypatch.setattr(agenttools_hatch_escalation, "resolve_home", lambda: str(home))
     env_var = hatch_env_var("pin-primary-worktree")
 
@@ -1822,3 +1834,352 @@ def test_pull_deny_falls_back_to_original_block_without_new_ask(tmp_path):
     assert argv_file.read_text().splitlines() == [
         "ask", "--verify-grant", "--pull", "--hook", hook_id
     ]
+
+
+# ── trusted-path resolution: macOS / Linux / Cygwin install layouts ────────────────────────────
+
+
+def _install(path: Path, root: Path, *, body: str = _ALLOW_REPLY_SH) -> Path:
+    """A fake tg-ctl at `path` whose dirs up to `root` are 0755 regardless of the runner's umask."""
+    _write_tg_ctl(path, body)
+    for directory in (path.parent, *path.parent.parents):
+        if directory == root or root not in directory.parents:
+            break
+        directory.chmod(0o755)
+    return path
+
+
+def _git_checkout(path: Path) -> Path:
+    (path / ".git").mkdir(parents=True)
+    return path
+
+
+def _lookup(monkeypatch, home: Path, cwd: Path, *, system=(), candidates=None):
+    monkeypatch.setattr(agenttools_hatch_escalation, "resolve_home", lambda: str(home))
+    monkeypatch.setattr(agenttools_hatch_escalation, "_TRUSTED_TG_CTL_PATHS", tuple(system))
+    return agenttools_hatch_escalation._find_tg_ctl(candidates, str(cwd))
+
+
+def _stat(mode: int, *, uid: int | None = None, gid: int = 4242) -> os.stat_result:
+    return os.stat_result((mode, 0, 0, 1, os.geteuid() if uid is None else uid, gid, 0, 0, 0, 0))
+
+
+def test_local_bin_symlink_into_tg_cli_checkout_is_trusted(tmp_path, monkeypatch):
+    """This machine's layout: `~/.local/bin/tg-ctl` -> `~/.local/share/tg-cli/tg-ctl`, where the
+    target dir is itself a tg-cli git checkout. The symlink is followed, and a checkout the agent
+    is NOT working in is fine."""
+    home = tmp_path / "home"
+    target = _install(home / ".local" / "share" / "tg-cli" / "tg-ctl", tmp_path)
+    _git_checkout(target.parent)
+    link = home / ".local" / "bin" / "tg-ctl"
+    link.parent.mkdir(parents=True)
+    link.parent.chmod(0o755)
+    link.symlink_to(Path("..") / "share" / "tg-cli" / "tg-ctl")
+    project = _git_checkout(tmp_path / "project")
+
+    lookup = _lookup(monkeypatch, home, project)
+
+    assert lookup.path == target
+
+
+def test_tg_ctl_inside_the_checkout_the_agent_works_in_is_rejected(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    checkout = home / ".local" / "share" / "tg-cli"
+    _install(checkout / "tg-ctl", tmp_path)
+    _git_checkout(checkout)
+    (checkout / "features").mkdir()
+
+    lookup = _lookup(monkeypatch, home, checkout / "features", candidates=[checkout / "tg-ctl"])
+
+    assert lookup.path is None
+    assert f"inside the git checkout {checkout}" in lookup.unavailable_reason("x")
+
+
+def test_symlink_hop_through_the_agents_checkout_is_rejected(tmp_path, monkeypatch):
+    """`~/.local/bin/tg-ctl` -> `<checkout>/redirect` -> a binary outside: both endpoints are
+    outside the checkout, but the agent's PR could repoint `redirect` at any exit-0 script."""
+    home = tmp_path / "home"
+    outside = _install(tmp_path / "opt" / "tg-ctl", tmp_path)
+    checkout = _git_checkout(tmp_path / "checkout")
+    (checkout / "redirect").symlink_to(outside)
+    link = home / ".local" / "bin" / "tg-ctl"
+    link.parent.mkdir(parents=True)
+    for directory in (home, home / ".local", link.parent):
+        directory.chmod(0o755)
+    link.symlink_to(checkout / "redirect")
+
+    lookup = _lookup(monkeypatch, home, checkout)
+
+    assert lookup.path is None
+    assert f"{checkout / 'redirect'} is inside the git checkout {checkout}" in lookup.unavailable_reason("x")
+
+
+def test_tg_ctl_in_the_primary_checkout_of_the_agents_linked_worktree_is_rejected(
+    tmp_path, monkeypatch
+):
+    """An agent in `.worktrees/w` can still edit the primary checkout, so that one counts too."""
+    main = _git_checkout(tmp_path / "main")
+    binary = _install(main / "tg-ctl", tmp_path)
+    gitdir = main / ".git" / "worktrees" / "w"
+    gitdir.mkdir(parents=True)
+    (gitdir / "commondir").write_text("../..\n")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {gitdir}\n")
+
+    lookup = _lookup(monkeypatch, tmp_path / "home", worktree, candidates=[binary])
+
+    assert lookup.path is None
+    assert f"inside the git checkout {main}" in lookup.unavailable_reason("x")
+
+
+def test_dotfiles_repo_rooted_at_home_does_not_swallow_home_bins(tmp_path, monkeypatch):
+    home = _git_checkout(tmp_path / "home")
+    binary = _install(home / ".local" / "bin" / "tg-ctl", tmp_path)
+
+    assert _lookup(monkeypatch, home, home).path == binary
+
+
+def test_homebrew_cellar_symlink_is_trusted(tmp_path, monkeypatch):
+    """Homebrew links `<prefix>/bin/tg-ctl` relatively into the Cellar (both /opt/homebrew and
+    /usr/local prefixes, and Linuxbrew, use this shape)."""
+    prefix = tmp_path / "opt" / "homebrew"
+    cellar = _install(prefix / "Cellar" / "tg-cli" / "1.2.0" / "bin" / "tg-ctl", tmp_path)
+    link = prefix / "bin" / "tg-ctl"
+    link.parent.mkdir()
+    link.parent.chmod(0o755)
+    link.symlink_to(Path("..") / "Cellar" / "tg-cli" / "1.2.0" / "bin" / "tg-ctl")
+
+    lookup = _lookup(monkeypatch, tmp_path / "home", tmp_path, system=[link])
+
+    assert lookup.path == cellar
+
+
+def test_cygwin_exe_suffix_is_found_for_a_bare_candidate(tmp_path, monkeypatch):
+    exe = _install(tmp_path / "usr" / "local" / "bin" / "tg-ctl.exe", tmp_path)
+    monkeypatch.setattr(agenttools_hatch_escalation, "_IS_CYGWIN", True)
+
+    lookup = _lookup(monkeypatch, tmp_path / "home", tmp_path, system=[exe.with_name("tg-ctl")])
+
+    assert lookup.path == exe
+
+
+def test_bare_candidate_does_not_match_exe_outside_cygwin(tmp_path, monkeypatch):
+    exe = _install(tmp_path / "bin" / "tg-ctl.exe", tmp_path)
+    monkeypatch.setattr(agenttools_hatch_escalation, "_IS_CYGWIN", False)
+
+    assert _lookup(monkeypatch, tmp_path / "home", tmp_path, system=[exe.with_name("tg-ctl")]).path is None
+
+
+def test_cygwin_windows_drive_path_in_rig_config_is_translated(tmp_path, monkeypatch):
+    exe = _install(tmp_path / "cygdrive" / "c" / "Users" / "me" / "bin" / "tg-ctl.exe", tmp_path)
+    home = tmp_path / "home"
+    config = _write_rig_config(home, None)
+    config.write_text("tg_ctl:\n  tg_ctl_path: 'C:\\Users\\me\\bin\\tg-ctl.exe'\n")
+    monkeypatch.setattr(agenttools_hatch_escalation, "_IS_CYGWIN", True)
+    monkeypatch.setattr(
+        agenttools_hatch_escalation, "_cygdrive_prefix", lambda: str(tmp_path / "cygdrive")
+    )
+
+    assert _lookup(monkeypatch, home, tmp_path, candidates=[]).path == exe
+
+
+def test_cygwin_administrators_ownership_is_trusted_only_on_cygwin(monkeypatch):
+    info = _stat(stat.S_IFREG | 0o755, uid=544)
+    monkeypatch.setattr(agenttools_hatch_escalation, "_IS_CYGWIN", False)
+    assert "owned by uid 544" in agenttools_hatch_escalation.path_trust_problem("/x", info)
+    monkeypatch.setattr(agenttools_hatch_escalation, "_IS_CYGWIN", True)
+    assert agenttools_hatch_escalation.path_trust_problem("/x", info) is None
+
+
+def test_world_writable_install_dir_is_rejected(tmp_path, monkeypatch):
+    binary = _install(tmp_path / "shared" / "bin" / "tg-ctl", tmp_path)
+    binary.parent.chmod(0o777)
+
+    lookup = _lookup(monkeypatch, tmp_path / "home", tmp_path, system=[binary])
+
+    assert lookup.path is None
+    assert f"{binary.parent} is world-writable" in lookup.unavailable_reason("x")
+
+
+def test_world_writable_binary_is_rejected(tmp_path, monkeypatch):
+    binary = _install(tmp_path / "bin" / "tg-ctl", tmp_path)
+    binary.chmod(0o777)
+
+    lookup = _lookup(monkeypatch, tmp_path / "home", tmp_path, system=[binary])
+
+    assert lookup.path is None
+    assert f"{binary} is world-writable" in lookup.unavailable_reason("x")
+
+
+def test_sticky_world_writable_dir_on_the_way_is_fine(tmp_path, monkeypatch):
+    """`/tmp`-style sticky dirs: nobody else can rename or replace an entry we own in them."""
+    binary = _install(tmp_path / "sticky" / "mine" / "tg-ctl", tmp_path)
+    (tmp_path / "sticky").chmod(0o1777)
+
+    assert _lookup(monkeypatch, tmp_path / "home", tmp_path, system=[binary]).path == binary
+
+
+def test_trusted_symlink_into_a_world_writable_dir_is_rejected(tmp_path, monkeypatch):
+    target = _install(tmp_path / "drop" / "tg-ctl", tmp_path)
+    target.parent.chmod(0o777)
+    link = tmp_path / "bin" / "tg-ctl"
+    link.parent.mkdir()
+    link.parent.chmod(0o755)
+    link.symlink_to(target)
+
+    lookup = _lookup(monkeypatch, tmp_path / "home", tmp_path, system=[link])
+
+    assert lookup.path is None
+    assert f"{target.parent} is world-writable" in lookup.unavailable_reason("x")
+
+
+def test_group_write_is_trusted_only_for_a_private_group(monkeypatch):
+    info = _stat(stat.S_IFDIR | 0o775, gid=4242)
+    monkeypatch.setattr(agenttools_hatch_escalation, "_is_private_group", lambda gid: False)
+    assert "group-writable by gid 4242" in agenttools_hatch_escalation.path_trust_problem("/d", info)
+    monkeypatch.setattr(agenttools_hatch_escalation, "_is_private_group", lambda gid: gid == 4242)
+    assert agenttools_hatch_escalation.path_trust_problem("/d", info) is None
+
+
+def test_path_owned_by_another_account_is_rejected():
+    info = _stat(stat.S_IFREG | 0o755, uid=os.geteuid() + 4242)
+    assert "not by you or root" in agenttools_hatch_escalation.path_trust_problem("/x", info)
+
+
+def test_untrusted_rig_config_is_ignored_and_reported(tmp_path, monkeypatch):
+    marker = tmp_path / "called"
+    evil = _install(tmp_path / "evil" / "tg-ctl", tmp_path, body=_allow_body(marker))
+    home = tmp_path / "home"
+    config = _write_rig_config(home, evil)
+    config.chmod(0o666)
+
+    lookup = _lookup(monkeypatch, home, tmp_path, candidates=[])
+
+    assert lookup.path is None
+    assert f"{config}: ignored ({config} is world-writable)" in lookup.unavailable_reason("x")
+
+
+def test_rig_config_tilde_path_expands_against_the_real_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    binary = _install(home / "tools" / "tg-ctl", tmp_path)
+    _write_rig_config(home, "~/tools/tg-ctl")
+    monkeypatch.setenv("HOME", str(tmp_path / "doctored"))
+
+    assert _lookup(monkeypatch, home, tmp_path, candidates=[]).path == binary
+
+
+def test_denial_reason_lists_every_searched_path_and_why(tmp_path):
+    missing = tmp_path / "nowhere" / "tg-ctl"
+    env_var = hatch_env_var("pin-primary-worktree")
+
+    result = request_hatch_approval(
+        "pin-primary-worktree",
+        {"target": "feat/x"},
+        cwd=str(tmp_path),
+        env={env_var: "Need to inspect the primary checkout before repairing it."},
+        tg_ctl_candidates=[missing],
+        timeout_s=1,
+    )
+
+    assert result.approved is False
+    assert result.reason.startswith("tg-ctl is not available at a trusted executable path (searched: ")
+    assert f"{missing}: {missing.parent} does not exist" in result.reason
+
+
+def test_test_sandbox_refuses_a_tg_ctl_outside_pytest_basetemp(tmp_path, monkeypatch):
+    """The conftest-exported sandbox var keeps hook SUBPROCESSES (which the resolve_home patch
+    never reaches) off the machine's real tg-ctl."""
+    binary = _install(tmp_path / "outside" / "tg-ctl", tmp_path)
+    sandbox = tmp_path / "sandbox"
+    monkeypatch.setenv("AGENTTOOLS_TEST_HERMETIC_HOME", str(sandbox / "home"))
+
+    lookup = _lookup(monkeypatch, sandbox / "home", tmp_path, system=[binary])
+
+    assert lookup.path is None
+    assert f"outside the test sandbox {sandbox}" in lookup.unavailable_reason("x")
+
+
+# ── machine_config_mapping: PyYAML-free reader for the machine-global rig config ───────────────
+
+
+_RIG_SHAPED_CONFIG = """\
+version: 1
+agent_tools_source: ~/dev/agent-tools  # trailing comment
+agent_hooks:
+  enabled: true
+  items:
+    skills-read-gate:
+      enabled: false
+notes: |
+  ci: this block scalar is not a key
+tools:
+  items:
+    - name: review
+      repo: ~/work/review-cli
+ci:
+  items:
+    ship:
+      external_review_owners:
+      - alex-mextner
+      - 'second-owner'
+      require_external_review: false
+tg_ctl:
+  tg_ctl_path: "~/.local/bin/tg-ctl"
+"""
+
+
+def test_machine_config_reads_rig_written_block_yaml():
+    read = agenttools_hatch_escalation.machine_config_mapping
+    assert read(_RIG_SHAPED_CONFIG, ("ci", "items", "ship")) == {
+        "external_review_owners": ["alex-mextner", "second-owner"],
+        "require_external_review": False,
+    }
+    assert read(_RIG_SHAPED_CONFIG, ("tg_ctl",)) == {"tg_ctl_path": "~/.local/bin/tg-ctl"}
+    assert read(_RIG_SHAPED_CONFIG, ("missing", "block")) is None
+
+
+def test_machine_config_keeps_hash_inside_an_escaped_single_quoted_value():
+    mapping = agenttools_hatch_escalation.machine_config_mapping(
+        "ship:\n  name: 'a b''c #d'  # real comment\n", ("ship",)
+    )
+    assert mapping == {"name": "a b'c #d"}
+
+
+def test_machine_config_reads_one_line_flow_lists_and_json():
+    read = agenttools_hatch_escalation.machine_config_mapping
+    assert read("ship:\n  owners: [a, 'b', \"c\"]\n  none: []\n", ("ship",)) == {
+        "owners": ["a", "b", "c"],
+        "none": [],
+    }
+    assert read('{"ship": {"owners": ["a"], "on": false}}', ("ship",)) == {
+        "owners": ["a"],
+        "on": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ci:\n  items: {ship: {require_external_review: false}}\n",  # flow mapping on the path
+        "ci:\n  items:\n    ship: {}\n  items:\n    ship: {}\n",  # duplicate key on the path
+        "ci: false\n",
+        "ci:\n    items: {}\n  oops: 1\n",  # inconsistent indentation
+        "a: 1\n---\nci: {}\n",  # second document
+        "ci:\n\titems: 1\n",
+        "&anchor ci:\n  items: {}\n",
+        '{"ci": {"items": {"ship": {"x": 1, "x": 2}}}}',
+        "[]",
+    ],
+)
+def test_machine_config_refuses_ambiguous_structure_on_the_path(text):
+    with pytest.raises(agenttools_hatch_escalation.MachineConfigError):
+        agenttools_hatch_escalation.machine_config_mapping(text, ("ci", "items", "ship"))
+
+
+@pytest.mark.parametrize(
+    "value", ["*alias", "&a false", "!!bool false", "yes", "off", "0", "1.5", "|", '"esc\\"aped"', "a: b"]
+)
+def test_machine_config_leaves_values_it_will_not_interpret_unparsed(value):
+    mapping = agenttools_hatch_escalation.machine_config_mapping(f"ship:\n  flag: {value}\n", ("ship",))
+    assert mapping == {"flag": agenttools_hatch_escalation.UNPARSED}

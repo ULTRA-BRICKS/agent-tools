@@ -6335,15 +6335,15 @@ _ALLOW_REPLY_SH = (
 
 
 def _fake_home_with_tg_ctl(tmp_path: Path, tg_ctl: Path, *, name: str = "fake-home") -> Path:
-    """A fake HOME dir carrying a rig.yaml whose `agent_hooks.tg_ctl_path` points at the fake
-    tg-ctl. The hatch helper resolves tg-ctl from the OS account's real home (pwd.getpwuid), so
-    in-process module tests monkeypatch `resolve_home` to return THIS dir — a controllable tg-ctl
-    that never touches the real one or messages Alex, matching the production resolution path."""
+    """A fake HOME dir whose machine-global rig config (`.config/rig/config.yaml`) sets
+    `tg_ctl.tg_ctl_path` to the fake tg-ctl. The hatch helper resolves tg-ctl from the OS account's
+    real home (pwd.getpwuid), so in-process module tests monkeypatch `resolve_home` to return THIS
+    dir — a controllable tg-ctl that never touches the real one or messages Alex, matching the
+    production resolution path."""
     home = tmp_path / name
-    home.mkdir()
-    (home / "rig.yaml").write_text(
-        f'agent_hooks:\n  tg_ctl_path: "{tg_ctl}"\n', encoding="utf-8"
-    )
+    config = home / ".config" / "rig" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(f'tg_ctl:\n  tg_ctl_path: "{tg_ctl}"\n', encoding="utf-8")
     return home
 
 
@@ -7916,7 +7916,7 @@ def _run_hatch_main(monkeypatch, tmp_path, *, request, resolve_home, audit,
                     timeout="5", margin=None, trusted=None, dry_run=None):
     """Call review_quorum_hatch.main() with resolve_home monkeypatched to a fixed dir and the
     hatch env set. Returns the exit code. `resolve_home` is the dir the helper will treat as the
-    account's real home (where it looks for a rig.yaml tg_ctl_path override)."""
+    account's real home (where it looks for the rig config's tg_ctl.tg_ctl_path override)."""
     mod = _load_hatch_module()
     monkeypatch.setattr(mod, "resolve_home", lambda: str(resolve_home))
     # The shared lib now resolves tg-ctl authority from ITS OWN resolve_home (not the cwd the ship
@@ -8499,7 +8499,7 @@ def _load_skip_ci_hatch_module():
 def _run_skip_ci_hatch_main(monkeypatch, *, request, resolve_home, audit,
                             timeout="5", dry_run=None):
     """Call skip_ci_hatch.main() with resolve_home monkeypatched to a fixed fake home (where the
-    lib looks for a rig.yaml tg_ctl_path override) and the hatch env set. Returns the exit code."""
+    lib looks for the rig config's tg_ctl.tg_ctl_path override) and the hatch env set. Returns the exit code."""
     mod = _load_skip_ci_hatch_module()
     monkeypatch.setattr(mod, "resolve_home", lambda: str(resolve_home))
     monkeypatch.setattr(mod.hatch_escalation, "resolve_home", lambda: str(resolve_home))

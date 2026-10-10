@@ -480,7 +480,11 @@ def test_old_inline_sentinel_no_longer_bypasses(repo, monkeypatch):
 
 # ── Telegram hatch escalation (deny-by-default) ────────────────────────────────────────────
 
-def _fake_tg_ctl(path: Path, body: str) -> Path:
+def _fake_tg_ctl(tmp_path: Path, body: str) -> Path:
+    """A fake tg-ctl BESIDE the `repo` fixture's checkout (which is `tmp_path` itself): the hatch
+    lib refuses a tg-ctl inside the git checkout the guarded agent works in."""
+    path = tmp_path.parent / f"{tmp_path.name}-tg-ctl" / "tg-ctl"
+    path.parent.mkdir(exist_ok=True)
     path.write_text("#!/bin/sh\n" + body)
     path.chmod(0o755)
     return path
@@ -503,7 +507,7 @@ def test_hatch_unset_blocks_and_names_env_var(repo, monkeypatch):
 
 def test_hatch_bare_flag_denies_without_tg_call(repo, tmp_path, monkeypatch):
     marker = tmp_path / "asked"
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    tg_ctl = _fake_tg_ctl(tmp_path, f"touch {marker}\nexit 0\n")
     monkeypatch.setattr(nsfe.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     out, _e, code = _run("sed -i 's/a/b/' app.ts", repo, monkeypatch,
                          env={"RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT": "1"})
@@ -513,7 +517,7 @@ def test_hatch_bare_flag_denies_without_tg_call(repo, tmp_path, monkeypatch):
 
 def test_hatch_justification_exit0_allows(repo, tmp_path, monkeypatch):
     marker = tmp_path / "asked"
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\n" + _ALLOW_REPLY_SH)
+    tg_ctl = _fake_tg_ctl(tmp_path, f"touch {marker}\n" + _ALLOW_REPLY_SH)
     monkeypatch.setattr(nsfe.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     out, _e, code = _run(
         "sed -i 's/a/b/' app.ts", repo, monkeypatch,
@@ -525,7 +529,7 @@ def test_hatch_justification_exit0_allows(repo, tmp_path, monkeypatch):
 
 
 def test_hatch_justification_exit1_blocks(repo, tmp_path, monkeypatch):
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    tg_ctl = _fake_tg_ctl(tmp_path, "exit 1\n")
     monkeypatch.setattr(nsfe.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     out, _e, code = _run(
         "sed -i 's/a/b/' app.ts", repo, monkeypatch,
@@ -545,7 +549,7 @@ def test_hatch_inline_command_justification_allows(repo, tmp_path, monkeypatch):
     marker = tmp_path / "asked"
     question = tmp_path / "q.txt"
     tg_ctl = _fake_tg_ctl(
-        tmp_path / "tg-ctl",
+        tmp_path,
         f'touch {marker}\ncat > "{question}"\n' + _ALLOW_REPLY_SH,
     )
     monkeypatch.setattr(nsfe.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))

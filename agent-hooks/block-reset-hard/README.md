@@ -115,8 +115,6 @@ An exported value takes precedence over an inline one.
 agent_hooks:
   approval_cmd: "/path/to/approve.sh"   # optional; run when a reset --hard/clean -f would block
   approval_cmd_timeout_s: 5             # optional; default 5.0, capped at 6.0
-  tg_ctl_path: "/path/to/tg-ctl"         # optional tg-ctl override — read ONLY from the ACCOUNT
-                                         # HOME's rig.yaml (never this repo's; see hatch note below)
 ```
 
 `agent_hooks.approval_cmd` is a **single, shared key** — the same `approval_cmd` is read by
@@ -142,13 +140,20 @@ ButtonRequest on stdin; only a well-formed reply on stdout whose decision is exp
 allows — an empty or unparseable reply, an explicit deny, any nonzero exit, launch errors, and
 timeouts all deny (a clean exit alone is NOT approval: `tg-ctl ask` exits 0 regardless of
 outcome). The helper never resolves
-`tg-ctl` from ambient `PATH`. **The approval binary is a trust anchor: it is resolved from the
-account's REAL home only** (`agent_hooks.tg_ctl_path` in the home `rig.yaml`, home located via
-`pwd.getpwuid` — never `$HOME`, never the repo/`cwd` the hook runs in), then the hardcoded absolute
-candidates `/Users/ultra/.files/bin/tg-ctl` (`/Users/ultra/.files/repos/tg-cli/tg-ctl` after
-realpath), `/usr/local/bin/tg-ctl`, `/opt/homebrew/bin/tg-ctl`. A **repo-local** `tg_ctl_path` is
-deliberately IGNORED — otherwise a guarded agent could commit `rig.yaml` pointing it at an
-always-exit-0 binary and self-approve (the exact self-service bypass this gate closes).
+`tg-ctl` from ambient `PATH`. **The approval binary is a trust anchor resolved from the
+account's REAL home only** (home located via `pwd.getpwuid` — never `$HOME`, `$XDG_CONFIG_HOME`,
+or the repo/`cwd` the hook runs in): first `tg_ctl.tg_ctl_path` in the machine-global rig config
+`~/.config/rig/config.yaml` (rig's own key for where tg-ctl lives; `~/` expands against the real
+home, a Cygwin `C:\…` path is translated), then `~/.local/bin`, `~/bin`, `~/.files/bin`,
+`~/.linuxbrew/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/home/linuxbrew/.linuxbrew/bin`,
+`/usr/bin` (on Cygwin `tg-ctl.exe` also matches). Every directory on the way (symlinks followed
+hop by hop) and the binary itself must be owned by you or root and writable by nobody else —
+group-write is accepted only for your user-private group (umask 002 distros), gid 0, macOS
+`admin`, or Cygwin Administrators/SYSTEM — and the binary must not live inside the git checkout
+(or its primary worktree) the agent is working in. A denial lists every path searched and why it
+was passed over. A **repo-local** `tg_ctl_path` is deliberately IGNORED — otherwise a guarded
+agent could commit config pointing it at an always-exit-0 binary and self-approve (the exact
+self-service bypass this gate closes).
 
 > `approval_cmd` is read with the same minimal, stdlib-only rig.yaml scanner this hook family
 > uses (no YAML library is imported). It is a single-line scalar: quote the value, and avoid a
