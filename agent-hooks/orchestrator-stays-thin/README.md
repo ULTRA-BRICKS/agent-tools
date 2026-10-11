@@ -10,26 +10,56 @@ One script binds two points via two descriptors; it branches on `event["point"]`
 
 - **`pre-write`** — a **code** Edit/Write (non-docs) by the main thread → warn-then-block.
   Docs are exempt: a path matching `\.(md|mdx|txt|rst)$` or under `docs/` is always allowed.
-  So are omp harness URIs (agent-tools#828) — `agent://<id>`/`agent://all` (messaging
+  So are omp harness URIs (agent-tools#828, #861 evidence #6: the orchestrator's steering note
+  to a subagent was blocked after the warn tier) — `agent://<id>`/`agent://all` (messaging
   subagents), `proc://<id>/kill`, `xd://report_issue`, `local://`, `artifact://`, `skill://`,
-  `history://`, `mcp://` — which are orchestration, not files. The file-rewriting
-  `xd://ast_edit`/`xd://resolve` and any URI with a `..` segment still count as code writes,
-  also when percent-encoded (same rules as `worktree-only-writes`).
+  `history://`, `mcp://` — which are orchestration, not files, whatever the body says. The
+  file-rewriting `xd://ast_edit`/`xd://resolve` and any URI with a `..` segment still count as
+  code writes, also when percent-encoded (same rules as `worktree-only-writes`). Explicit scheme
+  list, deny-by-default: `file://`/`ssh://` name a file and are judged as a path.
 - **`pre-bash`** — a clearly **multi-step / implementation-shaped** Bash by the main thread →
   warn-then-block. Implementation-shaped = chained `> 2` steps (`&&`/`;`/`||`/`|`/newline), OR a
   heredoc, OR an obvious build/edit (`sed -i`, `tee`, `npm`/`cargo`/`make` build, **`git commit`/
-  `git push`**, **test runs** `pytest`/`go test`/`npm`/`bun`/`cargo test`). A bare `>`/`>>`
-  redirect is **not** implementation on its own (`python foo.py > out.log` is allowed).
+  `git push`**, **test runs** `pytest`/`go test`/`npm`/`bun`/`cargo test`), OR a sanctioned
+  orchestration head chained with a segment the allow-list does not recognize (see below). A bare
+  `>`/`>>` redirect is **not** implementation on its own (`python foo.py > out.log` is allowed).
   Read-only inspection **and sanctioned orchestration** are **never** blocked — including a chain
   of **any length** where every segment's head is inspection (`git status`/`log`/`diff`/`show`/
-  `branch`, `ls`, `cat`, `grep`, `find`, `head`, `tail`, `wc`, a print-only `sed -n`, …) **or** orchestration
-  (`tg`, `review`, `task`, `git worktree list`), across `|`, `&&`, `;`, `||` or newline
-  (`git status && ls`, `tg 'a' && tg 'b'`, `review diff && tg done`). But a chain that merely
-  *starts* allowed (`git status && sed -i ...`, `tg done && git commit`), or that mixes in any
-  build/edit/heredoc segment, is judged on its **full** content — not waved through on its prefix.
-  Judgement is per-segment-**head**: a build token used only as an argument/needle of an allowed
-  command (`cat tee.log`, `grep cargo notes`, `git log | rg gh`) stays allowed; only a
-  build/edit/commit/`gh` *at a segment head* counts.
+  `branch`, `ls`, `cat`, `grep`, `find`, `head`, `tail`, `wc`, `sort`, `tr`, `cut`, `jq`, `ps`/`pgrep`/`pstree`/`top`/`ss`/`lsof`, a
+  print-only `sed -n`, a print-only `awk`, `[`/`test`/`read`/`printf`, …) **or** orchestration
+  (`tg`, `task`, `review`, `omp-steer`, `tg-ctl status|inbox|audit-delivery|ask|omp-live
+  status|send`, `rig status|doctor|sysmon status|sample|incidents|--version`,
+  `git worktree list`, the read-only `gh` allowlist), across `|`, `&&`, `;`, `||` or newline
+  (`git status && ls`, `tg 'a' && tg 'b'`, `review diff && tg done`) — **loops and conditionals
+  included** (agent-tools#861): `for`/`do`/`done`/`while`/`until`/`if`/`then`/`elif`/`else`/`fi`
+  are segmentation keywords, stripped before classification and never counted as steps, so `for p
+  in A B; do omp-steer $p 'x' | tr '\n' ' '; done; tg 'done'` is one orchestration line and
+  `for f in a b; do git commit -m x; done` is a `git commit` (the loop body's real head), not a
+  3-step chain. But a chain that merely *starts* allowed (`git status && sed -i ...`, `tg done &&
+  git commit`), or that mixes in any build/edit/heredoc segment, is judged on its **full**
+  content — not waved through on its prefix. Judgement is per-segment-**head**: a build token
+  used only as an argument/needle of an allowed command (`cat tee.log`, `grep cargo notes`, `git
+  log | rg gh`) stays allowed; only a build/edit/commit/`gh` *at a segment head* counts.
+
+  **An orchestration carve-out never launders an unrecognized companion (agent-tools#861).** A
+  segment granted by one of the explicit carve-outs (`tg`, `task`, `omp-steer`, `tg-ctl`, `rig`,
+  `review`, `dev`, read-only `gh`) that shares a line with a segment the allow-list does NOT
+  recognize — `omp-steer 7 'x'; rm -rf y`, `tg 'done' && python3 deploy.py` — is refused at ANY
+  chain length, 2 segments included: the carve-out is for orchestration-ONLY lines, and `rm`/
+  `chmod`/`scp`/`mv`/… match no named mutation pattern, so this is the per-segment analogue of
+  the `gh ship 205; rm -rf /` gap agent-tools#363 closed for the per-LINE grant. Pure-inspection
+  chains keep the generic 2-segment gray zone (`cat a | python3 x.py` is still allowed alone).
+
+  **The message names the rule (agent-tools#861).** Every WARN/BLOCK is five lines — `TRIGGER:`
+  (the exact rule that fired, quoting the offending segment(s): `chain of 4 segments;
+  unrecognized heads: \`mkdir a\`, \`touch b\`, \`cp b c\` (+1 more)` / `implementation-shaped
+  segment: \`git commit -m x\`` / `sanctioned orchestration \`omp-steer 7 'x'\` chained with an
+  unrecognized command: \`rm -rf y\`` / `heredoc (<<) …` / `code write to \`<path>\``), `WHY:` (one
+  sentence), `DO THIS:` (the firing harness's own delegation recipe plus what IS allowed inline),
+  `EXCEPTION:` (the deny-by-default Telegram hatch). The previous single ~900-char paragraph
+  never said which rule fired; the supervisor session guessed a quoted substring had matched
+  `git commit`, reworded it (bypass-shaped) and was blocked again — the real cause was the then-
+  unknown `omp-steer` head tripping the chain-length fallback.
 
   **Read-only `sed` (agent-tools#541).** `sed` is not in the head-only `READ_ONLY_BASH` regex
   (a plain `sed\b` would also grant `sed -i` and `sed 'w file'`); instead `_is_read_only_sed`, a
@@ -159,14 +189,31 @@ classified read-only; use the escape hatch or a subagent for those.
 **Subagent-exempt:** a dispatched subagent does the actual work, so it is always allowed. This
 gate governs the orchestrator only. `_is_subagent` trusts, in order: (1) sanitized
 `args.agent_id` — Claude Code child (`cc_hook_bridge` T2: CC's top-level field overwrites,
-model/tool_input copies dropped); (2) process env `RIG_AGENT_ID` / `RIG_DETACHED_AGENT=1` —
-detached launcher child, read here as well as by the bridges, because a worker whose
-`args.agent_id` was not injected was still gated; (3) a nested omp `PI_SESSION_FILE`
-(`.../<session-id>/<agent>.jsonl`) — Task/eval child. Never a top-level `event.agent_id`
-fallback, never model-controlled `tool_input` (agent-tools#115). A running orchestrator
-cannot retroactively mutate its process env. Empty/whitespace is not a subagent. The MAIN
-omp session file (`.../<session-id>.jsonl`) is not nested and stays governed
-(agent-tools#634).
+model/tool_input copies dropped) AND every native omp Task/eval/workpool child (see below);
+(2) process env `RIG_AGENT_ID` / `RIG_DETACHED_AGENT=1` — detached launcher child, read here as
+well as by the bridges, because a worker whose `args.agent_id` was not injected was still gated;
+(3) a nested omp `PI_SESSION_FILE` (`.../<session-id>/<agent>.jsonl`) in the HOOK process env —
+Task/eval child. Never a top-level `event.agent_id` fallback, never model-controlled
+`tool_input` (agent-tools#115). A running orchestrator cannot retroactively mutate its process
+env. Empty/whitespace is not a subagent. The MAIN omp session file (`.../<session-id>.jsonl`)
+is not nested and stays governed (agent-tools#634).
+
+**How an omp subagent actually reaches tier (1) — verified live on omp 18.8.1, 2026-10-10
+(agent-tools#861).** Inside a `task`/`workpool` child, the child's OWN Bash environment carries
+NO `PI_SESSION_FILE` and no `RIG_AGENT_ID` (both empty in a dispatched worker's shell), so
+nothing the worker runs could identify itself by env. What identifies it is the bridge:
+`lib/omp_hook_bridge/extension.ts` reads the CHILD's `ctx.sessionManager.getSessionFile()` —
+the nested transcript `~/.omp/agent/sessions/<project-slug>/<session-id>/<AgentName>.jsonl`,
+one directory deeper per task-depth level — forwards it as payload `sessionFile`, and spawns
+`dispatch.py` with that path as `PI_SESSION_FILE` (plus `RIG_SESSION_ID`); `dispatch.py` then
+restores `args.agent_id = <AgentName>` from the nested path (or `omp-nested:<sessionId>` from
+`isMainSession: false` while the child's session is still in-memory). Tier (3) is therefore the
+dispatcher's env, not the harness's — the test suite drives the REAL dispatcher with the payload
+alone (`test_subagent_exempt_via_real_omp_bridge_payload_session_file`) and pins the main-shaped
+negative (`test_top_level_omp_session_via_real_bridge_payload_is_still_gated`). Hooks DO fire
+for every subagent tool call (the worker's own `write`/`bash` show up in
+`~/.cache/agent-tools/hooks-debug.log`); `review`'s own `omp -p --no-extensions` children run
+with no extensions and hence no hooks at all, by design.
 
 **Harness-unified (agent-tools#573):** an earlier revision exempted the WHOLE codex, opencode,
 and omp harnesses from this gate entirely (`EXEMPT_HARNESSES = {"codex", "opencode", "omp"}`,
@@ -518,6 +565,67 @@ laundering resistance to `tg`.
 **Subagent-exempt, same as everything else in this gate:** a dispatched subagent (`agent_id`
 present) runs `task` freely regardless of this predicate.
 
+## `omp-steer`, `tg-ctl`, read-only `rig`, loops and filters (agent-tools#861, Alex 2026-10-10)
+
+Alex's ruling: every agent, the supervisor session included, stays an orchestrator — but the gate
+must make the sanctioned path obvious instead of inviting workarounds. Root cause of the incident
+(supervisor omp 18.8.1 session, cwd `/tmp`): a pure-orchestration line — a `for` loop steering
+four live omp sessions via `omp-steer`, each receipt piped through `grep`/`tr`, then `tg send` —
+was blocked by the ≥3-segment fallback because `omp-steer`, `tr`, and the `for …`/`do …`/`done`
+pseudo-segments were all unrecognized heads, and the message never said so.
+
+Three per-segment grants, each a shlex predicate in the `_is_tg_command` mould (bare exact head
+token, `VAR=val` env-prefix skip, no path-qualification, deny on an unparseable segment, head-only),
+sharing the same companion-safety vetoes every carve-out has (chain-splitting, the bare-`&` split,
+the heredoc veto, the substitution-liveness scanner):
+
+| Predicate | Granted | NOT granted (stays delegated) |
+| --- | --- | --- |
+| `_is_omp_steer_command` | `omp-steer …` — any args (`list`, `<pid\|cwd\|all> 'text'`) | `omp-steer-foo`, `/path/omp-steer` |
+| `_is_tg_ctl_command` | `tg-ctl status\|inbox\|audit-delivery\|ask …`, `tg-ctl omp-live status\|send …` | `start`/`run`/`stop`/`restart`/`enable`/`disable`/`install-hooks`/`omp-live install`/anything else (`_TG_CTL_READONLY_SUBCOMMANDS`) |
+| `_is_rig_readonly_command` | `rig status …`, `rig doctor` (no `--yes`/`--fix`/`--optional`), `rig sysmon status\|sample\|incidents …`, `rig --version`/`-h` | `rig apply`, `rig init`, `rig worktree create/remove/gc`, `rig config set`, `rig sysmon test-alert\|simulate\|restore`, `rig doctor --yes` (`_RIG_BARE_READONLY_SUBCOMMANDS` + per-subcommand tables) |
+
+`task` was already sanctioned (`_is_task_command`); `block-raw-ticket` identifies the same tool by
+its `tasklib` marker — this gate matches the bare `task` head, consistent with that hook's
+"read-only `task …` stays allowed" contract.
+
+**Read-only text filters.** `READ_ONLY_BASH` gained the pure stdout filters and shell builtins a
+loop or pipe over an allowed head carries — `tr`, `read`, `printf`, `true`/`false`, `test`/`[`/
+`[[`, `sleep`, `seq`, `diff`, `comm`, `paste`, `nl`, `tac`, `rev`, `basename`/`dirname`/
+`realpath`/`readlink`, the checksum tools — argv-boundary anchored (`(?=\s|$)`, not `\b`, so
+`test.sh`/`tr-x` are not the builtin). `awk` is NOT in that regex: `_is_read_only_awk` grants
+`awk`/`gawk`/`mawk`/`nawk` only when no program comes from a file (`-f`/`--file`), no gawk
+extension or in-place load (`-i`/`-l`), no `-e`/`--source`, and no `system(`/`|`/`>` appears
+anywhere in the argv — `print > "f"`, `print | "sort"`, `"date" | getline` all refuse, the same
+GRANT-direction discipline as `_is_read_only_sed`.
+
+**Loops and conditionals are segmentation, not heads.** `_norm_segments` now runs
+`_strip_shell_keywords` on each `_split_chain` segment: a leading `do`/`then`/`else`/`elif`/`if`/
+`while`/`until` is dropped so the real head is classified (`do git commit -m x` IS a `git commit`
+— previously hidden behind `do`, caught only by chain length); a bare `done`/`fi` (or `done <
+list.txt`, `done 2>&1 >log` — a redirect alone, per the bare-`>` doctrine; NOT a process
+substitution `done >(cmd)`, which runs `cmd` and stays a judged segment) is a pseudo-segment and
+vanishes — not a step, never counted toward the ≥3-segment fallback. A `for v in LIST` segment
+names no command but LIST may run one: each live `$(…)`/backtick inner of LIST is spliced in as
+its own judged segment (`for x in $(rm -rf y); do echo ok; done` blocks on `rm -rf y`; `for x in
+$(cat pids); do omp-steer …` stays orchestration). `_split_chain` itself is untouched (the
+`_is_unchained_gh_ship` invariant still rests on it). `_seg_is_impl_signal` is unchanged:
+`for f in a b; do git commit -m x; done` blocks.
+
+**A carve-out never launders an unrecognized companion.** See the overview: `omp-steer 7 'x'; rm
+-rf y` is refused at 2 segments (TRIGGER: `sanctioned orchestration … chained with an unrecognized
+command: \`rm -rf y\``), for every carve-out, because `rm`/`chmod`/`mv`/… have no named mutation
+pattern and 2 segments never reach the length fallback — the per-segment analogue of
+agent-tools#363. The same rule applies one level down, exactly as #363 did for `gh ship`: the
+inner command of a LIVE substitution beside a carve-out (`tg 'x' $(rm -rf y)`, `rig status
+$(chmod -R 000 /)`) is a companion too and is refused (`_orchestration_companions`), while a
+benign inner (`tg "$(cat f)"`, the `$(cat <<'EOF' … EOF)` report idiom) is allowed and is not. A
+vetoed carve-out segment (`tg 'find -delete'`, inert FIND_MUTATION text) is not its own companion
+and keeps its pre-existing single-segment outcome.
+
+**Subagent-exempt, same as everything else in this gate:** a dispatched subagent (`agent_id`
+present) runs all of these — and `tg-ctl stop`, `rig apply`, … — freely regardless.
+
 ## Tiering — WARN then BLOCK
 
 The **first** offense in the TTL window **WARNs** (allow + message); a **repeat** in the
@@ -623,4 +731,13 @@ rc=$?; echo "exit=$rc"   # allowlisted gh read → exit=0 (allow, never warns �
 echo '{"point":"pre-bash","cwd":"/r","args":{"command":"TG_BOT_TOKEN=x tg --format html x"}}' \
   | ./orchestrator_stays_thin.py
 rc=$?; echo "exit=$rc"   # env-prefixed tg → exit=0 (allow, never warns — tg-carveout-159)
+
+echo '{"point":"pre-bash","cwd":"/r","args":{"command":"for p in A B; do omp-steer $p x | tr a b; done; tg done"}}' \
+  | ./orchestrator_stays_thin.py
+rc=$?; echo "exit=$rc"   # orchestration-only loop → exit=0 (allow, never warns — agent-tools#861)
+echo '{"point":"pre-bash","cwd":"/r","args":{"command":"omp-steer 1 x; rm -rf /tmp/y"}}' \
+  | ./orchestrator_stays_thin.py
+rc=$?; echo "exit=$rc"   # carve-out + unrecognized companion → exit=0 (first offense, WARN); the
+                          # message's TRIGGER line names it: sanctioned orchestration `omp-steer 1 x`
+                          # chained with an unrecognized command: `rm -rf /tmp/y`
 ```

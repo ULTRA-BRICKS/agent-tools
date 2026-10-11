@@ -69,6 +69,39 @@
 
 ### Changed
 
+- `agent-hooks/orchestrator-stays-thin`: the block/warn message is five structured lines —
+  `TRIGGER` (the exact rule that fired, quoting the offending segment(s): `chain of 4 segments;
+  unrecognized heads: …`, `implementation-shaped segment: …`, `heredoc …`, `code write to …`),
+  `WHY` (one sentence), `DO THIS` (the firing harness's delegation recipe plus what is allowed
+  inline), `EXCEPTION` (the deny-by-default Telegram hatch) — replacing a single ~900-char
+  paragraph that never named the rule, so the supervisor session guessed and reworded a pure
+  orchestration command (agent-tools#861). Logic: `omp-steer` (any args), `tg-ctl
+  status|inbox|audit-delivery|ask|omp-live status|send` and read-only `rig`
+  (`status`, `doctor` without `--yes`/`--fix`/`--optional`, `sysmon status|sample|incidents`,
+  `--version`) are sanctioned orchestration via shlex predicates built like
+  `_is_tg_command`, deny-by-default tables for the mutating subcommands; `tr`/`read`/`printf`/
+  `test`/`[`/`seq`/`diff`/checksums join the read-only filters and a print-only `awk` (no `-f`/
+  `-i`/`-e`, no `system(`/`|`/`>` anywhere) is read-only like `sed -n`; `for`/`do`/`done`/`while`/
+  `until`/`if`/`then`/`elif`/`else`/`fi` are segmentation keywords stripped before
+  classification and never counted as chain steps (so a loop over sanctioned heads is one
+  orchestration line, and `do git commit` is recognized as a commit instead of hiding behind
+  `do`; only a plain-file redirect may trail `done`/`fi` — a process substitution `done >(cmd)`
+  runs `cmd` and stays a judged segment, as does each live `$(…)` inside a `for … in` list —
+  `for x in $(rm -rf y); do echo ok; done` blocks). New rule, closing the per-segment analogue of the
+  agent-tools#363 `gh ship 205; rm -rf /`
+  gap: a carve-out segment (`tg`/`task`/`omp-steer`/`tg-ctl`/`rig`/`review`/`dev`/read-only `gh`)
+  chained with a segment the allow-list does not recognize is refused at any length —
+  `omp-steer 1 x; rm -rf y` and `tg done && python3 deploy.py` now warn-then-block at 2 segments
+  (the inner of a live `$(…)` beside a carve-out counts as a companion too). `ps`/`pgrep`/
+  `pstree`/`top`/`ss`/`lsof` join the read-only inspection heads (the supervisor's subagent
+  process checks were blocked at 10 segments). Pre-write: a `write` to an omp harness URI
+  (`agent://`, `proc://`, `xd://`, `mcp://`, … — the #828 `_is_harness_uri` set) is never a code
+  write, whatever the body — the orchestrator's steering note to a subagent was blocked after
+  the warn tier.
+  Docs/tests pin the real omp 18.8.1 subagent mechanism: the child's own Bash env carries no
+  `PI_SESSION_FILE`; `omp_hook_bridge` forwards the child's `ctx.sessionManager.getSessionFile()`
+  and restores `args.agent_id`, which is what exempts it.
+
 - `cc_hook_bridge` and `codex_hook_bridge` no longer read the tg-ctl Stop-hook inbox on `Stop`
   (agent-tools#832). Claude Code and Codex are tmux-only (tg-cli#456): tg-ctl stopped queuing
   for them and archived their stranded backlog as `stranded-<stamp>.jsonl`. An unnamed cc/codex

@@ -290,13 +290,25 @@ def _is_harness_uri(raw: str) -> bool:
 # `_is_all_read_only` — so `sed -n '1,240p' f && git status` is inspection exactly like `head`,
 # while `sed -i` keeps tripping `BUILD_EDIT` as before.
 READ_ONLY_BASH = re.compile(
-    r"^\s*(?:git\s+(?:status|log|diff|show|branch)\b|ls\b|cat\b|less\b|head\b|tail\b|"
+    r"^\s*(?:git\s+(?:status|log|diff|show|branch|rev-parse|ls-files|describe|blame|shortlog|"
+    r"rev-list)\b|ls\b|cat\b|less\b|head\b|tail\b|"
     r"grep\b|rg\b|find\b|pwd\b|echo\b|which\b|env\b|wc\b|stat\b|tree\b|file\b|jq\b|"
     # read-only system-info + text-filter verification tools (SYNC with fix/159 READ_ONLY_BASH):
     # so a verify pipe `df -h | grep /dev | head` / `gh pr view | jq | head` is not blocked by the
     # >=3-segment rule (coordinator: verification is the orchestrator's own altitude).
     r"sort\b|uniq\b|cut\b|column\b|df\b|du\b|lsblk\b|free\b|ps\b|uname\b|"
-    r"uptime\b|whoami\b|hostname\b|nproc\b|date\b)"
+    r"uptime\b|whoami\b|hostname\b|nproc\b|date\b|"
+    # Pure text filters / shell builtins a pipeline or loop body over an allowed head carries
+    # (agent-tools#861): `… | tr '\n' ' '`, `while read l; do …`, `printf`, `[ -f x ]`, plus the
+    # process/socket inspection family the supervisor verifies subagents with (`pgrep -fa …`,
+    # `pstree`, `top -bn1`, `ss`, `lsof`). None of them writes anywhere but stdout (a `>`
+    # redirect is already not implementation on its own); `awk` is NOT here — it can
+    # `system()`/`print > file` — see `_is_read_only_awk`. `pkill`/`kill` are NOT here either.
+    # Argv-boundary anchored (`(?=\s|$)`, like CD_HEAD), not `\b`, so `test.sh`/`tr-x` are not
+    # mistaken for the builtin (the agent-tools#370 `\b` quirk is not extended to these).
+    r"(?:tr|read|printf|true|false|test|sleep|seq|diff|comm|paste|nl|tac|rev|basename|"
+    r"dirname|realpath|readlink|md5sum|sha1sum|sha256sum|shasum|cksum|"
+    r"pgrep|pstree|top|ss|lsof|\[\[?)(?=\s|$))"
 )
 # Sanctioned ORCHESTRATION commands the main thread legitimately runs ITSELF — coordination and
 # reporting only. A chain composed entirely of them (or read-only inspection) must never flap into
@@ -366,6 +378,15 @@ READ_ONLY_BASH = re.compile(
 # for the two-review-round rationale this one inherits verbatim: no path-qualification, basename-
 # exact `task` token match, self-contained `VAR=val` env-prefix skip), consulted directly by
 # `_seg_is_allowed` alongside `_is_tg_command`.
+#
+# `omp-steer`, `tg-ctl` (read/steer subcommands only) and read-only `rig` subcommands are
+# likewise absent from this regex and granted by their own shlex predicates (`_is_omp_steer_command`,
+# `_is_tg_ctl_command`, `_is_rig_readonly_command`, agent-tools#861): steering a live omp session,
+# reading the Telegram daemon's state, and reading rig's drift/doctor/sysmon reports are
+# orchestration by definition — the same altitude as `tg`/`task` — but each of those CLIs also has
+# mutating subcommands (`tg-ctl start/stop/enable`, `rig apply`, `rig doctor --yes/--fix`), so
+# the tg-ctl/rig grants are a fixed subcommand table (`_TG_CTL_READONLY_SUBCOMMANDS`,
+# `_RIG_BARE_READONLY_SUBCOMMANDS` + per-subcommand tables), deny-by-default like `_GH_READONLY_SUBCOMMANDS`.
 ORCH_ALLOW = re.compile(
     r"^\s*(?:"
     r"review\b"                                           # multi-model review CLI (read-only)
@@ -670,38 +691,45 @@ CD_HEAD = re.compile(r"^\s*cd(?=\s|$)")
 # anywhere in a segment: a read-only `find` head must not launder them into the allow-list.
 FIND_MUTATION = re.compile(r"\s-(?:delete|exec|execdir|ok|okdir|fprintf|fprint0|fprint|fls)\b")
 
-# Rewritten per the CTO's explicit clarification (tg thread, 2026-07-08/#7103): this hook is an
-# INTENTIONAL, jointly-accepted operating model — not friction an agent should route around. The
-# orchestrator plans and dispatches; a subagent does the implementation-shaped work (an edit, a
-# build, a raw `git commit`/`git push`, a test run — AND nearly all `gh`, including CI/PR
-# verification). A prior draft framed this as a terse rule ("does not implement inline") that read
-# as adversarial and invited unwanted workarounds. The message now states WHY (the agreed model,
-# not an error), HOW to proceed (dispatch a subagent), and that fighting it is out of scope. The
-# `gh ship` / read-only-`gh` carve-out (agent-tools#159/#162) was REMOVED here per tg#7103
-# (shipping and CI verification were both delegated), then PARTIALLY RESTORED (Alex tg#9977,
-# agent-tools#159): narrowly, an UNCHAINED `gh ship <PR#>` only (agent-tools#363 narrowed this
-# further to a per-LINE grant — see `_is_unchained_gh_ship`). The orchestrator may run that one
-# exact, unchained shape inline again, same as a subagent ("the orchestrator CAN gh ship like
-# agents can, but BY DEFAULT agents do it"); CI/PR verification, every other gh subcommand, and a
-# `gh ship <PR#>` chained with anything else all stay delegated, so this MESSAGE still fires for
-# those.
+# The message is STRUCTURED (agent-tools#861): TRIGGER names the exact rule that fired and quotes
+# the offending segment(s); WHY is one sentence; DO THIS gives the firing harness's own delegation
+# recipe plus the inline-safe alternative; EXCEPTION states the deny-by-default hatch. A prior
+# version was one ~900-char paragraph ("agreed with the CTO", "NO self-service bypass") that never
+# said WHICH rule fired — the supervisor session guessed that a quoted substring had matched
+# `git commit`, reworded the text (bypass-shaped) and was blocked again; the real cause was an
+# unrecognized `omp-steer` head tripping the chain-length fallback. An agent that can see the rule
+# and the segment has nothing to guess at and no reason to route around the gate. Earlier history:
+# the `gh ship` / read-only-`gh` carve-out (agent-tools#159/#162) was removed per tg#7103, then an
+# UNCHAINED `gh ship <PR#>` was restored (Alex tg#9977, narrowed to per-LINE by agent-tools#363 —
+# see `_is_unchained_gh_ship`); every other gh shape still fires this message.
+
+# What the orchestrator CAN run inline, named in DO THIS so the inline-safe alternative is explicit
+# instead of implied (pre-bash only; a pre-write's alternative is the docs carve-out).
+_INLINE_SAFE = (
+    "Inline-safe at any length, loops included: tg, task, review, omp-steer, tg-ctl/rig reads, "
+    "read-only gh, inspection/filters (ls, cat, grep, jq, tr…); a harmless lone step may be its "
+    "own single Bash call."
+)
 
 
-def _message_for(harness) -> str:
+def _message_for(harness, point: str, trigger: str, blocked: bool, hatch_denied: str | None = None) -> str:
+    """The five-line WARN/BLOCK message (README: verdict, TRIGGER, WHY, DO THIS, EXCEPTION). A
+    denied/unavailable hatch (``hatch_denied`` = its reason) is reported INSIDE the EXCEPTION
+    line, never as a sixth line — the first `TRIGGER:` line is what agents parse."""
+    verdict = "BLOCKED" if blocked else f"WARN — a repeat within {TTL_S // 60} min BLOCKS"
+    alternative = _INLINE_SAFE if point == "pre-bash" else (
+        "Docs paths (*.md/*.mdx/*.txt/*.rst, docs/) are always allowed."
+    )
+    # The reason can carry raw tg-ctl stdout (review finding): keep it printable and on one line.
+    denied = f"hatch escalation denied: {_printable(hatch_denied)} — " if hatch_denied else ""
     return (
-        "By design, not a bug: this session is the orchestrator, and the operating model — agreed "
-        "with the CTO — is that it never implements inline. Planning, dispatching, and reading "
-        "reports back is its job; doing the Edit/Write/Bash itself is not — that includes an edit, a "
-        "build, a raw `git commit`/`git push`, a test run, AND nearly all `gh` (CI/PR verification "
-        "like `gh pr checks`/`gh run` are a subagent's job too, not the orchestrator's — an unchained "
-        "`gh ship <PR#>`, alone on the line, is the one sanctioned exception, agent-tools#159/#363). "
-        "Dispatch a subagent to do this "
-        f"({_delegation_recipe(harness)}) or model it as a Workflow, then "
-        "read its report. This isn't friction to route around — if it's "
-        "genuinely wrong for a case, raise that, don't bypass it. There is NO self-service bypass; for "
-        "a genuine exception ASK the human, or request a one-time Telegram approval by setting "
-        "RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN=\"<written justification>\" (deny-by-default; a "
-        "bare 1 is rejected). (delegate-work-to-subagents, enforced.)"
+        f"orchestrator-stays-thin {verdict}.\n"
+        f"TRIGGER: {trigger}.\n"
+        "WHY: orchestrator session — plan, dispatch, verify; implementation runs in a subagent.\n"
+        f"DO THIS: delegate — {_delegation_recipe(harness)}. {alternative}\n"
+        f"EXCEPTION: {denied}deny-by-default, no self-service bypass — ask the human, or "
+        "RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN=\"<justification>\" <command> for a one-time "
+        "Telegram approval (a bare 1 is rejected)."
     )
 
 
@@ -891,7 +919,7 @@ def _is_code_write(args: dict) -> bool:
     if not isinstance(path, str) or not path.strip():
         return False  # no path to judge → don't claim it's a code write
     if _is_harness_uri(path):
-        return False  # a harness channel (peer message, job control), not a file
+        return False  # a harness channel (peer message, job control), not a file — whatever the body says
     if DOCS_PATH.search(path) or DOCS_DIR.search(path):
         return False  # docs are not implementation
     return True
@@ -1029,9 +1057,81 @@ def _split_chain(command: str) -> list[str]:
     return [s for s in segs if s.strip()]
 
 
+# Shell reserved words that PRECEDE a command inside a compound (`do cmd`, `then cmd`, `if cmd`,
+# `while cmd`) — stripped so the real head gets classified — and the ones that stand ALONE as a
+# pseudo-segment (`for v in a b`, `done`, `fi`) and name no command at all (agent-tools#861).
+# `_split_chain` splits on `;`/newline, so `for p in A B; do x; done` yields `for p in A B`,
+# `do x`, `done` — before this, the `for …` and `done` pseudo-segments were unknown heads that
+# inflated the chain count AND the `do x` body's real head (`x`) was hidden behind `do`, so a loop
+# body of `git commit` was blocked only by the length fallback, never recognized as a commit.
+_PREFIX_KEYWORDS_RE = re.compile(r"^\s*(?:(?:do|then|else|elif|if|while|until)(?=\s|$)\s*)+")
+_PSEUDO_SEGMENT_RE = re.compile(r"^\s*(?:done|fi)(?=\s|$)")
+# `for v in LIST` names no command of its own, but LIST may RUN one through a substitution
+# (`for x in $(rm -rf y)`, review finding on #861) — `_norm_segments` splices each live inner
+# command in as its own segment, so it is judged exactly like a chained step.
+_FOR_SEGMENT_RE = re.compile(r"^\s*for(?=\s|$)(?P<list>.*)$", re.DOTALL)
+# A redirection operator token as shlex yields it — `<`, `>`, `>>`, `2>`, `&>` (operator, target
+# is the NEXT token or glued: `>out`), or an fd duplication `2>&1` (self-contained) — what may
+# legitimately trail a `done`/`fi`. The target must be a PLAIN filename: no `(`/`)`, `<`/`>` or
+# backtick, so `done >(./payload.sh)`, `done < <(reboot)` and `done < $(reboot)` — process and
+# command substitutions that RUN a command (review findings on #861) — never pass as "just a
+# redirect" and stay judged segments. A `$var` target is fine (expands, runs nothing).
+_REDIRECT_TOK = re.compile(r"^(?:\d*[<>]{1,2}|&>>?)(?:(?P<dup>&\d+)|(?P<target>[^\s`()<>]*))$")
+_PLAIN_FILENAME_RE = re.compile(r"^[^\s`()<>]+$")
+
+
+def _is_redirect_only(toks: list[str]) -> bool:
+    """True when ``toks`` is nothing but redirections (operator [+ plain-file target] pairs, fd dups)."""
+    i = 0
+    while i < len(toks):
+        m = _REDIRECT_TOK.match(toks[i])
+        if not m:
+            return False
+        if m.group("dup") or m.group("target"):
+            i += 1
+        elif i + 1 < len(toks) and _PLAIN_FILENAME_RE.match(toks[i + 1]):
+            i += 2
+        else:
+            return False  # dangling operator, or a substitution where a filename belongs
+    return True
+
+
+def _strip_shell_keywords(segment: str) -> str:
+    """Drop leading compound-command keywords from ``segment`` so its REAL command head is what
+    gets classified; return ``""`` for a pseudo-segment that names no command (a bare `done`/`fi`,
+    or `done < list.txt` — a redirect alone is not implementation, matching the doctrine for a
+    bare `>`/`>>`). Any OTHER remainder after `done`/`fi` is kept as the segment so it is still
+    judged (conservatively: an unrecognized head). Text-slicing, not a shlex re-join, so the
+    surviving command text reaches every downstream predicate byte-for-byte (a re-quoted `'['`
+    would no longer match the `[` builtin). A `for v in …` segment is `_norm_segments`' job."""
+    rest = _PREFIX_KEYWORDS_RE.sub("", segment, count=1)
+    m = _PSEUDO_SEGMENT_RE.match(rest)
+    if m:
+        rest = rest[m.end():]
+        try:
+            if _is_redirect_only(shlex.split(rest)):
+                return ""
+        except ValueError:
+            pass  # unbalanced quote: keep the remainder, it is judged (and refused) downstream
+    return rest
+
+
 def _norm_segments(command: str) -> list[str]:
-    """Chain-split (quote-aware) then strip wrappers from each segment (the unit of classification)."""
-    return [_strip_wrappers(s) for s in _split_chain(command)]
+    """Chain-split (quote-aware), drop loop/conditional pseudo-segments and their keywords, then
+    strip wrappers from each segment (the unit of classification). A `for v in LIST` segment
+    contributes the inner command(s) of LIST's live substitutions (every nesting depth — `for x
+    in $(echo $(rm …))` runs `rm`, review finding), nothing else."""
+    out: list[str] = []
+    for seg in _split_chain(command):
+        seg = _strip_shell_keywords(seg)  # `then for …` → `for …`; `for` itself is kept
+        for_m = _FOR_SEGMENT_RE.match(seg)
+        if for_m:
+            for inner in _substitution_inners(for_m.group("list")):
+                out.extend(_norm_segments(inner))
+            continue
+        if seg.strip():
+            out.append(_strip_wrappers(seg))
+    return out
 
 
 def _blank_single_quoted(command: str) -> str:
@@ -1410,18 +1510,37 @@ def _seg_is_allowed(segment: str) -> bool:
         return False
     if _git_subcommand(segment) == "branch" and _git_branch_has_arg(segment):
         return False
-    if (
+    return _seg_is_inspection(segment) or _seg_is_orchestration(segment)
+
+
+def _seg_is_inspection(segment: str) -> bool:
+    """Read-only inspection / text-filter head, or the `cd` companion — the half of the allow-list
+    that is NOT a carve-out (no veto applied here; `_seg_is_allowed` owns the vetoes)."""
+    return bool(
         READ_ONLY_BASH.search(segment)
         or _is_read_only_sed(segment)
-        or ORCH_ALLOW.search(segment)
-        or _dev_segment_is_allowed(segment)
+        or _is_read_only_awk(segment)
         or CD_HEAD.match(segment)
+        or _git_subcommand(segment) in _GIT_READ_SUBS  # `git -C d status`, `/usr/bin/git log`, …
+    )
+
+
+def _seg_is_orchestration(segment: str) -> bool:
+    """Sanctioned ORCHESTRATION head — the explicit carve-outs (`review`, `git worktree list`, known
+    `dev` shapes, `tg`, `task`, `omp-steer`, read/steer `tg-ctl`, read-only `rig`, read-only `gh`).
+    Distinguished from `_seg_is_inspection` because a carve-out chained with an UNRECOGNIZED
+    segment is refused at any length (`_implementation_reason`, agent-tools#861), while a
+    pure-inspection chain keeps the generic 2-segment gray zone."""
+    return bool(
+        ORCH_ALLOW.search(segment)
+        or _dev_segment_is_allowed(segment)
         or _is_tg_command(segment)
         or _is_task_command(segment)
+        or _is_omp_steer_command(segment)
+        or _is_tg_ctl_command(segment)
+        or _is_rig_readonly_command(segment)
         or _is_gh_readonly_command(segment)
-    ):
-        return True
-    return _git_subcommand(segment) in _GIT_READ_SUBS  # `git -C d status`, `/usr/bin/git log`, …
+    )
 
 
 # The gh head as a plain regex, robust to an UNBALANCED-quote segment that shlex cannot parse:
@@ -1775,14 +1894,7 @@ def _is_tg_command(segment: str) -> bool:
     default for a GRANT-direction predicate facing uncertain input is to not grant (Opus/Fable
     round 3: decide the fallback direction on its own merits once the predicate is load-bearing,
     not by inheriting an old regex's behavior)."""
-    try:
-        toks = shlex.split(segment)
-    except ValueError:
-        return False
-    i = 0
-    while i < len(toks) and _ASSIGN_RE.match(toks[i]):
-        i += 1
-    return i < len(toks) and toks[i] == "tg"
+    return _is_bare_head_command(segment, "tg")
 
 
 def _is_task_command(segment: str) -> bool:
@@ -1817,14 +1929,139 @@ def _is_task_command(segment: str) -> bool:
     Consulted directly by `_seg_is_allowed`, per-segment, exactly where `_is_tg_command` is — the
     tg allowance's laundering guards (chain-splitting, the substitution-liveness scanner, the bare
     `&` split) apply to `task` the same way, unconditionally, since they are not predicate-specific."""
+    return _is_bare_head_command(segment, "task")
+
+
+def _argv_after_env(segment: str) -> list[str] | None:
+    """shlex argv of ``segment`` with leading ``VAR=val`` env-prefix tokens skipped, or None when
+    the segment is unparseable (unbalanced quote — a GRANT-direction caller must then not grant).
+    The exact-token discipline `_is_tg_command`/`_is_task_command` document (no path-
+    qualification, basename-EXACT head) is the caller's: this helper only tokenizes."""
     try:
         toks = shlex.split(segment)
     except ValueError:
-        return False
+        return None
     i = 0
     while i < len(toks) and _ASSIGN_RE.match(toks[i]):
         i += 1
-    return i < len(toks) and toks[i] == "task"
+    return toks[i:]
+
+
+def _is_bare_head_command(segment: str, head: str) -> bool:
+    """The shared body of the exact-head carve-outs (`tg`, `task`, `omp-steer`): a bare EXACT
+    ``head`` token after any env prefix — no path-qualification, no needle, no grant on an
+    unparseable segment. Each wrapper keeps its own authorization history in its docstring."""
+    argv = _argv_after_env(segment)
+    return bool(argv) and argv[0] == head
+
+
+def _is_omp_steer_command(segment: str) -> bool:
+    """True when a segment's COMMAND head is `omp-steer` (the local wrapper around
+    `tg-ctl omp-live send` that types a note into a live omp session) — ANY argument shape
+    (`list`, `<pid|cwd|all> '<text>'`). Steering a running session is orchestration by definition
+    (agent-tools#861: the supervisor's `for p in …; do omp-steer $p '…'; done` loop was blocked only
+    because this head was unknown). Same shape and trust reasoning as `_is_tg_command`: bare
+    exact token, env-prefix skip, deny on an unparseable segment, head-only (never a needle)."""
+    return _is_bare_head_command(segment, "omp-steer")
+
+
+# tg-ctl subcommands that only READ daemon state or deliver a message to a live session.
+# `start`/`stop`/`restart`/`enable`/`disable`/`install-hooks`/`omp-live install`/… change the
+# machine and stay delegated (deny-by-default: a subcommand not in this table is not granted).
+_TG_CTL_READONLY_SUBCOMMANDS = frozenset({"status", "inbox", "audit-delivery", "ask"})
+_TG_CTL_OMP_LIVE_SUBCOMMANDS = frozenset({"status", "send"})
+
+
+def _is_tg_ctl_command(segment: str) -> bool:
+    """True when a segment's COMMAND is a read/steer `tg-ctl` shape: `tg-ctl status|inbox|
+    audit-delivery|ask …` or `tg-ctl omp-live status|send …` (agent-tools#861). The Telegram
+    daemon's lifecycle subcommands (`start`, `stop`, `restart`, `enable`, `disable`,
+    `install-hooks`, `omp-live install`, …) are machine mutations and are NOT granted."""
+    argv = _argv_after_env(segment)
+    if not argv or argv[0] != "tg-ctl" or len(argv) < 2:
+        return False
+    if argv[1] == "omp-live":
+        return len(argv) >= 3 and argv[2] in _TG_CTL_OMP_LIVE_SUBCOMMANDS
+    return argv[1] in _TG_CTL_READONLY_SUBCOMMANDS
+
+
+# rig subcommands that only REPORT (drift, dependency health, resource-monitor state). `rig apply`,
+# `rig worktree create/remove/gc` (rig 0.56.1 has no `worktree list`, review finding), `rig config
+# set`, `rig doctor --yes/--fix/--optional` (installs/repairs) and everything else stay delegated
+# (deny-by-default).
+_RIG_BARE_READONLY_SUBCOMMANDS = frozenset({"status"})  # `doctor`/`sysmon` have their own branches below
+_RIG_SYSMON_READONLY_SUBCOMMANDS = frozenset({"status", "sample", "incidents"})
+_RIG_INFO_FLAGS = frozenset({"--version", "-h", "--help"})
+# The ONLY flags a read-only `rig doctor` may carry. An allow-list, not a deny table of today's
+# `--yes`/`--fix`/`--optional`: argparse accepts any unambiguous PREFIX of a long flag (`--ye` ==
+# `--yes`, review finding) and a future `--purge-cache`/`-y` must not slip in either (review
+# finding — under-grant is the safe direction, like `_is_read_only_sed`/`_is_read_only_awk`).
+_RIG_DOCTOR_ALLOWED_FLAGS = frozenset({"-h", "--help"})
+
+
+def _is_rig_doctor_readonly_arg(tok: str) -> bool:
+    """A `rig doctor` argument that cannot install or repair: a non-flag, or an allow-listed flag."""
+    return not tok.startswith("-") or tok in _RIG_DOCTOR_ALLOWED_FLAGS
+
+
+def _is_rig_readonly_command(segment: str) -> bool:
+    """True when a segment's COMMAND is a read-only `rig` shape (agent-tools#861): `rig status …`,
+    `rig doctor` (WITHOUT `--yes`/`--fix`/`--optional`, which install or repair), `rig sysmon
+    status|sample|incidents …`, or a bare `rig --version`/`-h`/`--help`. Everything else — `rig
+    apply`, `rig worktree …`, `rig config set`, `rig init`, `rig sysmon test-alert|simulate|restore`
+    — mutates the machine or the repo and stays delegated. Only `doctor` gets a flag scan: `status`
+    and `sysmon status|sample|incidents` take no mutating flag today (`-h`/`-C`/`--config`/`--json`/
+    `--show` only, checked against rig-cli 0.56.1 `--help`), so their trailing tokens are not
+    inspected."""
+    argv = _argv_after_env(segment)
+    if not argv or argv[0] != "rig" or len(argv) < 2:
+        return False
+    sub = argv[1]
+    if sub in _RIG_INFO_FLAGS:
+        return len(argv) == 2  # bare `rig --version`/`-h`: trailing args are not inspected elsewhere
+    if sub == "doctor":
+        return all(_is_rig_doctor_readonly_arg(tok) for tok in argv[2:])
+    if sub == "sysmon":
+        return len(argv) >= 3 and argv[2] in _RIG_SYSMON_READONLY_SUBCOMMANDS
+    return sub in _RIG_BARE_READONLY_SUBCOMMANDS
+
+
+_AWK_HEADS = frozenset({"awk", "gawk", "mawk", "nawk"})
+# Anything that lets an awk PROGRAM leave stdout: `system(` (run a command), `|` (pipe to/from a
+# command, `print | "cmd"` / `"cmd" | getline`), `>` (`print > "file"`, `>>`), and gawk's `@include`/
+# `@load`/`@namespace`/indirect-call `@` directives (a file-backed program by another name). Scanned
+# over EVERY argv token, program and operands alike — under-granting is the safe direction.
+_AWK_ESCAPE = re.compile(r"system\s*\(|[|>@]")
+_AWK_REFUSED_LONG_FLAGS = frozenset({"--file", "--include", "--load", "--source", "--exec"})
+# Short flags refused ANYWHERE in a cluster (gawk glues their operand — `-fprog.awk`, `-iinplace` —
+# and a bare boolean may precede them: `-Vi prog.awk` is `-V -i prog.awk`, review finding, the same
+# whole-cluster scan `_sed_scripts` does); `E` is gawk's `--exec FILE` (file-backed program, review
+# finding); `W` covers mawk's whole `-W <option>` family (`-W exec FILE`, abbreviable to `-W e`,
+# review finding).
+_AWK_REFUSED_SHORT = frozenset({"f", "i", "l", "e", "E", "W"})
+
+
+def _is_read_only_awk(segment: str) -> bool:
+    """True when a segment's COMMAND head is `awk` (gawk/mawk/nawk) used as a pure text filter
+    (agent-tools#861): no program read from a file (`-f`/`--file` — unknowable), no gawk
+    extension/library load (`-i`/`-l`), no `-e`/`--source` fragments (a second program text whose
+    position this walk does not model), and no `system(`/`|`/`>` anywhere in the argv. Mirrors
+    `_is_read_only_sed`'s direction: GRANT only on a shape that provably prints to stdout."""
+    argv = _argv_after_env(segment)
+    if not argv or argv[0] not in _AWK_HEADS:
+        return False
+    for tok in argv[1:]:
+        if tok.startswith("--"):
+            name = tok.split("=", 1)[0]
+            # getopt_long takes any unambiguous PREFIX (`--incl=x` == `--include=x`), so refuse
+            # every `--…` that is a prefix of a refused flag, `--` included (under-grant is safe).
+            if any(flag.startswith(name) for flag in _AWK_REFUSED_LONG_FLAGS):
+                return False
+        elif len(tok) > 1 and tok[0] == "-" and _AWK_REFUSED_SHORT & set(tok[1:]):
+            return False  # `-f prog.awk`, `-fprog.awk`, `-Vi prog.awk`, `-l mod`, `-e '…'`
+        if _AWK_ESCAPE.search(tok):
+            return False
+    return True
 
 
 def _seg_is_impl_signal(segment: str) -> bool:
@@ -1890,7 +2127,16 @@ def _dev_segment_is_unknown(segment: str) -> bool:
 _GIT_GLOBAL_OPT_ARG = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
 )
-_GIT_READ_SUBS = frozenset({"status", "log", "diff", "show", "branch"})
+# The read-only git subcommands (SYNC with the `git\s+(?:…)` alternative in READ_ONLY_BASH).
+# `rev-parse`/`ls-files`/`describe`/`blame`/`shortlog`/`rev-list` joined for agent-tools#861:
+# `cd $(git rev-parse --show-toplevel) && tg done` carries a read-only plumbing inner that the
+# carve-out companion rule must recognize as allowed. `tag`/`remote`/`config` are NOT here —
+# their bare form reads but an argument writes (`git tag v1`, `git remote add`). Neither is
+# `cat-file`: `--filters`/`--textconv` run a configured filter/textconv program (review finding).
+_GIT_READ_SUBS = frozenset({
+    "status", "log", "diff", "show", "branch",
+    "rev-parse", "ls-files", "describe", "blame", "shortlog", "rev-list",
+})
 
 
 def _git_subcommand(segment: str) -> str | None:
@@ -2150,7 +2396,9 @@ def _is_all_read_only(command: str) -> bool:
     if HEREDOC.search(command):
         return False
     segs = _norm_segments(command)
-    return bool(segs) and all(READ_ONLY_BASH.search(s) or _is_read_only_sed(s) for s in segs)
+    return bool(segs) and all(
+        READ_ONLY_BASH.search(s) or _is_read_only_sed(s) or _is_read_only_awk(s) for s in segs
+    )
 
 
 def _is_all_inline_allowed(command: str) -> bool:
@@ -2182,7 +2430,9 @@ def _is_all_inline_allowed(command: str) -> bool:
     or a chain that is PURELY read-only with zero orchestration heads at all, both satisfy this the
     SAME way. Moving `tg` out of `ORCH_ALLOW` and into its own predicate therefore does not change
     which chains get the any-length exemption — every `_seg_is_allowed` source (`READ_ONLY_BASH`,
-    `ORCH_ALLOW`, `_is_tg_command`, `_is_task_command`, `_dev_segment_is_allowed`, `CD_HEAD`) contributes equally to
+    `ORCH_ALLOW`, `_is_tg_command`, `_is_task_command`, `_is_omp_steer_command`,
+    `_is_tg_ctl_command`, `_is_rig_readonly_command`, `_dev_segment_is_allowed`, `CD_HEAD`,
+    the read-only sed/awk predicates) contributes equally to
     this `all(...)`. `gh ship <PR#>` is deliberately NOT one of those sources any more
     (agent-tools#363) — it is granted only by the separate `_is_unchained_gh_ship` check below,
     which is per-LINE, not per-segment; see that function's own docstring for why.
@@ -2194,26 +2444,57 @@ def _is_all_inline_allowed(command: str) -> bool:
     if _is_unchained_gh_ship(command):
         return True
     segs = _norm_segments(command)
-    return bool(segs) and all(_seg_is_allowed(s) for s in segs)
+    if not segs or not all(_seg_is_allowed(s) for s in segs):
+        return False
+    # Every segment is allowed — but a carve-out segment must not launder an unrecognized
+    # command hidden in a live substitution (`tg 'x' $(rm -rf y)`, agent-tools#861): the
+    # companion rule, one level down. `_implementation_reason` names it in the TRIGGER line.
+    return not _orchestration_companions(command, segs)[1]
 
 
-# A single-level substitution — `$(…)`, backticks, `<(…)`/`>(…)` — capturing its INNER command.
-# One level (no nested parens) on purpose: a discipline heuristic, not a shell parser.
-_SUBST_INNER = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|[<>]\(([^()]*)\)")
+def _outer_substitutions(text: str) -> list[str]:
+    """The inner text of each OUTERMOST live substitution in ``text`` — `$(…)` / `<(…)` / `>(…)`
+    with balanced parens, and backticks. Balanced, not `[^()]*` (review finding on #861: `tg
+    "$(rm -rf $(pwd))"` runs `rm`, and a one-level regex saw only `pwd`). An unterminated opener
+    takes the rest of the text as its inner (conservative: judged, not dropped). A discipline
+    heuristic, not a shell parser: a `)` inside double quotes inside `$(…)` ends it early, which
+    only under-grants (the truncated inner is an unrecognized segment)."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "`":
+            j = text.find("`", i + 1)
+            out.append(text[i + 1:] if j < 0 else text[i + 1:j])
+            i = n if j < 0 else j + 1
+        elif c in "$<>" and text.startswith("(", i + 1):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                depth += (text[j] == "(") - (text[j] == ")")
+                j += 1
+            out.append(text[i + 2:j - 1] if depth == 0 else text[i + 2:])
+            i = j
+        else:
+            i += 1
+    return out
 
 
 def _substitution_inners(command: str) -> list[str]:
-    """Inner commands of the LIVE substitutions in ``command``. Scanned on a copy with only
-    SINGLE-quoted spans blanked: single-quoted text is literal (never a substitution), but a
-    substitution inside DOUBLE quotes still EXECUTES (`gh ship "$(gh api … -X POST)"`) and must be
-    extracted and judged (#164 review P2). Lets a mutation smuggled in a substitution head-position
-    (`gh ship $(gh api -X POST …)`) still be judged: the outer segment head is `gh ship`, so only
-    scanning the inner catches the `gh api` mutation (codex review)."""
+    """Inner commands of the LIVE substitutions in ``command``, at EVERY nesting depth. Scanned on
+    a copy with only SINGLE-quoted spans blanked: single-quoted text is literal (never a
+    substitution), but a substitution inside DOUBLE quotes still EXECUTES (`gh ship "$(gh api … -X
+    POST)"`) and must be extracted and judged (#164 review P2). Lets a mutation smuggled in a
+    substitution head-position (`gh ship $(gh api -X POST …)`) still be judged: the outer segment
+    head is `gh ship`, so only scanning the inner catches the `gh api` mutation (codex review).
+    Each inner is scanned again until none remain, so `tg x $(echo \\`rm -rf y\\`)` and
+    `tg "$(rm -rf $(pwd))"` both surface `rm` (review findings on #861)."""
     inners: list[str] = []
-    for m in _SUBST_INNER.finditer(_blank_single_quoted(command)):
-        inner = next((g for g in m.groups() if g), "")
-        if inner.strip():
-            inners.append(inner)
+    pending = [command]
+    while pending:
+        for inner in _outer_substitutions(_blank_single_quoted(pending.pop())):
+            if inner.strip():
+                inners.append(inner)
+                pending.append(inner)
     return inners
 
 
@@ -2226,9 +2507,51 @@ def _has_mutating_substitution(command: str) -> bool:
                for s in _norm_segments(inner))
 
 
-def _is_implementation_bash(command: str) -> bool:
+def _orchestration_companions(command: str, segs: list[str]) -> tuple[list[str], list[str]]:
+    """``(orchestration, companions)`` for the carve-out companion rule (agent-tools#861): the
+    segments granted by a sanctioned-orchestration predicate, and — only meaningful when that list
+    is non-empty — every command on the line the allow-list does NOT recognize: a chained segment
+    (`omp-steer 7 'x'; rm -rf y`) OR the inner command of a LIVE substitution (`tg 'x' $(rm -rf
+    y)`), the same one-level-down gap agent-tools#363 closed for `gh ship`. A benign inner
+    (`tg "$(cat f)"`) is allowed and is not a companion; a vetoed orchestration segment
+    (`tg 'find -delete'`, inert FIND_MUTATION text) is not its OWN companion."""
+    orchestration = [s for s in segs if _seg_is_orchestration(s)]
+    if not orchestration:
+        return [], []
+    # NOT redundant: a FIND_MUTATION-vetoed `tg 'find -delete'` is orchestration but not allowed.
+    companions = [s for s in segs if not _seg_is_allowed(s) and not _seg_is_orchestration(s)]
+    companions += [s for inner in _substitution_inners(command)
+                   for s in _norm_segments(inner) if not _seg_is_allowed(s)]
+    # A `for`-list inner is already in `segs` AND found again by the whole-line scan: name it once.
+    return orchestration, list(dict.fromkeys(companions))
+
+
+def _quote_segments(segments: list[str], limit: int = 3) -> str:
+    """`seg1`, `seg2`, … for the TRIGGER line: stripped, truncated to 60 chars each, at most
+    ``limit`` named (+N more). Line breaks inside a quoted argument become `⏎` so TRIGGER stays
+    one line (the five-line message contract)."""
+    shown = [f"`{_printable(s.strip()).replace('`', chr(39))[:60]}`" for s in segments[:limit]]
+    extra = len(segments) - len(shown)
+    return ", ".join(shown) + (f" (+{extra} more)" if extra > 0 else "")
+
+
+# Newlines and every other C0/DEL control character (an ANSI `\x1b[2J` in a quoted argument or a
+# path would reach the terminal verbatim via `warn()`, review finding) become a visible `⏎`.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _printable(text: str) -> str:
+    return _CONTROL_CHARS_RE.sub("⏎", text)
+
+
+def _implementation_reason(command: str) -> str | None:
+    """The rule that makes ``command`` implementation-shaped, as the TRIGGER line of the block/warn
+    message (`chain of 4 segments; unrecognized heads: …`), or None when it is orchestration /
+    inspection. Naming the exact rule AND the offending segment(s) is what stops an agent from
+    guessing (agent-tools#861: the supervisor assumed a quoted substring matched `git commit` and
+    reworded the text — bypass-shaped — when the real cause was an unknown `omp-steer` head)."""
     if not command.strip():
-        return False
+        return None
     # Neutralize a data-only `$(cat <<'EOF' … EOF)` heredoc substitution FIRST (agent-tools#699)
     # — before ANY other check in this function sees the raw text — so it can neither trip the
     # blunt HEREDOC veto below nor get its own prose (which may contain a literal `;`/`&&`/`|`)
@@ -2245,20 +2568,48 @@ def _is_implementation_bash(command: str) -> bool:
     # ship exception any more), so a bare `gh ship 605` is allowed ONLY because this check runs
     # BEFORE the impl-signal scan below. Do not reorder these two checks.
     if _is_all_inline_allowed(command):
-        return False
+        return None
     if HEREDOC.search(command):
-        return True
+        return "heredoc (`<<`) in the command — a heredoc body can carry a script or an edit"
     # A build/edit head or a gh api mutation in ANY (env-stripped) segment is implementation — even
     # a single unchained one (`git commit`, `env pytest`, `gh api -X POST`). `_split_chain` splits a
     # bare `&`, so `tg done & git commit` is judged on its `git commit` segment.
-    if any(_seg_is_impl_signal(s) for s in _norm_segments(command)):
-        return True
+    segs = _norm_segments(command)
+    impl = [s for s in segs if _seg_is_impl_signal(s)]
+    if impl:
+        return f"implementation-shaped segment: {_quote_segments(impl)}"
     # ...and a mutation smuggled inside a substitution head-position, which no segment head sees.
     if _has_mutating_substitution(command):
-        return True
-    # Otherwise, multiple chained steps (>= 3 segments, i.e. >= 2 operators) is impl-shaped. Counted
-    # from the quote-aware split so a `|` inside a quoted arg is not counted as an operator.
-    return len(_split_chain(command)) >= 3
+        return "a `$(…)`/backtick/`<(…)` substitution runs an implementation-shaped command"
+    # A sanctioned ORCHESTRATION head (tg/task/omp-steer/tg-ctl/rig/review/dev/read-only gh — the
+    # carve-outs, as opposed to plain read-only inspection) must not share a line with a segment
+    # the allow-list does not recognize, at ANY chain length (agent-tools#861): `omp-steer 7 'x';
+    # rm -rf y` is a 2-segment chain, below the length fallback, and `rm` matches no named
+    # mutation pattern — exactly the laundering shape agent-tools#363 closed for `gh ship`, but
+    # for the per-segment grants. The carve-out is for orchestration-ONLY lines; an unrecognized
+    # companion makes the line not that. Pure-inspection chains keep their 2-segment gray zone.
+    # A vetoed orchestration segment (`tg 'find -delete'`, FIND_MUTATION text) is not its OWN
+    # companion: it forfeits the allow-list for the length fallback as before, nothing more.
+    unknown = [s for s in segs if not _seg_is_allowed(s)]
+    orchestration, companions = _orchestration_companions(command, segs)
+    if companions:
+        return (f"sanctioned orchestration {_quote_segments(orchestration, 1)} chained with an "
+                f"unrecognized command: {_quote_segments(companions)}")
+    # Otherwise, multiple chained steps (>= 3 segments, i.e. >= 2 operators) is impl-shaped.
+    # Counted from the quote-aware RAW split (a `|` inside a quoted arg is not an operator) —
+    # NOT the keyword-stripped one: a `for`/`do`/`done` wrapper around a single unrecognized
+    # command (`for x in 1; do rm -rf /tmp/x; done`) was a 3-step chain before agent-tools#861
+    # and must stay one (review finding); keyword stripping only decides what each step IS, so
+    # an orchestration-only loop still takes the all-inline fast path above.
+    raw_count = len(_split_chain(command))
+    if raw_count >= 3:
+        return (f"chain of {raw_count} segments; unrecognized heads: {_quote_segments(unknown)}"
+                if unknown else f"chain of {raw_count} segments")
+    return None
+
+
+def _is_implementation_bash(command: str) -> bool:
+    return _implementation_reason(command) is not None
 
 
 # ── per-repo opt-out (rig.yaml) ─────────────────────────────────────────────────────────
@@ -2380,7 +2731,7 @@ def main() -> int:
     args = event.get("args") or {}
     point = event.get("point") or ""
     cwd = str(event.get("cwd") or "")
-    message = _message_for(event.get("harness"))
+    harness = event.get("harness")
 
     # Per-repo opt-out (Alex tg#5743): a repo that legitimately does inline work on main
     # (e.g. 3d-cli) sets `agent_hooks.orchestrator_only: false` in its rig.yaml. Default ON, so an
@@ -2395,14 +2746,15 @@ def main() -> int:
     if not isinstance(command, str):
         command = str(command)
 
+    trigger: str | None = None
     if point == "pre-write":
-        offending = _is_code_write(args)
+        if _is_code_write(args):
+            path = args.get("file_path") or args.get("path") or args.get("notebook_path") or ""
+            trigger = f"code write to {_quote_segments([path], limit=1)} (not a docs path)"
     elif point == "pre-bash":
-        offending = _is_implementation_bash(command)
-    else:
-        offending = False
+        trigger = _implementation_reason(command)
 
-    if not offending:
+    if trigger is None:
         emit("allow")
         return 0
 
@@ -2426,10 +2778,11 @@ def main() -> int:
                 warn(f"orchestrator-stays-thin allowed via hatch escalation ({hatch.reason})")
                 emit("allow", f"allowed via hatch escalation ({hatch.reason})")
                 return 0
-            emit("block", f"hatch escalation denied: {hatch.reason}\n{message}")
+            emit("block", _message_for(harness, point, trigger, blocked=True, hatch_denied=hatch.reason))
             return BLOCK_EXIT_CODE
-        emit("block", message)
+        emit("block", _message_for(harness, point, trigger, blocked=True))
         return BLOCK_EXIT_CODE
+    message = _message_for(harness, point, trigger, blocked=False)
     warn(message)
     emit("allow", message)  # advisory first offense
     return 0
