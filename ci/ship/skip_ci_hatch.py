@@ -40,9 +40,14 @@ RIG_HATCH_REQUEST_SHIP_SKIP_CI is DENIED, a real written justification prints an
 annotated "would request Telegram approval". The real (non-dry-run) merge ALWAYS requires a live
 approval; a justification alone never unlocks a real admin merge.
 
-Exit codes (read by ship.sh): 0 approved, 1 requested-but-not-approved (blank/bare/denied/
-timeout), 2 not requested (should not happen — ship only calls this when the env var is set),
+Exit codes (read by ship.sh): 0 approved, 1 requested-but-not-approved (blank/bare/denied),
+2 not requested (should not happen — ship only calls this when the env var is set),
 3 the shared lib could not be imported (fail-closed).
+
+The ask is sent as a CRITICAL ButtonRequest (agent-tools#873): no local wait bound and no
+tg-ctl-side 115 s `ASK_TOTAL_TIMEOUT_MS`, so a ship blocks until Alex answers, and an Approve
+tapped after the ship was interrupted mints a grant a retry redeems with
+`RIG_HATCH_REQUEST_SHIP_SKIP_CI="approved:hgr-…"`.
 """
 from __future__ import annotations
 
@@ -93,16 +98,6 @@ def resolve_home() -> str:
     keying off getpwuid (not the env) means a shipper cannot redirect approval by exporting a
     doctored HOME. Overridable in tests via monkeypatch (never via the environment)."""
     return pwd.getpwuid(os.getuid()).pw_dir
-
-
-def _float_env(name: str) -> float | None:
-    raw = os.environ.get(name)
-    if not raw:
-        return None
-    try:
-        return float(raw)
-    except ValueError:
-        return None
 
 
 def _truthy_env(name: str) -> bool:
@@ -180,15 +175,9 @@ def main() -> int:
         sys.stdout.write(f"{_VERDICT_DENIED} {_blank_bare_denial_reason(justification)}\n")
         return 1
 
-    kw: dict[str, float] = {}
-    timeout_s = _float_env("SHIP_HATCH_TIMEOUT_S")
-    if timeout_s is not None:
-        kw["timeout_s"] = timeout_s
-    margin_s = _float_env("SHIP_HATCH_PROCESS_MARGIN_S")
-    if margin_s is not None:
-        kw["process_margin_s"] = margin_s
-
-    result = hatch_escalation.request_hatch_approval(_HOOK_ID, ctx, cwd=resolve_home(), **kw)
+    result = hatch_escalation.request_hatch_approval(
+        _HOOK_ID, ctx, cwd=resolve_home(), critical=True
+    )
     # Emit an explicit verdict SENTINEL on stdout (single-lined) as a POSITIVE approval signal.
     # ship.sh authorizes the bypass only on exit 0 AND a leading "APPROVED " here, so a fake or
     # broken `python3` that merely exits 0 without producing the sentinel fails CLOSED (refuse).

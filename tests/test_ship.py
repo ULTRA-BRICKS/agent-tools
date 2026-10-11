@@ -7913,7 +7913,7 @@ def _load_hatch_module():
 
 
 def _run_hatch_main(monkeypatch, tmp_path, *, request, resolve_home, audit,
-                    timeout="5", margin=None, trusted=None, dry_run=None):
+                    trusted=None, dry_run=None):
     """Call review_quorum_hatch.main() with resolve_home monkeypatched to a fixed dir and the
     hatch env set. Returns the exit code. `resolve_home` is the dir the helper will treat as the
     account's real home (where it looks for the rig config's tg_ctl.tg_ctl_path override)."""
@@ -7931,9 +7931,6 @@ def _run_hatch_main(monkeypatch, tmp_path, *, request, resolve_home, audit,
     monkeypatch.setenv("SHIP_HATCH_CODE", "HYP-200")
     monkeypatch.setenv("SHIP_HATCH_ITER", "1")
     monkeypatch.setenv("SHIP_HATCH_MODELS", "1")
-    monkeypatch.setenv("SHIP_HATCH_TIMEOUT_S", timeout)
-    if margin is not None:
-        monkeypatch.setenv("SHIP_HATCH_PROCESS_MARGIN_S", margin)
     if dry_run is None:
         monkeypatch.delenv("SHIP_DRY_RUN", raising=False)
     else:
@@ -8026,17 +8023,45 @@ def test_hatch_denial_returns_1_and_audits(tmp_path, monkeypatch):
     assert rec["decision"] == "bypass:denied", rec
 
 
-def test_hatch_timeout_returns_1(tmp_path, monkeypatch):
-    """When Alex does not answer in time (tg-ctl hangs past the timeout) the helper returns 1 —
-    silence is not approval."""
-    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body="sleep 10\nexit 0\n")
+def test_hatch_ask_is_critical_and_honours_a_reply_after_the_old_wait_bound(tmp_path, monkeypatch):
+    """#873: the ship hatch is a CRITICAL ask. The outbound ButtonRequest JSON carries
+    `"critical": true` (what lifts tg-ctl's own 115 s ASK_TOTAL_TIMEOUT_MS and enables late-approval
+    grants), and the helper has no local wait bound: SHIP_HATCH_TIMEOUT_S=1 no longer cuts off a
+    reply that arrives later — the approval is honoured instead of discarded."""
+    import json
+
+    payload_file = tmp_path / "payload.json"
+    tg = _write_fake_tg_ctl(
+        tmp_path, name="tg-ctl",
+        body=f'cat > "{payload_file}"\nsleep 2\n' + _ALLOW_REPLY_SH,
+    )
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("SHIP_HATCH_TIMEOUT_S", "1")
+    monkeypatch.setenv("SHIP_HATCH_PROCESS_MARGIN_S", "0")
+    rc = _run_hatch_main(
+        monkeypatch, tmp_path, request="Security hotfix; Alex answers after the old 1s bound.",
+        resolve_home=home, audit=audit,
+    )
+    assert rc == 0, "a critical ask must wait for the reply, not time out locally"
+    payload = json.loads(payload_file.read_text())
+    assert payload["critical"] is True, payload
+    assert payload["hookId"] == "ship-review-quorum", payload
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "bypass:approved", rec
+
+
+def test_hatch_silence_is_still_denied_in_critical_mode(tmp_path, monkeypatch):
+    """Critical mode changes how long the helper waits, never what counts as approval: tg-ctl
+    exiting with no decision (the daemon gave up / Alex never answered) still returns 1."""
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body="exit 0\n")
     home = _fake_home_with_tg_ctl(tmp_path, tg)
     audit = tmp_path / "audit.jsonl"
     rc = _run_hatch_main(
-        monkeypatch, tmp_path, request="No response expected — testing the timeout path.",
-        resolve_home=home, audit=audit, timeout="1", margin="1",
+        monkeypatch, tmp_path, request="No response expected — testing the silence path.",
+        resolve_home=home, audit=audit,
     )
-    assert rc == 1, "a timed-out hatch must return 1"
+    assert rc == 1, "silence is not approval"
 
 
 def test_hatch_dry_run_skips_tg_contact_and_audit(tmp_path, monkeypatch, capsys):
@@ -8313,7 +8338,6 @@ def _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy, *, request, audi
     # --skip-ci is now hatch-gated too; request it so the fake approving skip_ci_hatch.py beside the
     # copy is consulted (deny-by-default otherwise refuses before the merge, masking the quorum path).
     env["RIG_HATCH_REQUEST_SHIP_SKIP_CI"] = "test skip-ci wiring"
-    env.pop("SHIP_HATCH_TIMEOUT_S", None)
     if audit is not None:
         env["SHIP_AUDIT_FILE"] = str(audit)
     if env_extra:
@@ -8496,8 +8520,7 @@ def _load_skip_ci_hatch_module():
     return importlib.reload(mod)
 
 
-def _run_skip_ci_hatch_main(monkeypatch, *, request, resolve_home, audit,
-                            timeout="5", dry_run=None):
+def _run_skip_ci_hatch_main(monkeypatch, *, request, resolve_home, audit, dry_run=None):
     """Call skip_ci_hatch.main() with resolve_home monkeypatched to a fixed fake home (where the
     lib looks for the rig config's tg_ctl.tg_ctl_path override) and the hatch env set. Returns the exit code."""
     mod = _load_skip_ci_hatch_module()
@@ -8507,7 +8530,6 @@ def _run_skip_ci_hatch_main(monkeypatch, *, request, resolve_home, audit,
     monkeypatch.setenv("SHIP_AUDIT_FILE", str(audit))
     monkeypatch.setenv("SHIP_HATCH_PR", "1")
     monkeypatch.setenv("SHIP_HATCH_BRANCH", "feat")
-    monkeypatch.setenv("SHIP_HATCH_TIMEOUT_S", timeout)
     if dry_run is None:
         monkeypatch.delenv("SHIP_DRY_RUN", raising=False)
     else:
@@ -8583,6 +8605,27 @@ def test_skip_ci_hatch_denial_returns_1_and_audits(tmp_path, monkeypatch):
     assert rc == 1, "a declined --skip-ci hatch must return 1"
     rec = json.loads(audit.read_text().strip())
     assert rec["decision"] == "skipci:bypass:denied", rec
+
+
+def test_skip_ci_hatch_ask_is_critical(tmp_path, monkeypatch):
+    """#873: the outbound ButtonRequest JSON carries `"critical": true` so tg-ctl drops its own
+    115 s ASK_TOTAL_TIMEOUT_MS for this ask and a late Approve can mint a grant."""
+    import json
+
+    payload_file = tmp_path / "payload.json"
+    tg = _write_fake_tg_ctl(
+        tmp_path, name="tg-ctl", body=f'cat > "{payload_file}"\n' + _ALLOW_REPLY_SH,
+    )
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_skip_ci_hatch_main(
+        monkeypatch, request="CI Actions billing suspended; local gates green; hotfix must ship.",
+        resolve_home=home, audit=audit,
+    )
+    assert rc == 0
+    payload = json.loads(payload_file.read_text())
+    assert payload["critical"] is True, payload
+    assert payload["hookId"] == "ship-skip-ci", payload
 
 
 def test_skip_ci_hatch_dry_run_reason_approves_without_tg_contact(tmp_path, monkeypatch):
@@ -8786,8 +8829,7 @@ def _load_external_review_hatch_module():
     return importlib.reload(mod)
 
 
-def _run_external_review_hatch_main(monkeypatch, *, request, resolve_home, audit,
-                                     timeout="5", dry_run=None):
+def _run_external_review_hatch_main(monkeypatch, *, request, resolve_home, audit, dry_run=None):
     """Call external_review_hatch.main() with resolve_home monkeypatched to a fixed fake home and
     the hatch env set. Returns the exit code."""
     mod = _load_external_review_hatch_module()
@@ -8797,7 +8839,6 @@ def _run_external_review_hatch_main(monkeypatch, *, request, resolve_home, audit
     monkeypatch.setenv("SHIP_AUDIT_FILE", str(audit))
     monkeypatch.setenv("SHIP_HATCH_PR", "1")
     monkeypatch.setenv("SHIP_HATCH_BRANCH", "feat")
-    monkeypatch.setenv("SHIP_HATCH_TIMEOUT_S", timeout)
     if dry_run is None:
         monkeypatch.delenv("SHIP_DRY_RUN", raising=False)
     else:
@@ -8874,6 +8915,85 @@ def test_external_review_hatch_denial_returns_1_and_audits(tmp_path, monkeypatch
     assert rc == 1, "a declined external-review hatch must return 1"
     rec = json.loads(audit.read_text().strip())
     assert rec["decision"] == "external-review:bypass:denied", rec
+
+
+def test_external_review_hatch_ask_is_critical(tmp_path, monkeypatch):
+    """#873: the outbound ButtonRequest JSON carries `"critical": true` so tg-ctl drops its own
+    115 s ASK_TOTAL_TIMEOUT_MS for this ask and a late Approve can mint a grant."""
+    import json
+
+    payload_file = tmp_path / "payload.json"
+    tg = _write_fake_tg_ctl(
+        tmp_path, name="tg-ctl", body=f'cat > "{payload_file}"\n' + _ALLOW_REPLY_SH,
+    )
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_external_review_hatch_main(
+        monkeypatch, request="reviewer unreachable, genuinely urgent hotfix HYP-999",
+        resolve_home=home, audit=audit,
+    )
+    assert rc == 0
+    payload = json.loads(payload_file.read_text())
+    assert payload["critical"] is True, payload
+    assert payload["hookId"] == "ship-external-review", payload
+
+
+def test_external_review_hatch_retry_redeems_late_approval_grant(tmp_path, monkeypatch):
+    """#873: a retry with `RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW=approved:hgr-…` (the grant a
+    late Approve minted after the first ship's ask expired) verifies the grant with
+    `tg-ctl ask --verify-grant <id> --hook ship-external-review` instead of posting a NEW ask,
+    returns 0 and audits external-review:bypass:approved. The retry's operation fingerprint is
+    IDENTICAL to the original ask's (same PR/branch/repo) — that is what lets tg-ctl bind the
+    late grant to this ship and not another."""
+    import json
+
+    grant_id = "hgr-85d3654be317"
+    argv_file = tmp_path / "argv.txt"
+    payload_file = tmp_path / "payload.json"
+    reply = json.dumps({
+        "requestId": "hatch-ship-external-review-original",
+        "approvalId": grant_id,
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {"behavior": "allow"},
+        },
+    })
+    tg = _write_fake_tg_ctl(
+        tmp_path, name="tg-ctl",
+        body=(
+            f'printf "%s\\n" "$@" > "{argv_file}"\n'
+            f'cat > "{payload_file}"\n'
+            f"printf '%s' '{reply}'\nexit 0\n"
+        ),
+    )
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+
+    # The original ship: a written justification posts a live (critical) ask.
+    rc = _run_external_review_hatch_main(
+        monkeypatch, request="reviewer unreachable, genuinely urgent hotfix HYP-999",
+        resolve_home=home, audit=audit,
+    )
+    assert rc == 0
+    original = json.loads(payload_file.read_text())
+    assert argv_file.read_text().splitlines() == ["ask", "--agent", original["agent"]]
+    assert original["critical"] is True, original
+
+    # The retry of the same ship, carrying the grant the late Approve minted.
+    rc = _run_external_review_hatch_main(
+        monkeypatch, request=f"approved:{grant_id}", resolve_home=home, audit=audit,
+    )
+    assert rc == 0, "a verified late-approval grant must approve the retry"
+    argv = argv_file.read_text().splitlines()
+    assert argv == ["ask", "--verify-grant", grant_id, "--hook", "ship-external-review"], argv
+    retry = json.loads(payload_file.read_text())
+    assert retry["operation"]["kind"] == "ship-external-review", retry
+    assert retry["operation"]["fingerprint"], retry
+    assert retry["operation"]["fingerprint"] == original["operation"]["fingerprint"]
+    assert retry["operation"]["cwd"] == original["operation"]["cwd"]
+    rec = json.loads(audit.read_text().strip().splitlines()[-1])
+    assert rec["decision"] == "external-review:bypass:approved", rec
+    assert grant_id in rec.get("override_reason", ""), rec
 
 
 def test_external_review_hatch_dry_run_reason_approves_without_tg_contact(tmp_path, monkeypatch):

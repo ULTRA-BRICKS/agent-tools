@@ -2846,9 +2846,9 @@ _review_quorum_audit_log() {
 # SECURITY: neither WHICH lib runs nor WHICH tg-ctl is asked is shipper-controllable. The helper
 # imports the lib from a fixed path, and resolves tg-ctl off the OS identity's REAL home
 # (pwd.getpwuid) — NOT the $HOME env var and NOT the repo worktree — so no ambient env var and no
-# rig.yaml a PR commits can redirect approval to an always-approve stub. (SHIP_HATCH_TIMEOUT_S can
-# only SHORTEN the wait, which fails CLOSED — a shorter wait denies, never approves — so it is a
-# safe tuning knob, not a bypass.)
+# rig.yaml a PR commits can redirect approval to an always-approve stub. The ask is a CRITICAL
+# ButtonRequest (agent-tools#873): no local or tg-ctl-side timeout, and a late Approve mints a
+# grant a retry redeems with `RIG_HATCH_REQUEST_SHIP_<GATE>="approved:hgr-…"`.
 _review_quorum_hatch_check() {  # uses $TASK_CODE $QITER $QMODELS_N $PR
   # `python3 -I` = isolated mode: ignores PYTHONPATH/PYTHONHOME, skips the user site and
   # sitecustomize, and does not add cwd to sys.path — so a shipping agent cannot inject a

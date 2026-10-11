@@ -82,6 +82,14 @@
 
 ### Fixed
 
+- The three `ship` Telegram hatches — `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM`,
+  `RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW`, `RIG_HATCH_REQUEST_SHIP_SKIP_CI` — now send their
+  `tg-ctl ask` as a critical ButtonRequest (`"critical": true`, agent-tools#873). They used the
+  lib's default non-critical mode, so tg-ctl's own 115 s `ASK_TOTAL_TIMEOUT_MS` expired the ask
+  while the ship was still waiting and a later Approve tap landed on nothing. Critical mode lifts
+  that daemon-side bound, drops the local wait bound, and makes a late Approve mint a grant a
+  retry can redeem with `RIG_HATCH_REQUEST_SHIP_<GATE>="approved:hgr-…"`.
+
 - On Forgejo, `ship` deletes a merged PR's head branch through the API, with the same credential
   that merged it (agent-tools#860). It used to run `git push origin --delete`, which needs a
   separate git credential. Without one the branch stayed behind silently, with no audit line

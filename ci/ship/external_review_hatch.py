@@ -37,9 +37,14 @@ Dry-run divergence (deliberate, matching skip_ci_hatch.py): `--dry-run` never ac
 it must not fire a live Telegram round-trip. In dry-run this helper sends NO message but still
 enforces deny-by-default at the justification level.
 
-Exit codes (read by ship.sh): 0 approved, 1 requested-but-not-approved (blank/bare/denied/
-timeout), 2 not requested (should not happen — ship only calls this when the env var is set),
+Exit codes (read by ship.sh): 0 approved, 1 requested-but-not-approved (blank/bare/denied),
+2 not requested (should not happen — ship only calls this when the env var is set),
 3 the shared lib could not be imported (fail-closed).
+
+The ask is sent as a CRITICAL ButtonRequest (agent-tools#873): no local wait bound and no
+tg-ctl-side 115 s `ASK_TOTAL_TIMEOUT_MS`, so a ship blocks until Alex answers, and an Approve
+tapped after the ship was interrupted mints a grant a retry redeems with
+`RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW="approved:hgr-…"`.
 """
 from __future__ import annotations
 
@@ -75,16 +80,6 @@ def resolve_home() -> str:
     """The account's REAL home directory, from the OS identity — deliberately NOT $HOME.
     Overridable in tests via monkeypatch (never via the environment)."""
     return pwd.getpwuid(os.getuid()).pw_dir
-
-
-def _float_env(name: str) -> float | None:
-    raw = os.environ.get(name)
-    if not raw:
-        return None
-    try:
-        return float(raw)
-    except ValueError:
-        return None
 
 
 def _truthy_env(name: str) -> bool:
@@ -158,15 +153,9 @@ def main() -> int:
     # or approved. A local early return here would skip that shared sink entirely, hiding a
     # blank/bare hatch attempt from the repo-wide "escape hatches have no audit sink" tracking
     # (review-cli Codex pass, GH-459: this exact gap, closed here by NOT special-casing blank).
-    kw: dict[str, float] = {}
-    timeout_s = _float_env("SHIP_HATCH_TIMEOUT_S")
-    if timeout_s is not None:
-        kw["timeout_s"] = timeout_s
-    margin_s = _float_env("SHIP_HATCH_PROCESS_MARGIN_S")
-    if margin_s is not None:
-        kw["process_margin_s"] = margin_s
-
-    result = hatch_escalation.request_hatch_approval(_HOOK_ID, ctx, cwd=resolve_home(), **kw)
+    result = hatch_escalation.request_hatch_approval(
+        _HOOK_ID, ctx, cwd=resolve_home(), critical=True
+    )
     reason = (result.reason or "").replace("\r", " ").replace("\n", " ")
     if result.approved:
         _audit("external-review:bypass:approved", result.reason or "")
