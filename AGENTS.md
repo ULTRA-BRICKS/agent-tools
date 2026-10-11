@@ -354,6 +354,32 @@ them to *every* project and user. If you want the catalog of always-apply behavi
 
 ---
 
+## Heavy work runs on Runpod
+
+This workstation is shared by many agent sessions, the review queue and the owner's own
+desktop; a full suite here starves all of them (it froze the machine twice on 2026-10-10).
+**Rule: locally, a single test file at most; the full suite goes to a Runpod pod** via the
+`runpod-offload` universal skill this catalog ships (`skill://runpod-offload`, i.e.
+[`skills/universal/runpod-offload/SKILL.md`](skills/universal/runpod-offload/SKILL.md);
+script `~/.agents/skills/runpod-offload/runpod-run`, on PATH as `runpod-run`).
+
+Heavy here: `uv run --with pytest pytest tests/` (the whole suite — 6,000+ tests, the
+`ci/tests` gate), the `test_rig_detached_*` and bridge suites that spawn harness stubs.
+
+```bash
+runpod-run --apt nodejs -- uv run --with 'pytest>=8,<9' --with pyyaml --with jsonschema pytest tests -q
+                                        # full suite on a 4-vCPU CPU pod ($0.16/h), pod deleted when done
+runpod-run --apt nodejs --ttl 30 -- uv run --with 'pytest>=8,<9' --with pyyaml --with jsonschema pytest tests -q
+                                        # same, keeping the pod 30 idle minutes between runs
+uv run --with pytest pytest tests/test_<one>.py -q    # local: one file, that's the limit
+```
+
+`--apt nodejs` because the opencode-bridge tests shell out to `node`. `runpod-run --dry-run
+-- …` prints the plan and price; `runpod-run --status` / `--stop` list and terminate the
+pods this machine created — leave none behind.
+
+---
+
 ## Working in this repo
 
 - **Docs are English-only.** Every agent-facing doc — this `AGENTS.md`, any repo-level

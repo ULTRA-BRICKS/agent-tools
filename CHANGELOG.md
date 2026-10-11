@@ -4,6 +4,20 @@
 
 ### Added
 
+- `skills/universal/runpod-offload`: heavy work (a full test suite, a build, a benchmark, ML
+  or media batches) runs on a Runpod pod, not on the shared workstation (agent-tools#865).
+  The skill ships `runpod-run [--cpu FLAVOR-VCPUS|--gpu ID] [--ttl MIN] -- <command>`:
+  it reuses or creates a pod named `rr-<host>-<repo>` (quoting the live hourly price first;
+  a CPU pod's default disk respects Runpod's 10 GB/vCPU cap), rsyncs the checkout minus
+  everything git ignores, bootstraps the toolchain the lockfiles ask for (bun/node matching
+  the local version, uv always), runs the command with a timeout streaming its output,
+  exits with the remote exit code, and terminates the pod on any exit (EXIT trap) unless
+  `--ttl` (a bare `--keep` without a deadline is refused). `--stop` only touches pods that
+  prefix created; `--status` lists them, then every other pod on the account, each with $/h
+  and age, plus the account total; `--dry-run` prints the plan offline; a missing
+  `RUNPOD_API_KEY` exits 2 before any network call.
+  Provisioned at `~/.agents/skills/runpod-offload/runpod-run`.
+
 - `rig-detached-{omp,codex,opencode,claude-code}` hand the caller's forum topic to the detached
   child (agent-tools#848). Before detaching, each launcher runs `tg --session-topic` (tg-cli#553)
   and exports a numeric answer as `TG_TOPIC`, so the reparented child's `tg` calls and the
