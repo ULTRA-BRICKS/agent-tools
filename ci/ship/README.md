@@ -474,3 +474,39 @@ hatch" statement applies when no explicit Rig machine policy is configured.
 The reader uses Rig's supported Python 3.10+ runtime and PyYAML. Parent Rig and
 XDG configuration directories must also be user-owned and not group/world writable.
 When the trusted base already opts out, no extra repository query is performed.
+
+### Evidence instead of a review: `external_review_evidence_owners`
+
+A softer, conditional policy for owners whose PRs are reviewed by the automated pipeline
+rather than on GitHub (agent-tools#879). Same machine file, same trust rules:
+
+```yaml
+ci:
+  items:
+    ship:
+      external_review_evidence_owners:
+        - o-maan
+```
+
+For a listed owner, a PR with zero GitHub-side reviews is **not** refused or sent to the
+Telegram hatch at the gate. The gate defers its decision until after the acceptance gate and
+then passes — audited as `external-review:authorized:evidence` — only when **all** hold:
+
+- CI is green (every latest check passed), or the run uses `--skip-ci`, whose own live
+  approval still gates the admin merge; a CI-outage or known-flake local fallback is not green;
+- the review-quorum gate authorized on review-cli's own counts (not via its hatch);
+- the acceptance gate fully accepted the ticket — every criterion checked with a proof (a
+  skipped or disabled gate, a post-merge opt-out, or an already-closed ticket does not count);
+- zero unresolved review threads (re-read at decision time);
+- zero unaddressed PR conversation comments: a comment by anyone other than the PR author that
+  is not hidden on GitHub and has no later comment from the PR author.
+
+Otherwise ship lists the unmet criteria and falls back to the unchanged hatch-or-refuse path
+(`RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW`). An owner also in `external_review_owners` with
+`require_external_review: false` stays fully opted out. A malformed evidence list (not a list,
+wildcards, `owner/repo` entries) voids the whole policy file, like a malformed owner list.
+
+Unchanged and checked first, as for every owner: a PR with a real GitHub review passes, and a
+confirmed fleet-wide review-cli capacity outage auto-proceeds
+(`external-review:auto-proceed:capacity-outage`). "Addressed" is a mechanical check, not a
+judgement of the reply's content — the same boundary as the gate itself, which counts any review.

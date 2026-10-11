@@ -4,6 +4,14 @@
 
 ### Added
 
+- `gh ship`: the machine-only Rig policy key `ci.items.ship.external_review_evidence_owners`
+  (agent-tools#879). For a listed owner, a PR with zero GitHub-side reviews passes the
+  external-review gate without the Telegram hatch when CI is green (or the hatch-gated
+  `--skip-ci` path), the review quorum was met, the acceptance gate fully accepted the ticket,
+  and there are no unresolved review threads or unaddressed PR comments; the decision runs after
+  the acceptance gate and is audited as `external-review:authorized:evidence`. Any miss is
+  listed and falls back to the unchanged hatch-or-refuse path.
+
 - `skills/universal/runpod-offload`: heavy work (a full test suite, a build, a benchmark, ML
   or media batches) runs on a Runpod pod, not on the shared workstation (agent-tools#865).
   The skill ships `runpod-run [--cpu FLAVOR-VCPUS|--gpu ID] [--ttl MIN] -- <command>`:

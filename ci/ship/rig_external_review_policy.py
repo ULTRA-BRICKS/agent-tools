@@ -4,6 +4,13 @@
 Only the exact configured target owner may opt out. This is independent of
 review verdicts and never disables CI, local tests, permissions or thread checks.
 
+Decisions (stdout): `enabled` (the gate as written), `disabled` (the owner is in
+`external_review_owners` with `require_external_review: false`), or `evidence`
+(the owner is in `external_review_evidence_owners`: a zero-review PR passes the
+gate only on ship's own evidence — green CI, review quorum met, acceptance fully
+proven, no unresolved threads or unaddressed comments — else the hatch as usual).
+`disabled` wins over `evidence` for an owner listed in both.
+
 ship.sh runs this under `python3 -I`, so the only project code it loads is the
 stdlib-only hatch lib, by FIXED path (never a by-name import a PYTHONPATH could
 hijack): its `path_trust_problem` permission predicate and its PyYAML-free
@@ -30,7 +37,7 @@ OWNER = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\Z')
 REPOSITORY = re.compile(r'([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+)\Z')
 HATCH_LIB = Path(__file__).resolve().parents[2] / 'lib' / 'agenttools_hatch_escalation' / '__init__.py'
 # Reasons that mean "no policy to apply" or "applied as written" — nothing for the shipper to fix.
-QUIET_REASONS = frozenset({'not_configured', 'invalid_target', 'required_or_owner_not_opted_out', 'explicit_machine_owner_policy'})
+QUIET_REASONS = frozenset({'not_configured', 'invalid_target', 'required_or_owner_not_opted_out', 'explicit_machine_owner_policy', 'evidence_owner_policy'})
 
 
 def global_config_path() -> Path:
@@ -58,7 +65,7 @@ def machine_trust():
 
 
 def resolve(path: Path, repository: str, checkout_root: Path) -> dict:
-    result = {'required': True, 'source': str(path), 'repository': repository, 'reason': 'not_configured'}
+    result = {'required': True, 'evidence': False, 'source': str(path), 'repository': repository, 'reason': 'not_configured'}
     match = REPOSITORY.fullmatch(repository)
     if not match or not OWNER.fullmatch(match[1]) or match[2] in ('.', '..'):
         result['reason'] = 'invalid_target'
@@ -106,14 +113,18 @@ def resolve(path: Path, repository: str, checkout_root: Path) -> dict:
         value = {} if value is None else value
         required = value.get('require_external_review', True)
         owners = value.get('external_review_owners', [])
-        if type(required) is not bool or not isinstance(owners, list):
+        evidence_owners = value.get('external_review_evidence_owners', [])
+        if type(required) is not bool or not isinstance(owners, list) or not isinstance(evidence_owners, list):
             result['reason'] = 'invalid_policy'
             return result
-        if not all(isinstance(owner, str) and OWNER.fullmatch(owner) for owner in owners):
+        if not all(isinstance(owner, str) and OWNER.fullmatch(owner) for owner in owners + evidence_owners):
             result['reason'] = 'invalid_owner_scope'
             return result
-        if not required and match[1].casefold() in {owner.casefold() for owner in owners}:
+        target_owner = match[1].casefold()
+        if not required and target_owner in {owner.casefold() for owner in owners}:
             result.update(required=False, reason='explicit_machine_owner_policy')
+        elif target_owner in {owner.casefold() for owner in evidence_owners}:
+            result.update(evidence=True, reason='evidence_owner_policy')
         else:
             result['reason'] = 'required_or_owner_not_opted_out'
     except Exception as exc:
@@ -137,7 +148,11 @@ def main() -> None:
             'the external-review gate stays enabled.',
             file=sys.stderr,
         )
-    print(json.dumps(decision) if args.json else ('enabled' if decision['required'] else 'disabled'))
+    if not decision['required']:
+        verdict = 'disabled'
+    else:
+        verdict = 'evidence' if decision['evidence'] else 'enabled'
+    print(json.dumps(decision) if args.json else verdict)
 
 
 if __name__ == '__main__':

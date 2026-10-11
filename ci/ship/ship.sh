@@ -340,6 +340,11 @@ KNOWN_FLAKES=()
 # below to log the "confirmed" audit line only once `gh pr merge` has actually succeeded — see
 # that gate's own comment for why the audit must wait for the true terminal event.
 KF_AUDIT_PENDING=""
+# Evidence for the external-review gate's Rig evidence policy (external_review_evidence_owners,
+# see "external-review evidence decision" below). Each is set ONLY on its gate's own real pass —
+# never on a hatch, skip, disable or local-fallback path — so an empty value is "not proven".
+CI_EVIDENCE=""       # "green": every latest check passed; "skip-ci": the hatch-gated --skip-ci path
+QUORUM_EVIDENCE=""   # "met": the review-quorum gate authorized on review-cli's own counts
 # Auto-resolve addressed bot-nit review threads before the unresolved-threads gate (opt-in, #268).
 # Enabled by --resolve-addressed-threads or SHIP_RESOLVE_ADDRESSED_THREADS=1; only ever closes a
 # thread that is unresolved, OUTDATED (its code changed), authored ENTIRELY by bots, and has no
@@ -1755,6 +1760,9 @@ if [ "$SKIP_CI" = "0" ]; then
     sleep "$CI_POLL"
   done
   FAILED=$(printf '%s' "$ROLLUP" | jq "[.[] | select($SUCCESS_FILTER | not)] | length" 2>/dev/null || echo 1)
+  # Green means checks existed and every latest one passed — not the empty-rollup CI-outage
+  # local fallback (ROLLUP is [] there) and not the structural-outage / known-flake paths below.
+  if [ "${FAILED:-0}" = "0" ] && [ "${N:-0}" != "0" ]; then CI_EVIDENCE=green; fi
   if [ "${FAILED:-0}" != "0" ]; then
     TOTAL_CHECKS=$(printf '%s' "$ROLLUP" | jq 'length' 2>/dev/null || echo 0)
     if ci_appears_structurally_down "$TOTAL_CHECKS" "$FAILED"; then
@@ -1899,6 +1907,9 @@ if [ "$SKIP_CI" = "0" ]; then
     fi
   fi
 fi
+# --skip-ci never reaches a merge without its own live-approval hatch (_skip_ci_hatch_gate at the
+# merge), so for the external-review evidence policy it stands in for green CI on a repo without CI.
+if [ "$SKIP_CI" = "1" ]; then CI_EVIDENCE=skip-ci; fi
 
 # --- unresolved review threads (see ci/review-threads/) --------------------------------
 # Fail-CLOSED: if the API call fails we must NOT merge (a silent 0 would let an unresolved
@@ -3228,6 +3239,7 @@ else
           echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QROLES_N} roles for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
         fi
         _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" "" "$QROLES_N" "$MIN_ROLES" "$AUDIT_MIN_MODELS"
+        QUORUM_EVIDENCE=met
       else
         MODELS_SUMMARY=""
         [ "$MIN_MODELS_EXPLICIT" = "1" ] && MODELS_SUMMARY=", ${QMODELS_N}/${MIN_MODELS} distinct models${QMODELS:+ (models seen: ${QMODELS})}"
@@ -3397,11 +3409,53 @@ _external_review_hatch_check() {  # uses $PR $BRANCH $DRY_RUN
   python3 -I "$_SHIP_EXTERNAL_REVIEW_HATCH_PY"
 }
 
+# The zero-review terminal path: the one-time Telegram hatch when RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW
+# is set (returns 0 on approval), else the deny-by-default refusal. Exits 1 on any refusal.
+_external_review_hatch_or_refuse() {  # uses $PR $DRY_RUN
+  if [ -n "${RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW+x}" ]; then
+    local hrc=0 hout hverdict hreason=""
+    hout=$(_external_review_hatch_check 2>/dev/null) || hrc=$?
+    hverdict="${hout%% *}"
+    case "$hout" in *" "*) hreason="${hout#* }" ;; esac
+    if [ "$hrc" = "0" ] && [ "$hverdict" = "APPROVED" ]; then
+      if [ "$DRY_RUN" = "1" ]; then
+        echo "[ship] external-review --dry-run: justification present — a REAL run would request live Telegram approval before merging with zero reviews. (${hreason})"
+      else
+        echo "[ship] external-review: a one-time Telegram hatch escalation was APPROVED by Alex — proceeding with zero GitHub reviews. (${hreason})"
+      fi
+      return 0
+    fi
+    { echo "Refusing: external-review hatch escalation was requested but NOT approved: ${hreason:-no approval}."
+      echo "  Obtain live approval, or get an actual review posted on PR #$PR before shipping."; } >&2
+    # The helper logs its own bypass:denied only when it emitted DENIED during a REAL run. In
+    # dry-run it writes nothing (ship prints the would-be line); in every other non-DENIED case
+    # (fake/broken/absent interpreter, import-fail, unexpected verdict) it did NOT audit ->
+    # record fail-closed here.
+    case "$hverdict" in
+      DENIED) if [ "$DRY_RUN" = "1" ]; then _external_review_audit_log "external-review:bypass:denied" "$hreason"; fi ;;
+      *) _external_review_audit_log "external-review:bypass:denied" "$hreason" ;;
+    esac
+    exit 1
+  fi
+  { echo "Refusing: PR #$PR has ZERO GitHub-side reviews. Guard-B (review-cli's own automated pass) and 0 unresolved review threads do NOT prove a review ever happened — see PR #764 (HYP-1380), which merged this exact way."
+    echo "  Get a real review posted (a human, or a review bot like Codex) before shipping."
+    echo "  There is NO self-service override. To request a ONE-TIME bypass, set:"
+    echo "    RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW=\"<justification>\""
+    echo "  which asks Alex live on Telegram and proceeds ONLY on his real-time approval."
+    echo "  A SHIP_EXTERNAL_REVIEW=0 .ship-config line already MERGED to the base branch disables this gate entirely (ops off-switch; env SHIP_EXTERNAL_REVIEW=0 is ignored; a .ship-config committed only on THIS PR's own branch does not count)."; } >&2
+  _external_review_audit_log "external-review:refused" ""
+  exit 1
+}
+
 # BEGIN RIG MACHINE EXTERNAL REVIEW POLICY
 # Resolve the actual gh target (including --repo/GH_REPO), never assume CWD's owner.
 # This user-owned YAML policy is independent of the PR branch and only affects
 # this gate. All local/CI/review-quorum checks above remain in force.
 EXTREV_RIG_SOURCE=0
+# 1 = the target owner is in external_review_evidence_owners: a zero-review PR defers to the
+# evidence decision after the acceptance gate instead of hatching here.
+EXTREV_EVIDENCE_POLICY=0
+EXTREV_EVIDENCE_PENDING=0
 if [ "$EXTREV_ENABLED" = "1" ]; then
   if [ "${SHIP_PROVIDER_RESOLVED:-github}" = "forgejo" ]; then
     # The same trusted machine policy, checked against the Forgejo origin's own owner/repo.
@@ -3416,6 +3470,8 @@ if [ "$EXTREV_ENABLED" = "1" ]; then
   if [ "$EXTREV_RIG_DECISION" = "disabled" ]; then
     EXTREV_ENABLED=0
     EXTREV_RIG_SOURCE=1
+  elif [ "$EXTREV_RIG_DECISION" = "evidence" ]; then
+    EXTREV_EVIDENCE_POLICY=1
   fi
 fi
 # END RIG MACHINE EXTERNAL REVIEW POLICY
@@ -3455,38 +3511,13 @@ else
     if [ "$cap_flag" = "1" ]; then
       echo "[ship] external-review gate — PR #$PR has zero GitHub reviews, but review-cli confirms EVERY configured provider is exhausted right now (${cap_evidence:-see \`review capacity-check --json\`}) — auto-proceeding without a manual hatch prompt. Recorded to \$SHIP_AUDIT_FILE."
       _external_review_audit_log "external-review:auto-proceed:capacity-outage" "$cap_evidence"
-    elif [ -n "${RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW+x}" ]; then
-      hrc=0; hout=$(_external_review_hatch_check 2>/dev/null) || hrc=$?
-      hverdict="${hout%% *}"; hreason=""
-      case "$hout" in *" "*) hreason="${hout#* }" ;; esac
-      if [ "$hrc" = "0" ] && [ "$hverdict" = "APPROVED" ]; then
-        if [ "$DRY_RUN" = "1" ]; then
-          echo "[ship] external-review --dry-run: justification present — a REAL run would request live Telegram approval before merging with zero reviews. (${hreason})"
-        else
-          echo "[ship] external-review: a one-time Telegram hatch escalation was APPROVED by Alex — proceeding with zero GitHub reviews. (${hreason})"
-        fi
-      else
-        { echo "Refusing: external-review hatch escalation was requested but NOT approved: ${hreason:-no approval}."
-          echo "  Obtain live approval, or get an actual review posted on PR #$PR before shipping."; } >&2
-        # The helper logs its own bypass:denied only when it emitted DENIED during a REAL run. In
-        # dry-run it writes nothing (ship prints the would-be line); in every other non-DENIED case
-        # (fake/broken/absent interpreter, import-fail, unexpected verdict) it did NOT audit ->
-        # record fail-closed here.
-        case "$hverdict" in
-          DENIED) [ "$DRY_RUN" = "1" ] && _external_review_audit_log "external-review:bypass:denied" "$hreason" ;;
-          *) _external_review_audit_log "external-review:bypass:denied" "$hreason" ;;
-        esac
-        exit 1
-      fi
+    elif [ "$EXTREV_EVIDENCE_POLICY" = "1" ]; then
+      # Deferred, not waived: the acceptance verdict this policy needs is only known after the
+      # ticket gates below, so the decision (and any hatch fallback) runs right before the merge.
+      EXTREV_EVIDENCE_PENDING=1
+      echo "[ship] external-review gate — PR #$PR has zero GitHub reviews; Rig evidence policy for $EXTREV_RIG_TARGET defers the decision until after the acceptance gate (passes on green CI, review quorum met, acceptance proven, no unresolved threads or unaddressed comments; otherwise the hatch)."
     else
-      { echo "Refusing: PR #$PR has ZERO GitHub-side reviews. Guard-B (review-cli's own automated pass) and 0 unresolved review threads do NOT prove a review ever happened — see PR #764 (HYP-1380), which merged this exact way."
-        echo "  Get a real review posted (a human, or a review bot like Codex) before shipping."
-        echo "  There is NO self-service override. To request a ONE-TIME bypass, set:"
-        echo "    RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW=\"<justification>\""
-        echo "  which asks Alex live on Telegram and proceeds ONLY on his real-time approval."
-        echo "  A SHIP_EXTERNAL_REVIEW=0 .ship-config line already MERGED to the base branch disables this gate entirely (ops off-switch; env SHIP_EXTERNAL_REVIEW=0 is ignored; a .ship-config committed only on THIS PR's own branch does not count)."; } >&2
-      _external_review_audit_log "external-review:refused" ""
-      exit 1
+      _external_review_hatch_or_refuse
     fi
   fi
 fi
@@ -4122,6 +4153,69 @@ _acceptance_gate_looks_like_task_cli_json() {
   fi
 }
 _acceptance_gate
+
+# --- external-review evidence decision (Rig external_review_evidence_owners) ---------------
+# The owner's policy (agent-tools#879): for an owner listed in the trusted machine config's
+# `ci.items.ship.external_review_evidence_owners`, a PR with ZERO GitHub-side reviews ships
+# without the Telegram hatch when ALL of these already hold — and only then:
+#   • CI green (CI_EVIDENCE=green), or the --skip-ci path, whose own live-approval hatch still
+#     gates the admin merge below — a CI-outage / known-flake local fallback is NOT green;
+#   • the review-quorum gate authorized on review-cli's own counts (not its hatch);
+#   • the acceptance gate FULLY accepted the ticket — every criterion checked with a proof
+#     (not skipped, disabled, a post-merge opt-out, or an already-closed ticket);
+#   • zero unresolved review threads (re-read now, not the earlier count);
+#   • zero unaddressed PR conversation comments: a comment by anyone other than the PR author
+#     that is neither hidden on GitHub nor followed by a later comment from the PR author.
+# Any miss names itself and falls back to the unchanged hatch-or-refuse path. Runs after the
+# ticket gates, right before the merge, so the hatch still interrupts Alex only when a merge is
+# otherwise imminent (same ordering rationale as the gate's own comment above).
+# `gh pr view --json comments` returns every comment (gh paginates the connection itself; checked
+# against a 908-comment PR). Fail closed on incomplete data: no PR author is a read error, and a
+# comment without a timestamp can never be answered by a later reply.
+_external_review_unaddressed_comments() {  # prints the count; non-zero rc on a failed read
+  gh pr view "$PR" --json author,comments -q '
+    (.author.login // "") as $me
+    | if $me == "" then error("PR author unknown") else . end
+    | (.comments // []) as $all
+    | [$all[] | . as $c
+       | select((.author.login // "") != $me)
+       | select((.isMinimized // false) | not)
+       | select($c.createdAt == null
+           or ([$all[] | select((.author.login // "") == $me and .createdAt != null and .createdAt > $c.createdAt)] | length == 0))
+      ] | length' 2>/dev/null
+}
+_external_review_evidence_gate() {
+  [ "$EXTREV_EVIDENCE_PENDING" = "1" ] || return 0
+  local missing=() raw threads comments
+  case "$CI_EVIDENCE" in
+    green|skip-ci) : ;;
+    *) missing+=("CI is not green (no checks, a CI-outage or known-flake local fallback is not green CI)") ;;
+  esac
+  [ "$QUORUM_EVIDENCE" = "met" ] || missing+=("the review quorum was not met on review-cli's own counts")
+  [ "$ACCEPTANCE_GATE_FULLY_ACCEPTED" = "1" ] || missing+=("acceptance is not fully proven (the acceptance gate was skipped or disabled, passed on a post-merge opt-out, or the ticket is already closed)")
+  if raw=$(gh api graphql --paginate -F owner='{owner}' -F name='{repo}' -F pr="$PR" -f query="$THREAD_Q" \
+       --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length' 2>/dev/null); then
+    threads=$(printf '%s' "$raw" | awk '{s+=$1} END{print s+0}')
+    [ "$threads" = "0" ] || missing+=("${threads} unresolved review thread(s)")
+  else
+    missing+=("could not read the review threads")
+  fi
+  comments=$(_external_review_unaddressed_comments) || comments=""
+  case "$comments" in
+    0) : ;;
+    ''|*[!0-9]*) missing+=("could not read the PR comments") ;;
+    *) missing+=("${comments} unaddressed PR comment(s) — reply as the PR author or hide them as resolved") ;;
+  esac
+  if [ "${#missing[@]}" = "0" ]; then
+    echo "[ship] external-review gate PASSED on evidence (Rig policy for $EXTREV_RIG_TARGET): PR #$PR has zero GitHub reviews, but CI is ${CI_EVIDENCE}, the review quorum is met for ${TASK_CODE:-the ticket}, acceptance is proven for ${ACCEPTANCE_GATE_CODE}, and there are no unresolved threads or unaddressed comments."
+    _external_review_audit_log "external-review:authorized:evidence" "ci=${CI_EVIDENCE} quorum=${TASK_CODE:-} acceptance=${ACCEPTANCE_GATE_CODE}"
+    return 0
+  fi
+  { echo "[ship] external-review gate: Rig evidence policy for $EXTREV_RIG_TARGET NOT satisfied for PR #$PR (zero GitHub reviews):"
+    printf '    - %s\n' "${missing[@]}"; } >&2
+  _external_review_hatch_or_refuse
+}
+_external_review_evidence_gate
 
 # --- Forgejo final preflight -------------------------------------------------------------
 # Some call sites above tolerate a failed gh (`|| true`, `2>/dev/null`, a fallback value), so

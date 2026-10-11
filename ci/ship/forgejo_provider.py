@@ -554,7 +554,10 @@ def _raw_reviews(pr: PullRequest) -> list:
 
 def _pr_comments(pr: PullRequest) -> list:
     comments = pr.api.paged(pr.api.repo_path(f"/issues/{pr.number}/comments"))
-    return [{"author": {"login": ((c.get("user") or {}).get("login") or "")}, "body": c.get("body") or ""}
+    # createdAt orders an author's reply after a comment (the external-review evidence policy);
+    # Forgejo has no "hide comment", so isMinimized is absent and reads as false.
+    return [{"author": {"login": ((c.get("user") or {}).get("login") or "")}, "body": c.get("body") or "",
+             "createdAt": c.get("created_at")}
             for c in comments if isinstance(c, dict)]
 
 
@@ -591,6 +594,7 @@ FIELD_BUILDERS = {
     "body": lambda pr: pr.raw.get("body") or "",
     "url": lambda pr: pr.raw.get("html_url") or "",
     "number": lambda pr: pr.number,
+    "author": lambda pr: {"login": ((pr.raw.get("user") or {}).get("login") or "")},
     "createdAt": lambda pr: pr.raw.get("created_at"),
     "reviews": _pr_reviews,
     "comments": _pr_comments,

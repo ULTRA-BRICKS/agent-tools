@@ -240,3 +240,51 @@ def test_ship_block_passes_the_rejection_reason_through(config_path, tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == '1'
     assert 'not applied (unsafe_config' in result.stderr
+
+
+def write_evidence(path, evidence_owners, **ship):
+    ship['external_review_evidence_owners'] = evidence_owners
+    path.write_text(json.dumps({'ci': {'items': {'ship': ship}}}))
+    path.chmod(0o600)
+
+
+@pytest.mark.parametrize('repo', ['o-maan/psyfroggybot', 'O-MAAN/other'])
+def test_evidence_owner_gets_the_evidence_decision_not_a_disable(policy, config_path, tmp_path, repo):
+    write_evidence(config_path, ['o-maan'])
+    decision = policy.resolve(config_path, repo, tmp_path / 'checkout')
+    assert (decision['required'], decision['evidence'], decision['reason']) == (True, True, 'evidence_owner_policy')
+
+
+def test_evidence_policy_is_scoped_to_listed_owners(policy, config_path, tmp_path):
+    write_evidence(config_path, ['o-maan'])
+    decision = policy.resolve(config_path, 'someone-else/project', tmp_path / 'checkout')
+    assert (decision['required'], decision['evidence']) == (True, False)
+
+
+def test_full_disable_wins_over_evidence_for_an_owner_in_both(policy, config_path, tmp_path):
+    write_evidence(config_path, ['alex-mextner'], require_external_review=False, external_review_owners=['alex-mextner'])
+    decision = policy.resolve(config_path, 'alex-mextner/project', tmp_path / 'checkout')
+    assert (decision['required'], decision['evidence']) == (False, False)
+
+
+@pytest.mark.parametrize('owners', ['o-maan', ['*'], [7], ['o-maan/psyfroggybot'], None])
+def test_malformed_evidence_list_fails_closed_for_every_owner(policy, config_path, tmp_path, owners):
+    write_evidence(config_path, owners, require_external_review=False, external_review_owners=['alex-mextner'])
+    for repo in ('o-maan/psyfroggybot', 'alex-mextner/project'):
+        decision = policy.resolve(config_path, repo, tmp_path / 'checkout')
+        assert (decision['required'], decision['evidence']) == (True, False), (repo, decision)
+
+
+def test_cli_prints_evidence_and_ship_block_sets_the_evidence_flag(config_path, tmp_path):
+    write_evidence(config_path, ['o-maan'])
+    env = dict(os.environ, XDG_CONFIG_HOME=str(config_path.parent.parent))
+    result = subprocess.run([sys.executable, '-I', str(MODULE), 'o-maan/psyfroggybot', str(tmp_path / 'checkout')], capture_output=True, text=True, env=env)
+    assert (result.stdout.strip(), result.stderr) == ('evidence', '')
+    source = MODULE.with_name('ship.sh').read_text()
+    block = source.split('# BEGIN RIG MACHINE EXTERNAL REVIEW POLICY', 1)[1].split('# END RIG MACHINE EXTERNAL REVIEW POLICY', 1)[0]
+    env.update(ROOT=str(tmp_path / 'checkout'), _SHIP_SELF_DIR=str(MODULE.parent))
+    for target, expected in [('o-maan/psyfroggybot', '1:0:1'), ('foreign/project', '1:0:0')]:
+        script = 'set -eu\nEXTREV_ENABLED=1\ngh() { printf "%s" "$ACTUAL_TARGET"; }\n' + block + '\nprintf "%s:%s:%s" "$EXTREV_ENABLED" "$EXTREV_RIG_SOURCE" "$EXTREV_EVIDENCE_POLICY"'
+        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, env=dict(env, ACTUAL_TARGET=target))
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == expected

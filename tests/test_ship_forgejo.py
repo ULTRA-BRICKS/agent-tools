@@ -55,7 +55,7 @@ class FakeForgejo:
         self.requests: list[dict] = []
         self.state: dict = {
             "version_status": 200, "pr": {}, "main_sha": "", "statuses": {}, "reviews": [],
-            "review_comments": {}, "timeline": [], "files": ["docs/x.md"], "commits": [],
+            "review_comments": {}, "issue_comments": [], "timeline": [], "files": ["docs/x.md"], "commits": [],
             "branch_protection": {"enable_status_check": False, "status_check_contexts": []},
             "merge_head_override": None, "redirect_to": None,
             "branches": {}, "open_prs": [], "closed_prs": [], "delete_status": None, "pull_refs": {},
@@ -177,7 +177,7 @@ class FakeForgejo:
         if m:
             return 200, s["review_comments"].get(int(m.group(1)), []), "application/json"
         if sub == "/issues/1/comments":
-            return (201, {}, "application/json") if method == "POST" else listing([])
+            return (201, {}, "application/json") if method == "POST" else listing(s["issue_comments"])
         if sub == "/issues/1/timeline":
             return listing(s["timeline"])
         if sub == "/pulls/1/commits":
@@ -546,6 +546,31 @@ def test_reviews_exclude_pending_and_review_requests(api_fake, tmp_path):
     api_fake.state["reviews"].append({"id": 3, "state": "COMMENT", "user": {"login": "c"}, "dismissed": True})
     reviews = fp.pr_json(_ctx_for(api_fake, tmp_path).pr(1), ["reviews"])["reviews"]
     assert [r["state"] for r in reviews] == ["DISMISSED"]
+
+
+def test_unaddressed_comment_filter_reads_the_forgejo_shape(api_fake, tmp_path):
+    """ship's external-review evidence filter (agent-tools#879), run with the real jq over what the
+    adapter returns for `--json author,comments`: Forgejo has no hidden comments, so only an
+    author reply after a comment addresses it."""
+    import shutil
+    if not shutil.which("jq"):
+        pytest.skip("jq required")
+    _seed(api_fake)
+    api_fake.state["pr"]["user"] = {"login": "me"}
+    api_fake.state["issue_comments"] = [
+        {"user": {"login": "rev"}, "body": "a", "created_at": "2026-10-01T00:00:00Z"},
+        {"user": {"login": "me"}, "body": "done", "created_at": "2026-10-01T01:00:00Z"},
+        {"user": {"login": "rev"}, "body": "b", "created_at": "2026-10-02T00:00:00Z"},
+    ]
+    data = fp.pr_json(_ctx_for(api_fake, tmp_path).pr(1), ["author", "comments"])
+    assert data["author"] == {"login": "me"}
+    assert [c["createdAt"] for c in data["comments"]] == ["2026-10-01T00:00:00Z", "2026-10-01T01:00:00Z", "2026-10-02T00:00:00Z"]
+    source = SHIP.read_text(encoding="utf-8")
+    body = source.split("_external_review_unaddressed_comments() {", 1)[1]
+    query = re.search(r"--json author,comments -q '([^']+)'", body).group(1)
+    run = subprocess.run(["jq", "-r", query], input=json.dumps(data), capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip() == "1"  # only the second `rev` comment is unanswered
 
 
 THREAD_Q = ("query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name)"
