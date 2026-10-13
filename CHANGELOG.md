@@ -4,6 +4,10 @@
 
 ### Added
 
+- `gh ship --subject <text> --body <text> --author-email <email>`: set the merge commit's
+  message and author instead of the provider default (a GitHub squash otherwise joins every
+  commit message of the PR). Forgejo takes subject/body and refuses `--author-email`.
+
 - `gh ship`: the machine-only Rig policy key `ci.items.ship.external_review_evidence_owners`
   (agent-tools#879). For a listed owner, a PR with zero GitHub-side reviews passes the
   external-review gate without the Telegram hatch when CI is green (or the hatch-gated

@@ -2567,7 +2567,7 @@ def _fake_gh_empty_rollup_dir(tmp_path: Path) -> Path:
     return bindir
 
 
-def _run_ship_cidown(main: Path, bindir: Path, env_extra: dict | None = None):
+def _run_ship_cidown(main: Path, bindir: Path, env_extra: dict | None = None, extra_args: tuple[str, ...] = ()):
     """Run ship.sh without --skip-ci (CI gate fires) but with --no-screenshot-ok."""
     env = dict(os.environ)
     # Deterministic target inference: clear any ambient GH_REPO/GH_SHIP_REPO the dev/CI shell
@@ -2627,7 +2627,7 @@ def _run_ship_cidown(main: Path, bindir: Path, env_extra: dict | None = None):
         del env["SHIP_TEST_DIFF"]
         env["SHIP_TEST_DIFF_FILE"] = str(diff_file)
     return _sh(
-        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test", *extra_args,
         cwd=main, env=env,
     )
 
@@ -2799,6 +2799,33 @@ def test_empty_rollup_ci_outage_local_gate_passes_merges(repo_with_pr_worktree, 
     assert logged_merge.strip(), f"fake gh recorded no merge call:\n{r.stdout}"
     assert "--admin" not in logged_merge, f"outage merge must NOT pass --admin:\n{logged_merge}"
     assert "merged #1" in r.stdout, r.stdout
+
+
+def test_merge_message_flags_reach_gh_pr_merge(repo_with_pr_worktree, tmp_path):
+    """--subject/--body/--author-email reach `gh pr merge` verbatim, so a squash can carry a
+    chosen message instead of every commit message; a body may start with "-"."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "pull_request")
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+    merge_log = tmp_path / "merge-args.log"
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_MERGE_LOG": str(merge_log),
+    }, ("--subject", "fix: clean subject", "--body", "- clean body", "--author-email", "a@users.noreply.github.com"))
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    logged = merge_log.read_text(encoding="utf-8")
+    assert ("--squash --subject fix: clean subject --body - clean body "
+            "--author-email a@users.noreply.github.com") in logged, logged
+
+
+def test_merge_message_flag_without_value_refuses(repo_with_pr_worktree, tmp_path):
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+    r = _run_ship_cidown(main, bindir, extra_args=("--subject",))
+    assert r.returncode != 0
+    assert "--subject needs a non-empty value" in r.stderr, r.stderr
 
 
 def test_empty_rollup_ci_outage_local_gate_fails_refuses(repo_with_pr_worktree, tmp_path):

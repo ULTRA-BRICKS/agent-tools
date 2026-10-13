@@ -44,6 +44,7 @@
 #   ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run]
 #           [--no-screenshot-ok <reason>] [--resolve-addressed-threads]
 #           [--screenshot <path> [desc]]...
+#           [--subject <text>] [--body <text>] [--author-email <email>]
 #
 # Flags:
 #   --repo <owner/repo>    ship a PR that lives in a DIFFERENT repo than the current checkout:
@@ -59,6 +60,10 @@
 #                          WITHOUT --skip-ci: the normal path auto-detects the outage, runs the
 #                          local fallback gate, and does a normal (non-admin) merge.
 #   --dry-run              print what would happen; change nothing.
+#   --subject T / --body T the merge commit's subject / body, instead of the provider's default
+#                          (on GitHub a squash defaults to every commit message, which can carry
+#                          text the base branch should not get). Passed to `gh pr merge`.
+#   --author-email E       the merge commit's author email (GitHub only; Forgejo refuses it).
 #   --no-screenshot-ok R   override the UI screenshot requirement with a logged reason R.
 #   --no-version-bump-ok R override the version-bump requirement with a logged reason R
 #                          (genuine no-release ship: docs-only, pure test/CI, a revert).
@@ -336,6 +341,8 @@ TASK_CONFIG=""; TASK_CONFIG_ARGS=()
 SHOT_PATHS=(); SHOT_DESCS=()
 # --known-flake NAME, repeatable — see the "known-flake gate" block below _ci_github_status_indicator.
 KNOWN_FLAKES=()
+# --subject/--body/--author-email: passed to `gh pr merge` to set the merge commit's message/author.
+MERGE_MESSAGE_ARGS=(); MERGE_AUTHOR_EMAIL_SET=0
 # Set by the known-flake gate once its local test pass succeeds; consumed at the merge section
 # below to log the "confirmed" audit line only once `gh pr merge` has actually succeeded — see
 # that gate's own comment for why the audit must wait for the true terminal event.
@@ -352,7 +359,7 @@ QUORUM_EVIDENCE=""   # "met": the review-quorum gate authorized on review-cli's 
 # current thread is never touched (see the gate below).
 RESOLVE_THREADS=0
 case "${SHIP_RESOLVE_ADDRESSED_THREADS:-}" in 1|true|yes) RESOLVE_THREADS=1 ;; esac
-USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--rewrite-magic-close] [--screenshot <path> [desc]]... [--known-flake <check-name>]... [--task-config <path>]'
+USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--rewrite-magic-close] [--screenshot <path> [desc]]... [--known-flake <check-name>]... [--task-config <path>] [--subject <text>] [--body <text>] [--author-email <email>]'
 
 # Path to the review-quorum gate's hatch-escalation helper (ci/ship/review_quorum_hatch.py),
 # derived ONLY from this script's own location. That helper imports the shared
@@ -400,6 +407,10 @@ while [ "$i" -lt "$n" ]; do
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--known-flake needs a <check-name>." >&2; exit 1; }
       [ -n "${args[$i]}" ] || { echo "--known-flake check-name empty." >&2; exit 1; }
       KNOWN_FLAKES+=("${args[$i]}") ;;
+    # The value is taken verbatim, even when it starts with "-" (a body may open with a list item).
+    --subject|--body|--author-email)
+      i=$((i+1)); { [ "$i" -lt "$n" ] && [ -n "${args[$i]}" ]; } || { echo "$a needs a non-empty value." >&2; exit 1; }
+      MERGE_MESSAGE_ARGS+=("$a" "${args[$i]}"); [ "$a" = "--author-email" ] && MERGE_AUTHOR_EMAIL_SET=1 ;;
     --screenshot|--shot)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "$a needs a <path>." >&2; exit 1; }
       p=$(_caller_path "${args[$i]}")
@@ -683,6 +694,9 @@ if _ship_provider_wants_forgejo_probe; then
   if [ -n "$REPO_FLAG" ] || [ -n "${GH_SHIP_REPO:-}" ] || [ -n "${GH_REPO:-}" ]; then
     echo "Refusing: --repo / GH_SHIP_REPO / GH_REPO are GitHub-only; for a Forgejo PR run ship from that repository's checkout." >&2
     exit 1
+  fi
+  if [ "$MERGE_AUTHOR_EMAIL_SET" = "1" ]; then
+    echo "Refusing: --author-email is GitHub-only; the Forgejo merge API takes no author." >&2; exit 1
   fi
   SHIP_PROVIDER_RESOLVED=forgejo
   _ship_forgejo_init_state
@@ -4249,11 +4263,11 @@ if [ "$SKIP_CI" = "1" ]; then
   _skip_ci_hatch_gate
   _ship_forgejo_final_preflight
   echo "[ship] --skip-ci: admin-merging PR #${PR} (${BRANCH}) --${MERGE_METHOD} --admin ..."
-  run gh pr merge "$PR" "--$MERGE_METHOD" --admin
+  run gh pr merge "$PR" "--$MERGE_METHOD" --admin ${MERGE_MESSAGE_ARGS[@]+"${MERGE_MESSAGE_ARGS[@]}"}
 else
   _ship_forgejo_final_preflight
   echo "[ship] preflight clean — merging PR #${PR} (${BRANCH}) --${MERGE_METHOD} ..."
-  run gh pr merge "$PR" "--$MERGE_METHOD"
+  run gh pr merge "$PR" "--$MERGE_METHOD" ${MERGE_MESSAGE_ARGS[@]+"${MERGE_MESSAGE_ARGS[@]}"}
 fi
 # `run gh pr merge` above runs under `set -e` — a merge failure would have already aborted the
 # script, so reaching here means the merge (or its --dry-run stand-in) succeeded. ONLY now is it

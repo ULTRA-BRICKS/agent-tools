@@ -224,6 +224,12 @@ stays enabled). Role coverage is the predicate; `distinct_models_passed` is tele
   table row above); an unverifiable assertion is refused, same as not passing the flag. On
   success, runs the local fallback gate and merges only if it's green too. Logged to
   `SHIP_AUDIT_FILE`.
+- `--subject <text>` / `--body <text>` / `--author-email <email>` — the merge commit's subject,
+  body and author email, passed verbatim to `gh pr merge`. Without them a GitHub squash takes the
+  repository's default message, which can join every commit message of the PR — use them when
+  those messages must not reach the base branch. A value may start with `-`. The Forgejo provider
+  sends subject/body as the merge title/message and refuses `--author-email` (its merge API takes
+  no author) before any gate runs.
 
 The **review-quorum gate (Guard-B) has no override flag** by design — a bypass goes through live
 Telegram approval to Alex via `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"` (see the env

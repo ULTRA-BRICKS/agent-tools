@@ -703,7 +703,7 @@ def _require_write_credential(api: Api, action: str) -> None:
 _MERGE_DO = {"--squash": "squash", "--merge": "merge", "--rebase": "rebase"}
 
 
-def merge_pr(pr: PullRequest, method_flag: str, admin: bool) -> str:
+def merge_pr(pr: PullRequest, method_flag: str, admin: bool, subject: str | None = None, body: str | None = None) -> str:
     """POST /pulls/{index}/merge with head_commit_id = the pinned head (server-side race check)."""
     api = pr.api
     _require_write_credential(api, "merging")
@@ -711,6 +711,10 @@ def merge_pr(pr: PullRequest, method_flag: str, admin: bool) -> str:
     if do is None:
         raise ProviderError(f"merge method {method_flag!r} is unsupported (use --squash, --merge or --rebase)")
     payload = {"Do": do, "head_commit_id": pr.pinned_sha, "delete_branch_after_merge": False}
+    if subject is not None:
+        payload["MergeTitleField"] = subject
+    if body is not None:
+        payload["MergeMessageField"] = body
     if admin:
         payload["force_merge"] = True  # the --skip-ci admin path; already hatch-approved by ship.sh
     status, body = api.request("POST", api.repo_path(f"/pulls/{pr.number}/merge"), payload, "application/json")
@@ -1054,11 +1058,16 @@ def gh_pr(ctx: Context, action: str, rest: list[str]) -> str:
         pos, o, _fields = _take_opts(rest, set(), {"--name-only"})
         return diff_pr(ctx.pr(_pr_number(pos)), bool(o.get("--name-only")))
     if action == "merge":
-        pos, o, _fields = _take_opts(rest, set(), {"--squash", "--merge", "--rebase", "--admin"})
+        pos, o, _fields = _take_opts(rest, {"--subject", "--body", "--author-email"},
+                                     {"--squash", "--merge", "--rebase", "--admin"})
         methods = [m for m in _MERGE_DO if o.get(m)]
         if len(methods) != 1:
             raise ProviderError("`gh pr merge` needs exactly one of --squash/--merge/--rebase")
-        sha = merge_pr(ctx.pr(_pr_number(pos)), methods[0], bool(o.get("--admin")))
+        if "--author-email" in o:
+            raise ProviderError("`gh pr merge --author-email` is unsupported on the Forgejo provider "
+                                "(the merge API takes no author)")
+        sha = merge_pr(ctx.pr(_pr_number(pos)), methods[0], bool(o.get("--admin")),
+                       o.get("--subject"), o.get("--body"))
         return f"[forgejo] merged PR #{pos[0]} (merge commit {sha[:12]})\n"
     if action == "comment":
         pos, o, _fields = _take_opts(rest, {"--body", "-b"}, set())

@@ -610,6 +610,22 @@ def test_merge_sends_head_commit_id_and_audits(api_fake, tmp_path):
     assert audit[-1]["provider"] == "forgejo" and audit[-1]["head"] == head
 
 
+def test_merge_passes_subject_and_body_as_the_merge_message(api_fake, tmp_path):
+    head = _seed(api_fake)
+    fp.run_gh(_ctx_for(api_fake, tmp_path),
+              ["pr", "merge", "1", "--squash", "--subject", "fix: clean subject", "--body", "- clean body"])
+    (m,) = api_fake.merges()
+    assert m["body"] == {"Do": "squash", "head_commit_id": head, "delete_branch_after_merge": False,
+                         "MergeTitleField": "fix: clean subject", "MergeMessageField": "- clean body"}
+
+
+def test_merge_refuses_an_author_email(api_fake, tmp_path):
+    _seed(api_fake)
+    with pytest.raises(fp.ProviderError, match="author-email"):
+        fp.run_gh(_ctx_for(api_fake, tmp_path), ["pr", "merge", "1", "--squash", "--author-email", "a@b.c"])
+    assert api_fake.merges() == []
+
+
 def test_merge_without_credential_or_with_raced_head_fails(api_fake, tmp_path, monkeypatch):
     _seed(api_fake)
     monkeypatch.setenv("SHIP_FORGEJO_KEYS_FILE", str(tmp_path / "missing.json"))
