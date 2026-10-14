@@ -405,6 +405,34 @@ def test_real_justification_unexpected_exit_denies(tmp_path):
     assert "denied" in result.reason
 
 
+def test_tg_ctl_timeout_closes_its_pipe_streams(monkeypatch):
+    launched = []
+    popen = subprocess.Popen
+
+    def record_process(*args, **kwargs):
+        proc = popen(*args, **kwargs)
+        launched.append(proc)
+        return proc
+
+    monkeypatch.setattr(agenttools_hatch_escalation.subprocess, "Popen", record_process)
+    outcome = agenttools_hatch_escalation._run_tg_ctl_ask(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        "{}",
+        0.05,
+        requested_timeout=0.05,
+    )
+    assert isinstance(outcome, str) and "timed out" in outcome
+    assert len(launched) == 1
+    proc = launched[0]
+    assert proc.poll() is not None
+    try:
+        assert all(stream is not None and stream.closed for stream in (proc.stdin, proc.stdout, proc.stderr))
+    finally:
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+
+
 def test_real_justification_timeout_denies(tmp_path):
     tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", "sleep 5\nexit 0\n")
     repo = _repo_with_tg_ctl(tmp_path)

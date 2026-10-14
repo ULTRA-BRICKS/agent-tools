@@ -11,6 +11,7 @@ reached on the Forgejo path. No real PR is ever touched.
 from __future__ import annotations
 
 import importlib.util
+import base64
 import json
 import os
 import re
@@ -57,7 +58,10 @@ class FakeForgejo:
             "version_status": 200, "pr": {}, "main_sha": "", "statuses": {}, "reviews": [],
             "review_comments": {}, "issue_comments": [], "timeline": [], "files": ["docs/x.md"], "commits": [],
             "branch_protection": {"enable_status_check": False, "status_check_contexts": []},
-            "merge_head_override": None, "redirect_to": None,
+            "merge_head_override": None, "redirect_to": None, "pr_get_status_after_merge": None,
+            "runs": [], "run_jobs": {},
+            "workflow_dirs": [".github/workflows"],
+            "workflow_contents": {".github/workflows/tests.yml": "name: tests\non: [push, pull_request]\n"},
             "branches": {}, "open_prs": [], "closed_prs": [], "delete_status": None, "pull_refs": {},
             "branch_listing": None, "branch_get_status": {},
         }
@@ -111,7 +115,6 @@ class FakeForgejo:
 
             def do_DELETE(self):
                 self._dispatch("DELETE")
-
         return H
 
     def route(self, method, path, query, body):  # noqa: C901 - flat routing table
@@ -129,10 +132,21 @@ class FakeForgejo:
             return 404, {"message": "not found"}, "application/json"
         sub = path[len(p):]
 
+        if sub.startswith("/contents/") and method == "GET":
+            item = sub[len("/contents/"):]
+            if item in s["workflow_dirs"]:
+                return 200, [{"type": "file", "path": f} for f in s["workflow_contents"] if f.startswith(item + "/")], "application/json"
+            if item in s["workflow_contents"]:
+                return 200, {"type": "file", "path": item, "encoding": "base64",
+                             "content": base64.b64encode(s["workflow_contents"][item].encode()).decode()}, "application/json"
+            return 404, {"message": "not found"}, "application/json"
+
         def listing(items):
             return 200, (items if page == 1 else []), "application/json"
 
         if sub == "/pulls/1" and method == "GET":
+            if s["pr"].get("merged") and s["pr_get_status_after_merge"]:
+                return s["pr_get_status_after_merge"], {"message": "bad gateway"}, "application/json"
             return 200, self._live(s["pr"]), "application/json"
         if sub == "/pulls/1" and method == "PATCH":
             s["pr"].update(body)
@@ -184,6 +198,21 @@ class FakeForgejo:
             return listing(s["commits"])
         if sub == "/pulls/1/files":
             return listing([{"filename": f} for f in s["files"]])
+        if sub == "/actions/runs" and method == "GET":
+            runs = s["runs"]
+            if "head_sha" in query:
+                runs = [r for r in runs if r.get("commit_sha", query["head_sha"][0]) == query["head_sha"][0]]
+            if "run_number" in query:
+                runs = [r for r in runs if r.get("index_in_repo") == int(query["run_number"][0])]
+            runs = sorted(runs, key=lambda r: -r["id"])
+            return 200, {"total_count": len(runs), "workflow_runs": runs}, "application/json"
+        m = re.fullmatch(r"/actions/runs/(\d+)", sub)
+        if m:
+            run = next((r for r in s["runs"] if r["id"] == int(m.group(1))), None)
+            return (200, run, "application/json") if run else (404, {"message": "no run"}, "application/json")
+        m = re.fullmatch(r"/actions/runs/(\d+)/jobs", sub)
+        if m:
+            return 200, s["run_jobs"].get(int(m.group(1)), []), "application/json"
         if sub == "/pulls/1.diff":
             return 200, b"diff --git a/docs/x.md b/docs/x.md\n+hello\n", "text/plain"
         return 404, {"message": f"no route {method} {sub}"}, "application/json"
@@ -203,7 +232,6 @@ class FakeForgejo:
         if not pr.get("merged") or branch is None:
             return pr
         return {**pr, "head": {**pr["head"], "sha": branch["commit"]["id"]}}
-
     def merges(self):
         return [r for r in self.requests if r["method"] == "POST" and r["path"].endswith("/pulls/1/merge")]
 
@@ -272,8 +300,6 @@ def _seed_green(fake: FakeForgejo, head: str, main_sha: str) -> None:
 
 def _branch(name, sha, protected=False):
     return {"name": name, "commit": {"id": sha}, "protected": protected}
-
-
 @pytest.fixture
 def forge(tmp_path):
     bare = tmp_path / "origin.git"
@@ -469,8 +495,6 @@ def test_fj_key_store_location_per_platform(tmp_path, monkeypatch, platform, par
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
     assert fp._fj_keys_path().parts[-len(parts):] == parts
-
-
 def test_redirect_is_refused_and_credential_never_leaves_the_origin():
     target = FakeForgejo()
     source = FakeForgejo()
@@ -571,8 +595,6 @@ def test_unaddressed_comment_filter_reads_the_forgejo_shape(api_fake, tmp_path):
     run = subprocess.run(["jq", "-r", query], input=json.dumps(data), capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
     assert run.stdout.strip() == "1"  # only the second `rev` comment is unanswered
-
-
 THREAD_Q = ("query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name)"
             "{pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} "
             "nodes{isResolved}}}}}")
@@ -610,6 +632,19 @@ def test_merge_sends_head_commit_id_and_audits(api_fake, tmp_path):
     assert audit[-1]["provider"] == "forgejo" and audit[-1]["head"] == head
 
 
+def test_merge_is_audited_even_when_the_confirmation_read_fails(api_fake, tmp_path):
+    """The merge already happened server-side once the POST answers 200: the audit line must be
+    written before the confirmation read, and a failed read still refuses (never claims merged)."""
+    head = _seed(api_fake)
+    api_fake.state["pr_get_status_after_merge"] = 502
+    with pytest.raises(fp.ProviderError, match="502"):
+        fp.run_gh(_ctx_for(api_fake, tmp_path), ["pr", "merge", "1", "--squash"])
+    assert len(api_fake.merges()) == 1
+    audit = [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    assert audit[-1]["gate"] == "merge" and audit[-1]["head"] == head
+    assert audit[-1]["decision"] == "merged:unconfirmed" and audit[-1]["merge_commit"] == ""
+
+
 def test_merge_passes_subject_and_body_as_the_merge_message(api_fake, tmp_path):
     head = _seed(api_fake)
     fp.run_gh(_ctx_for(api_fake, tmp_path),
@@ -638,6 +673,282 @@ def test_merge_without_credential_or_with_raced_head_fails(api_fake, tmp_path, m
         fp.run_gh(_ctx_for(api_fake, tmp_path), ["pr", "merge", "1", "--squash"])
 
 
+# --- read-only Actions evidence for --known-flake -------------------------------------------
+# Identity of a check = (server workflow_id, job name). The status context's " (<event>)" suffix
+# is not identity; the base evidence must come from the EXACT base branch head.
+
+_CAND_CTX = "tests / pytest (pull_request)"
+
+
+def _run(rid, number, sha, status, workflow="tests.yml", event="push", **extra):
+    return {"id": rid, "index_in_repo": number, "commit_sha": sha, "status": status,
+            "workflow_id": workflow, "event": event, "trigger_event": event, **extra}
+
+
+def _job(jid, rid, name, status, attempt=1, **extra):
+    return {"id": jid, "run_id": rid, "name": name, "status": status, "attempt": attempt, **extra}
+
+
+def _seed_flake(fake, *, base_status="failure", base_workflow="tests.yml", base_job="pytest",
+                cand_job="pytest", cand_workflow="tests.yml"):
+    """Candidate head H fails `tests / pytest (pull_request)` (run #7); base head B has run #5."""
+    head = _seed(fake)
+    fake.state["workflow_contents"].setdefault(f".github/workflows/{cand_workflow}", "name: tests\n")
+    base = fake.state["main_sha"]
+    fake.state["statuses"][head] = [{
+        "context": _CAND_CTX, "status": "failure", "target_url": "/o/r/actions/runs/7/jobs/0",
+        "created_at": "2020-01-02T00:00:00Z", "updated_at": "2020-01-02T00:00:00Z"}]
+    fake.state["runs"] = [
+        _run(70, 7, head, "failure", workflow=cand_workflow, event="pull_request"),
+        _run(50, 5, base, base_status, workflow=base_workflow, unknown_future_field={"x": 1}),
+    ]
+    fake.state["run_jobs"] = {
+        70: [_job(700, 70, cand_job, "failure")],
+        50: [_job(500, 50, base_job, base_status, extra_field="ignored")],
+    }
+    return head, base
+
+
+def _run_list(ctx, *extra):
+    out = fp.run_gh(ctx, ["run", "list", "--branch", "main", *extra, "--status", "completed",
+                          "--limit", "5", "--json", "databaseId,conclusion"])
+    return json.loads(out)
+
+
+def _run_view_jobs(ctx, rid):
+    return json.loads(fp.run_gh(ctx, ["run", "view", str(rid), "--json", "jobs", "-q", ".jobs"]))
+
+
+def test_known_flake_evidence_matches_same_workflow_and_job_on_the_base_head(api_fake, tmp_path):
+    _seed_flake(api_fake)
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)  # ship pins the candidate head before the known-flake gate runs
+    assert _run_list(ctx) == [{"databaseId": 50, "conclusion": "failure"}]
+    jobs = _run_view_jobs(ctx, 50)
+    assert [(j["name"], j["conclusion"]) for j in jobs] == [(_CAND_CTX, "failure")]
+    assert jobs[0]["workflowId"] == "tests.yml" and jobs[0]["job"] == "pytest"  # receipt
+    assert all(r["method"] == "GET" for r in api_fake.requests)  # read-only
+
+
+def test_known_flake_forged_context_cannot_relabel_an_unrelated_actions_job(api_fake, tmp_path):
+    _seed_flake(api_fake, cand_job="lint", base_job="lint")
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_view_jobs(ctx, 50) == []
+
+
+def test_known_flake_forged_failure_cannot_claim_a_successful_candidate_job(api_fake, tmp_path):
+    _seed_flake(api_fake)
+    api_fake.state["run_jobs"][70][0]["status"] = "success"
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_view_jobs(ctx, 50) == []
+
+
+@pytest.mark.parametrize("unsupported", ["dynamic-name", "empty-first-directory", "target-workflow"])
+def test_known_flake_unsupported_actions_context_derivation_refuses(api_fake, tmp_path, unsupported):
+    _seed_flake(api_fake)
+    if unsupported == "dynamic-name":
+        api_fake.state["workflow_contents"][".github/workflows/tests.yml"] = "name: ${{ github.ref }}\n"
+    elif unsupported == "empty-first-directory":
+        api_fake.state["workflow_dirs"].insert(0, ".forgejo/workflows")
+    else:
+        api_fake.state["runs"][0]["trigger_event"] = "pull_request_target"
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    with pytest.raises(fp.ProviderError, match="workflow|context"):
+        _run_view_jobs(ctx, 50)
+
+
+@pytest.mark.parametrize("over", [
+    {"base_workflow": "other.yml"},  # same job name, different workflow file: no identity match
+    {"base_job": "lint"},  # same workflow, different job
+    {"cand_workflow": "nightly.yml"},  # the candidate's context comes from another workflow
+], ids=["other-workflow", "other-job", "candidate-other-workflow"])
+def test_known_flake_identity_collisions_never_match(api_fake, tmp_path, over):
+    _seed_flake(api_fake, **over)
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    for row in _run_list(ctx):
+        assert all(j["name"] != _CAND_CTX for j in _run_view_jobs(ctx, row["databaseId"]))
+
+
+def test_known_flake_cancelled_base_job_is_not_a_failure(api_fake, tmp_path):
+    _seed_flake(api_fake, base_status="cancelled")
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert [(j["name"], j["conclusion"]) for j in _run_view_jobs(ctx, 50)] == [(_CAND_CTX, "cancelled")]
+
+
+def test_known_flake_only_the_latest_run_and_attempt_count(api_fake, tmp_path):
+    head, base = _seed_flake(api_fake)
+    api_fake.state["runs"].append(_run(60, 6, base, "success"))  # newer run of the same workflow
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_list(ctx) == [{"databaseId": 60, "conclusion": "success"}]
+    api_fake.state["runs"].pop()
+    api_fake.state["run_jobs"][50].append(_job(501, 50, "pytest", "success", attempt=2))
+    assert [(j["name"], j["conclusion"]) for j in _run_view_jobs(ctx, 50)] == [(_CAND_CTX, "success")]
+
+
+def test_known_flake_missing_base_evidence_is_empty_not_confirmed(api_fake, tmp_path):
+    _seed_flake(api_fake)
+    api_fake.state["runs"] = [r for r in api_fake.state["runs"] if r["id"] != 50]
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_list(ctx) == []
+
+
+@pytest.mark.parametrize("total", ["missing", None, "2", True, False, 2.0, -1, 0, 2],
+                         ids=["missing", "null", "string", "true", "false", "float", "negative", "understated", "truncated"])
+def test_known_flake_incomplete_run_counts_cannot_hide_a_newer_pass(api_fake, tmp_path, monkeypatch, total):
+    _head, base = _seed_flake(api_fake)
+    api_fake.state["runs"].append(_run(60, 6, base, "success"))
+    api_fake.state["run_jobs"][60] = [_job(600, 60, "pytest", "success")]
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_list(ctx) == [{"databaseId": 60, "conclusion": "success"}]
+    call = fp.Api.call
+
+    def partial_runs(api, method, path, *args, **kwargs):
+        data = call(api, method, path, *args, **kwargs)
+        if "/actions/runs?head_sha=" in path:
+            data["workflow_runs"] = [r for r in data["workflow_runs"] if r["id"] == 50]
+            if total == "missing":
+                data.pop("total_count")
+            else:
+                data["total_count"] = total
+        return data
+
+    monkeypatch.setattr(fp.Api, "call", partial_runs)
+    with pytest.raises(fp.ProviderError, match="count|partial"):
+        _run_list(ctx)
+
+
+def test_known_flake_refuses_a_run_that_is_not_on_the_exact_base_head(api_fake, tmp_path):
+    head, _base = _seed_flake(api_fake)
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    with pytest.raises(fp.ProviderError, match="base"):
+        _run_view_jobs(ctx, 70)  # the candidate's own run is never base evidence
+
+
+def test_known_flake_external_status_without_a_run_link_has_no_identity(api_fake, tmp_path):
+    head, _base = _seed_flake(api_fake)
+    api_fake.state["statuses"][head][0]["target_url"] = "https://ci.example/build/7"
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_view_jobs(ctx, 50) == []
+
+
+@pytest.mark.parametrize("target", [
+    "https://unrelated.example/foreign/repo/actions/runs/7/jobs/0",
+    "/foreign/repo/actions/runs/7/jobs/0",
+    "same-host-foreign-repo",
+])
+def test_known_flake_foreign_status_link_has_no_local_identity(api_fake, tmp_path, target):
+    head, _base = _seed_flake(api_fake)
+    if target == "same-host-foreign-repo":
+        target = f"http://{api_fake.host_key}/foreign/repo/actions/runs/7/jobs/0"
+    api_fake.state["statuses"][head][0]["target_url"] = target
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_view_jobs(ctx, 50) == []
+
+
+def test_known_flake_nonadjacent_duplicate_attempts_fail_closed():
+    jobs = [{"name": "pytest", "attempt": attempt} for attempt in (1, 2, 1)]
+    with pytest.raises(fp.ProviderError, match="ambiguous"):
+        fp._latest_attempts(jobs)
+
+
+def test_known_flake_candidate_identity_is_reused_across_provider_processes(api_fake, tmp_path):
+    _seed_flake(api_fake)
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_view_jobs(ctx, 50)
+    assert _run_view_jobs(_ctx_for(api_fake, tmp_path), 50)
+    candidate_reads = [r for r in api_fake.requests if r["path"].endswith("/actions/runs/70/jobs")]
+    assert len(candidate_reads) == 1
+
+
+def test_known_flake_changed_status_link_invalidates_identity_cache(api_fake, tmp_path):
+    head, _base = _seed_flake(api_fake)
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_view_jobs(ctx, 50)
+    api_fake.state["statuses"][head][0]["target_url"] = "https://foreign.example/o/r/actions/runs/7/jobs/0"
+    assert _run_view_jobs(_ctx_for(api_fake, tmp_path), 50) == []
+
+
+def test_known_flake_reused_state_refuses_moved_candidate_head(api_fake, tmp_path):
+    _seed_flake(api_fake)
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_view_jobs(ctx, 50)
+    api_fake.state["pr"]["head"]["sha"] = "c" * 40
+    with pytest.raises(fp.ProviderError, match="head moved"):
+        _run_view_jobs(_ctx_for(api_fake, tmp_path), 50)
+
+
+def test_known_flake_identity_cache_is_bound_to_origin(api_fake, tmp_path):
+    _seed_flake(api_fake)
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    assert _run_view_jobs(ctx, 50)
+    other = FakeForgejo()
+    try:
+        _seed_flake(other, cand_job="lint")
+        keys = tmp_path / "keys.json"
+        stored = json.loads(keys.read_text())
+        stored["hosts"][other.host_key] = stored["hosts"][api_fake.host_key]
+        keys.write_text(json.dumps(stored))
+        assert _run_view_jobs(_ctx_for(other, tmp_path), 50) == []
+    finally:
+        other.close()
+
+
+@pytest.mark.parametrize("drop", ["workflow_id", "commit_sha", "status", "id"])
+def test_known_flake_missing_required_run_field_fails_closed(api_fake, tmp_path, drop):
+    _seed_flake(api_fake)
+    del api_fake.state["runs"][1][drop]
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    with pytest.raises(fp.ProviderError):
+        _run_list(ctx)
+
+
+@pytest.mark.parametrize("argv", [
+    ["run", "list", "--branch", "main", "--json", "databaseId,conclusion"],  # no --status completed
+    ["run", "list", "--branch", "main", "--status", "completed", "--json", "databaseId,headSha"],
+    ["run", "list", "--status", "completed", "--json", "databaseId"],  # no --branch
+    ["run", "view", "50", "--json", "jobs,url"],
+    ["run", "view", "50", "--log-failed"],
+    ["run", "rerun", "50"],
+])
+def test_known_flake_unsupported_run_shapes_fail_closed(api_fake, tmp_path, argv):
+    _seed_flake(api_fake)
+    ctx = _ctx_for(api_fake, tmp_path)
+    ctx.pr(1)
+    with pytest.raises(fp.ProviderError):
+        fp.run_gh(ctx, argv)
+
+
+def test_ship_known_flake_confirmed_on_forgejo_then_runs_the_local_gate(forge):
+    fake, head = forge["fake"], forge["head"]
+    base = fake.state["main_sha"]
+    fake.state["statuses"][head] = [{
+        "context": _CAND_CTX, "status": "failure", "target_url": "/o/r/actions/runs/7/jobs/0",
+        "created_at": "2020-01-02T00:00:00Z", "updated_at": "2020-01-02T00:00:00Z"}]
+    fake.state["runs"] = [_run(70, 7, head, "failure", event="pull_request"), _run(50, 5, base, "failure")]
+    fake.state["run_jobs"] = {70: [_job(700, 70, "pytest", "failure")], 50: [_job(500, 50, "pytest", "failure")]}
+    r = _ship(forge, "--dry-run", "--known-flake", _CAND_CTX, SHIP_LOCAL_TEST_CMD="true")
+    out = r.stdout + r.stderr
+    assert f"'{_CAND_CTX}' asserted via --known-flake and CONFIRMED" in out, out
+    fake.state["run_jobs"][50] = [_job(500, 50, "pytest", "success")]
+    r = _ship(forge, "--dry-run", "--known-flake", _CAND_CTX, SHIP_LOCAL_TEST_CMD="true")
+    assert r.returncode != 0 and "could NOT be confirmed" in r.stdout + r.stderr
+    assert fake.merges() == [] and _gh_log(forge) == ""
 # --- head-branch deletion after a verified merge -----------------------------------------------
 
 
@@ -875,11 +1186,11 @@ def test_cli_delete_head_and_prune_merged_entry_points(api_fake, tmp_path, monke
 # --- every gh call site in ship.sh is mapped or fails closed ----------------------------------
 
 MAPPED = {("pr", "view"), ("pr", "diff"), ("pr", "merge"), ("pr", "comment"), ("pr", "edit"),
-          ("api", "graphql"), ("repo", "view")}
+          ("api", "graphql"), ("repo", "view"), ("run", "list"), ("run", "view")}
 # Sites the Forgejo provider deliberately does NOT map (GitHub Actions evidence): each must fail.
 UNSUPPORTED_PROBES = {
-    ("run", "list"): ["run", "list", "--branch", "main"],
-    ("run", "view"): ["run", "view", "1", "--json", "jobs"],
+    ("run", "list", "no-status"): ["run", "list", "--branch", "main"],
+    ("run", "view", "no-json"): ["run", "view", "1"],
     ("api", "repos/{owner}/{repo}/actions/runs?head_sha=$head_sha&per_page=20"): ["api", "repos/o/r/actions/runs"],
     ("api", "repos/{owner}/{repo}/commits/$head_sha/check-runs?per_page=100"): ["api", "repos/o/r/commits/x/check-runs"],
     ("api", "repos/{owner}/{repo}/check-runs/$id/annotations"): ["api", "repos/o/r/check-runs/1/annotations"],
@@ -982,8 +1293,6 @@ def test_forgejo_ship_fork_head_is_kept_and_audited_by_the_provider(forge):
     kept = [json.loads(line) for line in (forge["tmp"] / "audit.jsonl").read_text().splitlines()
             if '"branch-delete"' in line]
     assert [(a["decision"], a["source"]) for a in kept] == [("keep", "ship")]
-
-
 def test_forgejo_dry_run_never_merges(forge):
     r = _ship(forge, "--dry-run")
     assert r.returncode == 0, r.stdout + r.stderr
@@ -1409,8 +1718,6 @@ def test_task_config_relative_path_resolves_against_the_callers_cwd(forge):
     assert r.returncode == 0, r.stdout + r.stderr
     gate = [c for c in calls if "|gate UB-25" in c]
     assert gate and all(f"--config {forge['main'] / 'routing.yaml'}" in c for c in gate)
-
-
 def test_task_config_invalid_file_refuses_before_any_gate(forge):
     r, calls = _ship_with_task_config(forge, _task_config(forge, body="backend: [\n"), _UB25_POST_MERGE, 0)
     assert r.returncode != 0 and "routing-only" in r.stderr, r.stdout + r.stderr

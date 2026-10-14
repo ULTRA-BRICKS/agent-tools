@@ -93,8 +93,11 @@ does the same for non-GitHub CI.
 
 ## Pinning / supply-chain
 
-`secret-scan.yml` pins the **gitleaks release version** (`GITLEAKS_VERSION`) and downloads
-that exact tarball; `actions/checkout` is pinned to a commit SHA. Bump deliberately.
+`secret-scan.yml` pins the **gitleaks release version** (`GITLEAKS_VERSION`) and the sha256
+of its linux_x64 tarball (`GITLEAKS_SHA256`, from the release's `gitleaks_<version>_checksums.txt`);
+the download is verified with `sha256sum -c` before it is extracted, into a job-local directory
+on `PATH` (so a non-root self-hosted runner user, e.g. a Forgejo/Gitea act runner, can install
+it). `actions/checkout` is pinned to a commit SHA. Bump version and digest together, deliberately.
 
 See the [`secret-scanning`](../../skills/universal/secret-scanning/SKILL.md) skill for the
 full local-hook + CI + tiers + extension story.

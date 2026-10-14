@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -20,9 +21,8 @@ _SCRATCH_ROOT = _ROOT / ".test-repos"
 
 
 def _scratch_base(tmp_path: Path) -> Path:
-    base = _SCRATCH_ROOT / tmp_path.name
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+    _SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"{tmp_path.name}-", dir=_SCRATCH_ROOT))
 
 
 def _run(*args: str, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
@@ -47,6 +47,15 @@ def _stage_file(repo: Path, relpath: str) -> None:
     staged.parent.mkdir(parents=True, exist_ok=True)
     staged.write_text("x\n", encoding="utf-8")
     assert _run("git", "add", relpath, cwd=repo).returncode == 0
+
+
+def test_review_gate_scratch_repos_are_distinct_for_repeated_test_paths(tmp_path):
+    first = _repo_with_staged_change(tmp_path)
+    second = _repo_with_staged_change(tmp_path)
+    assert first != second
+    assert first.is_dir() and second.is_dir()
+    for repo in (first, second):
+        assert _run(str(_REVIEW_GATE), cwd=repo).returncode == 1
 
 
 def _staged_diff_hash(repo: Path) -> str:

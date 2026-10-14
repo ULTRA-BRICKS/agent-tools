@@ -2902,7 +2902,7 @@ def test_omp_bridge_blocks_secret_write_via_eval_tool_fs_named_file_handle(tmp_p
 
 
 def test_eval_literal_does_not_catastrophically_backtrack_on_unterminated_backslash_run():
-    """Security-review finding (ReDoS): the old `(?:\\\\.|(?!closing).)*?` body alternative let
+    r"""Security-review finding (ReDoS): the old `(?:\\\\.|(?!closing).)*?` body alternative let
     a lone backslash be consumed either via `\\\\.` or via the bare `.` fallback, and that
     ambiguity's backtracking on a long run of backslashes before an unterminated quote was
     catastrophic (verified separately: 35 backslashes already took over a second, and each +5

@@ -100,6 +100,14 @@ def _decision(out: str) -> str:
     return json.loads(out)["decision"]
 
 
+def _assert_html_escaped_in_question(raw_question: str, value: str) -> None:
+    """The hatch question is Telegram HTML: `value` must arrive escaped, never raw."""
+    escaped = html.escape(value, quote=False)
+    assert escaped != value, "test input must contain a character that HTML-escapes"
+    assert escaped in raw_question and value not in raw_question
+    assert value in html.unescape(raw_question)
+
+
 def _touch_marker(marker: Path) -> None:
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("x")  # fresh mtime → counts as "review ran this session"
@@ -1126,7 +1134,7 @@ def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert not injected.exists()
-    assert justification in html.unescape(json.loads(question.read_text())["question"])  # Telegram HTML
+    _assert_html_escaped_in_question(json.loads(question.read_text())["question"], justification)
 
 
 def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
@@ -1153,7 +1161,7 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
     assert asked.exists()
     assert not injected.exists()
-    assert justification in html.unescape(json.loads(question.read_text())["question"])  # Telegram HTML
+    _assert_html_escaped_in_question(json.loads(question.read_text())["question"], justification)
 
 
 def test_hatch_justification_exit1_blocks_citing_denied(tmp_path, monkeypatch):

@@ -409,7 +409,6 @@ deletes every branch whose tip is **exactly** the merged head (`refs/pull/<n>/he
 same-repo PR, using the same keep rules. It never touches a branch with no merged PR at its tip, such as WIP or rescue
 branches. Branches that came back through a forge migration are typical candidates: a migration
 restores every PR head as a branch.
-
 **Credentials** are bound to the origin host: fj's key store entry for exactly that host
 (`fj auth login` / `fj auth add-token`), or `SHIP_FORGEJO_TOKEN` only together with
 `SHIP_FORGEJO_TOKEN_HOST` naming the same host. `GH_TOKEN`/`GITHUB_TOKEN` are never read. HTTP
@@ -423,13 +422,31 @@ when fj runs: an expired entry makes the provider run `fj -H <origin host> whoam
 refreshes and rewrites its store) and re-read it; if it is still expired, or its expiry is in a
 format the provider does not recognise, the run refuses.
 
+**`--known-flake` on Forgejo (read-only Actions evidence, same predicate):** the provider serves
+ship's `gh run list` / `gh run view --json jobs` calls from Forgejo's Actions API with GETs only.
+A check's identity is the server's `(workflow_id, job name)`, resolved for the candidate from its
+commit status link (`/actions/runs/<n>/jobs/<i>`). The link and caller-editable context alone are
+not authoritative: the context must match the independently reconstructed workflow name, actual
+job name and run event, and the candidate job must actually have failed. Workflow contents are
+read at the pinned head, using Forgejo's first-existing workflow-directory precedence. Only
+literal unquoted names and matching push/pull_request triggers are supported; dynamic names,
+target-branch payloads and unavailable metadata refuse. A status without an Actions job link
+never matches. Base evidence is read only for
+the same authenticated origin and repository as the status link; foreign links never acquire a
+local job's identity. Candidate identities are reused in private ship state only while the origin,
+pinned head and freshly read status metadata match. Base run evidence is read only for
+the exact head commit of the PR's base branch, only the newest run per workflow and the newest
+attempt per job count, and only a job status of `failure` confirms (a cancelled job does not). The
+rest is unchanged: every failing check must be asserted and confirmed, and the full local gate
+must pass. Missing, truncated or malformed evidence refuses.
+
 **Fails closed on Forgejo (no evidence source):**
 
 - `--resolve-addressed-threads`: Forgejo has no `isOutdated` or GraphQL resolve mutation, so the
   auto-resolve query is unsupported and the run refuses (see the evidence ledger below). Resolve
   conversations in the web UI and ship without the flag.
-- `--known-flake` and the "CI structurally down" re-classification of failed checks: both rely on
-  GitHub Actions run history / githubstatus.com, so a failing Forgejo check always refuses.
+- The "CI structurally down" re-classification of failed checks relies on GitHub check runs and
+  githubstatus.com, so it never fires on Forgejo.
 - `--repo` / `GH_SHIP_REPO` / `GH_REPO`: GitHub-only; run ship from the Forgejo checkout.
 - The Rig machine external-review policy (below) is read for the Forgejo origin's own
   `owner/repo`; the owner list carries no host, so an owner listed there is opted out on both

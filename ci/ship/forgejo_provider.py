@@ -17,7 +17,7 @@ cleanup runs `forgejo_provider.py delete-head <PR>`. `forgejo_provider.py prune-
 [--apply]` is the by-hand backlog sweep run from a checkout.
 
 Invariants (fail closed, never silently skip):
-  * Only the gh invocations ship.sh actually makes are emulated. Anything else — `gh run`,
+    * Only the gh invocations ship.sh actually makes are emulated. Anything else — unsupported `gh run`,
     `gh api repos/...`, any GraphQL mutation, an unknown `--json` field — exits non-zero with
     an actionable reason. Every ship.sh call site treats a gh failure as refuse or as
     "no extra evidence" (never as a pass); see ci/ship/README.md "Forgejo provider".
@@ -36,6 +36,8 @@ Stdlib only; Python 3.9+.
 from __future__ import annotations
 
 import fnmatch
+import base64
+import hashlib
 import json
 import os
 import re
@@ -371,6 +373,7 @@ class PullRequest:
     def __init__(self, api: Api, number: int, state_dir: str | None):
         self.api = api
         self.number = number
+        self.state_dir = state_dir
         self.raw = api.call("GET", api.repo_path(f"/pulls/{number}"))
         if not isinstance(self.raw, dict):
             raise ProviderError(f"Forgejo returned no pull request #{number}")
@@ -720,20 +723,28 @@ def merge_pr(pr: PullRequest, method_flag: str, admin: bool, subject: str | None
     status, body = api.request("POST", api.repo_path(f"/pulls/{pr.number}/merge"), payload, "application/json")
     if status != 200:
         raise ProviderError(_http_error_text("POST", f"merge of PR #{pr.number}", status, body, api.credential))
-    after = api.call("GET", api.repo_path(f"/pulls/{pr.number}"))
+    # The 200 means the merge happened server-side: a failed confirmation read must not leave
+    # it unaudited, so that path writes an `unconfirmed` line before refusing.
+    try:
+        after = api.call("GET", api.repo_path(f"/pulls/{pr.number}"))
+    except ProviderError:
+        _audit_merge(pr, do, admin, "", confirmed=False)
+        raise
     if not isinstance(after, dict) or not after.get("merged"):
+        _audit_merge(pr, do, admin, "", confirmed=False)
         raise ProviderError(f"Forgejo accepted the merge of PR #{pr.number} but does not report it merged — check the PR")
     merge_sha = str(after.get("merge_commit_sha") or "")
     _audit_merge(pr, do, admin, merge_sha)
     return merge_sha
 
 
-def _audit_merge(pr: PullRequest, do: str, admin: bool, merge_sha: str) -> None:
+def _audit_merge(pr: PullRequest, do: str, admin: bool, merge_sha: str, confirmed: bool = True) -> None:
+    decision = "merged:admin" if admin else "merged"
     _append_audit({
-        "gate": "merge", "provider": "forgejo", "decision": "merged:admin" if admin else "merged",
+        "gate": "merge", "provider": "forgejo", "decision": decision if confirmed else f"{decision}:unconfirmed",
         "host": pr.api.origin.host_key, "repo": pr.api.origin.slug, "pr": pr.number, "head": pr.pinned_sha,
         "method": do, "merge_commit": merge_sha,
-    }, "merged")
+    }, "merged" if confirmed else "merged (unconfirmed)")
 
 
 def _append_audit(line: dict, done: str) -> None:
@@ -766,6 +777,267 @@ def diff_pr(pr: PullRequest, name_only: bool) -> str:
         names = [f.get("filename") for f in files if isinstance(f, dict) and f.get("filename")]
         return "\n".join(names) + ("\n" if names else "")
     return pr.api.text(pr.api.repo_path(f"/pulls/{pr.number}.diff"))
+
+
+# --- gh-shaped CLI --------------------------------------------------------------------------
+
+
+# --- read-only Actions evidence for ship's --known-flake gate ------------------------------
+# Swagger: ActionRun{id,index_in_repo,status,workflow_id,commit_sha,event}, ActionRunJob{id,
+# name,status,attempt}; an Actions commit status links its job as
+# target_url=/<owner>/<repo>/actions/runs/<index_in_repo>/jobs/<n>. A check's identity is the
+# server's (workflow_id, job name): the " (<event>)" suffix of a status context is not identity.
+# Base evidence comes only from the EXACT base branch head, and only the newest run per workflow
+# and the newest attempt per job count. ship.sh keeps the rest of the predicate (the candidate's
+# check failed, the full local gate passes).
+
+_RUN_TERMINAL = frozenset({"success", "failure", "cancelled", "skipped"})
+_RUN_JOB_TARGET = re.compile(r"/actions/runs/(\d+)/jobs/(\d+)/?$")
+_RUN_LIST_FIELDS = frozenset({"databaseId", "conclusion"})
+
+
+def _typed(obj: object, key: str, typ: type, label: str):
+    value = obj.get(key) if isinstance(obj, dict) else None
+    if not isinstance(value, typ) or isinstance(value, bool) or value == "":
+        raise ProviderError(f"Forgejo {label} has no usable '{key}' — unsupported Actions response")
+    return value
+
+
+def _action_run(raw: object) -> dict:
+    return {"id": _typed(raw, "id", int, "action run"), "number": _typed(raw, "index_in_repo", int, "action run"),
+            "sha": _typed(raw, "commit_sha", str, "action run"), "status": _typed(raw, "status", str, "action run"),
+            "workflow": _typed(raw, "workflow_id", str, "action run"),
+            "event": raw.get("event"), "trigger_event": raw.get("trigger_event")}
+
+
+def _action_runs(api: Api, query: str) -> list[dict]:
+    data = api.call("GET", api.repo_path(f"/actions/runs?{query}&limit={PAGE_LIMIT}"))
+    total = _typed(data, "total_count", int, "run list")
+    if total < 0:
+        raise ProviderError("Forgejo run list has a negative total_count — unsupported Actions response")
+    rows = data.get("workflow_runs") if isinstance(data, dict) else None
+    if rows is None and total == 0:
+        rows = []
+    if not isinstance(rows, list):
+        raise ProviderError("Forgejo run list response has no workflow_runs — unsupported Actions response")
+    if total != len(rows):
+        raise ProviderError("Forgejo run list count does not match rows — refusing to judge from partial evidence")
+    return [_action_run(r) for r in rows]
+
+
+def _runs_on_sha(api: Api, sha: str) -> list[dict]:
+    runs = _action_runs(api, "head_sha=" + urllib.parse.quote(sha, safe=""))
+    if any(r["sha"] != sha for r in runs):
+        raise ProviderError("Forgejo returned a run for another commit to a head_sha query — refusing")
+    return runs
+
+
+def _latest_per_workflow(runs: list[dict]) -> list[dict]:
+    latest: dict[str, dict] = {}
+    for run in runs:
+        if run["workflow"] not in latest or run["id"] > latest[run["workflow"]]["id"]:
+            latest[run["workflow"]] = run
+    return sorted(latest.values(), key=lambda r: -r["id"])
+
+
+def _run_jobs(api: Api, run_id: int) -> list[dict]:
+    """Jobs in id order (the order the /jobs/<n> link indexes), each field type-checked."""
+    raw = api.call("GET", api.repo_path(f"/actions/runs/{run_id}/jobs"))
+    if not isinstance(raw, list):
+        raise ProviderError(f"Forgejo returned no job list for run {run_id} — unsupported Actions response")
+    jobs = [{"id": _typed(j, "id", int, "action job"), "name": _typed(j, "name", str, "action job"),
+             "status": _typed(j, "status", str, "action job"), "attempt": _typed(j, "attempt", int, "action job")}
+            for j in raw]
+    return sorted(jobs, key=lambda j: j["id"])
+
+
+def _latest_attempts(jobs: list[dict]) -> list[dict]:
+    latest: dict[str, dict] = {}
+    seen: set[tuple[str, int]] = set()
+    for job in jobs:
+        identity = (job["name"], job["attempt"])
+        if identity in seen:
+            raise ProviderError(f"two '{job['name']}' jobs share attempt {job['attempt']} — ambiguous evidence")
+        seen.add(identity)
+        prev = latest.get(job["name"])
+        if prev is None or job["attempt"] > prev["attempt"]:
+            latest[job["name"]] = job
+    return list(latest.values())
+
+
+def _pinned_pr(ctx: "Context") -> PullRequest:
+    """The one PR this ship run pinned (the known-flake gate runs after the first PR read)."""
+    pins = sorted(Path(ctx.state_dir).glob("pr-*.head")) if ctx.state_dir else []
+    numbers = [p.name[3:-5] for p in pins]
+    if len(numbers) != 1 or not numbers[0].isdigit():
+        raise ProviderError("run evidence needs exactly one pinned PR in this ship run — refusing")
+    return ctx.pr(int(numbers[0]))
+
+
+def _workflow_name(pr: PullRequest, workflow: str) -> str:
+    """Reconstruct only literal workflow names from the exact candidate commit.
+
+    Forgejo picks the first existing workflow directory, even if it lacks this file. Dynamic
+    names and target-branch workflow payloads cannot be independently reconstructed here.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", workflow):
+        raise ProviderError("unsupported Actions workflow path — refusing context evidence")
+    query = "?ref=" + urllib.parse.quote(pr.pinned_sha, safe="")
+    for directory in (".forgejo/workflows", ".gitea/workflows", ".github/workflows"):
+        path = pr.api.repo_path("/contents/" + directory) + query
+        status, body = pr.api.request("GET", path, None, "application/json")
+        if status == 404:
+            continue
+        if status != 200:
+            raise ProviderError(_http_error_text("GET", path, status, body, pr.api.credential))
+        try:
+            entries = json.loads(body)
+        except ValueError:
+            raise ProviderError("unsupported workflow directory response — refusing context evidence") from None
+        filename = directory + "/" + workflow
+        if not isinstance(entries, list) or not any(
+                isinstance(e, dict) and e.get("path") == filename and e.get("type") == "file" for e in entries):
+            raise ProviderError("selected workflow directory has no matching file — refusing context evidence")
+        data = pr.api.call("GET", pr.api.repo_path("/contents/" + filename) + query)
+        if not isinstance(data, dict) or data.get("path") != filename or data.get("encoding") != "base64":
+            raise ProviderError("unsupported workflow contents response — refusing context evidence")
+        try:
+            text = base64.b64decode(data["content"], validate=True).decode("utf-8")
+        except (KeyError, ValueError, TypeError, UnicodeError):
+            raise ProviderError("unusable workflow contents — refusing context evidence") from None
+        names = re.findall(r"^name:[ \t]*([^\r\n]*)$", text, re.MULTILINE)
+        if len(names) != 1 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _./()-]*", names[0]):
+            raise ProviderError("unsupported literal workflow name — refusing context evidence")
+        return names[0].strip()
+    raise ProviderError("no workflow directory on pinned head — refusing context evidence")
+
+
+def _candidate_identities(pr: PullRequest) -> dict[tuple[str, str], list[str]]:
+    """(workflow_id, job name) -> the candidate's own status contexts backed by that Actions job.
+    A context without an Actions job link on the pinned head has no identity (never matches).
+    Each gh call starts a provider process, so ship's private state shares identities only
+    while both the pinned head and freshly read status metadata remain the same."""
+    statuses = _combined_statuses(pr)
+    signature = hashlib.sha256(json.dumps({
+        "origin": f"{pr.api.origin.api_base}/{pr.api.origin.slug}", "statuses": statuses,
+    }, sort_keys=True).encode()).hexdigest()
+    cache = Path(pr.state_dir) / f"pr-{pr.number}.actions-identities.json" if pr.state_dir else None
+    if cache is not None:
+        try:
+            saved = json.loads(cache.read_text())
+            rows = saved["identities"]
+            if (saved.get("context_provenance") == 1 and saved["head"] == pr.pinned_sha and saved["statuses"] == signature
+                    and isinstance(rows, list)
+                    and all(isinstance(row, list) and len(row) == 3
+                            and isinstance(row[0], str) and isinstance(row[1], str)
+                            and isinstance(row[2], list) and all(isinstance(c, str) for c in row[2])
+                            for row in rows)):
+                return {(row[0], row[1]): row[2] for row in rows}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    found: dict[tuple[str, str], list[str]] = {}
+    runs_by_number: dict[int, list[dict]] = {}
+    jobs_by_run: dict[int, list[dict]] = {}
+    workflow_names: dict[str, str] = {}
+    for status in statuses:
+        context = status.get("context") if isinstance(status, dict) else None
+        try:
+            target = urllib.parse.urlsplit(str((status or {}).get("target_url") or ""))
+            origin = pr.api.origin
+            if target.scheme or target.netloc:
+                if (target.scheme != origin.scheme or target.hostname != origin.host
+                        or target.username is not None or target.password is not None
+                        or (target.port or (443 if target.scheme == "https" else 80))
+                        != (origin.port or (443 if origin.scheme == "https" else 80))):
+                    continue
+            prefix = f"/{origin.slug}"
+            path = urllib.parse.unquote(target.path)
+            if not path.startswith(prefix + "/"):
+                continue
+            m = _RUN_JOB_TARGET.fullmatch(path[len(prefix):])
+        except ValueError:
+            continue
+        if not context or not m:
+            continue
+        number = int(m.group(1))
+        if number not in runs_by_number:
+            runs_by_number[number] = _action_runs(pr.api, f"run_number={number}")
+        runs = runs_by_number[number]
+        if len(runs) != 1 or runs[0]["sha"] != pr.pinned_sha:
+            continue
+        run_id = runs[0]["id"]
+        if run_id not in jobs_by_run:
+            jobs_by_run[run_id] = _run_jobs(pr.api, run_id)
+        jobs = jobs_by_run[run_id]
+        index = int(m.group(2))
+        if index < len(jobs):
+            run, job = runs[0], jobs[index]
+            if run["event"] not in {"push", "pull_request"} or run["trigger_event"] != run["event"]:
+                raise ProviderError("unsupported Actions workflow event — refusing context evidence")
+            if run["workflow"] not in workflow_names:
+                workflow_names[run["workflow"]] = _workflow_name(pr, run["workflow"])
+            expected = f"{workflow_names[run['workflow']]} / {job['name']} ({run['event']})"
+            if context == expected and status.get("status") == "failure" and job["status"] == "failure":
+                found.setdefault((run["workflow"], job["name"]), []).append(context)
+    if cache is not None:
+        try:
+            cache.write_text(json.dumps({
+                "head": pr.pinned_sha, "statuses": signature, "context_provenance": 1,
+                "identities": [[workflow, job, contexts] for (workflow, job), contexts in found.items()],
+            }))
+        except OSError:
+            pass
+    return found
+
+
+def _base_head(pr: PullRequest) -> str:
+    return _require_str(_base_branch(pr).get("commit"), "id", "base branch commit.id")
+
+
+def run_list(ctx: "Context", branch: str, workflow: str | None, limit: int) -> list[dict]:
+    pr = _pinned_pr(ctx)
+    if branch != pr.base_ref:
+        raise ProviderError(f"run evidence is read only for this PR's base branch '{pr.base_ref}', not '{branch}'")
+    runs = _latest_per_workflow(_runs_on_sha(pr.api, _base_head(pr)))
+    if workflow:
+        runs = [r for r in runs if r["workflow"] == workflow]
+    return [{"databaseId": r["id"], "conclusion": r["status"]} for r in runs if r["status"] in _RUN_TERMINAL][:limit]
+
+
+def run_view_jobs(ctx: "Context", run_id: int) -> list[dict]:
+    pr = _pinned_pr(ctx)
+    base_head = _base_head(pr)
+    latest = {r["id"]: r for r in _latest_per_workflow(_runs_on_sha(pr.api, base_head))}
+    run = latest.get(run_id)
+    if run is None:
+        raise ProviderError(f"run {run_id} is not the newest run of its workflow on the base head "
+                            f"{base_head[:12]} — refusing it as base evidence")
+    identities = _candidate_identities(pr)
+    out = []
+    for job in _latest_attempts(_run_jobs(pr.api, run_id)):
+        for context in identities.get((run["workflow"], job["name"]), []):
+            out.append({"name": context, "conclusion": job["status"], "workflowId": run["workflow"],
+                        "job": job["name"], "runId": run_id, "attempt": job["attempt"]})
+    return out
+
+
+def gh_run(ctx: "Context", action: str, rest: list[str]) -> str:
+    if action == "list":
+        pos, o = _take_opts(rest, {"--branch", "--workflow", "--status", "--limit", "--json", "-q", "--jq"}, set())[:2]
+        fields = [f for f in (o.get("--json") or "").split(",") if f]
+        limit = o.get("--limit", "20")
+        if (pos or not o.get("--branch") or o.get("--status") != "completed" or not fields
+                or not set(fields) <= _RUN_LIST_FIELDS or not limit.isdigit()):
+            raise ProviderError("this `gh run list` shape is unsupported on the Forgejo provider (only "
+                                "`--branch <base> --status completed --json databaseId,conclusion`)")
+        rows = run_list(ctx, o["--branch"], o.get("--workflow"), int(limit))
+        return _emit([{f: r[f] for f in fields} for r in rows], o.get("-q") or o.get("--jq"))
+    if action == "view":
+        pos, o = _take_opts(rest, {"--json", "-q", "--jq"}, set())[:2]
+        if len(pos) != 1 or not pos[0].isdigit() or o.get("--json") != "jobs":
+            raise ProviderError("this `gh run view` shape is unsupported on the Forgejo provider (only `<id> --json jobs`)")
+        return _emit({"jobs": run_view_jobs(ctx, int(pos[0]))}, o.get("-q") or o.get("--jq"))
+    raise _unsupported(["run", action])
 
 
 # --- head-branch deletion after a verified merge ---------------------------------------------
@@ -972,8 +1244,6 @@ def prune_merged(ctx: Context, apply: bool) -> int:
 
 
 # --- gh-shaped CLI --------------------------------------------------------------------------
-
-
 def _unsupported(argv: list[str]) -> ProviderError:
     shown = " ".join(argv[:3])
     return ProviderError(f"`gh {shown} ...` is unsupported on the Forgejo provider — this gate has no "
@@ -1118,6 +1388,8 @@ def run_gh(ctx: Context, argv: list[str]) -> str:
         return gh_api(ctx, argv[1:])
     if len(argv) >= 2 and argv[0] == "repo":
         return gh_repo(ctx, argv[1], argv[2:])
+    if len(argv) >= 2 and argv[0] == "run":
+        return gh_run(ctx, argv[1], argv[2:])
     raise _unsupported(argv or [""])
 
 

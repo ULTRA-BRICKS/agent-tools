@@ -166,10 +166,11 @@ self-service bypass this gate closes).
 > bridge reaches this descriptor budget. This hook is `on_error: closed`, so a bridge timeout
 > already fails safe (deny) — the headroom keeps the message a clear block rather than a generic
 > dispatcher denial. Note this is only the agents-hooks/v1 descriptor budget enforced by
-> `cc_hook_bridge`. Claude Code's own command-hook `timeout` defaults to 600s, and the live
-> `~/.claude/settings.json` / rig-cli `hook_bridge_entries` currently register `cc_hook_bridge`
-> without a `timeout`. Until rig-cli or settings add a hook `timeout` above 960s, Claude Code can
-> still kill the bridge before a full Telegram wait finishes.
+> `cc_hook_bridge`. Claude Code's own command-hook `timeout` defaults to 600s.
+> Current rig-cli registers `cc_hook_bridge` with an outer `timeout` of at least 1200s, above
+> the bridge's 1100s aggregate budget. Older installations with no explicit timeout still need
+> normal `rig apply` reconciliation; Claude Code can otherwise kill the bridge at its 600s
+> default before a full Telegram wait finishes.
 
 > **Repo-wide impact:** this hook is **always on** (no opt-in gate, unlike pin-primary-worktree).
 > With nothing configured, `git reset --hard` and `git clean -f...` are a hard, non-bypassable

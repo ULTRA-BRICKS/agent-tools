@@ -32,7 +32,7 @@ import stat
 import subprocess  # noqa: S404 - runs an already-resolved absolute tg-ctl path
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -372,6 +372,7 @@ def request_hatch_approval(
             env_present=True,
             critical=critical,
         )
+    result = replace(result, reason=redact_for_display(result.reason))
     _append_overrides_log(
         hook_id,
         env_var,
@@ -1004,6 +1005,10 @@ def _run_tg_ctl_ask(
     except (OSError, ValueError) as exc:
         _kill_process_group(proc)
         return f"tg-ctl ask errored: {exc}"
+    finally:
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
     return proc.returncode, out, err
 
 
@@ -1070,10 +1075,12 @@ def _append_overrides_log(
             # kwarg — most hook call sites pass both (redundantly), but a caller that only
             # threads it through `context` (e.g. a future hook) must not ship a blank audit
             # `command` field just because the kwarg was omitted.
-            "command": str(command or context.get("command") or "")[:_DETAIL_CAP],
-            "reason": justification.strip()[:_DETAIL_CAP],
+            # Redacted BEFORE truncation, so the cap can never cut a secret pattern in half and
+            # leave its raw tail behind.
+            "command": redact_for_display(str(command or context.get("command") or ""))[:_DETAIL_CAP],
+            "reason": redact_for_display(justification.strip())[:_DETAIL_CAP],
             "decision": "approved" if result.approved else "denied",
-            "detail": result.reason[:_DETAIL_CAP],
+            "detail": redact_for_display(result.reason)[:_DETAIL_CAP],
             "cwd": cwd,
         }
         _append_json_line_0600(path, entry)
@@ -1830,6 +1837,128 @@ def _html_escape(value: object) -> str:
     return html.escape(str(value), quote=False)
 
 
+_REDACTED = "[REDACTED]"
+_AUTH_FLAGS_PATTERN = (
+    r"(?<!\S)(-[aBfgGhijJkLlNnOpqRsSvVZ#012346]*[uU]\s*|-a\s*"
+    r"|--user[=\s]+|--proxy-user[=\s]+|--auth[=\s]+)"
+)
+# Display-only secret patterns, applied in order. Each keeps the surrounding syntax (header name,
+# auth scheme, `user:`, `?token=`, `NAME=`) so a redacted command still reads as the same request.
+_DISPLAY_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (  # A quoted Authorization header can contain a scheme and multiple credential fields.
+        re.compile(
+            r"(?i)(['\"])((?:proxy-)?authorization\s*:\s*)"
+            r"([a-z][a-z0-9_-]*\s+)?(?:\\[^\n]|(?!\1)[^\\\n])*\1"
+            r"(?:'[^']*'|\"(?:\\[^\n]|[^\"\\])*\"|\\[^\n]|[^\s'\"\\])*"
+        ),
+        rf"\1\2\3{_REDACTED}\1",
+    ),
+    (  # JSON/HTTPie quoted header values, including schemes beyond Bearer/Basic.
+        re.compile(
+            r"(?i)\b((?:proxy-)?authorization['\"]?\s*:\s*)(['\"])"
+            r"([a-z][a-z0-9_-]*\s+)?(?:\\[^\n]|(?!\2)[^\\\n])*\2"
+        ),
+        rf"\1\2\3{_REDACTED}\2",
+    ),
+    (  # Unquoted shell header operands may escape the spaces separating scheme and value.
+        re.compile(
+            r"(?i)\b((?:proxy-)?authorization)((?:\\[ \t]|[ \t])*:(?:\\[ \t]|[ \t])*)"
+            r"([a-z][a-z0-9_-]*(?:\\[ \t]|[ \t])+)?(?:\\[^\n]|[^\s'\"\\])+"
+        ),
+        rf"\1\2\3{_REDACTED}",
+    ),
+    (  # Other HTTP credential headers: `X-Gitea-Token: X`, HTTPie `Name:'X'`.
+        re.compile(
+            r"(?i)\b(x-[a-z0-9-]*(?:token|key|secret|auth)[a-z0-9-]*"
+            r"|private-token|api-key)(['\"]?\s*:\s*['\"]?)((?:bearer|token|basic|digest)\s+)?"
+            r"([^\s'\"]+)"
+        ),
+        rf"\1\2\3{_REDACTED}",
+    ),
+    (  # `Cookie:` header — every pair up to the closing quote, not just the first one
+        re.compile(r"(?i)\b(cookie\s*:\s*)([^'\"\n]+)"),
+        rf"\1{_REDACTED}",
+    ),
+    (  # `--cookie 'a=1; b=2'` (quoted: whole value) / `--cookie a=1` (unquoted: one word)
+        re.compile(r"(?i)(--cookie(?:=|\s+))(?:(['\"])[^'\"\n]*|([^\s'\"]+))"),
+        rf"\1\2{_REDACTED}",
+    ),
+    (  # credential flags: `--token X`, `--password=X`, `--oauth2-bearer X`, `--http-password X`
+        re.compile(
+            r"(?i)(--[a-z0-9-]*(?:token|password|passwd|secret|bearer|api-key)(?:=|\s+))"
+            r"(?:'[^']*'|\"(?:\\[^\n]|[^\"\\])*\"|\\[^\n]|[^\s'\"\\])+"
+        ),
+        rf"\1{_REDACTED}",
+    ),
+    (  # The closing quote, rather than whitespace, bounds a quoted credential value.
+        re.compile(_AUTH_FLAGS_PATTERN + r"(['\"])([^:\s'\"]+):(?:\\[^\n]|(?!\2)[^\\\n])*\2"),
+        rf"\1\2\3:{_REDACTED}\2",
+    ),
+    (
+        re.compile(_AUTH_FLAGS_PATTERN + r"([^:\s'\"]+):(['\"])(?:\\[^\n]|(?!\3)[^\\\n])*\3"),
+        rf"\1\2:\3{_REDACTED}\3",
+    ),
+    (  # `curl -u user:pass`, clustered `-su`, `--user=user:pass`, HTTPie `-a user:pass`
+        re.compile(
+            _AUTH_FLAGS_PATTERN + r"(['\"]?)"
+            r"([^:\s'\"]+):([^\s'\"]+)"
+        ),
+        rf"\1\2\3:{_REDACTED}",
+    ),
+    (  # a token used as the whole `-u`/`--user` value (`-u TOKEN`, `-u TOKEN:`). Token-length
+        # only (16+), so `git push -u origin` / `sort -u file` stay readable.
+        re.compile(
+            _AUTH_FLAGS_PATTERN + r"(['\"]?)([A-Za-z0-9_.~+/-]{16,}):?(?=['\"\s]|$)"
+        ),
+        rf"\1\2{_REDACTED}",
+    ),
+    (  # URL userinfo: `https://user:pass@host`
+        re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)([^/\s:@'\"]+):([^/\s@'\"]+)@"),
+        rf"\1\2:{_REDACTED}@",
+    ),
+    (  # URL userinfo that is a bare token: `https://TOKEN@host` (token-length, so `git@` stays)
+        re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)([A-Za-z0-9_.~+-]{16,})@"),
+        rf"\1{_REDACTED}@",
+    ),
+    (  # curl's short cookie flag with inline pairs: `-b 'a=1; b=2'` / `-b a=1` (a cookie FILE
+        # path has no `=` and is left alone)
+        re.compile(r"(?<!\S)(-b\s*)(?:(['\"])[^'\"\n]*=[^'\"\n]*|([^\s'\"=]+=[^\s'\"]+))"),
+        rf"\1\2{_REDACTED}",
+    ),
+    (  # credential query parameters
+        re.compile(
+            r"(?i)([?&](?:access_token|token|api_key|apikey|key|secret|password|passwd"
+            r"|private_token|auth|sig|signature)=)([^&\s'\"#]+)"
+        ),
+        rf"\1{_REDACTED}",
+    ),
+    (  # JSON body credential fields
+        re.compile(
+            r'(?i)("(?:token|access_token|password|passwd|secret|api_key|private_token'
+            r'|client_secret)"\s*:\s*")([^"]*)(")'
+        ),
+        rf"\1{_REDACTED}\3",
+    ),
+    (  # `GITEA_TOKEN=X cmd`, `API_KEY='X'`, `-f token=X`
+        re.compile(
+            r"(?i)(?<![\w-])([a-z0-9_]*(?:token|secret|password|passwd|api_?key"
+            r"|private_key|credentials?)[a-z0-9_]*)=('[^']*'|\"[^\"]*\"|[^\s;&|'\"]+)"
+        ),
+        rf"\1={_REDACTED}",
+    ),
+)
+
+
+def redact_for_display(text: str) -> str:
+    """Mask credential VALUES in text a human sees or a log keeps (the Telegram preview and
+    `overrides.log`). Display-only: approval identity — `_operation_fingerprint` and the
+    inline-hatch parser — always runs on the ORIGINAL command, so two commands that differ only
+    in a secret share a preview but never an approval."""
+    for pattern, replacement in _DISPLAY_SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def _question(
     hook_id: str,
     justification: str,
@@ -1857,13 +1986,16 @@ def _question(
         f"<b>Branch:</b> <code>{_html_escape(branch)}</code>",
         "",
         f"<b>Hook:</b> <code>{_html_escape(hook_id)}</code>",
-        f"<b>Justification:</b> {_html_escape(justification)}",
+        f"<b>Justification:</b> {_html_escape(redact_for_display(justification))}",
     ]
 
     details: list[str] = []
     command = context.get("command")
+    # Redact BEFORE `_context_value` caps the length: a cap that cuts a secret pattern in half
+    # leaves a raw prefix no pattern can match any more.
     if command:
-        details.append(f"<b>Command:</b>\n{_html_escape(_context_value(command))}")
+        shown = _context_value(redact_for_display(str(command)))
+        details.append(f"<b>Command:</b>\n{_html_escape(shown)}")
     extra_lines: list[str] = []
     for key in sorted(context):
         if key in ("command", "hook"):
@@ -1871,7 +2003,8 @@ def _question(
         value = context[key]
         if value is None or value == "":
             continue
-        extra_lines.append(f"<b>{_html_escape(str(key))}:</b> {_html_escape(_context_value(value))}")
+        shown = _context_value(redact_for_display(str(value)))
+        extra_lines.append(f"<b>{_html_escape(str(key))}:</b> {_html_escape(shown)}")
     if extra_lines:
         details.append("\n".join(extra_lines))
 
