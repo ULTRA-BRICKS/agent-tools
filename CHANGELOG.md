@@ -144,6 +144,22 @@
 
 ### Fixed
 
+- `ops/mem-sentinel` (#884): the Linux per-omp-session memory watchdog moves under version
+  control (`sudo ops/mem-sentinel/install.sh` installs `/usr/local/sbin/mem-sentinel` and its
+  unit) and stops its false alarms. A session's footprint is now anon + shmem + swap from
+  `memory.stat`, not `memory.current`, so reclaimable page cache no longer counts. Session
+  steers fire only while MemAvailable is below 25 % or falling at 6 GB/min (the critical
+  broadcast near earlyoom's threshold is unchanged); a low-swap steer goes to the session that
+  holds the most swap, not the largest one. The kill advice names the heaviest child process
+  by anon RSS and never the session's own omp root; the message shows anon and page cache
+  separately and states its reason codes; an identical repeat steer waits 15 min instead of 3,
+  and a session quiet that long starts again at warning #1. Steers go to the exact pid and
+  sessionId of the scope's outermost omp (`tg-ctl omp-live send --session`; `omp-steer <pid>` also
+  matched other sessions' cwd), never without a discovered sessionId, and a new recipient starts
+  without the previous one's cooldown. Session discovery runs off the sampling thread so a hung
+  `tg-ctl` no longer stalls the sampler. The unit drops `After=multi-user.target`, an ordering
+  cycle with its own `WantedBy=multi-user.target`.
+
 - The three `ship` Telegram hatches — `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM`,
   `RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW`, `RIG_HATCH_REQUEST_SHIP_SKIP_CI` — now send their
   `tg-ctl ask` as a critical ButtonRequest (`"critical": true`, agent-tools#873). They used the

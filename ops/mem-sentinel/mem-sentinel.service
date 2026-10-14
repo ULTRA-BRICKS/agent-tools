@@ -1,0 +1,30 @@
+[Unit]
+Description=mem-sentinel: per-omp-session memory watchdog, steers the session that is eating RAM
+Documentation=https://git.hyperide.ai/ultrabricks/agent-tools/src/branch/main/ops/mem-sentinel/README.md
+# no After=multi-user.target: the unit is WantedBy= that target, which orders itself after its wanted
+# units, so the reverse edge would be an ordering cycle at boot (systemd drops a job to break it)
+# the sentinel's whole value is during a thrash: it must get scheduled and keep its pages
+# (systemd-oomd itself was starved for 18 min on 2026-10-11, see OPEN-ISSUES.md #6)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /usr/local/sbin/mem-sentinel
+Restart=always
+RestartSec=5
+Nice=-10
+OOMScoreAdjust=-900
+MemoryMin=256M
+MemoryLow=256M
+LimitMEMLOCK=infinity
+CPUWeight=500
+IOWeight=500
+# tunables: see CONFIG in /usr/local/sbin/mem-sentinel; override with a drop-in
+#   systemctl edit mem-sentinel  ->  [Service] Environment=MEM_SENTINEL_GROWTH_GB=3
+Environment=PYTHONUNBUFFERED=1
+# needs root for: all cgroup.procs/memory.current, /proc/*/environ (DISPLAY), runuser -u ultra
+NoNewPrivileges=no
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
