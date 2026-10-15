@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- `ci/ship`: post-merge cleanup no longer deletes a PR worktree that installed agent hooks still
+  execute code from (agent-tools#905). A `rig apply` run from a worktree to dogfood a hook
+  writes that worktree's path into the hook descriptors; deleting the tree left
+  runpod-offload-gate (`on_error: open`) silently open machine-wide after PR #904. The new
+  `ci/ship/hook_refs.py` scans every harness's descriptors, bridge commands, extension links
+  and `~/.config/agent-tools/env`; a referenced (or unscannable) tree is kept and ship prints
+  the references plus the fix (`rig apply commit --only agent_hooks`, re-check, `rig worktree
+  remove`).
 - `agent-hooks/heavy-op-memory-gate`: `runpod-run [options] -- <command>` is no longer treated
   as a local heavy operation — its block message told agents to use `runpod-run`, then blocked
   `runpod-run -- bun test ./tests` on the swap and live-runner checks because the remote

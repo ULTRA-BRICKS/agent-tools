@@ -863,6 +863,395 @@ def test_cleanup_guard_leaves_worktree_dirtied_after_preflight(repo_with_pr_work
 
 
 # ---------------------------------------------------------------------------------------
+# Hook-descriptor guard (agent-tools#905): an installed agent-hook descriptor (or a harness
+# config rig writes) whose cmd lives INSIDE the PR worktree must keep that worktree alive —
+# removing it makes every such hook fail, and an `on_error: open` hook then stops gating
+# machine-wide (runpod-offload-gate after PR #904). Each test runs under the conftest's
+# hermetic $HOME, so the descriptor dirs below are temp dirs, never the developer's real ones.
+# ---------------------------------------------------------------------------------------
+
+_HOOK_ROOT_ENV = ("OMP_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR",
+                  "RIG_CODEX_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME",
+                  "OMP_HOOKS_DIR", "CC_HOOKS_DIR", "CODEX_HOOKS_DIR", "OPENCODE_HOOKS_DIR",
+                  "AGENT_TOOLS_ROOT")
+
+
+@pytest.fixture
+def hook_home(monkeypatch):
+    """The hermetic $HOME with every harness-root override cleared, so the guard resolves the
+    default `~/.omp/agent`, `~/.claude`, `~/.codex`, `~/.config` roots under it."""
+    for name in _HOOK_ROOT_ENV:
+        monkeypatch.delenv(name, raising=False)
+    return Path(os.environ["HOME"])
+
+
+def _write_descriptor(hooks_dir: Path, cmd: Path, name: str = "demo-gate") -> Path:
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    desc = hooks_dir / f"{name}.pre-bash.json"
+    desc.write_text(json.dumps({"id": name, "point": "pre-bash", "cmd": str(cmd),
+                                "on_error": "open"}, indent=2) + "\n", encoding="utf-8")
+    return desc
+
+
+def _assert_kept_for_hooks(r, main: Path, wt: Path, cmd: Path, reference: Path):
+    assert r.returncode == 0, f"ship must exit 0 after merge; got {r.returncode}\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
+    assert wt.exists(), f"worktree backing a live hook was removed:\n{r.stdout}\n{r.stderr}"
+    assert cmd.exists(), f"hook cmd {cmd} no longer exists after ship"
+    remaining = _sh("git", "worktree", "list", "--porcelain", cwd=main).stdout
+    assert str(wt) in remaining, f"worktree was unlinked:\n{remaining}"
+    # The refusal names the referencing file and the exact fix to run.
+    assert str(reference) in r.stderr, f"guard did not name {reference}:\n{r.stderr}"
+    assert "rig apply commit --only agent_hooks" in r.stderr, r.stderr
+    assert f"worktree remove {wt}" in r.stderr, r.stderr
+
+
+def test_kept_rig_worktree_gets_rig_worktree_remove_fix(repo_with_pr_worktree, tmp_path, hook_home):
+    """A tree at the sanctioned `<main>/.worktrees/<name>` gets the `rig worktree remove <name>`
+    fix (removes tree + branch; a raw `git worktree remove` there is what the hooks redirect)."""
+    main, wt = repo_with_pr_worktree
+    (main / ".git" / "info" / "exclude").write_text("/.worktrees/\n", encoding="utf-8")
+    rig_wt = main / ".worktrees" / "feat"
+    rig_wt.parent.mkdir()
+    _git("worktree", "move", str(wt), str(rig_wt), cwd=main)
+    bindir = _fake_gh_dir(tmp_path)
+    cmd = rig_wt / "README.md"
+    desc = _write_descriptor(hook_home / ".omp" / "agent" / "hooks", cmd)
+
+    r = _run_ship(main, bindir)
+
+    assert rig_wt.exists() and cmd.exists(), r.stderr
+    assert str(desc) in r.stderr, r.stderr
+    assert f"rig worktree remove feat -C {main}" in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("from_inside", [False, True], ids=["from-main", "from-worktree"])
+def test_ship_keeps_worktree_backing_installed_hook_descriptor(
+    repo_with_pr_worktree, tmp_path, hook_home, from_inside
+):
+    """The #905 repro: an omp descriptor's cmd points into the PR worktree. After ship the
+    descriptor's cmd must still exist (the worktree is kept), and the fix command is printed."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    cmd = wt / "README.md"  # a tracked file of the PR branch stands in for the hook script
+    desc = _write_descriptor(hook_home / ".omp" / "agent" / "hooks", cmd)
+
+    r = _run_ship(main, bindir, cwd=wt if from_inside else None)
+
+    _assert_kept_for_hooks(r, main, wt, cmd, desc)
+    assert "re-rooting into" not in r.stdout, "re-rooted to remove a tree that backs a live hook"
+
+
+def test_ship_removes_worktree_when_descriptors_point_elsewhere(
+    repo_with_pr_worktree, tmp_path, hook_home
+):
+    """No false positive: descriptors pointing at the main checkout, or at a sibling path that
+    merely shares the worktree's name as a prefix (`<wt>-other/...`), do not block removal."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    hooks = hook_home / ".omp" / "agent" / "hooks"
+    _write_descriptor(hooks, main / "README.md", name="main-gate")
+    _write_descriptor(hooks, Path(f"{wt}-other") / "gate.py", name="sibling-gate")
+
+    r = _run_ship(main, bindir)
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\n{r.stdout}\n{r.stderr}"
+    assert not wt.exists(), f"worktree kept without a hook pointing into it:\n{r.stderr}"
+    assert "rig apply commit --only agent_hooks" not in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("layout", [
+    "claude-descriptor", "claude-settings-bridge", "claude-account-settings",
+    "claude-settings-reference-past-4mib", "codex-descriptor", "codex-config-toml",
+    "omp-extension-symlink", "omp-extension-file-uri", "omp-descriptor-json-unicode-escapes",
+    "opencode-descriptor", "opencode-plugin-package", "opencode-repo-local-plugin-main",
+    "opencode-repo-local-plugin-registry", "opencode-repo-local-plugins-dir-symlink",
+    "omp-extensions-dir-symlink", "codex-descriptor-cmd-via-external-symlink",
+    "claude-settings-pythonpath-via-external-symlink", "omp-descriptor-named-like-a-backup",
+    "codex-descriptor-cmd-with-space-via-symlink", "agent-tools-env",
+])
+def test_ship_keeps_worktree_referenced_by_any_rig_written_hook_config(
+    repo_with_pr_worktree, tmp_path, hook_home, layout
+):
+    """Every place rig writes a path the harnesses execute is scanned — the per-harness
+    descriptor dirs, the bridge commands in settings/config files, the omp/pi extension
+    symlinks, and the machine-level AGENT_TOOLS_ROOT pointer the `gh ship` delegator sources."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    cmd = wt / "README.md"
+    h = hook_home
+    if layout == "claude-descriptor":
+        ref = _write_descriptor(h / ".claude" / "hooks", cmd)
+    elif layout == "claude-settings-bridge":
+        ref = h / ".claude" / "settings.json"
+        ref.parent.mkdir(parents=True)
+        ref.write_text(json.dumps({"hooks": {"PreToolUse": [{"hooks": [{
+            "type": "command",
+            "command": f"PYTHONPATH={wt}/lib python3 -m cc_hook_bridge PreToolUse"}]}]}}),
+            encoding="utf-8")
+    elif layout == "claude-account-settings":
+        ref = h / ".claude-accounts" / "account-2" / "settings.json"
+        ref.parent.mkdir(parents=True)
+        ref.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{
+            "type": "command", "command": f"PYTHONPATH={wt}/lib python3 -m cc_hook_bridge Stop"}]}]}}),
+            encoding="utf-8")
+    elif layout == "codex-descriptor":
+        ref = _write_descriptor(h / ".codex" / "hooks", cmd)
+    elif layout == "codex-config-toml":
+        ref = h / ".codex" / "config.toml"
+        ref.parent.mkdir(parents=True)
+        ref.write_text(f'[hooks]\ncommand = "PYTHONPATH={wt}/lib python3 -m codex_hook_bridge"\n',
+                       encoding="utf-8")
+    elif layout == "claude-settings-reference-past-4mib":
+        # No read cap: a reference deep in a large settings file must not read as absent.
+        ref = h / ".claude" / "settings.json"
+        ref.parent.mkdir(parents=True)
+        ref.write_text(json.dumps({"padding": "x" * (5 * 1024 * 1024)}) + "\n"
+                       + json.dumps({"command": f"PYTHONPATH={wt}/lib python3 -m cc_hook_bridge"}),
+                       encoding="utf-8")
+    elif layout == "omp-extension-symlink":
+        ref = h / ".omp" / "agent" / "extensions" / "zz-agent-tools-hook-bridge.ts"
+        ref.parent.mkdir(parents=True)
+        ref.symlink_to(cmd)
+    elif layout == "omp-extension-file-uri":
+        # `file://` + an absolute path puts a `/` right before the tree's path.
+        ref = h / ".omp" / "agent" / "extensions" / "zz-agent-tools-hook-bridge.ts"
+        ref.parent.mkdir(parents=True)
+        ref.write_text(f'export {{ default }} from "file://{wt}/lib/omp_hook_bridge/x.ts";\n',
+                       encoding="utf-8")
+    elif layout == "omp-descriptor-json-unicode-escapes":
+        # Valid JSON a descriptor reader decodes to the plain path: `\u002f` for every `/`.
+        hooks = h / ".omp" / "agent" / "hooks"
+        hooks.mkdir(parents=True)
+        ref = hooks / "escaped-gate.pre-bash.json"
+        escaped = str(cmd).replace("/", "\\u002f")
+        ref.write_text(f'{{"id": "escaped-gate", "point": "pre-bash", "cmd": "{escaped}"}}\n',
+                       encoding="utf-8")
+        assert json.loads(ref.read_text(encoding="utf-8"))["cmd"] == str(cmd)
+    elif layout == "opencode-descriptor":
+        ref = _write_descriptor(h / ".config" / "opencode" / "hooks", cmd)
+    elif layout == "opencode-plugin-package":
+        # A packaged plugin is a real directory, not one flat file or link.
+        ref = h / ".config" / "opencode" / "plugins" / "agent-tools-bridge" / "dist" / "index.js"
+        ref.parent.mkdir(parents=True)
+        ref.write_text(f'require("{wt}/lib/opencode_hook_bridge/plugin.js");\n', encoding="utf-8")
+    elif layout == "opencode-repo-local-plugin-main":
+        # rig's default opencode bridge is a REPO-local link; the shipped repo's main checkout
+        # is always scanned.
+        (main / ".git" / "info" / "exclude").write_text("/.opencode/\n", encoding="utf-8")
+        ref = main / ".opencode" / "plugins" / "zz-agent-tools-hook-bridge.js"
+        ref.parent.mkdir(parents=True)
+        ref.symlink_to(cmd)
+    elif layout == "opencode-repo-local-plugin-registry":
+        # ...and so is every repo in rig's registry.
+        consumer = tmp_path / "consumer"
+        ref = consumer / ".opencode" / "plugins" / "zz-agent-tools-hook-bridge.js"
+        ref.parent.mkdir(parents=True)
+        ref.symlink_to(cmd)
+        registry = h / ".config" / "rig" / "repositories.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text(json.dumps({"version": 1, "repositories": [{"path": str(consumer)}]}),
+                            encoding="utf-8")
+    elif layout == "codex-descriptor-cmd-with-space-via-symlink":
+        # The runner execs `cmd` verbatim: a link dir with a space, never spelling the tree.
+        opt = tmp_path / "opt agent hooks"
+        opt.symlink_to(wt, target_is_directory=True)
+        ref = _write_descriptor(h / ".codex" / "hooks", opt / "README.md")
+    elif layout == "omp-descriptor-named-like-a-backup":
+        # Live: the loader reads every *.json; only `<name>.rig-bak-<timestamp>` is a backup.
+        ref = _write_descriptor(h / ".omp" / "agent" / "hooks", cmd, name="security.rig-bak")
+    elif layout == "codex-descriptor-cmd-via-external-symlink":
+        # The cmd never spells the tree's path: /…/opt-hooks is a link into the tree.
+        opt = tmp_path / "opt-hooks"
+        opt.symlink_to(wt, target_is_directory=True)
+        ref = _write_descriptor(h / ".codex" / "hooks", opt / "README.md")
+    elif layout == "claude-settings-pythonpath-via-external-symlink":
+        opt = tmp_path / "opt-agent-tools"
+        opt.symlink_to(wt, target_is_directory=True)
+        ref = h / ".claude" / "settings.json"
+        ref.parent.mkdir(parents=True)
+        ref.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{
+            "type": "command",
+            "command": f"PYTHONPATH=/usr/lib:{opt}/lib python3 -m cc_hook_bridge Stop"}]}]}}),
+            encoding="utf-8")
+    elif layout == "opencode-repo-local-plugins-dir-symlink":
+        # The plugins DIR is the link; its files hold no path at all (README.md here: "# x").
+        (main / ".git" / "info" / "exclude").write_text("/.opencode/\n", encoding="utf-8")
+        ref = main / ".opencode" / "plugins"
+        ref.parent.mkdir(parents=True)
+        ref.symlink_to(wt, target_is_directory=True)
+    elif layout == "omp-extensions-dir-symlink":
+        ref = h / ".omp" / "agent" / "extensions"
+        ref.parent.mkdir(parents=True)
+        ref.symlink_to(wt, target_is_directory=True)
+    else:  # agent-tools-env
+        ref = h / ".config" / "agent-tools" / "env"
+        ref.parent.mkdir(parents=True)
+        ref.write_text(f"AGENT_TOOLS_ROOT={wt}\n", encoding="utf-8")
+
+    r = _run_ship(main, bindir)
+
+    _assert_kept_for_hooks(r, main, wt, cmd, ref)
+
+
+@pytest.mark.parametrize("env_var", [
+    "OMP_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR", "RIG_CODEX_HOME", "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR", "OMP_HOOKS_DIR", "CC_HOOKS_DIR", "CODEX_HOOKS_DIR", "OPENCODE_HOOKS_DIR",
+])
+def test_ship_honors_harness_root_overrides(
+    repo_with_pr_worktree, tmp_path, hook_home, monkeypatch, env_var
+):
+    """A relocated harness root (omp's OMP_/PI_CODING_AGENT_DIR, rig's RIG_CODEX_HOME, Codex's
+    own CODEX_HOME, Claude's CLAUDE_CONFIG_DIR) or a bridge's own `<HARNESS>_HOOKS_DIR` is where
+    the descriptors live, so the guard looks there too."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    cmd = wt / "README.md"
+    root = tmp_path / f"relocated-{env_var.lower()}"
+    monkeypatch.setenv(env_var, str(root))
+    desc = _write_descriptor(root if env_var.endswith("_HOOKS_DIR") else root / "hooks", cmd)
+
+    r = _run_ship(main, bindir)
+
+    _assert_kept_for_hooks(r, main, wt, cmd, desc)
+
+
+def test_ship_keeps_worktree_an_exported_agent_tools_root_points_into(
+    repo_with_pr_worktree, tmp_path, hook_home, monkeypatch
+):
+    """The `gh ship` delegator prefers an exported AGENT_TOOLS_ROOT over the env file."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    monkeypatch.setenv("AGENT_TOOLS_ROOT", str(wt))
+
+    r = _run_ship(main, bindir)
+
+    _assert_kept_for_hooks(r, main, wt, wt / "README.md", "$AGENT_TOOLS_ROOT")
+
+
+def test_ship_honors_a_relative_hooks_dir_override_verbatim(
+    repo_with_pr_worktree, tmp_path, hook_home, monkeypatch
+):
+    """The bridges use `<HARNESS>_HOOKS_DIR` verbatim (`Path(value)`), so a relative value is
+    resolved against the cwd, not home — scan that location too."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    cmd = wt / "README.md"
+    (main / ".git" / "info" / "exclude").write_text("/relhooks/\n", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOOKS_DIR", "relhooks")
+    desc = _write_descriptor(main / "relhooks", cmd)
+
+    r = _run_ship(main, bindir)  # cwd = main
+
+    _assert_kept_for_hooks(r, main, wt, cmd, desc)
+
+
+def test_hook_refs_matches_a_shell_escaped_worktree_path(tmp_path, hook_home):
+    """A bridge command may spell a tree with a space as `feat\\ hook` (shell escaping)."""
+    wt = tmp_path / "feat hook"
+    (wt / "lib").mkdir(parents=True)
+    settings = hook_home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    escaped = str(wt).replace(" ", "\\ ")
+    settings.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{
+        "type": "command", "command": f"PYTHONPATH={escaped}/lib python3 -m cc_hook_bridge Stop"}]}]}}),
+        encoding="utf-8")
+
+    r = _sh(sys.executable, "-I", str(_SHIP.parent / "hook_refs.py"), str(wt), cwd=tmp_path,
+            env=dict(os.environ))
+
+    assert r.returncode == 3, f"exit {r.returncode}\n{r.stdout}\n{r.stderr}"
+    assert str(settings) in r.stdout, r.stdout
+
+
+
+@pytest.mark.parametrize("blocked", ["descriptor", "ancestor-dir"])
+def test_ship_keeps_worktree_when_hook_scan_cannot_read_a_descriptor(
+    repo_with_pr_worktree, tmp_path, hook_home, blocked
+):
+    """Fail safe: an unreadable descriptor — or a harness dir the shipping process cannot
+    enter, which hides every descriptor below it — might be the one pointing into the
+    worktree, so an incomplete scan keeps the tree (a leftover worktree is cheap; a
+    silently-open gate is not)."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads a mode-000 file")
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    desc = _write_descriptor(hook_home / ".codex" / "hooks", wt / "README.md")
+    locked = desc if blocked == "descriptor" else hook_home / ".codex"
+    locked.chmod(0)
+    try:
+        r = _run_ship(main, bindir)
+    finally:
+        locked.chmod(0o755 if blocked == "ancestor-dir" else 0o644)
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\n{r.stderr}"
+    assert wt.exists(), f"worktree removed although the hook scan was incomplete:\n{r.stderr}"
+    assert str(locked) in r.stderr, r.stderr
+    assert "unreadable" in r.stderr, r.stderr
+    assert "rig apply commit --only agent_hooks" in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("late", ["reference", "unreadable"])
+@pytest.mark.parametrize("self_hosted", [False, True], ids=["from-main", "tree-ships-itself"])
+def test_ship_warns_when_a_hook_points_into_the_tree_during_removal(
+    repo_with_pr_worktree, tmp_path, hook_home, self_hosted, late
+):
+    """The pre-removal scan is a snapshot. A descriptor written between it and the removal (a
+    concurrent `rig apply` from the tree) is caught by the post-removal re-scan and reported
+    loudly with the fix — as is a late descriptor the re-scan cannot read (the scan is then
+    incomplete). `tree-ships-itself` is agent-tools shipping its own PR: ship.sh and
+    hook_refs.py run from INSIDE the tree, so the scanner file is gone by the re-scan. Injected
+    by a post-checkout hook: ship detaches the tree's HEAD after the scan, right before
+    `git worktree remove`."""
+    if late == "unreadable" and os.geteuid() == 0:
+        pytest.skip("root reads a mode-000 file")
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    cmd = wt / "README.md"
+    ship = _SHIP
+    if self_hosted:
+        shutil.copytree(_SHIP.parent, wt / "ci" / "ship",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        _git("add", "-A", cwd=wt)
+        _git("commit", "-qm", "self-hosted ship", cwd=wt)
+        _git("push", "-q", "origin", "feat", cwd=wt)
+        ship = wt / "ci" / "ship" / "ship.sh"
+    hooks_dir = hook_home / ".omp" / "agent" / "hooks"
+    desc = hooks_dir / "late-gate.pre-bash.json"
+    githooks = tmp_path / "githooks"
+    githooks.mkdir()
+    post_checkout = githooks / "post-checkout"
+    post_checkout.write_text(
+        "#!/usr/bin/env bash\n"
+        f"mkdir -p {shlex.quote(str(hooks_dir))}\n"
+        f"printf '{{\"cmd\": \"%s\"}}\\n' {shlex.quote(str(cmd))} > {shlex.quote(str(desc))}\n"
+        + (f"chmod 000 {shlex.quote(str(desc))}\n" if late == "unreadable" else ""),
+        encoding="utf-8",
+    )
+    post_checkout.chmod(0o755)
+    _git("config", "core.hooksPath", str(githooks), cwd=main)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env.update(SHIP_TEST_BRANCH="feat", SHIP_DEFAULT_BRANCH="main", SHIP_MAIN_CHECKOUT=str(main))
+    r = _sh("bash", str(ship), "1", "--no-screenshot-ok", "test",
+            cwd=wt if self_hosted else main, env=env)
+
+    try:
+        assert r.returncode == 0, f"ship exited {r.returncode}\n{r.stdout}\n{r.stderr}"
+        assert desc.exists(), "the injected descriptor was never written — test proves nothing"
+        assert not wt.exists(), f"tree not removed — the pre-removal scan saw the late write:\n{r.stderr}"
+        expected = "started pointing into" if late == "reference" else "re-scan of the installed agent-hook wiring was incomplete"
+        assert expected in r.stderr, r.stderr
+        assert str(desc) in r.stderr, r.stderr
+        assert "rig apply commit --only agent_hooks" in r.stderr, r.stderr
+    finally:
+        if desc.exists():
+            desc.chmod(0o644)
+
+
+# ---------------------------------------------------------------------------------------
 # Version-bump gate: a ship of shippable SOURCE must bump the declared version (skill:
 # bump-version-on-release). The canonical failure is a version that never moves across
 # releases (`rig --version` stuck on a hardcoded 0.1.0). These tests pin the four required

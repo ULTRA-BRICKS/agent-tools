@@ -4425,6 +4425,81 @@ _refresh_main_checkout() {
   fi
 }
 
+# agent-tools#905: installed hook wiring (descriptor `cmd`s, bridge commands, extension links,
+# the AGENT_TOOLS_ROOT pointer) can execute code from INSIDE a PR worktree — `rig apply` run
+# from that worktree to dogfood a hook writes its path machine-wide. Deleting the tree then
+# breaks every such hook, and an `on_error: open` gate goes silently open for every session.
+# Ship KEEPS such a tree and prints the references plus the fix, rather than re-pointing them
+# itself with `rig apply`: that would rewrite every harness's hook wiring machine-wide from a
+# merge command — clobbering any other worktree a parallel agent is deliberately dogfooding,
+# and needing a rig that may be absent or fail half-way. A kept tree still holds the merged
+# code, so the hooks keep working until someone runs the printed fix.
+_SHIP_HOOK_REFS_PY="$_SHIP_SELF_DIR/hook_refs.py"
+# Read now: shipping agent-tools from its own PR worktree runs THAT tree's ci/ship, and the
+# post-removal re-scan below runs after the tree (and this file) is gone.
+_SHIP_HOOK_REFS_SRC=$(cat "$_SHIP_HOOK_REFS_PY" 2>/dev/null) || _SHIP_HOOK_REFS_SRC=""
+_SHIP_MAIN_Q=$(printf '%q' "$MAIN_CHECKOUT")  # for the paste-ready fix lines
+
+# hook_refs.py's contract (0 none / 3 found / 4 incomplete); a missing scanner is incomplete,
+# never "none" (`python3 -c ""` would exit 0). The main checkout is passed as a repo whose
+# repo-local opencode plugin links are scanned too.
+_ship_hook_refs() {
+  if [ -z "$_SHIP_HOOK_REFS_SRC" ]; then
+    echo "$_SHIP_HOOK_REFS_PY: missing or unreadable"
+    return 4
+  fi
+  python3 -I -c "$_SHIP_HOOK_REFS_SRC" "$1" "$MAIN_CHECKOUT" 2>&1
+}
+
+# Print one scan verdict and the fix.
+_ship_report_hook_refs() {
+  local wt="$1" rc="$2" refs="$3" found_msg="$4" incomplete_msg="$5" checker
+  if [ "$rc" -eq 3 ]; then echo "$found_msg" >&2; else echo "$incomplete_msg (scanner exit $rc)" >&2; fi
+  printf '%s\n' "$refs" | sed 's/^/[ship]   /' >&2
+  echo "[ship]   Fix, once ${DEFAULT_BRANCH} contains this merge — re-point the hooks at the main checkout:" >&2
+  echo "[ship]     rig apply commit --only agent_hooks -C $_SHIP_MAIN_Q" >&2
+  echo "[ship]   (a settings bridge or agent-tools/env line belongs to other rig areas: run a full rig apply commit -C $_SHIP_MAIN_Q)" >&2
+  # The checker must outlive the tree: prefer the main checkout's copy (present once merged).
+  checker="$MAIN_CHECKOUT/ci/ship/hook_refs.py"
+  [ -f "$checker" ] || checker="$_SHIP_HOOK_REFS_PY"
+  if [ -f "$checker" ]; then
+    echo "[ship]   then confirm nothing references the tree (exit 0):" >&2
+    echo "[ship]     python3 $(printf '%q' "$checker") $(printf '%q' "$wt") $_SHIP_MAIN_Q" >&2
+  fi
+}
+
+# Returns 0 when the worktree must be KEPT (reporting why + the fix), 1 when it may be removed.
+# Any scanner failure keeps the tree: a leftover worktree is cheap, a silently-open gate is not.
+_ship_keep_hook_backed_worktree() {
+  local wt="$1" refs rc
+  refs=$(_ship_hook_refs "$wt"); rc=$?
+  [ "$rc" -eq 0 ] && return 1
+  _ship_report_hook_refs "$wt" "$rc" "$refs" \
+    "[ship] keeping worktree $wt: installed agent hooks still execute code from it — removing it would break them (an on_error: open gate would stop gating machine-wide, agent-tools#905):" \
+    "[ship] keeping worktree $wt: could not fully scan the installed agent-hook wiring for references to it, so it may still back a live hook"
+  echo "[ship]   and only then remove it:" >&2
+  if [ "$(dirname "$wt")" = "$(cd "$MAIN_CHECKOUT" 2>/dev/null && pwd -P)/.worktrees" ]; then
+    echo "[ship]     rig worktree remove $(printf '%q' "$(basename "$wt")") -C $_SHIP_MAIN_Q" >&2
+  else
+    echo "[ship]     git -C $_SHIP_MAIN_Q worktree remove $(printf '%q' "$wt")" >&2
+    echo "[ship]     git -C $_SHIP_MAIN_Q branch -D $(printf '%q' "$BRANCH")" >&2
+  fi
+  return 0
+}
+
+# The pre-removal scan is a snapshot: a `rig apply` run from the tree while it was being removed
+# can still point a hook into it (no lock spans rig and ship). Re-scan after removal so that
+# window ends in a loud warning with the fix. Residual: a write landing after THIS scan is not
+# seen; closing it needs rig to refuse wiring whose target is missing (rig-cli#695).
+_ship_warn_hooks_left_dangling() {
+  local wt="$1" refs rc
+  refs=$(_ship_hook_refs "$wt"); rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  _ship_report_hook_refs "$wt" "$rc" "$refs" \
+    "[ship] WARNING: installed agent hooks started pointing into $wt while it was being removed — they now fail (an on_error: open gate is open machine-wide until fixed):" \
+    "[ship] WARNING: removed $wt, but the re-scan of the installed agent-hook wiring was incomplete — a hook may now point at the deleted tree"
+}
+
 cleanup() {
   set +e  # local to this function's subshell-free body: warn, don't abort
   if [ "${_FOREIGN_REPO_INVOKE:-0}" = "1" ]; then
@@ -4476,6 +4551,10 @@ cleanup() {
     st_rc=0; st=$(git -C "$wt" status --porcelain 2>/dev/null) || st_rc=$?
     is_clean=0; { [ "$st_rc" -eq 0 ] && [ -z "$st" ]; } && is_clean=1
 
+    if _ship_keep_hook_backed_worktree "$wt"; then
+      continue
+    fi
+
     if [ "$ORIG_PWD" = "$wt_real" ] || [ "${ORIG_PWD#"$wt_real"/}" != "$ORIG_PWD" ]; then
       # We are inside this worktree. A dirty/unverifiable self-tree is left alone (no re-root,
       # no removal) — destroying it would lose unshipped work.
@@ -4509,6 +4588,7 @@ cleanup() {
       # Record self-removal ONLY after a confirmed real removal (so the caller-contract NOTE
       # below never fires falsely — not in dry-run, not when removal failed and the dir lives).
       [ "$is_self" = "1" ] && [ "$DRY_RUN" != "1" ] && SELF_REMOVED="$reroot_target"
+      [ "$DRY_RUN" != "1" ] && _ship_warn_hooks_left_dangling "$wt"
     else
       echo "[ship] WARNING: could not remove worktree $wt — remove it manually (git worktree remove --force)." >&2
     fi

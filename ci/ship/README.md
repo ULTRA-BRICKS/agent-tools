@@ -29,9 +29,27 @@ that isn't actually ready even with a one-liner.
 | **No ticket / no acceptance** | When task-cli is on PATH, a PR with **no derivable ticket code** is refused — a PR with no ticket has no acceptance criteria, so nothing can be proven (agent-tools#639). Create a ticket (`task create`) and reference it (`Refs #N` / `Refs HYP-N`). Repos that never installed task-cli still skip. |
 | Local branch has unpushed/diverged commits, or dirty worktree | Avoids merging stale/uncommitted local state. |
 
-Then it squash-merges, deletes the remote branch, removes the local branch+worktree
-(unless you're *inside* that worktree — then it's left so your session keeps a cwd), and
-fast-forwards your main checkout.
+Then it squash-merges, deletes the remote branch, removes the local branch+worktree (from
+*inside* that worktree it first re-roots into the main checkout; a dirty tree is left in
+place), and fast-forwards your main checkout.
+
+**A worktree that backs installed agent hooks is kept** (agent-tools#905). Before removing a
+PR worktree, cleanup runs [`hook_refs.py`](hook_refs.py) over the hook wiring rig installs —
+every harness's descriptors, bridge commands, extension/plugin links and
+`~/.config/agent-tools/env`, at their default and env-relocated paths (the exact list is the
+module docstring). A descriptor still pointing into the tree (left there by a `rig apply` run
+from the worktree to dogfood a hook) would break the moment the tree is deleted, and an
+`on_error: open` gate would stop gating machine-wide without a word. So ship keeps the tree,
+lists each reference, and prints the fix: `rig apply commit --only agent_hooks -C <main>`,
+re-check with `hook_refs.py <tree>`, then `rig worktree remove <name>`. An unreadable wiring
+file also keeps the tree (the scan is incomplete). The scan is a snapshot — nothing locks `rig
+apply` out while ship removes the tree — so ship re-scans after each removal and prints a
+WARNING plus the same fix if a hook started pointing into the tree meanwhile (or the re-scan
+was incomplete); a write landing after that re-scan is rig's to refuse (rig-cli#695). Ship does
+not run `rig apply` itself: that rewrites every harness's hook wiring machine-wide from a merge
+command, clobbering any other worktree another agent is deliberately dogfooding; the kept tree
+holds the merged code, so the hooks keep working until the fix runs. (`rig worktree gc --yes`
+does not run this check yet: rig-cli#695.)
 
 When ship decides CI is structurally unavailable and runs its local fallback gates, the
 test runner picks a command in this order (highest priority first):
