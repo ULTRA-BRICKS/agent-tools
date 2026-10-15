@@ -49,7 +49,14 @@ def _isolated_gpu_slots_and_thresholds(tmp_path, monkeypatch):
     threshold override change what a test exercises."""
     monkeypatch.setenv("RIG_GPU_SLOT_DIR", str(tmp_path / "gpu-slots"))
     monkeypatch.setenv("RIG_GPU_SLOTS", "2")
-    for name in ("RIG_GPU_SLOT_FD", "RIG_HEAVY_OP_MAX_WIRED_PCT", "RIG_HEAVY_OP_MIN_AVAILABLE_MB"):
+    # No developer install (~/.local/bin/review, ~/.agents) may decide what a test sees.
+    monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+    for name in (
+        "RIG_GPU_SLOT_FD", "RIG_HEAVY_OP_MAX_WIRED_PCT", "RIG_HEAVY_OP_MIN_AVAILABLE_MB",
+        "RIG_HEAVY_OP_MAX_PSI_SOME10", "RIG_HEAVY_OP_MIN_SWAP_FREE_PCT", "RIG_HEAVY_OP_MAX_LIVE",
+        "RIG_HEAVY_OP_HEADROOM_MB", "RIG_HEAVY_OP_COST_REVIEW_MB", "RIG_HEAVY_OP_COST_DOCKER_MB",
+        "RIG_HEAVY_OP_COST_SUITE_MB", "REVIEW_ADMISSION",
+    ):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -306,61 +313,451 @@ def test_one_unwrapped_load_next_to_a_wrapped_one_is_still_ungated():
     assert hook.classify_heavy_operation(command) == hook.GPU_MODEL_LABEL
 
 
+# ── runpod-run offload: the suite after `--` runs on a Runpod pod, not here ──────────
+
+_RUNPOD_RUN_HEADER = (
+    "#!/usr/bin/env bash\n"
+    "# runpod-run — run one heavy command (test suite, build, benchmark) on a Runpod pod\n"
+)
+
+
+@pytest.fixture
+def offload_script(tmp_path, monkeypatch):
+    """A real-looking runpod-run install: the skill script, a `~/.local/bin` symlink to it,
+    and that dir on PATH (as on a rig-managed machine). Returns the skill script's path."""
+    home = tmp_path / "home"
+    skill = home / ".agents" / "skills" / "runpod-offload" / "runpod-run"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(_RUNPOD_RUN_HEADER + "exec ssh pod \"$@\"\n")
+    skill.chmod(0o755)
+    local_bin = home / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)  # the review_cli fixture may have made it
+    (local_bin / "runpod-run").symlink_to(skill)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", f"{local_bin}:{os.environ.get('PATH', '')}")
+    return skill
+
+
+@pytest.mark.parametrize("command", [
+    "runpod-run -- bun test ./tests",
+    "runpod-run --ttl 30 -- bun test ./tests",
+    "~/.local/bin/runpod-run --cpu cpu3c-8 -- pytest -q",
+    "{skill} --gpu 'NVIDIA GeForce RTX 4090' -- python bench.py",
+    "RUNPOD_RUN_STATE=/tmp/rr runpod-run --ttl 30 -- npm test",
+    "CI=1 timeout -k 30 3700 runpod-run -- cargo test --workspace",
+    "nice -n 5 runpod-run -- make all",
+    "cd /repo && runpod-run --ttl 30 -- bun test ./tests 2>&1 | tail -50",
+    "runpod-run -- bash -c 'bun test && pytest'",
+    "runpod-run -- stt a.wav",
+    # Re-pointing syntax in the REMOTE command runs on the pod, not here (review finding).
+    "runpod-run -- bash -c 'export PATH=/opt/bin:$PATH && make test'",
+    "runpod-run --ttl 30 -- bash -c 'f(){ make \"$@\"; }; f test'",
+    "runpod-run -- env PATH=/opt/bin bun test",
+])
+def test_runpod_run_offloads_are_not_local_heavy_operations(command, offload_script):
+    command = command.replace("{skill}", str(offload_script))
+    assert hook.classify_heavy_operation(command) is None, command
+
+
+@pytest.mark.parametrize("command", [
+    "runpod-run -- bun test ./tests && bun test",
+    "bun test; runpod-run --ttl 30 -- bun test",
+    "runpod-run -- true | pytest -q",
+    "runpod-run -- echo \"$(npm test)\"",
+    "runpod-run -- echo `pytest`",
+    "runpod-run -- x; review diff -C .",
+    "echo runpod-run && bun test",  # runpod-run as an operand is not the program
+])
+def test_heavy_commands_chained_around_runpod_run_still_run_locally(command, offload_script):
+    assert hook.classify_heavy_operation(command) is not None, command
+
+
+def test_help_flag_of_runpod_run_does_not_exempt_a_chained_heavy_command(offload_script):
+    assert hook.classify_heavy_operation("runpod-run --help; review diff -C .") is not None
+    assert hook.classify_heavy_operation("runpod-run -- ls -h; review diff -C .") is not None
+
+
+@pytest.mark.parametrize("command", [
+    'function runpod-run { shift; "$@"; }; runpod-run -- bun test ./tests',
+    # zsh expands the function NAME (review finding): any function definition disqualifies.
+    'dash=-; function runpod${dash}run(){ shift; "$@"; }; runpod-run -- bun test ./tests',
+    'dash=-; runpod${dash}run () { shift; "$@"; }; runpod-run -- bun test ./tests',
+    "eval 'f(){ :; }'; runpod-run -- bun test ./tests",
+    # Sourced shell code is invisible to the hook and may define the function (review finding).
+    "source /tmp/evil; runpod-run -- bun test ./tests",
+    ". /tmp/evil && runpod-run -- bun test ./tests",
+    # zsh: the `path` array and the `functions` table re-point a name too (review finding).
+    "path=(/tmp/evil $path); runpod-run -- bun test ./tests",
+    "functions[runpod-run]='shift; \"$@\"'; runpod-run -- bun test ./tests",
+    "export HOME=/tmp/evil; ~/.local/bin/runpod-run -- bun test ./tests",
+    "sudo runpod-run -- bun test ./tests",  # resolved through sudo's PATH, not ours (review finding)
+    "command -p runpod-run -- bun test ./tests",  # the shell's default PATH (review finding)
+    "builtin source /tmp/evil; runpod-run -- bun test ./tests",
+    "path[1]=/tmp/evil; runpod-run -- bun test ./tests",  # zsh, element-wise (review finding)
+    "PATH[0]=/tmp/evil; runpod-run -- bun test ./tests",
+    # zsh re-points via declaration/array builtins and fpath too (review finding).
+    "set -A path /tmp/evil $path; runpod-run -- bun test ./tests",
+    "typeset path=(/tmp/evil); runpod-run -- bun test ./tests",
+    "typeset -U path; path+=/tmp/evil; runpod-run -- bun test ./tests",
+    "declare -x PATH; runpod-run -- bun test ./tests",
+    "local path; runpod-run -- bun test ./tests",
+    "readonly 'PATH'=/tmp/evil; runpod-run -- bun test ./tests",
+    "unset path; runpod-run -- bun test ./tests",
+    "path+=/tmp/evil; runpod-run -- bun test ./tests",
+    "fpath=(/tmp/evil $fpath); runpod-run -- bun test ./tests",
+    "FPATH=/tmp/evil runpod-run -- bun test ./tests",
+    'runpod-run() { shift; "$@"; }; runpod-run -- bun test ./tests',
+    "'runpod-run'() { shift; \"$@\"; }; runpod-run -- bun test ./tests",  # the shell removes the quotes
+    "alias runpod-run='env'; runpod-run -- bun test ./tests",
+    "alias 'runpod-run'=env; runpod-run -- bun test ./tests",
+    "PATH=/tmp/evil:$PATH runpod-run -- bun test ./tests",
+    "PATH=/tmp/evil:$PATH; runpod-run -- bun test ./tests",  # an earlier segment re-points it
+    "export PATH=/tmp/evil:$PATH && runpod-run -- bun test ./tests",
+    "hash -p /tmp/evil/runpod-run runpod-run; runpod-run -- bun test ./tests",
+    "./runpod-run -- bun test ./tests",  # relative: whatever sits in the cwd
+    "{fake} -- bun test ./tests",  # named runpod-run, but not the installed script
+    "{forged} -- bun test ./tests",  # carries the real header, still not the installed script
+    "{symlink} -- bun test ./tests",  # a runpod-run symlink to python
+])
+def test_spoofed_runpod_run_is_not_exempt(command, offload_script, tmp_path):
+    """Review findings: the name alone, or the script's header, is spoofable — each of these
+    runs the suite locally."""
+    fake = tmp_path / "evil" / "runpod-run"
+    fake.parent.mkdir()
+    fake.write_text("#!/bin/sh\nshift; exec \"$@\"\n")
+    forged = tmp_path / "forged" / "runpod-run"
+    forged.parent.mkdir()
+    forged.write_text(_RUNPOD_RUN_HEADER + "shift; exec \"$@\"\n")
+    symlink = tmp_path / "evil2" / "runpod-run"
+    symlink.parent.mkdir()
+    symlink.symlink_to(sys.executable)
+    for name, path in (("{fake}", fake), ("{forged}", forged), ("{symlink}", symlink)):
+        command = command.replace(name, str(path))
+    assert hook.classify_heavy_operation(command) is not None, command
+
+
+def test_the_runpod_run_on_path_must_be_the_installed_script(monkeypatch, tmp_path):
+    forged = tmp_path / "runpod-run"
+    forged.write_text(_RUNPOD_RUN_HEADER + "shift; exec \"$@\"\n")
+    forged.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert hook.classify_heavy_operation("runpod-run -- bun test ./tests") is not None
+
+
+def test_the_checkout_copy_of_runpod_run_is_trusted():
+    """The skill script in this hook's own agent-tools checkout is the other trusted install."""
+    script = _HOOK.parents[2] / "skills" / "universal" / "runpod-offload" / "runpod-run"
+    assert hook.classify_heavy_operation(f"{script} -- bun test ./tests") is None
+
+
+def _register_worktree(repo: Path, worktree: Path, name: str = "feat") -> None:
+    """What `git worktree add` records: `<repo>/.git/worktrees/<name>/gitdir` → `<worktree>/.git`,
+    and `<worktree>/.git` → `gitdir: <repo>/.git/worktrees/<name>`."""
+    entry = repo / ".git" / "worktrees" / name
+    entry.mkdir(parents=True)
+    (entry / "gitdir").write_text(f"{worktree / '.git'}\n")
+    worktree.mkdir(parents=True, exist_ok=True)
+    (worktree / ".git").write_text(f"gitdir: {entry}\n")
+
+
+def test_install_and_worktrees_from_a_linked_worktree(tmp_path):
+    """Review finding: a root that is itself a linked worktree (`.git` is a file) still reaches
+    its main checkout and its sibling worktrees."""
+    main, first, second = tmp_path / "main", tmp_path / "wt" / "a", tmp_path / "wt" / "b"
+    _register_worktree(main, first, "a")
+    _register_worktree(main, second, "b")
+    assert hook._install_and_worktrees(first) == {main, first, second}
+    assert hook._install_and_worktrees(main) == {main, first, second}
+    assert hook._install_and_worktrees(tmp_path / "plain") == {tmp_path / "plain"}
+
+
+def test_a_registered_worktree_copy_of_runpod_run_is_trusted(monkeypatch, tmp_path):
+    checkout = tmp_path / "agent-tools"
+    worktree = checkout / ".worktrees" / "feat"
+    worktree_script = worktree / "skills" / "universal" / "runpod-offload" / "runpod-run"
+    worktree_script.parent.mkdir(parents=True)
+    worktree_script.write_text("#!/usr/bin/env bash\n")
+    monkeypatch.setattr(hook, "__file__", str(checkout / "agent-hooks" / "heavy-op-memory-gate" / "heavy_op_memory_gate.py"))
+    command = f"{worktree_script} -- bun test ./tests"
+    assert hook.classify_heavy_operation(command) is not None, "a directory under .worktrees/ is not a worktree"
+    _register_worktree(checkout, worktree)
+    assert hook.classify_heavy_operation(command) is None
+    other = tmp_path / "elsewhere" / ".worktrees" / "feat" / "skills" / "universal" / "runpod-offload" / "runpod-run"
+    other.parent.mkdir(parents=True)
+    other.write_text("#!/bin/sh\n")
+    assert hook.classify_heavy_operation(f"{other} -- bun test ./tests") is not None
+
+
+def test_runpod_run_not_on_path_is_not_exempt(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert hook.classify_heavy_operation("runpod-run -- bun test ./tests") is not None
+
+
+# ── review-cli handoff: review-cli admits its own runs (review-cli#614) ───────────────
+
+_FAKE_ADMISSION = '''\
+import os
+from types import SimpleNamespace
+
+
+def load_settings(config=None, env=None):
+    env = os.environ if env is None else env
+    if env.get("FAKE_ADMISSION_RAISE"):
+        raise RuntimeError("broken config")
+    return SimpleNamespace(enabled=env.get("REVIEW_ADMISSION", "1") not in ("0", "false", "off", "no"))
+'''
+
+
+def _review_checkout(root: Path) -> Path:
+    (root / "bin").mkdir(parents=True)
+    (root / "reviewlib").mkdir()
+    (root / "bin" / "review").write_text("#!/usr/bin/env python3\n")
+    (root / "bin" / "review").chmod(0o755)
+    (root / "reviewlib" / "__init__.py").write_text("")
+    (root / "reviewlib" / "admission.py").write_text(_FAKE_ADMISSION)
+    return root
+
+
+@pytest.fixture
+def review_cli(tmp_path, monkeypatch):
+    """An installed review-cli with the admission controller: a checkout whose
+    `reviewlib.admission.load_settings()` answers from REVIEW_ADMISSION, the `~/.local/bin/review`
+    symlink to its `bin/review`, that dir on PATH. Returns the root. The hook imports
+    `reviewlib` from it, so `sys.path` and `sys.modules` are restored afterwards."""
+    home = tmp_path / "home"
+    root = _review_checkout(home / "work" / "review-cli")
+    local_bin = home / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+    (local_bin / "review").symlink_to(root / "bin" / "review")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", f"{local_bin}:{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    stale = [name for name in sys.modules if name == "reviewlib" or name.startswith("reviewlib.")]
+    for name in stale:
+        monkeypatch.delitem(sys.modules, name)
+    yield root
+    for name in [name for name in sys.modules if name == "reviewlib" or name.startswith("reviewlib.")]:
+        del sys.modules[name]
+
+
+@pytest.mark.parametrize("command", [
+    "review diff --staged --task 633",
+    "review quorum --task 1 'q'",
+    "timeout 1800 review diff --staged -C .",
+    "~/.local/bin/review brainstorm x",
+    "{root}/bin/review just-ask q",
+    "cd /repo && review diff --staged 2>&1 | tail -40",
+])
+def test_installed_review_cli_with_admission_takes_the_review(command, review_cli):
+    assert hook.review_cli_handoff(command.replace("{root}", str(review_cli))) is not None, command
+
+
+def test_a_registered_review_cli_worktree_takes_the_review(review_cli):
+    worktree = _review_checkout(review_cli / ".worktrees" / "feat")
+    command = f"{worktree}/bin/review diff --staged"
+    assert hook.review_cli_handoff(command) is None, "a directory under .worktrees/ is not a worktree"
+    _register_worktree(review_cli, worktree)
+    assert hook.review_cli_handoff(command) == ""
+
+
+def test_review_handoff_keeps_other_heavy_work_in_the_command(review_cli):
+    rest = hook.review_cli_handoff("review diff --staged && bun test")
+    assert rest == "bun test"
+    assert hook.classify_heavy_operation(rest) == "build/test suite"
+
+
+@pytest.mark.parametrize("command", [
+    "review() { shift; \"$@\"; }; review diff",
+    "function review { :; }; review diff",
+    "r=review; function ${r} { :; }; review diff",
+    "alias 'review'=env; review diff",
+    "PATH=/tmp/evil:$PATH; review diff",
+    "set -A path /tmp/evil $path; review diff",  # zsh (review finding)
+    "typeset path=(/tmp/evil); review diff",
+    "path+=/tmp/evil; review diff",
+    "hash -p /tmp/evil/review review; review diff",
+    "./bin/review diff",  # relative
+    "{fake}/bin/review diff",  # a look-alike checkout with an admission controller, not the installed one
+    "python3 {root}/bin/review diff",  # not the program position
+    "REVIEW_ADMISSION=0 review diff",
+    "env REVIEW_ADMISSION=false review diff",
+    "export REVIEW_ADMISSION=off; review diff",
+    "REVIEW_ADMISSION=$OFF review diff",  # expands to anything; only a literal true is trusted
+    "REVIEW_ADMISSION=\"$(cat flag)\" review diff",
+    "REVIEW_ADMISSION=1#x review diff",  # not a literal true to review-cli's parser
+    "source ~/.zshrc; review diff",
+    "HOME=/tmp/other review diff",  # would read another config than the one asked
+    "sudo review diff",  # another user's PATH and config (review finding)
+    "env review diff",
+    "XDG_CONFIG_HOME=/tmp/x review diff",
+])
+def test_review_is_not_handed_off_when_it_may_not_be_admitted(command, review_cli, tmp_path):
+    fake = _review_checkout(tmp_path / "fake-review-cli")
+    command = command.replace("{fake}", str(fake)).replace("{root}", str(review_cli))
+    assert hook.review_cli_handoff(command) is None, command
+
+
+def test_review_cli_without_the_admission_controller_is_not_handed_off(review_cli):
+    (review_cli / "reviewlib" / "admission.py").unlink()
+    assert hook.review_cli_handoff("review diff --staged") is None
+
+
+def test_review_cli_decides_whether_admission_is_on(review_cli, monkeypatch):
+    """review-cli's own `load_settings()` answers (its YAML and env semantics); any failure
+    there means no handoff (review finding: a regex over its config missed valid YAML)."""
+    monkeypatch.setenv("REVIEW_ADMISSION", "0")
+    assert hook.review_cli_handoff("review diff") is None
+    monkeypatch.delenv("REVIEW_ADMISSION")
+    monkeypatch.setenv("FAKE_ADMISSION_RAISE", "1")
+    assert hook.review_cli_handoff("review diff") is None
+    monkeypatch.delenv("FAKE_ADMISSION_RAISE")
+    assert hook.review_cli_handoff("review diff") == ""
+
+
+@pytest.mark.parametrize("command", [
+    "REVIEW_ADMISSION=1 review diff",
+    "export REVIEW_ADMISSION=on; review diff",
+    "review diff; export REVIEW_ADMISSION=0",
+    "unset REVIEW_ADMISSION; review diff",
+    "env -u REVIEW_ADMISSION review diff",
+    "env -i review diff",
+    "REVIEW_ADMISSION_HEADROOM=0 review diff",
+    "REVIEW_X=1 review diff",
+])
+def test_a_command_that_may_change_the_reviews_environment_is_not_handed_off(command, review_cli):
+    """review-cli is asked with this hook's environment; a command that may give the review
+    another one is gated here as before (review findings: export order, `unset`, `env -u`)."""
+    assert hook.review_cli_handoff(command) is None, command
+
+
+def test_runpod_run_remote_tail_does_not_stop_a_review_handoff(review_cli, offload_script):
+    command = "runpod-run -- bash -c 'export PATH=/opt/bin:$PATH && make test' && review diff --staged"
+    rest = hook.review_cli_handoff(command)
+    assert rest is not None and hook.classify_heavy_operation(rest) is None
+
+
+def test_review_cli_output_never_reaches_the_protocol_stdout(review_cli, monkeypatch):
+    admission = review_cli / "reviewlib" / "admission.py"
+    admission.write_text("print('noise')\n" + _FAKE_ADMISSION)
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    assert hook.review_cli_handoff("review diff") == ""
+    assert out.getvalue() == ""
+
+
+def test_no_installed_review_cli_means_no_handoff(tmp_path):
+    fake = _review_checkout(tmp_path / "rc")
+    assert hook.review_cli_handoff(f"{fake}/bin/review diff") is None
+
+
 # ── read_pressure_level — platform DISPATCH (not fallback-chain) ─────────────────
 
 def test_read_pressure_level_dispatches_to_macos_reader_on_darwin():
     calls = []
     hook.read_pressure_level(
         macos_reader=lambda: (calls.append("macos"), 4)[1],
-        linux_reader=lambda: (calls.append("linux"), 1)[1],
         platform_name="Darwin",
     )
     assert calls == ["macos"]
 
 
-def test_read_pressure_level_dispatches_to_linux_reader_on_linux():
+def test_read_pressure_level_is_none_on_linux():
+    """Linux has no jetsam level; its pressure signal is the raw PSI reading."""
     calls = []
-    hook.read_pressure_level(
-        macos_reader=lambda: (calls.append("macos"), 4)[1],
-        linux_reader=lambda: (calls.append("linux"), 2)[1],
-        platform_name="Linux",
-    )
-    assert calls == ["linux"]
-
-
-def test_read_pressure_level_does_not_cross_fall_back():
-    """A None from the platform's own reader is NOT chased with the other
-    platform's reader — dispatch is exclusive, by design (see docstring)."""
-    result = hook.read_pressure_level(macos_reader=lambda: None, linux_reader=lambda: 2, platform_name="Darwin")
-    assert result is None
+    assert hook.read_pressure_level(macos_reader=lambda: (calls.append("macos"), 4)[1], platform_name="Linux") is None
+    assert calls == []
 
 
 def test_read_pressure_level_none_when_reader_unavailable():
-    assert hook.read_pressure_level(macos_reader=lambda: None, linux_reader=lambda: None, platform_name="Darwin") is None
+    assert hook.read_pressure_level(macos_reader=lambda: None, platform_name="Darwin") is None
 
 
-def test_linux_pressure_reader_maps_avg10_to_levels():
-    def make_reader(text):
-        return lambda path: text
-
-    critical_text = "some avg10=75.00 avg60=50.00 avg300=20.00 total=123\nfull avg10=10.00\n"
-    warn_text = "some avg10=25.00 avg60=10.00 avg300=5.00 total=123\nfull avg10=1.00\n"
-    normal_text = "some avg10=2.00 avg60=1.00 avg300=0.50 total=123\nfull avg10=0.00\n"
-
-    assert hook._read_linux_pressure_level(read_text=make_reader(critical_text)) == 4
-    assert hook._read_linux_pressure_level(read_text=make_reader(warn_text)) == 2
-    assert hook._read_linux_pressure_level(read_text=make_reader(normal_text)) == 1
+def test_linux_psi_reader_returns_some_avg10():
+    text = "some avg10=25.50 avg60=10.00 avg300=5.00 total=123\nfull avg10=1.00\n"
+    assert hook._read_linux_psi_some10(read_text=lambda path: text) == 25.5
 
 
-def test_linux_pressure_reader_none_on_missing_file():
+def test_linux_psi_reader_none_on_missing_file():
     def raiser(path):
         raise OSError("no such file")
 
-    assert hook._read_linux_pressure_level(read_text=raiser) is None
+    assert hook._read_linux_psi_some10(read_text=raiser) is None
 
 
-def test_linux_pressure_reader_none_on_unparseable_content():
-    assert hook._read_linux_pressure_level(read_text=lambda p: "garbage, no psi fields here") is None
+def test_linux_psi_reader_none_on_unparseable_content():
+    assert hook._read_linux_psi_some10(read_text=lambda p: "garbage, no psi fields here") is None
+
+
+def test_read_linux_psi_some10_is_linux_only(monkeypatch):
+    monkeypatch.setattr(hook, "_read_linux_psi_some10", lambda read_text=None: 42.0)
+    assert hook.read_linux_psi_some10(platform_name="Darwin") is None
+    assert hook.read_linux_psi_some10(platform_name="Linux") == 42.0
+
+
+def test_psi_above_threshold_blocks_and_below_allows():
+    decision, message = hook.decide("build/test suite", level=None, block_at=2, psi_some10=12.0, max_psi_some10=10.0)
+    assert decision == "block"
+    assert "PSI some avg10" in message
+    assert hook.decide("build/test suite", level=None, block_at=2, psi_some10=9.9, max_psi_some10=10.0) == ("allow", None)
+
+
+def test_max_psi_env_override_and_rejection(monkeypatch):
+    monkeypatch.setenv("RIG_HEAVY_OP_MAX_PSI_SOME10", "2.5")
+    assert hook._max_psi_some10() == 2.5
+    for raw in ("0", "100", "lots", "-1"):
+        monkeypatch.setenv("RIG_HEAVY_OP_MAX_PSI_SOME10", raw)
+        assert hook._max_psi_some10() == hook.DEFAULT_MAX_PSI_SOME10
+
+
+def _swap_snapshot(available_gib, swap_free_gib, swap_total_gib=16):
+    gib = 1024**3
+    return hook.MemorySnapshot(
+        48 * gib, 2 * gib, int(available_gib * gib),
+        swap_total_bytes=swap_total_gib * gib, swap_free_bytes=int(swap_free_gib * gib),
+    )
+
+
+def test_full_swap_with_plenty_of_ram_allows():
+    """2026-10-14: swap 83% full of stale pages while MemAvailable was 37 GB and PSI 0 — the
+    unconditioned swap check blocked an idle machine."""
+    snap = _swap_snapshot(30, 1.6)  # swap 90% full
+    assert hook.decide("build/test suite", level=None, block_at=2, memory=snap, min_available_mb=8192, live_runners=[]) == ("allow", None)
+
+
+def test_full_swap_blocks_without_a_live_runner_scan():
+    """Review finding: with the scan unavailable the budget knows no reservations, so a roomy
+    budget proves nothing — the swap check stays unconditional, as before the budget."""
+    decision, message = hook.decide("build/test suite", level=None, block_at=2, memory=_swap_snapshot(30, 1.6), min_available_mb=8192)
+    assert decision == "block"
+    assert "swap is 90% full" in message and "no live-runner scan is available" in message
+
+
+def test_full_swap_blocks_when_ram_is_short():
+    """2026-10-11: swap had been 100% full all night when RAM ran short — nowhere to go."""
+    decision, message = hook.decide(
+        "build/test suite", level=None, block_at=2, memory=_swap_snapshot(6, 1.6), min_available_mb=4096, live_runners=[]
+    )
+    assert decision == "block"
+    assert "swap is 90% full" in message
+    assert "Memory budget: 6144 MB available − 0 MB reserved for 0 live runner(s) − 3072 MB" in message
+
+
+def test_swap_is_checked_below_twice_the_headroom_even_when_the_budget_itself_passes():
+    # 10 GiB − 3 GiB suite = 7168 MB left: above the 4096 MB headroom, below 2 x 4096.
+    decision, message = hook.decide(
+        "build/test suite", level=None, block_at=2, memory=_swap_snapshot(10, 1.6), min_available_mb=4096, live_runners=[]
+    )
+    assert decision == "block"
+    assert "swap is 90% full" in message and "budget does not cover" not in message
+    healthy = _swap_snapshot(10, 8)
+    assert hook.decide("build/test suite", level=None, block_at=2, memory=healthy, min_available_mb=4096, live_runners=[]) == ("allow", None)
+
+
+def test_no_swap_skips_the_swap_check():
+    gib = 1024**3
+    snap = hook.MemorySnapshot(48 * gib, 2 * gib, 30 * gib)  # swap fields default to 0
+    assert hook.decide("build/test suite", level=None, block_at=2, memory=snap, min_available_mb=8192) == ("allow", None)
 
 
 # ── macOS reader — the one function that actually runs in production ─────────────
@@ -551,13 +948,372 @@ def test_max_wired_pct_rejects_values_that_would_disable_or_break_the_check(monk
 
 def test_min_available_mb_env_override(monkeypatch):
     monkeypatch.setenv("RIG_HEAVY_OP_MIN_AVAILABLE_MB", "100")
-    assert hook._min_available_mb() == 100
+    assert hook._min_available_mb(platform_name="Darwin") == 100
+    assert hook._min_available_mb(platform_name="Linux") == 100
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "none"])
 def test_min_available_mb_rejects_values_that_would_disable_the_check(monkeypatch, raw):
     monkeypatch.setenv("RIG_HEAVY_OP_MIN_AVAILABLE_MB", raw)
-    assert hook._min_available_mb() == hook.DEFAULT_MIN_AVAILABLE_MB
+    assert hook._min_available_mb(platform_name="Darwin") == hook.DEFAULT_MIN_AVAILABLE_MB
+
+
+def test_min_available_mb_linux_default_is_8gib_or_a_fifth_of_ram():
+    """2026-10-11: the 512 MB floor never fired on the 48 GB box (MemAvailable bottomed at
+    ~1.9 GB while it thrashed). 20% of 48 GB ≈ 9.6 GB; 8 GiB on anything smaller than 40 GB."""
+    gib = 1024**3
+    big = hook.MemorySnapshot(48 * gib, 0, 48 * gib)
+    small = hook.MemorySnapshot(16 * gib, 0, 16 * gib)
+    assert hook._min_available_mb(big, platform_name="Linux") == 48 * 1024 * 20 // 100
+    assert hook._min_available_mb(small, platform_name="Linux") == 8192
+    assert hook._min_available_mb(None, platform_name="Linux") == 8192
+    assert hook._min_available_mb(big, platform_name="Darwin") == hook.DEFAULT_MIN_AVAILABLE_MB
+
+
+# ── live heavy runners — a /proc snapshot, attributed to omp sessions ─────────────
+
+def _table(rows):
+    """{pid: (ppid, comm, argv)} → the scanner's table shape."""
+    return {pid: hook._ProcInfo(ppid, comm, argv) for pid, (ppid, comm, argv) in rows.items()}
+
+
+_LIVE_TABLE = _table({
+    1: (0, "systemd", ["/sbin/init"]),
+    100: (1, "omp", ["omp"]),  # root session A
+    101: (100, "omp", ["omp", "__omp_worker_daemon_broker"]),  # a worker daemon, not a session
+    110: (100, "bash", ["bash", "-c", "uv run pytest tests/"]),
+    111: (110, "uv", ["uv", "run", "pytest", "tests/"]),  # launcher: collapses under …
+    112: (111, "python", ["/repo/.venv/bin/python", "/repo/.venv/bin/pytest", "tests/"]),  # … the runner root
+    113: (112, "python", ["/repo/.venv/bin/python", "-c", "xdist worker"]),
+    200: (1, "omp", ["omp", "-r"]),  # root session B
+    201: (200, "omp", ["omp", "--subagent"]),  # a subagent's omp under session B
+    210: (201, "python", ["python3", "/x/review-cli/.venv/bin/review", "diff", "-C", "."]),
+    211: (210, "node", ["node", "/home/u/.local/bin/claude", "-p", "review this"]),
+    212: (210, "codex", ["codex", "exec", "review this"]),
+    300: (1, "bash", ["bash"]),
+    301: (300, "node", ["node", "/home/u/.local/bin/claude"]),  # interactive claude: not a seat
+    302: (300, "bun", ["bun", "test", "./tests"]),  # no omp ancestor
+    303: (300, "grep", ["grep", "-rn", "vitest.config", "src"]),  # `vitest.config` is not `vitest`
+    304: (300, "node", ["node", "/repo/node_modules/.bin/tsc", "-b"]),
+    305: (300, "docker", ["docker", "buildx", "build", "."]),
+})
+
+
+@pytest.fixture
+def _fake_proc(tmp_path, monkeypatch):
+    """Point the scanner's `/proc` at an empty dir so a test pid never resolves to a real
+    process's cwd/statm on the developer's machine."""
+    monkeypatch.setattr(hook, "_PROC", tmp_path / "proc")
+
+
+def test_scan_collapses_launcher_trees_and_attributes_sessions(_fake_proc):
+    sessions = {100: {"pid": 100, "cwd": "/home/u/repo-a", "title": "A: fix tests"}}
+    runners = hook.scan_live_runners(table=_LIVE_TABLE, pss=lambda pid: pid * 10)
+    by_pid = {r.pid: r for r in runners}
+    # 112/113 collapse under the `uv run pytest` launcher 111; the review's seat CLIs 211/212
+    # collapse into the review process 210.
+    assert sorted(by_pid) == [111, 210, 302, 304, 305]
+    assert by_pid[111].label == "pytest" and by_pid[111].pss_mb == 1110 + 1120 + 1130, "the whole tree's PSS"
+    assert by_pid[111].omp_pid == 100 and by_pid[111].session == "", "titles are resolved later"
+    assert by_pid[210].pss_mb == 2100 + 2110 + 2120
+    assert by_pid[302].label == "bun test" and by_pid[302].omp_pid is None
+    assert by_pid[304].label == "tsc --build"
+    assert by_pid[305].label == "docker build"
+    described = {r.pid: r for r in hook.describe_live_runners(runners, sessions=lambda: sessions)}
+    assert described[111].session == 'omp 100 (/home/u/repo-a) "A: fix tests"'
+    assert described[302].session == ""
+
+
+def test_scan_review_seats_collapse_into_one_review_attributed_to_the_root_omp_session(_fake_proc):
+    runners = hook.describe_live_runners(hook.scan_live_runners(table=_LIVE_TABLE, pss=lambda pid: 0), sessions=lambda: {})
+    reviews = [r for r in runners if r.label.startswith("review")]
+    assert [(r.pid, r.label) for r in reviews] == [(210, "review (2 seat(s): claude, codex)")]
+    # The subagent's omp (201) is passed over for the ROOT session (200); with no tg-ctl entry
+    # and no /proc cwd for it, the pid alone is shown.
+    assert reviews[0].session == "omp 200"
+    assert not any(r.pid == 301 for r in runners), "an interactive claude is not a review seat"
+
+
+def test_review_without_seats_is_not_a_runner(_fake_proc):
+    table = _table({
+        1: (0, "systemd", ["/sbin/init"]),
+        10: (1, "python", ["python3", "/x/review-cli/.venv/bin/review", "task", "705", "--check"]),
+    })
+    assert hook.scan_live_runners(table=table, pss=lambda pid: 0) == []
+
+
+def test_scan_excludes_its_own_ancestry(monkeypatch):
+    table = _table({
+        1: (0, "systemd", ["/sbin/init"]),
+        50: (1, "python", ["python", "-m", "pytest", "tests/test_heavy_op_memory_gate.py"]),
+        51: (50, "python", ["python", "hook.py"]),
+    })
+    monkeypatch.setattr(hook.os, "getpid", lambda: 51)
+    assert hook.scan_live_runners(table=table, pss=lambda pid: 0) == []
+
+
+def test_pss_reads_smaps_rollup_and_rss_reads_statm(_fake_proc, tmp_path):
+    rollup = tmp_path / "proc" / "77" / "smaps_rollup"
+    rollup.parent.mkdir(parents=True)
+    rollup.write_text("55d0-7ffd ---p 00000000 00:00 0  [rollup]\nRss:  4194304 kB\nPss:  1048576 kB\n")
+    assert hook._pss_mb(77) == 1024
+    assert hook._pss_mb(78) is None, "unreadable (another user's process) or gone"
+    statm = tmp_path / "proc" / "78" / "statm"
+    statm.parent.mkdir(parents=True)
+    pages = 2 * 1024 * 1024 * 1024 // os.sysconf("SC_PAGE_SIZE")
+    statm.write_text(f"999999 {pages} 0 0 0 0 0\n")
+    assert hook._rss_mb(78) == 2048
+    assert hook._rss_mb(79) == 0, "gone"
+
+
+def test_tree_footprint_never_sums_fallback_rss(_fake_proc):
+    """Review findings: summed RSS double-counts pages forked workers share, which would shrink
+    the reservation; where PSS is unreadable (another user's tree) the largest single RSS
+    stands in instead of 0 (which would reserve the full cost) or the RSS sum."""
+    table = _table({
+        1: (0, "systemd", ["/sbin/init"]),
+        700: (1, "pytest", ["pytest", "-n", "2"]),
+        701: (700, "python", ["python", "-c", "xdist worker"]),
+        702: (700, "python", ["python", "-c", "xdist worker"]),
+    })
+    unreadable = hook.scan_live_runners(table=table, pss=lambda pid: None, rss=lambda pid: 2048)
+    assert [r.pss_mb for r in unreadable] == [2048], "max RSS, not 3 x 2048"
+    readable = hook.scan_live_runners(table=table, pss=lambda pid: 700, rss=lambda pid: 2048)
+    assert [r.pss_mb for r in readable] == [2100]
+    mixed = hook.scan_live_runners(table=table, pss=lambda pid: None if pid == 702 else 100, rss=lambda pid: 1500)
+    assert [r.pss_mb for r in mixed] == [1500]
+
+
+def test_describe_skips_the_session_lookup_without_omp_ancestors():
+    calls = []
+    runners = [hook.LiveRunner(302, 0, "bun test", "", None)]
+    assert hook.describe_live_runners(runners, sessions=lambda: calls.append(1) or {}) == runners
+    assert calls == []
+
+
+def test_runner_label_examples():
+    assert hook._runner_label(["make", "-j8", "check"]) == "make check"
+    assert hook._runner_label(["cargo", "test", "--workspace"]) == "cargo test"
+    assert hook._runner_label(["go", "test", "./..."]) == "go test"
+    assert hook._runner_label(["/usr/bin/python3", "-m", "mypy", "src"]) == "mypy"
+    assert hook._runner_label(["node", "/r/node_modules/.bin/jest"]) == "jest"
+    assert hook._runner_label(["uv", "run", "--with", "pytest", "pytest", "tests/"]) == "pytest"
+    assert hook._runner_label(["timeout", "600", "uv", "run", "pytest"]) == "pytest"
+    assert hook._runner_label(["/repo/.venv/bin/python", "/repo/.venv/bin/pytest", "-q"]) == "pytest"
+    assert hook._runner_label(["cargo", "build"]) is None
+    assert hook._runner_label(["bun", "run", "dev"]) is None
+    assert hook._runner_label(["node", "/r/node_modules/.bin/tsc", "--noEmit"]) is None
+
+
+@pytest.mark.parametrize("argv", [
+    ["grep", "pytest", "README.md"],
+    ["echo", "mypy"],
+    ["vim", "tests/test_pytest.py"],
+    ["bash", "-c", "grep -rn vitest src"],  # the script is one word, not an executable position
+    ["git", "commit", "-m", "pytest"],
+    ["tail", "-f", "jest.log"],
+])
+def test_runner_label_ignores_runner_names_in_operand_positions(argv):
+    """Review finding: a long-lived `grep pytest` or `echo mypy` must not count toward the limit."""
+    assert hook._runner_label(argv) is None, argv
+
+
+def test_scan_does_not_count_runpod_run_trees(_fake_proc, offload_script):
+    """`runpod-run -- bun test` names a runner in its argv, but the suite runs on the pod;
+    the local process and its ssh child are not heavy runners."""
+    table = _table({
+        1: (0, "systemd", ["/sbin/init"]),
+        100: (1, "omp", ["omp"]),
+        400: (100, "runpod-run", ["bash", str(offload_script), "--ttl", "30", "--", "bun", "test", "./tests"]),
+        401: (400, "ssh", ["ssh", "-p", "22", "runner@1.2.3.4", "bash -c x runpod-run /workspace/r 3600s bun test ./tests"]),
+        402: (400, "bun", ["bun", "test", "./tests"]),  # even a stray child is the offload's
+        410: (100, "bash", ["bash", "./runpod-run", "--", "pytest", "-q"]),  # relative: not pinnable, so counted
+        411: (410, "python", ["python", "-m", "pytest", "-q"]),
+        500: (100, "bun", ["bun", "test", "./tests"]),  # a real local suite still counts
+    })
+    assert [r.pid for r in hook.scan_live_runners(table=table, pss=lambda pid: 0)] == [411, 500]
+
+
+def test_scan_counts_a_process_merely_named_runpod_run(_fake_proc, tmp_path):
+    """Review finding: a spoofed `runpod-run` (here a pass-through shim) runs the suite locally."""
+    fake = tmp_path / "evil" / "runpod-run"
+    fake.parent.mkdir()
+    fake.write_text("#!/bin/sh\nexec \"$@\"\n")
+    table = _table({
+        1: (0, "systemd", ["/sbin/init"]),
+        600: (1, "runpod-run", ["sh", str(fake), "--", "bun", "test", "./tests"]),
+        601: (600, "bun", ["bun", "test", "./tests"]),
+    })
+    assert [r.pid for r in hook.scan_live_runners(table=table, pss=lambda pid: 0)] == [601]
+
+
+@pytest.mark.parametrize("argv", [
+    ["bash", "{skill}", "--", "bun", "test"],
+    ["/usr/bin/env", "bash", "{local_bin}", "--ttl", "30", "--", "pytest"],
+    ["timeout", "3700", "{skill}", "--", "pytest"],
+])
+def test_is_offload_process_matches_the_real_runpod_run_in_executable_position(argv, offload_script):
+    local_bin = Path(os.environ["HOME"]) / ".local" / "bin" / "runpod-run"
+    argv = [word.format(skill=offload_script, local_bin=local_bin) for word in argv]
+    assert hook._is_offload_process(hook._ProcInfo(1, "bash", argv))
+
+
+def test_is_offload_process_ignores_runpod_run_as_an_operand(offload_script):
+    assert not hook._is_offload_process(hook._ProcInfo(1, "grep", ["grep", str(offload_script), "README.md"]))
+    assert not hook._is_offload_process(hook._ProcInfo(1, "pytest", ["pytest", "tests/test_runpod-run.py"]))
+
+
+def _runners(n, label="pytest", pss_mb=None):
+    return [
+        hook.LiveRunner(1000 + i, 500 + i if pss_mb is None else pss_mb, label, f"omp {10 + i} (~/repo-{i})", 10 + i)
+        for i in range(n)
+    ]
+
+
+_GIB_MB = 1024
+
+
+def _avail(gib):
+    return hook.MemorySnapshot(48 * 1024**3, 2 * 1024**3, int(gib * 1024**3))
+
+
+def test_budget_allows_a_review_next_to_two_runners_with_plenty_of_ram():
+    """2026-10-14: 23 GB available, PSI 0, two runners live — the fixed cap of 2 blocked this."""
+    assert hook.decide(
+        "multi-model review-cli pass", level=None, block_at=2, memory=_avail(23), min_available_mb=9830,
+        psi_some10=0.0, live_runners=_runners(2),
+    ) == ("allow", None)
+
+
+def test_budget_blocks_a_suite_while_four_reviews_have_not_grown_yet():
+    """Four reviews whose seats still sit at 300 MB each reserve 4 x 2.7 GiB — with the suite's
+    own 3 GiB, more than the 10 GiB available, whatever their current footprint says."""
+    decision, message = hook.decide(
+        "test-suite runner", level=None, block_at=2, memory=_avail(10), min_available_mb=4096,
+        psi_some10=0.0, live_runners=_runners(4, label="review (4 seat(s): claude, codex)", pss_mb=300),
+    )
+    assert decision == "block"
+    arithmetic = (
+        "10240 MB available − 11088 MB reserved for 4 live runner(s) − 3072 MB for this "
+        "test-suite runner = -3920 MB left (headroom 4096 MB)"
+    )
+    assert f"the memory budget does not cover it: {arithmetic}" in message
+    assert f"\nMemory budget: {arithmetic}." in message
+    assert "  - pid 1000  300 MB  review (4 seat(s): claude, codex)  (reserves 2772 MB)  ← omp 10 (~/repo-0)" in message
+    assert "hard ceiling" not in message
+
+
+def test_budget_costs_by_class():
+    costs = hook.CostTable()
+    # Measured: review-cli's sampler, 294 runs, whole review tree peak p95 1125 MB, max 3195 MB.
+    assert hook._expected_cost_mb("multi-model review-cli pass", costs) == 3 * _GIB_MB
+    assert hook._expected_cost_mb("review (1 seat(s): codex)", costs) == 3 * _GIB_MB
+    assert hook._expected_cost_mb("docker build", costs) == 8 * _GIB_MB
+    for label in ("pytest", "bun test", "tsc --build", "build/test suite", hook.GPU_MODEL_LABEL):
+        assert hook._expected_cost_mb(label, costs) == 3 * _GIB_MB, label
+    assert hook._reserved_mb(hook.LiveRunner(1, 5000, "pytest", ""), costs) == 0, "a runner past its estimate reserves nothing"
+
+
+def test_budget_env_overrides(monkeypatch):
+    monkeypatch.setenv("RIG_HEAVY_OP_COST_REVIEW_MB", "4096")
+    monkeypatch.setenv("RIG_HEAVY_OP_COST_SUITE_MB", "0")  # would disable the reservation: default
+    monkeypatch.setenv("RIG_HEAVY_OP_HEADROOM_MB", "2048")
+    assert hook._cost_table() == hook.CostTable(4096, hook.DEFAULT_COST_DOCKER_MB, hook.DEFAULT_COST_SUITE_MB)
+    assert hook._headroom_mb() == 2048
+
+
+def test_budget_needs_a_live_runner_scan():
+    """macOS (no scan): the budget would be a far higher floor than its own thresholds."""
+    assert hook.decide("multi-model review-cli pass", level=1, block_at=2, memory=_avail(6)) == ("allow", None)
+
+
+def test_live_runner_ceiling_blocks_even_with_plenty_of_ram():
+    decision, message = hook.decide("test-suite runner", level=None, block_at=2, memory=_avail(200), live_runners=_runners(5))
+    assert decision == "block"
+    assert "5 heavy runner(s) are already live on the machine (hard ceiling 5" in message
+    assert "budget does not cover" not in message
+    assert message.endswith(
+        "Heavy runners live right now (5; ceiling 5):\n"
+        "  - pid 1000  500 MB  pytest  (reserves 2572 MB)  ← omp 10 (~/repo-0)\n"
+        "  - pid 1001  501 MB  pytest  (reserves 2571 MB)  ← omp 11 (~/repo-1)\n"
+        "  - pid 1002  502 MB  pytest  (reserves 2570 MB)  ← omp 12 (~/repo-2)\n"
+        "  - pid 1003  503 MB  pytest  (reserves 2569 MB)  ← omp 13 (~/repo-3)\n"
+        "  - pid 1004  504 MB  pytest  (reserves 2568 MB)  ← omp 14 (~/repo-4)"
+    )
+    assert "runpod-run" in message
+    assert hook.decide("test-suite runner", level=None, block_at=2, memory=_avail(200), live_runners=_runners(4)) == ("allow", None)
+
+
+def test_live_runners_are_listed_when_another_signal_blocks():
+    assert hook.decide("test-suite runner", level=None, block_at=2, live_runners=_runners(1)) == ("allow", None)
+    decision, message = hook.decide("test-suite runner", level=None, block_at=2, live_runners=_runners(1), psi_some10=50.0)
+    assert decision == "block"
+    assert "Heavy runners live right now (1; ceiling 5):\n  - pid 1000  500 MB  pytest" in message
+
+
+def test_max_live_env_override_and_rejection(monkeypatch):
+    monkeypatch.setenv("RIG_HEAVY_OP_MAX_LIVE", "4")
+    assert hook._max_live() == 4
+    monkeypatch.setenv("RIG_HEAVY_OP_MAX_LIVE", "0")
+    assert hook._max_live() == hook.DEFAULT_MAX_LIVE
+
+
+def _crowded_full_swap(available_gib):
+    gib = 1024**3
+    return hook.MemorySnapshot(48 * gib, 2 * gib, int(available_gib * gib), swap_total_bytes=16 * gib, swap_free_bytes=0)
+
+
+def test_review_admission_skips_budget_swap_and_ceiling():
+    """review-cli queues on those itself (review-cli#614): six live reviews, a full swap and a
+    budget far below zero do not block a review it admits."""
+    runners = _runners(6, label="review (4 seat(s): claude, codex)", pss_mb=300)
+    kwargs = dict(level=None, block_at=2, memory=_crowded_full_swap(12), min_available_mb=9830, psi_some10=0.0, live_runners=runners)
+    assert hook.decide(hook.REVIEW_LABEL, review_admission=True, **kwargs) == ("allow", None)
+    decision, message = hook.decide(hook.REVIEW_LABEL, **kwargs)
+    assert decision == "block" and "budget does not cover" in message and "hard ceiling" in message
+
+
+@pytest.mark.parametrize("signal", ["available", "psi", "level"])
+def test_review_admission_still_blocks_on_emergency_signals(signal):
+    kwargs = dict(level=None, block_at=2, memory=_crowded_full_swap(30), min_available_mb=9830, psi_some10=0.0, live_runners=[])
+    if signal == "available":
+        kwargs["memory"] = _crowded_full_swap(6)
+    elif signal == "psi":
+        kwargs["psi_some10"] = 25.0
+    else:
+        kwargs["level"] = 4
+    decision, message = hook.decide(hook.REVIEW_LABEL, review_admission=True, **kwargs)
+    assert decision == "block", signal
+    assert "review-cli's admission controller would queue this review" in message
+    assert "swap is" not in message and "Memory budget" not in message
+
+
+def test_live_runners_guarded_fails_open(monkeypatch):
+    def boom():
+        raise RuntimeError("proc unreadable")
+
+    monkeypatch.setattr(hook, "scan_live_runners", boom)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    assert hook._live_runners_guarded(platform_name="Linux") is None
+    assert hook._live_runners_guarded(platform_name="Darwin") is None
+
+
+def test_unreadable_proc_is_a_failed_scan_not_an_empty_one(monkeypatch, tmp_path):
+    """Review finding: an empty table read as "nothing running" would skip the swap check's
+    no-scan fallback."""
+    monkeypatch.setattr(hook, "_PROC", tmp_path / "no-proc")
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    assert hook._live_runners_guarded(platform_name="Linux") is None
+
+
+def test_real_proc_scan_is_fast_and_does_not_crash():
+    """The real `/proc` read (no mocks) must stay well under the hook's budget."""
+    if not Path("/proc/self/stat").exists():
+        pytest.skip("no /proc")
+    started = time.monotonic()
+    runners = hook.scan_live_runners()
+    assert time.monotonic() - started < 0.3
+    assert all(isinstance(r, hook.LiveRunner) for r in runners)
 
 
 # ── _block_at_level — env override, restricted to the real jetsam levels ─────────
@@ -666,7 +1422,7 @@ def _run(command, monkeypatch, *, macos_level, memory=None, env: dict | None = N
     monkeypatch.setattr(hook, "_read_macos_memory_snapshot", lambda run=None: memory)
     monkeypatch.setattr(hook, "_read_linux_memory_snapshot", lambda read_text=None: None)
     monkeypatch.setattr(hook, "_read_macos_pressure_level", lambda run=None: macos_level)
-    monkeypatch.setattr(hook, "_read_linux_pressure_level", lambda read_text=None: None)
+    monkeypatch.setattr(hook, "_read_linux_psi_some10", lambda read_text=None: None)
     monkeypatch.setattr(hook.platform, "system", lambda: "Darwin")
     out, err = io.StringIO(), io.StringIO()
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"args": {"command": command}})))
@@ -758,7 +1514,7 @@ def test_main_fails_open_on_unparseable_stdin(monkeypatch):
 def test_main_applies_to_orchestrator_and_subagent_alike(monkeypatch):
     """No agent_id gating — unlike subagent-no-bg-longproc, this fires for BOTH."""
     monkeypatch.setattr(hook, "_read_macos_pressure_level", lambda run=None: 4)
-    monkeypatch.setattr(hook, "_read_linux_pressure_level", lambda read_text=None: None)
+    monkeypatch.setattr(hook, "_read_linux_psi_some10", lambda read_text=None: None)
     monkeypatch.setattr(hook.platform, "system", lambda: "Darwin")
     for agent_id in (None, "sub-1"):
         args = {"command": "npm run build"}
@@ -899,3 +1655,42 @@ def test_main_does_not_apply_gpu_slots_to_non_gpu_heavy_ops(monkeypatch, gpu_slo
     gpu_slot_holders(2)
     out, _err, code = _run("npm test", monkeypatch, macos_level=1, memory=_snapshot(_HEALTHY_LOW_FREE_VM_STAT))
     assert code == 0
+
+
+def test_main_allows_runpod_run_under_critical_pressure(monkeypatch, offload_script):
+    out, _err, code = _run("runpod-run --ttl 30 -- bun test ./tests", monkeypatch, macos_level=4)
+    assert code == 0
+    assert json.loads(out)["decision"] == "allow"
+
+
+def test_main_still_blocks_a_local_suite_chained_after_runpod_run(monkeypatch, offload_script):
+    out, _err, code = _run("runpod-run -- bun test ./tests && bun test", monkeypatch, macos_level=4)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert json.loads(out)["decision"] == "block"
+
+
+def _run_linux(command, monkeypatch, *, memory, runners, psi=0.0):
+    monkeypatch.setattr(hook, "read_memory_snapshot", lambda *a, **k: memory)
+    monkeypatch.setattr(hook, "_live_runners_guarded", lambda *a, **k: runners)
+    monkeypatch.setattr(hook, "describe_live_runners", lambda rs, *a, **k: rs)
+    monkeypatch.setattr(hook, "read_linux_psi_some10", lambda *a, **k: psi)
+    monkeypatch.setattr(hook, "read_pressure_level", lambda *a, **k: None)
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"args": {"command": command}})))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    hook.main()
+    return json.loads(out.getvalue())
+
+
+def test_main_hands_an_installed_review_to_review_cli(monkeypatch, review_cli):
+    crowded = dict(memory=_crowded_full_swap(20), runners=_runners(6, label="review (2 seat(s): claude, codex)", pss_mb=300))
+    assert _run_linux("review diff --staged --task 633", monkeypatch, **crowded)["decision"] == "allow"
+    # Other heavy work in the same command, or a review not handed off, is gated as before.
+    assert _run_linux("review diff --staged && bun test", monkeypatch, **crowded)["decision"] == "block"
+    # Started together, neither gate reserves the other (review finding): no handoff then.
+    roomy = dict(memory=_crowded_full_swap(30), runners=_runners(5, label="review (2 seat(s): claude, codex)", pss_mb=300))
+    assert _run_linux("review diff --staged & bun test", monkeypatch, **roomy)["decision"] == "block", "the ceiling still applies"
+    assert _run_linux("REVIEW_ADMISSION=0 review diff --staged", monkeypatch, **crowded)["decision"] == "block"
+    assert _run_linux("bun test", monkeypatch, **crowded)["decision"] == "block"
+    assert _run_linux("review diff --staged", monkeypatch, memory=_crowded_full_swap(4), runners=[])["decision"] == "block"

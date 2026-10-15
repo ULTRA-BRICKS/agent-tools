@@ -1,0 +1,9 @@
+{
+  "id": "runpod-offload-gate",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/runpod-offload-gate/runpod_offload_gate.py",
+  "priority": 37,
+  "timeout_ms": 960000,
+  "on_error": "open",
+  "description": "In a repo whose AGENTS.md/CLAUDE.md (cwd or any parent) mentions `runpod-run` or `Heavy work runs on Runpod`, blocks running a WHOLE suite locally and names the `runpod-run -- bash -c '<command>'` equivalent: pytest (also via uv run / python -m / poetry run / coverage run) with no path, a directory, or more than two files; scripts/check.sh; mypy with anything but exactly one file (-p/-m included); bun test / vitest / jest with no file or a directory; npm|pnpm|yarn|bun test and `run test`; cargo test without --test NAME; go test ./... or with no package; docker build, docker buildx build, docker compose up, docker-compose up. One test file stays allowed, as do --help/--version. Argv-aware (shell-tokenized; `cd x &&`, `timeout N`, `env`, inline VAR=val and launchers peeled; a runner name inside a quoted argument never matches). Applies to every session, subagents included (the 2026-10-10 swarm was subagents). Deny-by-default Telegram hatch: RIG_HATCH_REQUEST_RUNPOD_OFFLOAD_GATE=\"<written justification>\". Added after the 2026-10-10/11 thrash incidents on the shared Linux workstation, where the projects' AGENTS.md already stated the rule and agents ran the suites anyway."
+}

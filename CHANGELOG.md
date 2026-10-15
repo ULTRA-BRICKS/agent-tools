@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+### Fixed
+
+- `agent-hooks/heavy-op-memory-gate`: `runpod-run [options] -- <command>` is no longer treated
+  as a local heavy operation — its block message told agents to use `runpod-run`, then blocked
+  `runpod-run -- bun test ./tests` on the swap and live-runner checks because the remote
+  command's words were classified. The exemption is per simple command (a heavy command chained
+  around it, or a `$(…)` the local shell expands into its argv, is still gated), and the
+  live-runner `/proc` scan no longer counts a `runpod-run` process tree. Only the installed
+  script is exempt: the program must resolve (PATH lookup, or an absolute/`~/` path, after
+  symlinks) to `~/.agents/skills/runpod-offload/runpod-run` or the checkout's own copy (or one
+  in its registered git worktrees); a
+  relative path, or a command whose local part (not what follows runpod-run's `--`) defines
+  any function or alias (incl. zsh `functions[…]`), assigns PATH/zsh `path`/HOME/XDG_CONFIG_HOME,
+  uses `hash -p` or runs unseen shell code (`source`, `.`,
+  `eval`), gets no exemption.
+- `agent-hooks/heavy-op-memory-gate`: the fixed "2 heavy runners live → block" cap is now an
+  adaptive memory budget. A new heavy op is admitted iff `MemAvailable` − Σ live runners'
+  max(0, expected cost − tree PSS) − its own expected cost ≥ `RIG_HEAVY_OP_HEADROOM_MB` (4 GiB);
+  expected costs: docker build 8 GiB, review run 3 GiB (measured by review-cli's sampler over
+  294 runs: peak p50 678 MB, p95 1125 MB, max 3195 MB), other suites/runners 3 GiB
+  (`RIG_HEAVY_OP_COST_REVIEW_MB` / `_DOCKER_MB` / `_SUITE_MB`). `RIG_HEAVY_OP_MAX_LIVE` stays as a
+  hard backstop, default raised from 2 to 5. The swap-% check fires only while the budget leaves
+  less than 2 × headroom (2026-10-14: swap 83% full of stale pages with 37 GB available and PSI
+  0 blocked an idle box), and unconditionally when the live-runner scan is unavailable (an
+  unreadable `/proc` counts as unavailable). A
+  review's seat CLIs now count as one runner per review, with the whole tree's PSS
+  (`smaps_rollup`; RSS double-counted shared worker pages; where PSS is unreadable the largest
+  single RSS in the tree stands in). The block message shows the budget
+  arithmetic and each runner's reservation.
+- `agent-hooks/heavy-op-memory-gate`: a `review` pass is no longer double-gated. When the
+  `review` program resolves to the installed review-cli (`~/.local/bin/review`'s checkout, its
+  main checkout or a registered git worktree) and review-cli itself reports admission on (the
+  hook calls its `reviewlib.admission.load_settings()`, review-cli#614, with the hook's own
+  environment — so a command mentioning `REVIEW_ADMISSION`, or a review prefixed with an
+  assignment, `env` option or `sudo`/`env`/`su` wrapper, is not handed off), review-cli queues the run itself; the hook
+  skips the budget, swap and live-runner
+  ceiling for it and blocks only on the emergency signals (MemAvailable floor, PSI, wired share,
+  jetsam level). Same anti-spoofing rules as `runpod-run` (`sudo runpod-run` is not exempt either);
+  a command that also starts other heavy work is not handed off but gated whole at the costlier
+  label, and live reviews still count in other operations' budgets.
+
 ### Added
 
 - `decision-request-discipline`: effort saved is never an option's pro (no do-nothing /
@@ -30,6 +71,29 @@
 - `gh ship --subject <text> --body <text> --author-email <email>`: set the merge commit's
   message and author instead of the provider default (a GitHub squash otherwise joins every
   commit message of the PR). Forgejo takes subject/body and refuses `--author-email`.
+- `agent-hooks/runpod-offload-gate` (pre-bash, priority 37, on_error open, every session incl.
+  subagents): in a repo whose `AGENTS.md`/`CLAUDE.md` (cwd or any parent) mentions `runpod-run`
+  or `Heavy work runs on Runpod`, blocks a WHOLE suite locally — pytest (also via `uv run` /
+  `python -m` / `poetry run` / `coverage run -m`) with no path, a directory, or more than two
+  files; `scripts/check.sh`; mypy with anything but exactly one file; `bun test`/`vitest`/`jest`
+  with no file or a directory; `npm|pnpm|yarn|bun test`; `cargo test` without `--test`; `go test
+  ./...`; `docker build`/`docker compose up` — and names the `runpod-run -- bash -c '<command>'`
+  equivalent. One test file stays allowed. Argv-aware (the sibling hooks' tokenizer; `cd x &&`,
+  wrappers, inline env and launchers peeled). Hatch: `RIG_HATCH_REQUEST_RUNPOD_OFFLOAD_GATE`.
+  Added after the 2026-10-10/11 thrash incidents on the shared Linux workstation, where the
+  projects' AGENTS.md already stated the rule and agents ran the suites anyway.
+
+- `agent-hooks/heavy-op-memory-gate`: Linux thresholds calibrated against the 2026-10-10/11
+  incidents (48 GB / 16 GB swap workstation; MemAvailable never fell below ~1.9 GB while the box
+  thrashed, so the old 512 MB floor never fired). Linux now blocks a heavy operation when
+  `MemAvailable` < max(8 GiB, 20% of MemTotal) (`RIG_HEAVY_OP_MIN_AVAILABLE_MB`), PSI
+  `/proc/pressure/memory` `some avg10` > 10% (`RIG_HEAVY_OP_MAX_PSI_SOME10`), SwapFree < 30% of
+  SwapTotal (`RIG_HEAVY_OP_MIN_SWAP_FREE_PCT`), or when ≥ 2 heavy runners are already live
+  (`RIG_HEAVY_OP_MAX_LIVE`; a stateless `/proc` scan for pytest / bun test / vitest / jest / mypy /
+  tsc -b / cargo test / go test / make test|check / docker build and the claude/codex/opencode
+  seats under a `review` process, each listed with pid, RSS and its omp session via
+  `tg-ctl omp-live status`). The jetsam-level mapping of PSI is gone: Linux reads PSI directly.
+  macOS behaviour is unchanged.
 
 - `gh ship`: the machine-only Rig policy key `ci.items.ship.external_review_evidence_owners`
   (agent-tools#879). For a listed owner, a PR with zero GitHub-side reviews passes the
