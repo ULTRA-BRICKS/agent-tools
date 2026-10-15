@@ -173,6 +173,10 @@ to unblock you goes out as `tg --tag problem` — the same structure applies to 
 3. **Problem** — what concretely needs deciding (not abstractly).
 4. **Options** — only ones that each have a real advantage. Each option gets **meaningful,
    reasonable pros / cons** — the kind that actually move the choice, not filler.
+   **Effort saved is not a pro.** Never offer a do-nothing / leave-as-is / "less work" option
+   as if "zero work", "faster", or "no changes needed" were its advantage. An option belongs
+   in the list only if it is better *for the human's goal* in some concrete way; if its only
+   selling point is that the agent does less, drop it.
 5. **Recommendation** — which option you think is right, and why.
 6. **Where to look in the code** — the specific files and lines for a fast review.
 7. **Screenshots** — if the problem is visual: BEFORE (the problem) + a description of the
@@ -280,6 +284,12 @@ A PR-or-drop request must state:
 - What's lost on drop (effort, uniqueness of the approach).
 - The risks on merge (conflicts, regressions, test coverage).
 
+**Keep-or-close of needed work is not a decision.** If the human's standing instruction is to
+finish all work (e.g. "everything needed must be finished, not closed"), then an unmerged
+branch/PR whose work is still needed is simply **finished** — split into reviewable PRs if
+it's large. Don't escalate "keep or close?" for it; the standing goal already answered it.
+Escalate only work whose *need* is genuinely unknown, with the evidence above.
+
 ## Common mistakes
 
 - **Forwarding a quorum-settled question.** The models already agreed; you turned it into "A
@@ -299,6 +309,10 @@ A PR-or-drop request must state:
   escalation failed its one job. Paste the literal sentence(s) from the section, every time.
 - **Escalating "ship or hold" over review findings.** That routing is settled (fix on-scope
   findings in the PR; off-scope → follow-up ticket + ship). Apply the fixed rule, don't ask.
+- **Padding options with a do-nothing choice.** "Leave as is — pro: zero work" / "close the
+  PR — pro: less effort". Effort saved is not a pro, and asking keep-or-close about work the
+  standing goal says to finish is a non-decision. Finish it (split if large); offer only
+  options with a real advantage for the human.
 
 ## Why
 

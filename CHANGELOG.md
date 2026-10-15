@@ -4,6 +4,9 @@
 
 ### Added
 
+- `decision-request-discipline`: effort saved is never an option's pro (no do-nothing /
+  leave-as-is options padded with "zero work"), and keep-or-close of still-needed work is
+  not a decision under a "finish everything" standing goal — finish it, split if large.
 - `block-raw-ticket`: Forgejo/Gitea and raw-API coverage (UB-25). With task-cli armed, the
   guard now also blocks `fj issue` / `fj repo labels` writes, `tea issues` / `tea comment` /
   `tea label` writes, REST writes to `repos/<o>/<r>/(issues|labels)` via curl, wget, HTTPie
