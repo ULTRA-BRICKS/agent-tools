@@ -5,5 +5,5 @@
   "priority": 60,
   "timeout_ms": 10000,
   "on_error": "open",
-  "description": "After the agent writes/edits a file, runs the project's CONFIGURED formatter on just that file (oxfmt → prettier → biome for JS/TS; ruff/black for py; gofmt for go; rustfmt for rs; repo-local tool preferred over global). No-op when no formatter is configured/available. Makes formatting a harness concern instead of a per-project manual step. on_error=open and never blocks: a formatting convenience must never wedge the agent. Escape hatch: NO_FORMAT_HOOK=1."
+  "description": "After the agent writes/edits a file, runs the formatter the project CONFIGURES on just that file (biome for JS/TS/JSON/CSS when a biome config exists and does not plainly switch its formatter off, else oxfmt/prettier when configured; ruff when configured, else black for py; gofmt for go; rustfmt for rs; repo-local tool preferred over global). No-op when no formatter is configured, or the configured one is not installed (never falls through to another). Makes formatting a harness concern instead of a per-project manual step. on_error=open and never blocks: a formatting convenience must never wedge the agent. Escape hatch: NO_FORMAT_HOOK=1."
 }

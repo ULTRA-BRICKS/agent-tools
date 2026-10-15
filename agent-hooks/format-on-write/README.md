@@ -22,30 +22,56 @@ is the opposite shape: let the write land, then clean it up. That needs a point 
 ## Detection table
 
 Resolves the formatter by **(repo config, file extension)**, walking up from the written
-file to the **git** repo root (the `.git` dir). A repo-**local** tool
-(`node_modules/.bin/<tool>`) is always preferred over a global one — same resolution
-`lefthook.yml` / npm scripts use. The first candidate that is configured/available wins;
-the rest are skipped. The table is **fixed** (not project-configurable); an unsupported
-tool falls through to a no-op.
+file to the **git** repo root (the `.git` dir). The **first formatter the repo configures**
+for that extension is the one used — availability alone never selects a tool. Once chosen,
+a repo-**local** bin (`node_modules/.bin/<tool>`) is preferred over a global one on PATH
+(same resolution `lefthook.yml` / npm scripts use). If the configured formatter is not
+installed the hook is a **no-op** — it never falls through to another formatter. The table
+is **fixed** (not project-configurable); an unsupported tool falls through to a no-op.
 
-> Repo-local lookup is anchored on the `.git` root, so it only fires **inside a git
-> worktree**. Outside one (no `.git` up the tree), only globally-installed formatters
-> (`gofmt`, `rustfmt`, a global `oxfmt`/`prettier`) can apply — repo-local bins are invisible.
+Why config, not availability: a repo that formats JS/TS with biome but keeps prettier for
+Markdown (biome.json + a `.prettierrc` + a prettier devDependency) has
+`node_modules/.bin/prettier` installed. Picking "the first installed tool" ran prettier on
+every `.ts` write there, and its `trailingComma: "es5"` stripped the trailing commas biome's
+default `"all"` requires — the repo's own lint then failed in CI (agent-tools#901).
 
-"Configured/available" means, per tool: a repo-local bin, OR (for oxfmt/prettier) the tool
-named in `package.json` **and** present on PATH, OR (biome) a `biome.json(c)` at root +
-on PATH, OR (ruff/black/gofmt/rustfmt) simply present on PATH.
+> Repo config is read at the `.git` root, so JS formatters only fire **inside a git
+> worktree**. Outside one (no `.git` up the tree) only the language-canonical formatters
+> (`gofmt`, `rustfmt`, `black`) can apply.
 
-| Extension | Candidates (in order) | How it's detected | Invocation |
-| --- | --- | --- | --- |
-| `.js .jsx .mjs .cjs .ts .tsx .mts .cts .json .jsonc .css .md .mdx .html .yaml .yml` | **oxfmt** → **prettier** → **biome** | oxfmt: `node_modules/.bin/oxfmt`, else `oxfmt` in `package.json` + on PATH. prettier: same. biome: `node_modules/.bin/biome`, else `biome.json(c)` at root + on PATH. | `oxfmt --write --no-error-on-unmatched-pattern <f>` / `prettier --write <f>` / `biome format --write <f>` |
-| `.py .pyi` | **ruff** → **black** | local/global `ruff`; else local/global `black` | `ruff format <f>` / `black -q <f>` |
-| `.go` | **gofmt** | `gofmt` on PATH (ships with Go) | `gofmt -w <f>` |
-| `.rs` | **rustfmt** | `rustfmt` on PATH (ships with Rust) | `rustfmt <f>` |
+"Configured" means, per tool:
 
-If the extension isn't in the table, or no candidate is configured/available → **no-op,
-allow**. The hook never reformats the whole tree (it always passes the single written
-file), and never installs a formatter.
+- **biome** — a `biome.json`, `biome.jsonc`, `.biome.json` or `.biome.jsonc` at the root.
+  For the JS/TS family, JSON and CSS; HTML only when the config opts in
+  (`html.formatter.enabled: true`), as biome itself does; Markdown/YAML go on to
+  oxfmt/prettier. A lint-only biome — the root config
+  plainly turns the formatter off for the file's language (`javascript` / `json` / `css`
+  `.formatter.enabled`, else the global `formatter.enabled`, is `false`) — leaves those
+  files to oxfmt/prettier. When the effective setting needs biome's own resolution (a
+  nested biome config between the file and the root, an `extends` chain, a `"root": false`
+  config, or `overrides` that touch formatting), biome keeps the file: at worst it formats
+  nothing, but a second formatter never takes over a file biome may own.
+- **oxfmt** — a `.oxfmtrc.json(c)` or `oxfmt.config.(m)ts` at the root, or `oxfmt` as a
+  direct `dependencies` / `devDependencies` entry in `package.json`.
+- **prettier** — a `.prettierrc*` / `prettier.config.*` file at the root, a top-level
+  `"prettier"` key in `package.json`, or `prettier` as a direct (dev)dependency. A transitive
+  install that merely drops a bin into `node_modules/.bin`, or a mention elsewhere in
+  `package.json` (`eslint-config-prettier`, a description), does not count.
+- **ruff** — a `ruff.toml` / `.ruff.toml`, a `[tool.ruff*]` section in `pyproject.toml`, or a
+  repo-local `node_modules/.bin/ruff`; a merely global ruff never takes over a Black repo.
+- **black / gofmt / rustfmt** — the language's canonical formatter: used whenever installed.
+
+| Extension | Formatters (first configured wins) | Invocation |
+| --- | --- | --- |
+| `.js .jsx .mjs .cjs .ts .tsx .mts .cts .json .jsonc .css .html` | **biome** → **oxfmt** → **prettier** | `biome format --write <f>` / `oxfmt --write --no-error-on-unmatched-pattern <f>` / `prettier --write <f>` |
+| `.md .mdx .yaml .yml` | **oxfmt** → **prettier** | as above |
+| `.py .pyi` | **ruff** → **black** | `ruff format <f>` / `black -q <f>` |
+| `.go` | **gofmt** | `gofmt -w <f>` |
+| `.rs` | **rustfmt** | `rustfmt <f>` |
+
+If the extension isn't in the table, no formatter is configured, or the configured one is
+not installed → **no-op, allow**. The hook never reformats the whole tree (it always passes
+the single written file), and never installs a formatter.
 
 ## Escape hatch
 

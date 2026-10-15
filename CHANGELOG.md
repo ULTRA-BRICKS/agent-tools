@@ -154,6 +154,15 @@
 
 ### Fixed
 
+- `agent-hooks/format-on-write` (#901): the formatter is chosen by the repo's own config,
+  never by what happens to be installed. biome (a biome config) wins for the JS/TS/JSON/CSS
+  files it formats (HTML when the config opts in) unless its formatter is plainly switched off
+  there (a lint-only biome); oxfmt and prettier run only when the repo configures them (a config file,
+  a `package.json` `"prettier"` key, or a direct (dev)dependency); a configured-but-missing
+  formatter is a no-op instead of falling through to another one. Previously a
+  `node_modules/.bin/prettier` in a biome repo reformatted every agent `.ts` write with
+  prettier's `trailingComma: "es5"`, failing the repo's biome lint in CI.
+
 - `ops/mem-sentinel` (#884): the Linux per-omp-session memory watchdog moves under version
   control (`sudo ops/mem-sentinel/install.sh` installs `/usr/local/sbin/mem-sentinel` and its
   unit) and stops its false alarms. A session's footprint is now anon + shmem + swap from

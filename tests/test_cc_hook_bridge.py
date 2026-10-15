@@ -1305,6 +1305,7 @@ def test_post_write_format_then_lint_ordering(tmp_path):
                         cmd=LINT_ON_WRITE, on_error="open", priority=70)
     repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)
+    (repo / ".oxfmtrc.json").write_text("{}")  # oxfmt is the repo's configured formatter
     bind = repo / "node_modules" / ".bin"
     bind.mkdir(parents=True)
     # fake formatter: append a marker to the (last-arg) file, exit 0
@@ -1340,6 +1341,7 @@ def test_post_write_format_on_write_stays_silent_even_on_formatter_error(tmp_pat
                         cmd=FORMAT_ON_WRITE, on_error="open", priority=60)
     repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)
+    (repo / ".oxfmtrc.json").write_text("{}")  # oxfmt is the repo's configured formatter
     bind = repo / "node_modules" / ".bin"
     bind.mkdir(parents=True)
     oxfmt = bind / "oxfmt"
