@@ -142,7 +142,10 @@ watch the agent's chat. "I'll remind them later" is not a channel.
 "all the open decisions", reply with a **single message listing ALL currently-open decisions**,
 each in the format below (concrete question + options with real pros/cons + recommendation) —
 not a vague category ("need to decide D1/D4/D5") and not scattered fragments. Keep it current:
-mark resolved ones closed; don't re-list them as open.
+mark resolved ones closed; don't re-list them as open. `tg` (≥ 1.64.0) sends that list and
+then records **every** decision in it as owed: follow the list with one `--reply-to` reply
+per decision (see "Untagged messages are checked too" below), so each one can be answered
+on its own.
 
 ## The decision-request format (8 points — the human decides in 30s without reading code)
 
@@ -205,6 +208,9 @@ request, and a `question`-tagged send is refused with exactly that hint. It requ
   to arrive as broken plain text).
 - **Recommendation**, **Context** (a `file:line` + one line on what it does), and a
   **"where to look" `file:line`**.
+- **Glossary** (tg ≥ 1.64.0) — every internal name the request uses (ticket, module, flag,
+  acronym) explained in one phrase, under a `Glossary` / `Глоссарий` heading or an inline
+  "Глоссарий: …" line. A request without it is blocked like any other missing section.
 - **STRUCTURE (readability)** — the reason an 8-point message can still be rejected: it must
   be a scannable Rich Message, **not a wall of text**. Each section under its own
   `<h3>`/`<h4>` heading; enumerations as short one-line `<ul>`/`<li>` items (**never** an
@@ -215,6 +221,7 @@ Copy-pasteable good shape (see `tg help format` for the full GOOD-vs-BAD example
 
 ```
 tg --tag decision --format html '<h3>Context</h3><p>features/foo.ts:42 does X.</p><hr>
+<h3>Glossary</h3><ul><li>X — what the internal name means, in one phrase</li></ul><hr>
 <h3>Options</h3><table><tr><th>Option</th><th>Pros</th><th>Cons</th></tr>
 <tr><td>A</td><td>fast</td><td>risky</td></tr>
 <tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>
@@ -235,6 +242,54 @@ This check is a heuristic floor (keyword/structure matching on free-form, often-
 text), not a semantic reviewer: it can be satisfied by a message that technically has all the
 sections but is still a weak escalation. Meeting the gate is necessary, not sufficient — write
 an actually good comparison, don't just clear the regex.
+
+### Untagged messages are checked too — the intent gate (tg ≥ 1.64.0)
+
+Skipping `--tag decision` no longer skips the format. `tg` reads every agent-written body
+(an agent process above it, or an agent env marker such as `TG_AI_MODEL` / `RIG_AGENT_ID`)
+and decides by content:
+
+- **A question to the reader** — a sentence ending in `?`, or a decision imperative
+  ("решай", "выбери", "жду твоего решения", "let me know") — is a decision request and needs
+  the format above. A bare "Решай, оставлять его или закрыть" is **blocked** (exit 1) with
+  the list of missing sections.
+- **A problem** (an explicit blocker: "блокер", "нет доступа", "blocked on") needs Context,
+  evidence / where to look, the ask ("нужен доступ к …"), and ≥ 2 headings with `<hr>`.
+- **A report** of finished work ("готово", "смержил", "merged") needs a reference (`#123`,
+  `ABC-123`, a URL) and verification (tests / CI / a live check); `tg report` builds one.
+- **Decision + problem + report in one message** is blocked: send them separately. The
+  exception is a message that is already a well-formed decision request: tg reads everything
+  in it as that decision's context (a Context section routinely names merges and failures)
+  and passes it. So the gate will NOT catch a real blocker or report tucked into a
+  well-formed decision; keep them out yourself and send each as its own message.
+
+**One decision per message, sent as a reply.** A message that is valid on its own is
+**sent**, and items in it that need a message of their own are **recorded as owed**:
+- a question outside the decision format in a report or an answer, or one asked in a
+  well-formed decision request outside its own sections (before its first heading, or under
+  Where to look / Glossary / an unrelated heading);
+- in a problem, a separate choice beyond its own unblock request ("could you grant
+  access to staging?" is the problem's ask, not a decision, and is not owed);
+- when one message carries **several** decision requests, **every one of them**, the first
+  included (a list of decisions owes one reply per decision);
+- a blocker hidden in a **report**.
+
+Send each as its own reply to that message, in its format. tg prints each owed item with its
+kind and the exact command: a question or a decision is owed as a **decision**, a blocker
+from a report as a **problem**.
+tg records a hidden blocker only from a report, so a blocker you mention inside an `answer`
+is NOT tracked: send it yourself as a separate `--tag problem` message.
+
+```
+tg --reply-to <id from the OK tg#<id> line> --tag decision --format html '<h3>Context</h3>…'
+tg --reply-to <id from the OK tg#<id> line> --tag problem  --format html '<h3>Context</h3>…'
+```
+
+A reply settles the oldest owed item **of its own kind** under that message, and only if it
+passes the gate — a decision reply never settles an owed problem. `tg obligations` lists what is still
+owed (`--check` exits 1 while any is open; `dismiss <id> --reason "…"` for a misread
+rhetorical question). Iterate with `tg --dry-run`, which prints the verdict without sending
+or recording. `tg help format` documents the gate in full.
 
 ## Showing a child-repo diff: formatted Telegram text, NEVER a raw `.patch`
 

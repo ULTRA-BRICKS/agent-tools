@@ -7,6 +7,13 @@
 - `decision-request-discipline`: effort saved is never an option's pro (no do-nothing /
   leave-as-is options padded with "zero work"), and keep-or-close of still-needed work is
   not a decision under a "finish everything" standing goal — finish it, split if large.
+- `decision-request-discipline`: documents what tg ≥ 1.64.0 enforces (tg-cli#706): the
+  Glossary section is required (the copy-pasteable example now carries one and passes
+  `tg --dry-run`), and the intent gate checks UNTAGGED agent messages too — a prose question
+  is blocked, a report that also asks something is sent but owes the question as a
+  `--reply-to` decision reply (`tg obligations`), a decision+problem+report mix is blocked
+  unless the message is already a well-formed decision request (then it is all that
+  decision's context — the skill says to keep real blockers/reports out of it yourself).
 - `block-raw-ticket`: Forgejo/Gitea and raw-API coverage (UB-25). With task-cli armed, the
   guard now also blocks `fj issue` / `fj repo labels` writes, `tea issues` / `tea comment` /
   `tea label` writes, REST writes to `repos/<o>/<r>/(issues|labels)` via curl, wget, HTTPie
