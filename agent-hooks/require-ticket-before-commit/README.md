@@ -78,6 +78,16 @@ gated. An *unlisted* wrapper (`unshare`, `bash -c '…'`) or an unparseable comm
 — a documented best-effort limitation, consistent with `on_error: open` (process discipline,
 not a security boundary).
 
+## Repos that keep tracker ids out of commit messages
+
+A repo mirrored to a public one may forbid tracker ids in commit messages (Conloca's mirror leak
+guard fails any commit to a public-mirrored file whose message names one). There the ticket goes in
+the **branch name only** (`fix/GL-315-ticket-in-branch`) and the message carries none: the gate
+reads the branch, so the commit passes. Write the key in capitals — the branch is matched with the
+same `KEY-NUM` pattern as the message, so `fix/gl-315-…` is not a ticket (a lowercase match would
+also hit version segments like `cli-0-12-2`). The pull request is not consulted: it usually does not
+exist yet when the first commit is made.
+
 ## Exemptions (no ticket expected)
 
 These commits skip the gate by default:

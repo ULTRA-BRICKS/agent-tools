@@ -9,7 +9,8 @@ the contract the task-cli Docker test and the orchestration swarm depend on:
   - the block message LEADS with the stable marker `[require-ticket] BLOCKED: no ticket
     reference`, so an external check can assert on one fixed string.
   - EVERY accepted ticket-reference form PASSES (Closes #N / Fixes #N / #N / a KEY-NUM
-    task-cli id / a `task:` form / a `[ticket: …]` trailer) — a legit commit is never wedged.
+    task-cli id / a `task:` form / a `[ticket: …]` trailer / a KEY-NUM id in the branch
+    name alone, the public-mirror form) — a legit commit is never wedged.
   - the OLD per-commit self-service escapes are DEAD: a `[skip-ticket: <reason>]` message
     trailer and an inline `REQUIRE_TICKET_SKIP=1 git commit …` no longer bypass (both removed).
   - the only sanctioned out for a genuinely ticketless commit is the Telegram hatch
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -200,6 +202,44 @@ def test_valid_ref_forms_pass(subject):
     r = _run(f'git commit -m {subject!r}')
     assert r["code"] == 0, f"{subject!r} should pass but exit={r['code']} ({r['message']})"
     assert r["decision"] == "allow"
+
+
+# ── the public-mirror ticket form: the ticket in the branch name, none in the message ───────────
+# A repo mirrored to a public one (Conloca) keeps tracker ids out of every commit message, because
+# its leak guard fails any message that names one. The ticket lives in the branch name instead, so
+# the gate must accept a plain message on a ticket branch, written either as `-m` or as `-F <file>`.
+# The key must be in capitals: a lowercase `gl-315` is not read as a ticket (a lowercase KEY-NUM
+# would also match `cli-0-12-2`-style version segments).
+
+def _repo_on(tmp_path, branch: str):
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", "-b", branch, str(repo)], check=True)
+    return repo
+
+
+@pytest.mark.parametrize("branch", ["fix/GL-315-ticket-in-branch", "GL-315-ticket-in-branch"])
+def test_ticket_in_branch_name_passes_a_message_without_one(tmp_path, branch):
+    repo = _repo_on(tmp_path, branch)
+    r = _run(f"git -C {shlex.quote(str(repo))} commit -m 'fix(tooling): commit with a noreply email' -m 'Why it changed.'")
+    assert r["code"] == 0, f"branch {branch} should satisfy the gate ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_ticket_in_branch_name_passes_a_message_file_without_one(tmp_path):
+    repo = _repo_on(tmp_path, "fix/GL-315-ticket-in-branch")
+    msg = tmp_path / "COMMIT_MSG.txt"
+    msg.write_text("fix(tooling): commit with a noreply email\n\nWhy it changed.\n", encoding="utf-8")
+    r = _run(f"git -C {shlex.quote(str(repo))} commit -F {shlex.quote(str(msg))}")
+    assert r["code"] == 0, f"a -F file on a ticket branch must pass ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_lowercase_ticket_in_branch_name_still_blocks(tmp_path):
+    repo = _repo_on(tmp_path, "fix/gl-315-ticket-in-branch")
+    r = _run(f"git -C {shlex.quote(str(repo))} commit -m 'fix(tooling): commit with a noreply email'")
+    assert r["code"] == 10
+    assert r["decision"] == "block"
+
 
 
 # ── regression: the OLD per-commit self-service escapes are DEAD ─────────────────────────────────
