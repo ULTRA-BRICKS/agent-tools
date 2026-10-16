@@ -199,6 +199,7 @@ async def confirm_failure(
     *,
     max_pages: int,
     min_available_mib: int,
+    private_display: bool = False,
 ) -> str:
     """Confirm one fixed page/turn; no idle probes or retry of a dispatch result."""
     if not guardian.apply or not structural_failure(candidate):
@@ -271,6 +272,20 @@ async def confirm_failure(
 
     async def run():
         nonlocal expected
+        if private_display:
+            if not allowed():
+                return "confirmation-blocked"
+            structural = await passive.observe()
+            guardian.record_safety(structural)
+            if (
+                not allowed()
+                or not structural_failure(structural)
+                or structural.identity != candidate.identity
+            ):
+                return "confirmation-blocked"
+            await page.bring_to_front()
+            # The first adapter observation rechecks allowed() and structure
+            # after activation before opening a model menu or authorizing send.
         previous_sample: float | None = None
         while allowed():
             observed = await adapter.observe()
@@ -425,6 +440,9 @@ async def serve_live(args, store: Store) -> None:
                                     max_pages=getattr(args, "max_pages", 6),
                                     min_available_mib=getattr(
                                         args, "min_available_mib", 2048
+                                    ),
+                                    private_display=getattr(
+                                        args, "private_display", False
                                     ),
                                 )
                             finally:

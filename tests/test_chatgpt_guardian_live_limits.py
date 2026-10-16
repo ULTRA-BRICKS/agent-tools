@@ -42,6 +42,103 @@ def page_at(url=PROJECT):
     )
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        "none",
+        "default",
+        "idle",
+        "draft",
+        "running",
+        "pages",
+        "transport",
+        "stop",
+        "during-stop",
+        "during-draft",
+        "during-url",
+        "during-pages",
+        "during-transport",
+    ],
+)
+def test_private_display_activation_is_opt_in_and_rechecks_safety(
+    tmp_path, monkeypatch, change
+):
+    async def scenario():
+        store = Store(tmp_path / "db", account="glide.vc")
+        store.enroll(CHAT)
+        page = page_at()
+        context = SimpleNamespace(pages=[page])
+        transport = SimpleNamespace(reason="")
+        stop = asyncio.Event()
+        observed = FAILURE
+        if change in ("draft", "running"):
+            observed = replace(observed, **{change: True})
+        if change == "idle":
+            observed = replace(observed, status="Complete")
+        if change == "pages":
+            context.pages.extend(page_at("about:blank") for _ in range(6))
+        if change == "transport":
+            transport.reason = "lost"
+        if change == "stop":
+            stop.set()
+        passive = SimpleNamespace(observe=AsyncMock(side_effect=lambda: observed))
+        active = SimpleNamespace(
+            observe=AsyncMock(return_value=FAILURE), send=AsyncMock()
+        )
+        monkeypatch.setattr(
+            live,
+            "LiveAdapter",
+            lambda *a, **kw: (
+                passive if kw.get("allow_active_probe") is False else active
+            ),
+        )
+        monkeypatch.setattr(live, "available_memory", lambda: 3 * 1024**3)
+
+        async def activate():
+            nonlocal observed
+            await asyncio.sleep(0)
+            if change == "during-stop":
+                stop.set()
+            if change == "during-draft":
+                observed = replace(observed, draft=True)
+            if change == "during-url":
+                page.url = CHAT
+            if change == "during-pages":
+                context.pages.extend(page_at("about:blank") for _ in range(6))
+            if change == "during-transport":
+                transport.reason = "lost"
+
+        page.bring_to_front.side_effect = activate
+        kwargs = {} if change == "default" else {"private_display": True}
+        await live.confirm_failure(
+            Guardian(store, apply=True),
+            page,
+            FAILURE,
+            context,
+            transport,
+            stop,
+            max_pages=6,
+            min_available_mib=2048,
+            **kwargs,
+        )
+        assert page.bring_to_front.await_count == (
+            1 if change == "none" or change.startswith("during-") else 0
+        )
+        if change.startswith("during-") or change in (
+            "idle",
+            "draft",
+            "running",
+            "pages",
+            "transport",
+            "stop",
+        ):
+            active.observe.assert_not_awaited()
+        active.send.assert_not_awaited()
+        assert not store.status()["attempts"]
+
+    asyncio.run(scenario())
+
+
 def test_missing_closed_redirected_tabs_stay_missing_across_cycles_and_restart(
     tmp_path,
 ):
@@ -106,7 +203,8 @@ def test_poll_interval_rejects_fast_or_nonfinite_values(tmp_path, interval):
         )
 
 
-def test_poll_defaults_and_resource_limits(tmp_path, monkeypatch):
+@pytest.mark.parametrize("private_display", [False, True])
+def test_poll_defaults_and_resource_limits(tmp_path, monkeypatch, private_display):
     captured = []
 
     async def serve(args, store):
@@ -121,11 +219,13 @@ def test_poll_defaults_and_resource_limits(tmp_path, monkeypatch):
             "--cdp",
             "http://127.0.0.1:9223",
             "--once",
+            *(["--private-display"] if private_display else []),
         ]
     )
     assert captured[0].poll_interval == 60
     assert captured[0].max_pages == 6
     assert captured[0].min_available_mib == 2048
+    assert captured[0].private_display is private_display
     assert live.resource_pause(7, 3 * 1024**3) == "page-ceiling"
     assert live.resource_pause(6, 2 * 1024**3) == ""
     assert live.resource_pause(4, 2 * 1024**3 - 1) == "low-memory"
@@ -204,8 +304,9 @@ def test_recent_performance_429_seeds_stop_without_navigation(tmp_path):
         "empty-sibling-pages",
     ],
 )
+@pytest.mark.parametrize("private_display", [False, True])
 def test_service_cycles_are_passive_bounded_and_detach(
-    tmp_path, monkeypatch, capsys, condition
+    tmp_path, monkeypatch, capsys, condition, private_display
 ):
     """Drive serve_live itself; every Playwright boundary is in-memory."""
     from playwright import async_api
@@ -349,6 +450,7 @@ def test_service_cycles_are_passive_bounded_and_detach(
             workspace="glide.vc",
             once=False,
             poll_interval=30,
+            private_display=private_display,
         )
         await live.serve_live(args, store)
         assert delays == [60, 60]
@@ -357,7 +459,22 @@ def test_service_cycles_are_passive_bounded_and_detach(
         page.evaluate_handle.assert_not_called()
         page.goto.assert_not_called()
         page.reload.assert_not_called()
-        page.bring_to_front.assert_not_called()
+        activations = (
+            (2 if condition == "burst" else 1)
+            if private_display and condition in ("apply", "quota", "burst")
+            else 0
+        )
+        if condition == "burst" and private_display:
+            assert (
+                page.bring_to_front.await_count + second.bring_to_front.await_count
+                == activations
+            )
+        else:
+            assert page.bring_to_front.await_count == activations
+        if not activations:
+            page.bring_to_front.assert_not_called()
+            if condition == "burst":
+                second.bring_to_front.assert_not_called()
         context.new_page.assert_not_called()
         context.close.assert_not_called()
         browser.close.assert_not_called()

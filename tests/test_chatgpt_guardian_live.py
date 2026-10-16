@@ -114,6 +114,141 @@ def test_aria_hidden_panel_and_stable_closed_model_signature():
     run(case, html=MENU_HTML)
 
 
+@pytest.mark.parametrize(
+    "condition",
+    ["settles", "sol", "never", "wrong", "duplicate", "stop", "turn", "url", "cancel"],
+)
+def test_model_probe_waits_for_visible_selection_without_sending(condition):
+    html = MENU_HTML.replace(
+        "full.setAttribute('aria-hidden','false');};",
+        """full.setAttribute('aria-hidden','false');full.style.opacity='0';
+        window.panelOpened=performance.now();
+        setTimeout(()=>{if(window.condition!=='never')full.style.opacity='1';},200);};""",
+    )
+
+    async def case(page, adapter):
+        await page.evaluate("value=>window.condition=value", condition)
+        await page.evaluate("""() => {
+          document.addEventListener('keydown',e=>{if(e.key==='Escape')window.closedAt=performance.timeOrigin+performance.now()});
+          if(window.condition==='sol'){
+            window.model='GPT-5.6 Sol';window.effort='Extra High';
+            document.querySelector('[role=status]').textContent='Extra High, 4 of 5.';
+            for(const radio of full.children){const selected=radio.textContent===window.model;
+              radio.setAttribute('aria-checked',String(selected));radio.setAttribute('data-model-selected',String(selected));}
+          }
+          if(window.condition==='wrong')full.firstElementChild.textContent='Unknown Model';
+          if(window.condition==='duplicate')full.append(full.firstElementChild.cloneNode(true));
+          document.querySelector('[aria-label="Select model"]').addEventListener('click',()=>setTimeout(()=>{
+            if(window.condition==='turn')document.querySelector('[data-turn-key]').setAttribute('data-turn-key','33333333-3333-4333-8333-333333333333');
+            if(window.condition==='url')history.pushState({},'', '/c/cccccccc-cccc-4ccc-8ccc-cccccccccccc');
+          },80));
+        }""")
+        adapter.mutation_allowed = lambda: not stopped[0]
+        stopped = [False]
+
+        async def interrupt():
+            while not await page.evaluate("Boolean(window.panelOpened)"):
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.08)
+            if condition == "stop":
+                stopped[0] = True
+            if condition == "cancel":
+                pending.cancel()
+
+        started = time.monotonic()
+        pending = asyncio.create_task(adapter.probe_model())
+        watcher = asyncio.create_task(interrupt())
+        try:
+            if condition == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            else:
+                await pending
+        finally:
+            await watcher
+        observed = await page.evaluate(adapter.script, {"probe": adapter.probe})
+        assert observed["verified"] == (condition in ("settles", "sol"))
+        if condition in ("settles", "sol"):
+            assert observed["model"] == ("Sol" if condition == "sol" else "Astra")
+            assert time.monotonic() - started >= 0.2
+            assert await page.evaluate("p=>p.at<=window.closedAt", adapter.probe)
+        assert time.monotonic() - started < 3
+        assert await page.evaluate("window.switches") == 0
+        assert not await page.evaluate("Boolean(window.clicks)")
+        assert await page.locator("[contenteditable]").text_content() == ""
+        if condition != "url":
+            assert not (await adapter._menu_state())["open"]
+
+    run(case, html=html)
+
+
+def test_model_probe_reopens_retained_full_panel_without_hidden_toggle():
+    html = (
+        MENU_HTML
+        + """<script>
+window.toggleClicks=0;window.composerWrites=0;window.retained=false;
+document.querySelector('[contenteditable]').addEventListener('input',()=>window.composerWrites++);
+document.querySelector('[aria-label="Select model"]').addEventListener('click',()=>{
+  window.toggleClicks++;window.retained=true;
+});
+const openMenu=trigger.onclick;
+trigger.onclick=()=>{
+  openMenu();
+  if(window.retained){
+    simple.setAttribute('aria-hidden','true');full.setAttribute('aria-hidden','false');
+    simple.style.position=full.style.position='absolute';
+    simple.style.top=full.style.top='40px';simple.style.left=full.style.left='8px';
+    full.style.zIndex='1';full.style.background='white';full.style.opacity='0';
+    window.panelOpened=performance.timeOrigin+performance.now();
+    setTimeout(()=>{full.style.opacity='1';window.panelVisible=performance.timeOrigin+performance.now();},200);
+  }
+};
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&window.retained){
+  window.closedAt=performance.timeOrigin+performance.now();
+  simple.setAttribute('aria-hidden','true');full.setAttribute('aria-hidden','false');
+}});
+</script>"""
+    )
+
+    async def case(page, adapter):
+        for attempt in range(3):
+            started = time.monotonic()
+            await adapter.probe_model()
+            observed = await page.evaluate(adapter.script, {"probe": adapter.probe})
+            assert observed["verified"] and observed["model"] == "Astra"
+            assert (
+                await page.locator('#full [aria-checked="true"]').text_content()
+                == "GPT-6"
+            )
+            assert time.monotonic() - started < 3
+            if attempt:
+                assert await page.evaluate(
+                    "p=>p.at>=window.panelVisible&&p.at<=window.closedAt",
+                    adapter.probe,
+                )
+                assert time.monotonic() - started >= 0.2
+            assert await page.evaluate("window.toggleClicks") == 1
+            assert await page.evaluate("window.switches") == 0
+            assert await page.evaluate("window.composerWrites") == 0
+            assert not await page.evaluate("Boolean(window.clicks)")
+            assert await page.locator("[contenteditable]").text_content() == ""
+            assert not (await adapter._menu_state())["open"]
+
+    run(case, html=html)
+
+
+def test_model_probe_leaves_preexisting_menu_open():
+    async def case(page, adapter):
+        await page.locator("[data-codex-intelligence-trigger]").click()
+        await adapter.probe_model()
+        assert (await adapter._menu_state())["open"]
+        assert adapter.probe is None
+        assert await page.evaluate("window.switches") == 0
+        assert not await page.evaluate("Boolean(window.clicks)")
+
+    run(case, html=MENU_HTML)
+
+
 @pytest.mark.parametrize("model", ["Astra", "Sol"])
 def test_hidden_measurement_does_not_replace_rendered_model_label(model):
     html = MENU_HTML.replace(

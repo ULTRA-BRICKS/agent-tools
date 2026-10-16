@@ -53,6 +53,19 @@ class LiveAdapter(PlaywrightAdapter):
         structural = self._parse_observation(await self.page.evaluate(self.script, {}))
         if not replace(structural, verified=True).safe_failure():
             return
+        url = self.page.url
+
+        async def safe():
+            if not self.mutation_allowed() or self.page.url != url:
+                return False
+            current = self._parse_observation(await self.page.evaluate(self.script, {}))
+            return (
+                self.mutation_allowed()
+                and self.page.url == url
+                and current.identity == structural.identity
+                and replace(current, verified=True).safe_failure()
+            )
+
         candidate = None
         try:
             trigger = self.page.locator(
@@ -62,41 +75,63 @@ class LiveAdapter(PlaywrightAdapter):
                 return
             if (await self._menu_state())["open"]:
                 return
-            if not self.mutation_allowed():
+            if not await safe():
                 return
             await trigger.click(timeout=1500)
             try:
-                if not (await self._menu_state())["selected"]:
-                    full = self.page.locator(
-                        '[role="menuitem"][aria-label="Select model"]:visible'
-                    )
-                    if await full.count() == 1 and self.mutation_allowed():
-                        await full.click(timeout=1500)
-                state = await self._menu_state()
-                model = (
-                    self.labels.get(state["selected"][0], "")
-                    if len(state["selected"]) == 1
-                    else ""
-                )
+                deadline = time.monotonic() + 1.5
+                entered_full = False
+                while time.monotonic() < deadline and await safe():
+                    state = await self._menu_state()
+                    if state["selected"]:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    if not entered_full:
+                        full = self.page.get_by_role(
+                            "menuitem", name="Select model", exact=True
+                        )
+                        if await full.count() == 1 and await safe():
+                            await full.click(timeout=max(1, remaining * 1000))
+                            entered_full = True
+                            continue
+                    await asyncio.sleep(min(0.05, remaining))
+                else:
+                    return
+                if (
+                    time.monotonic() >= deadline
+                    or not await safe()
+                    or len(state["selected"]) != 1
+                ):
+                    return
+                model = self.labels.get(state["selected"][0], "")
+                if not model:
+                    return
+                captured_at = time.monotonic()
                 candidate = await self.page.evaluate_handle(
                     self.script, {"action": "probe", "labels": self.labels}
                 )
             finally:
-                await self.page.keyboard.press("Escape")
+                if self.page.url == url:
+                    await self.page.keyboard.press("Escape")
             effort = ""
             if model == "Sol":
-                if not self.mutation_allowed():
+                if not await safe():
                     return
                 await trigger.click(timeout=1500)
                 try:
                     if (await self._menu_state())["effort"] == ["Extra High, 4 of 5."]:
                         effort = "Extra High"
                 finally:
-                    await self.page.keyboard.press("Escape")
+                    if self.page.url == url:
+                        await self.page.keyboard.press("Escape")
             # Closing updates the trigger asynchronously; capture only its stable
             # closed signature, retaining independent full-panel model evidence.
             previous = None
             for _ in range(20):
+                if not await safe():
+                    return
                 state = await self._menu_state()
                 wanted = "Pro" if model == "Astra" else "5.6 Extra High"
                 if (
@@ -113,7 +148,7 @@ class LiveAdapter(PlaywrightAdapter):
                             "effort": effort,
                         },
                     )
-                    self.probed_at = time.monotonic()
+                    self.probed_at = captured_at
                     return
                 previous = state["signature"]
                 await asyncio.sleep(0.05)

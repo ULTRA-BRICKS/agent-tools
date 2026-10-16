@@ -87,14 +87,26 @@ each cycle. Stored watches work without startup `--watch`, and an explicit
 unwatch survives restart even if its URL remains in startup arguments. Existing
 project URLs are matched by canonical `/c/<id>` identity. Missing, closed or
 redirected tabs stay missing across cycles and restarts. The service never opens,
-navigates, reloads, foregrounds or closes a tab. Duplicate tabs fail closed.
+navigates, reloads or closes a tab. Foreground activation is disabled by default.
+Duplicate tabs fail closed.
 Unrelated history/settings tabs are ignored.
+
+When Chrome runs on an operator-managed private virtual screen, add
+`live --private-display` alongside the other live arguments to allow activation
+of the single eligible failed tab inside its confirmation burst. Use this option
+only on that private screen: it calls `page.bring_to_front()` and can otherwise
+steal desktop focus. Idle scans never activate tabs. Safety and structural checks
+run before and after activation. This provides no headless or login guarantee;
+the operator must provide the private display and authenticated ordinary browser.
 
 Idle polling is passive, including with `--apply`. Only a structurally confirmed
 latest `Thinking failed` on exactly one enrolled page can start a confirmation
 burst when apply is enabled. Each burst observes that same page about every three
 seconds for at most 35 seconds. Fresh model menu evidence is required; unavailable
-proof reports `confirmation-blocked` and ends the burst immediately. The existing
+proof reports `confirmation-blocked` and ends the burst. The model probe polls for
+up to 1.5 seconds for a unique visible selected GPT-6 or GPT-5.6 Sol after opening
+the menu/full panel; hidden or transparent selection and the generic Pro label
+cannot identify a model. Probing never selects a model. The existing
 Guardian requires 20 seconds of unchanged verified evidence with gaps of at most
 six seconds before reserving and sending. A burst stops after its first dispatch
 result, including an uncertain send; durable dedup and rate limits still apply.

@@ -224,6 +224,11 @@ def main(argv=None) -> int:
         help="Authorize one bounded confirmation burst for a latest failed turn",
     )
     live.add_argument(
+        "--private-display",
+        action="store_true",
+        help="Allow failure-candidate activation on an operator-managed private virtual display",
+    )
+    live.add_argument(
         "--once",
         action="store_true",
         help="One observation cycle for diagnostics; stability still requires 20 seconds",
