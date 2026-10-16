@@ -73,6 +73,10 @@
 
 ### Added
 
+- `slop-check` universal skill: run `slop-check` (ultrabricks/slop-cli) on English and
+  Russian prose before posting issues, PR bodies, release notes, review comments and tg reports;
+  how to act on findings, exit codes 0/1/2 (agent-tools#923).
+
 - `runpod-offload` (`runpod-run`): a spend ledger and `--report` (agent-tools#910). Every
   run-mode invocation (refusals, usage errors and Ctrl-C included; not `--dry-run`) appends one
   JSON line to `~/.cache/runpod-run/ledger.jsonl`, written by the script itself so a caller

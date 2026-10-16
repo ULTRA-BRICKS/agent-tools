@@ -7,6 +7,8 @@ description: Use when a frontend TypeScript/JavaScript repo adopts or hits anti-
 
 Anti-slop is a specialized semantic layer inside the broader policy documented in [`../README.md`](../README.md). Do not consume it as a remote runtime dependency. `agent-tools` pins the reviewed fork at `vendor/anti-slop`; Rig vendors the supported asset tree from that pinned source into each target repository.
 
+This skill covers code. For AI tells in prose (issues, PR bodies, tg reports) use the universal `slop-check` skill.
+
 ## Preferred repairs
 
 When a rule fires, preserve evidence rather than suppressing the rule:
