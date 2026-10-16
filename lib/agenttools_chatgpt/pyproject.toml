@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttools-chatgpt"
+version = "0.1.0"
+description = "Observe-first ChatGPT Guardian with durable conservative recovery controls"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+
+[project.optional-dependencies]
+browser = ["playwright>=1.60,<2"]
+ha = ["playwright>=1.60,<2", "aiohttp>=3.13,<4"]
+test = ["pytest>=8,<10", "playwright>=1.60,<2"]
+
+[project.scripts]
+chatgpt-guardian = "agenttools_chatgpt.cli:main"
+
+[tool.setuptools]
+packages = ["agenttools_chatgpt"]
+[tool.setuptools.package-dir]
+agenttools_chatgpt = "."
+[tool.setuptools.package-data]
+agenttools_chatgpt = ["dom.js", "README.md", "INTEGRATION.md"]
