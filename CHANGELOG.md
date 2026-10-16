@@ -12,6 +12,13 @@
   and `~/.config/agent-tools/env`; a referenced (or unscannable) tree is kept and ship prints
   the references plus the fix (`rig apply commit --only agent_hooks`, re-check, `rig worktree
   remove`).
+- `agent-hooks/heavy-op-memory-gate`: a run of one or two test files (`bun test ./tests/x.test.ts
+  -t foo`, `pytest a.py b.py::T`, `go test ./pkg/foo_test.go`, also through `uv run`/`python -m`/
+  `poetry run`) is gated on the emergency signals only — `MemAvailable` floor, PSI, wired
+  share, jetsam level — not on the memory budget, the swap check or the live-runner ceiling
+  (agent-tools#911: one test file was blocked for "7 heavy runner(s) already live"). A bare
+  suite, a directory operand, three or more files, or any other heavy command in the same line
+  keeps the full checks. `decide`'s `review_admission` flag is now `emergency_only`.
 - `agent-hooks/heavy-op-memory-gate`: `runpod-run [options] -- <command>` is no longer treated
   as a local heavy operation — its block message told agents to use `runpod-run`, then blocked
   `runpod-run -- bun test ./tests` on the swap and live-runner checks because the remote

@@ -55,7 +55,7 @@ def _isolated_gpu_slots_and_thresholds(tmp_path, monkeypatch):
         "RIG_GPU_SLOT_FD", "RIG_HEAVY_OP_MAX_WIRED_PCT", "RIG_HEAVY_OP_MIN_AVAILABLE_MB",
         "RIG_HEAVY_OP_MAX_PSI_SOME10", "RIG_HEAVY_OP_MIN_SWAP_FREE_PCT", "RIG_HEAVY_OP_MAX_LIVE",
         "RIG_HEAVY_OP_HEADROOM_MB", "RIG_HEAVY_OP_COST_REVIEW_MB", "RIG_HEAVY_OP_COST_DOCKER_MB",
-        "RIG_HEAVY_OP_COST_SUITE_MB", "REVIEW_ADMISSION",
+        "RIG_HEAVY_OP_COST_SUITE_MB", "REVIEW_ADMISSION", "PYTEST_ADDOPTS", "PYTEST_PLUGINS",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -1268,7 +1268,7 @@ def test_review_admission_skips_budget_swap_and_ceiling():
     budget far below zero do not block a review it admits."""
     runners = _runners(6, label="review (4 seat(s): claude, codex)", pss_mb=300)
     kwargs = dict(level=None, block_at=2, memory=_crowded_full_swap(12), min_available_mb=9830, psi_some10=0.0, live_runners=runners)
-    assert hook.decide(hook.REVIEW_LABEL, review_admission=True, **kwargs) == ("allow", None)
+    assert hook.decide(hook.REVIEW_LABEL, emergency_only=True, **kwargs) == ("allow", None)
     decision, message = hook.decide(hook.REVIEW_LABEL, **kwargs)
     assert decision == "block" and "budget does not cover" in message and "hard ceiling" in message
 
@@ -1282,7 +1282,7 @@ def test_review_admission_still_blocks_on_emergency_signals(signal):
         kwargs["psi_some10"] = 25.0
     else:
         kwargs["level"] = 4
-    decision, message = hook.decide(hook.REVIEW_LABEL, review_admission=True, **kwargs)
+    decision, message = hook.decide(hook.REVIEW_LABEL, emergency_only=True, **kwargs)
     assert decision == "block", signal
     assert "review-cli's admission controller would queue this review" in message
     assert "swap is" not in message and "Memory budget" not in message
@@ -1694,3 +1694,213 @@ def test_main_hands_an_installed_review_to_review_cli(monkeypatch, review_cli):
     assert _run_linux("REVIEW_ADMISSION=0 review diff --staged", monkeypatch, **crowded)["decision"] == "block"
     assert _run_linux("bun test", monkeypatch, **crowded)["decision"] == "block"
     assert _run_linux("review diff --staged", monkeypatch, memory=_crowded_full_swap(4), runners=[])["decision"] == "block"
+
+
+@pytest.mark.parametrize("command, small", [
+    ("bun test ./tests/x.test.ts -t foo", True),
+    ("uv run --with pytest pytest tests/a.py tests/b.py::T -q", True),
+    ("pytest tests/a.py tests/b.py tests/c.py", False),
+    ("pytest tests/", False),
+    ("bun test", False),
+    ("go test ./pkg/foo_test.go", True),
+    ("bun test a.test.ts && bun test", False),
+    # The 2026-10-15 13:44Z block that motivated agent-tools#911.
+    ("bun test ./tests/session-topic-integration.test.ts -t 'routes a topic'", True),
+    ("nice -n19 ionice -c3 uv run --with 'pytest>=8,<9' python -m pytest tests/a.py -q", True),
+    ("cd sub && bun test x.test.ts", True),
+    ("poetry run pytest tests/a.py -k slow", True),
+    # jest/vitest operands are patterns: one that is not a file here may match the whole tree
+    # (round-4 review finding; the extant-file case is `test_js_pattern_operands_must_name_a_file`).
+    ("vitest run src/a.test.ts", False),
+    ("vitest src/a.test.ts", False),  # no `run`: may start resident watch mode (round-3 review)
+    ("jest src/a.test.js src/b.test.js", False),
+    ("jest .+", False),
+    ("vitest run .test.ts", False),
+    ("bun test .test.ts", False),
+    ("bun test ./.test.ts", True),  # `./`: a path, which bun runs as that one file
+    ("pytest -n auto tests/a.py", False),  # xdist forks a worker per CPU (round-4 review)
+    ("jest --maxWorkers=8 src/a.test.js", False),
+    ("PYTEST_PLUGINS=collect_all pytest tests/a.py", False),  # round-5 review
+    ("go test -run TestX ./pkg/foo_test.go", True),
+    ("pytest -k tests/a.py", False),  # `-k`'s value is a keyword, not a file: the whole suite
+    ("pytest tests", False),  # no extension: a directory, whether it exists or not
+    ("bun test ./tests", False),
+    ("go test ./pkg", False),
+    ("go test ./...", False),
+    ("vitest run", False),
+    ("pytest a.py & review diff", False),
+    ('echo "$(bun test)" && bun test x.test.ts', False),
+    ("npm test", False),
+    ("git status", False),
+    # Review findings: the shell expands these before the runner starts.
+    ("pytest tests/*.py", False),
+    ("bun test tests/*.test.ts", False),
+    ("pytest tests/{a,b,c}.py", False),
+    ("pytest $FILES.py", False),
+    ("pytest 'tests/a.py::test_x[1]'", True),
+    # Review findings: modes that collect more than the files named.
+    ("pytest --pyargs pkg.tests", False),
+    ("python -m pytest --pyargs pkg.tests", False),
+    ("jest --findRelatedTests src/component.ts", False),
+    ("jest --testPathPattern=src src/a.test.js", False),
+    ("jest -o src/a.test.js", False),
+    ("vitest run --changed src/a.test.ts", False),
+    ("vitest related src/component.ts", False),
+    ("vitest bench perf.bench.ts", False),
+    # Round-2 review findings: options outside the allowlist (config/project/rest-of-argv modes).
+    ("go test -args a_test.go", False),
+    ("go test -args ./pkg/a_test.go", False),
+    ("jest --projects ./jest.config.js", False),
+    ("vitest run --workspace vitest.workspace.ts", False),
+    ("pytest --cov=src tests/a.py", False),
+    ("pytest -c other.ini tests/a.py", False),
+    # Allowlisted option spellings stay small.
+    ("pytest -xvs tests/a.py", True),
+    ("pytest -kslow tests/a.py", True),
+    ("pytest --tb=short -rA tests/a.py", True),
+    ("go test -v -count=1 --run=TestX ./pkg/foo_test.go", True),
+    ("go test -parallel 64 ./pkg/foo_test.go", False),  # worker fan-out (round-7 review)
+    ("go test -cpu 1,2,4,8 ./pkg/foo_test.go", False),
+    ("setsid -c uv run pytest tests/a.py tests/b.py", True),
+    ("stdbuf -oL bun test ./tests/x.test.ts", True),
+    # Round-3 review findings: arguments added behind the command line's back, another cwd.
+    ("PYTEST_ADDOPTS=tests/ pytest tests/a.py", False),
+    ("export PYTEST_ADDOPTS=tests/; pytest tests/a.py", False),
+    ("pytest -o addopts=tests/ tests/a.py", False),
+    ("pytest -p myplugin tests/a.py", False),
+    ("uv run --directory sub pytest suite.py", False),
+    ("uv --directory=sub run pytest suite.py", False),
+    ("poetry -C sub run pytest suite.py", False),
+])
+def test_small_test_run_classifier(command, small, tmp_path):
+    assert hook.small_test_run(command, str(tmp_path)) is small, command
+
+
+def test_small_test_run_judges_an_existing_path_by_what_it_is(tmp_path):
+    (tmp_path / "suite.d").mkdir()
+    (tmp_path / "Makefile_test").write_text("")
+    assert hook.small_test_run("pytest suite.d", str(tmp_path)) is False
+    assert hook.small_test_run("pytest Makefile_test", str(tmp_path)) is True
+
+
+def test_vitest_subcommands_are_never_small_even_when_named_like_an_existing_file(tmp_path):
+    """Round-2 review finding: `related` was only rejected because no file of that name existed."""
+    for name in ("related", "bench"):
+        (tmp_path / name).write_text("")
+    (tmp_path / "component.ts").write_text("")
+    assert hook.small_test_run("vitest related component.ts", str(tmp_path)) is False
+    assert hook.small_test_run("vitest bench component.ts", str(tmp_path)) is False
+
+
+def test_small_test_run_resolves_operands_after_a_cd(tmp_path):
+    """Round-3 review finding: `cd sub && pytest suite.py` resolves `suite.py` in `sub`."""
+    (tmp_path / "sub" / "suite.py").mkdir(parents=True)
+    (tmp_path / "sub" / "a.py").write_text("")
+    (tmp_path / "suite.py").write_text("")
+    assert hook.small_test_run("cd sub && pytest suite.py", str(tmp_path)) is False
+    assert hook.small_test_run("pushd sub; pytest suite.py", str(tmp_path)) is False
+    assert hook.small_test_run("cd sub && pytest a.py", str(tmp_path)) is True
+    assert hook.small_test_run("pytest suite.py", str(tmp_path)) is True
+    # An unresolvable target leaves the extension rule for JS operands; pytest's config can't be
+    # found then, so it gets full checks.
+    assert hook.small_test_run('cd "$X" && bun test x.test.ts', str(tmp_path)) is True
+    assert hook.small_test_run('cd "$X" && bun test x', str(tmp_path)) is False
+    assert hook.small_test_run('cd "$X" && pytest suite.py', str(tmp_path)) is False
+    # Round-4/6 review findings: a `cd` in a subshell, a pipeline, the background, behind `||`,
+    # or after a command that may fail and skip it leaves no telling where the runner runs.
+    (tmp_path / "suite.py").unlink()
+    (tmp_path / "suite.py").mkdir()
+    (tmp_path / "sub" / "x.test.ts").write_text("")
+    assert hook.small_test_run("cd sub && bun test x.test.ts", str(tmp_path)) is True
+    assert hook.small_test_run("cd sub; cd .; bun test x.test.ts", str(tmp_path)) is True
+    for command in (
+        "(cd sub && make prep); pytest suite.py",
+        "cd sub || cd other; bun test x.test.ts",
+        "cd sub | bun test x.test.ts",
+        "cd sub & bun test x.test.ts",
+        "false && cd sub; bun test x.test.ts",
+        "git status && cd sub && bun test x.test.ts",
+    ):
+        assert hook.small_test_run(command, str(tmp_path)) is False, command
+
+
+def test_js_pattern_operands_must_name_a_file(tmp_path):
+    (tmp_path / "src").mkdir()
+    for name in ("a.test.ts", "a.test.js", "b.test.js"):
+        (tmp_path / "src" / name).write_text("")
+    cwd = str(tmp_path)
+    assert hook.small_test_run("vitest run src/a.test.ts", cwd) is True
+    assert hook.small_test_run("vitest --run src/a.test.ts", cwd) is True
+    assert hook.small_test_run("jest src/a.test.js src/b.test.js", cwd) is True
+    assert hook.small_test_run("bun test src/a.test.ts", cwd) is True
+    assert hook.small_test_run("jest a.test.js", cwd) is False, "not a file here: a regex over every path"
+    assert hook.small_test_run("jest 'src/a.test.(js|ts)'", cwd) is False
+
+
+@pytest.mark.parametrize("config, addopts, small", [
+    ("pytest.ini", "[pytest]\naddopts = -q --tb=short\n", True),
+    ("pytest.ini", "[pytest]\naddopts = tests/\n", False),
+    ("tox.ini", "[pytest]\naddopts =\n    -q\n    tests/\n", False),
+    ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = "-q tests"\n', False),
+    ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = [\n  "-q",\n  "tests",\n]\n', False),
+    ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = ["-q", "-x"]\ntestpaths = ["tests"]\n', True),
+    ("setup.cfg", "[tool:pytest]\naddopts = -p xdist\n", False),
+    # Round-7 review finding: config options are held to the command line's allowlist.
+    ("pytest.ini", "[pytest]\naddopts = -n auto\n", False),
+    ("pytest.ini", "[pytest]\naddopts = -nauto --strict-markers\n", False),
+    ("pytest.ini", "[pytest]\naddopts = --strict-markers -ra\n", True),
+    # Round-5 review finding: multiline TOML strings and backslash continuations.
+    ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = """\n-q\ntests/\n"""\n', False),
+    ("pyproject.toml", "[tool.pytest.ini_options]\naddopts = '''-q\ntests/'''\n", False),
+    ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = """-q -x"""\ntestpaths = ["tests"]\n', True),
+    ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = "-q \\\ntests/"\n', False),
+])
+def test_pytest_config_addopts_that_add_operands_mean_full_checks(tmp_path, config, addopts, small):
+    """Round-4 review finding: `addopts = tests/` makes `pytest tests/unit/a.py` collect `tests/`."""
+    (tmp_path / "tests" / "unit").mkdir(parents=True)
+    (tmp_path / "tests" / "unit" / "a.py").write_text("")
+    (tmp_path / config).write_text(addopts)
+    assert hook.small_test_run("pytest tests/unit/a.py", str(tmp_path)) is small
+
+
+@pytest.mark.parametrize("name", ["PYTEST_ADDOPTS", "PYTEST_PLUGINS"])
+def test_inherited_pytest_env_means_full_checks(tmp_path, monkeypatch, name):
+    monkeypatch.setenv(name, "tests/" if name == "PYTEST_ADDOPTS" else "collect_all")
+    assert hook.small_test_run("pytest tests/a.py", str(tmp_path)) is False
+
+
+def test_an_extant_dotfile_named_like_a_test_is_still_a_pattern(tmp_path):
+    """Round-5 review finding: a file literally named `.test.ts` turns `bun test .test.ts` into a
+    filter over every test file."""
+    (tmp_path / ".test.ts").write_text("")
+    assert hook.small_test_run("bun test .test.ts", str(tmp_path)) is False
+    assert hook.small_test_run("jest .test.ts", str(tmp_path)) is False
+
+
+def test_small_test_run_allowed_with_many_live_runners(monkeypatch):
+    """2026-10-15 13:44Z: one test file was blocked for "7 heavy runner(s) already live" on a
+    box with room to spare (agent-tools#911). The ceiling, budget and swap checks are for
+    suites; a 1-2 file run is gated on the emergency signals only."""
+    crowded = dict(memory=_crowded_full_swap(30), runners=_runners(7))
+    assert _run_linux("bun test ./tests/x.test.ts -t foo", monkeypatch, **crowded)["decision"] == "allow"
+    assert _run_linux("pytest tests/a.py tests/b.py", monkeypatch, **crowded)["decision"] == "allow"
+    suite = _run_linux("bun test ./tests", monkeypatch, **crowded)
+    assert suite["decision"] == "block" and "7 heavy runner(s)" in suite["message"]
+    kwargs = dict(level=None, block_at=2, memory=_crowded_full_swap(30), min_available_mb=9830, psi_some10=0.0, live_runners=_runners(7))
+    assert hook.decide("build/test suite", emergency_only=True, **kwargs) == ("allow", None)
+
+
+@pytest.mark.parametrize("signal", ["available", "psi"])
+def test_small_test_run_still_blocked_on_emergency(signal, monkeypatch):
+    memory, psi = (_crowded_full_swap(6), 0.0) if signal == "available" else (_crowded_full_swap(30), 25.0)
+    result = _run_linux("bun test ./tests/x.test.ts", monkeypatch, memory=memory, runners=_runners(7), psi=psi)
+    assert result["decision"] == "block", signal
+    assert ("free or reclaimable" if signal == "available" else "PSI some avg10") in result["message"]
+    assert "review-cli's admission controller" not in result["message"]
+    assert "hard ceiling" not in result["message"] and "Memory budget" not in result["message"]
+    assert "locally run one or two test files" not in result["message"], "would name the blocked command"
+
+
+def test_full_suite_block_still_points_at_runpod_and_small_runs():
+    _decision, message = hook.decide("build/test suite", level=4, block_at=2)
+    assert "runpod-run -- <command>" in message and "locally run one or two test files at most" in message

@@ -72,6 +72,49 @@ large-v3-turbo model into Metal buffers, wired 24.65 of 25.77 GB (95.7%) and ker
 the Mac, while the jetsam pressure level (then this hook's only signal) stayed "normal"
 (agent-tools#817).
 
+## One or two test files
+
+A command whose only heavy simple command runs one or two test FILES is gated like a review
+handed to review-cli: on the emergency signals only (`MemAvailable` below its floor, PSI above its
+limit, the wired share, the jetsam level), never on the memory budget, the swap check or the
+live-runner ceiling. That is the local workflow the block message itself recommends; on
+2026-10-15 `bun test ./tests/session-topic-integration.test.ts -t …` was blocked for "7 heavy
+runner(s) already live" on a box with tens of GB free (agent-tools#911).
+
+| Runner | Small run | Full checks |
+| --- | --- | --- |
+| `pytest` (also `uv run [--with …] pytest`, `python -m pytest`, `poetry run pytest`) | `pytest tests/a.py tests/b.py::TestX -k slow` | `pytest`, `pytest tests/`, `pytest a.py b.py c.py` |
+| `bun test`, `vitest run` (or `--run`), `jest` | `bun test ./tests/x.test.ts -t foo` | `bun test`, `bun test ./tests`, `vitest x.test.ts` (may start watch mode) |
+| `go test` | `go test -run TestX ./pkg/foo_test.go` | `go test`, `go test ./pkg`, `go test ./...` |
+
+Operands follow runpod-offload-gate's rule: an existing path is judged by what it is; a path that
+does not exist (`cd sub && bun test x.test.ts`) is a directory when its last component has no
+extension. Paths are looked up from the event's `cwd`, moved by a leading chain of literal
+`cd`/`pushd` joined by `&&`/`;`. After an unresolvable one (`cd "$X"`, `cd -`, `popd`), or into a
+directory that does not exist here, only the extension rule applies. A directory change anywhere
+else — a subshell, a pipeline, the background, behind `||`, or after another command
+(`false && cd sub; bun test x.test.ts`) — means full checks. jest's operands
+are regexes and vitest's and `bun test`'s (unless spelled `./x`) substring filters, so for those an
+operand must be a literal test-file name (`x.test.ts`, not `.test.ts`) that exists here — or, with
+the directory unknown, just the literal name (`jest .+`, `vitest run .test.ts` mean full checks). A
+filter is unanchored, so `a.test.ts` also runs `data.test.ts`: a few more files, never the tree.
+
+No operand at all is the whole suite. Options are an allowlist per runner — name filters (`-k`,
+`-t`, `-run`), verbosity, fail-fast, timeouts — so a mode that collects more than the files named
+(`pytest --pyargs`/`-o addopts=…`/`-p plugin`, `jest --findRelatedTests`/`--projects`, `vitest
+--workspace`, `vitest related`, `go test -args`), a worker fan-out (`pytest -n auto`, `jest
+--maxWorkers`, `go test -parallel`/`-cpu`) or any unknown option means full checks. So does an operand the shell may expand
+(`tests/*.py`, `tests/{a,b}.py`, `$FILES`), a launcher that moves to another directory (`uv run
+--directory`, `poetry -C`), and any other heavy command in the same line (`bun test a.test.ts &&
+bun test`, `pytest a.py & review diff`, a heavy `$(…)`). For pytest, so does any `PYTEST_…`
+variable in the command, `PYTEST_ADDOPTS`/`PYTEST_PLUGINS` in the hook's environment, an unknown
+directory, and a `pytest.ini`/`.pytest.ini`/`pyproject.toml`/`tox.ini`/`setup.cfg` at or above an
+operand whose `addopts` (also a TOML multiline string or array) holds an operand or an option
+outside the same allowlist (`addopts = tests/`, `addopts = -n auto`). A variable exported by an earlier tool call lives only in the agent's shell,
+out of a pre-bash hook's sight, and a `conftest.py` can still do anything: this is a memory gate,
+not a sandbox. A small run blocked on an emergency signal is not told to "run one or two test
+files" — it already does; it waits.
+
 ## The signals
 
 Either signal blocks. A signal that cannot be read contributes nothing; when neither can be read

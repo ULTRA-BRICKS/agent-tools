@@ -107,6 +107,11 @@ provider fit with 20% headroom, so this hook skips the budget, swap and live-run
 checks for it and blocks it only on the emergency signals (MemAvailable floor, PSI limit,
 wired share, jetsam level). Live reviews still count as runners in every OTHER heavy
 operation's budget. See `review_cli_handoff` for how "installed" is pinned.
+A run of ONE OR TWO test files (`bun test ./tests/x.test.ts -t foo`, `pytest a.py b.py::T`,
+`go test ./pkg/foo_test.go`; see `small_test_run`) is gated the same way, on the emergency
+signals only: it is the local workflow the block message itself recommends, and the
+ceiling, budget and swap checks exist for whole suites (agent-tools#911: one test file was
+blocked for "7 heavy runner(s) already live" on a box with tens of GB free).
 
 "Heavy operation" is intentionally scoped to the operations actually implicated in
 the incidents: the extension rebuild script (`build-and-install.sh`),
@@ -1018,6 +1023,417 @@ def classify_heavy_operation(command: str) -> Optional[str]:
     return None
 
 
+# ── one or two test files: emergency signals only (agent-tools#911) ───────────────
+# The block message told agents to "locally run one test file at most"; the live-runner
+# ceiling, budget and swap checks then refused exactly that (2026-10-15 13:44Z: `bun test
+# ./tests/session-topic-integration.test.ts -t …` blocked for "7 heavy runner(s) already
+# live"). Such a run is gated on the emergency signals only, like a review handed to
+# review-cli. The operand rule is runpod-offload-gate's (`_pytest_verdict` and friends,
+# copied: hooks are standalone stdlib scripts): an existing path is judged by what it is; a
+# path that does not exist here (another checkout, a `cd` earlier in the chain) is a
+# directory when its last component has no extension. No operand at all is the whole suite.
+_SMALL_RUN_MAX_FILES = 2
+# The `classify_heavy_operation` labels a test run gets; anything else (a GPU load, a review,
+# an extension rebuild) is never a small test run.
+_SMALL_RUN_LABELS = frozenset({"build/test suite", "test-suite runner"})
+# Wrappers `_program_index` does not peel (`nice -n19 ionice -c3 uv run …`, the invocation
+# this repo's AGENTS.md prescribes), each with its value-taking options (`setsid` has none).
+_SMALL_RUN_WRAPPERS = {
+    "ionice": frozenset({"-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid", "--pgid", "--uid"}),
+    "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
+    "setsid": frozenset(),
+}
+# An operand path the shell may expand into many words (`tests/*.py`, `tests/{a,b,c}.py`,
+# `$FILES`): its pre-shell spelling says nothing about how many files run (review finding). A
+# pytest node id's `[param]` after `::` is not checked.
+_SHELL_EXPANSION_CHARS = frozenset("*?[{$")
+
+
+class _RunnerOptions(NamedTuple):
+    """The options a small run may carry — an ALLOWLIST, so a mode that collects more than the
+    files named (`pytest --pyargs`, `jest --findRelatedTests`/`--projects`, `vitest --workspace`,
+    `go test -args`; review findings) or anything else unknown means full checks. `flags` take no
+    separate value (a glued `--bail=3` is fine); `values` take one, separate or glued (`-k slow`,
+    `-kslow`, `--tb=short`). Name filters, verbosity, fail-fast and timeouts only."""
+
+    flags: frozenset[str]
+    values: frozenset[str]
+
+
+_RUNNER_OPTIONS = {
+    "pytest": _RunnerOptions(
+        frozenset({
+            "-q", "-v", "-x", "-s", "-l", "--quiet", "--verbose", "--exitfirst", "--lf",
+            "--last-failed", "--ff", "--failed-first", "--nf", "--new-first", "--sw", "--stepwise",
+            "--stepwise-skip", "--no-header", "--no-summary", "--showlocals", "--disable-warnings",
+            "--runxfail", "--strict-markers",
+        }),
+        # No `-o`/`--override-ini`/`-p`: `-o addopts=tests/` or a plugin can add a whole tree
+        # (round-3 review finding). No `-n`/`--numprocesses`: xdist forks a worker per CPU
+        # (round-4 review finding).
+        frozenset({
+            "-k", "-m", "-W", "-r", "--tb", "--maxfail", "--durations", "--timeout",
+            "--color", "--capture", "--import-mode",
+            "--basetemp", "--junitxml", "--junit-xml", "--log-level", "--log-cli-level", "--deselect",
+        }),
+    ),
+    "bun test": _RunnerOptions(
+        frozenset({"--bail", "--only", "--todo", "--update-snapshots", "--coverage"}),
+        frozenset({"-t", "--test-name-pattern", "--timeout"}),
+    ),
+    "vitest": _RunnerOptions(
+        frozenset({"--run", "--silent", "--passWithNoTests", "--update", "-u", "--allowOnly", "--globals", "--bail"}),
+        frozenset({"-t", "--testNamePattern", "--reporter", "--retry", "--testTimeout", "--hookTimeout"}),
+    ),
+    "jest": _RunnerOptions(
+        frozenset({
+            "--ci", "--runInBand", "-i", "--silent", "--verbose", "--bail", "-b", "--no-cache",
+            "--detectOpenHandles", "--forceExit", "--passWithNoTests", "-u", "--updateSnapshot",
+            "--colors", "--json", "--useStderr",
+        }),
+        frozenset({"-t", "--testNamePattern", "--testTimeout", "--outputFile"}),
+    ),
+    # Go's flag package spells every option with one or two dashes; matched without them. No
+    # `-parallel`/`-p`/`-cpu`: worker fan-out, like pytest's `-n` (round-7 review finding).
+    "go test": _RunnerOptions(
+        frozenset({"v", "race", "failfast", "json", "cover", "short"}),
+        frozenset({"run", "skip", "count", "timeout", "tags", "shuffle", "vet", "coverprofile", "covermode"}),
+    ),
+}
+# vitest subcommands other than `run` (`related` runs every test importing a file; `bench`,
+# `watch`, `dev` stay resident; review finding): never small.
+_VITEST_OTHER_SUBCOMMANDS = frozenset({"related", "bench", "watch", "dev", "list", "init", "typecheck"})
+# Launchers whose `run` subcommand executes its operand, with their value-taking options, and
+# the options that move the runner to another directory (`uv run --directory sub pytest
+# suite.py` resolves `suite.py` there; round-3 review finding): with one of those, never small.
+_SMALL_RUN_LAUNCHERS = {
+    "uv": frozenset({
+        "--with", "-w", "--with-requirements", "--with-editable", "--python", "-p", "--project",
+        "--directory", "--group", "--only-group", "--extra", "--env-file", "--index",
+        "--default-index", "--find-links", "-f", "--package", "--exclude-newer", "--config-file",
+        "--cache-dir", "--index-url", "-i", "--extra-index-url", "--constraints", "-c",
+        "--build-constraints", "-b", "--overrides", "--link-mode", "--resolution", "--prerelease",
+        "--python-preference", "--color", "--config-setting", "-C",
+    }),
+    "poetry": frozenset({"-C", "--directory", "-P", "--project"}),
+}
+_LAUNCHER_CWD_FLAGS = {"uv": frozenset({"--directory"}), "poetry": frozenset({"-C", "--directory"})}
+# `PYTEST_ADDOPTS=tests/ pytest a.py` prepends `tests/` to pytest's arguments and
+# `PYTEST_PLUGINS=x` loads a plugin that may add more (round-3/5 review findings): a command that
+# mentions any `PYTEST_` variable, or a hook environment that carries one, is never small. A
+# variable exported by an EARLIER tool call lives only in the agent's shell, which a pre-bash hook
+# cannot see (residual of a memory gate). So is a pytest run under a config file whose `addopts`
+# carries anything but options (`addopts = tests/`; round-4 review finding).
+_PYTEST_ENV_PREFIX = "PYTEST_"
+_PYTEST_ENV = ("PYTEST_ADDOPTS", "PYTEST_PLUGINS")
+_PYTEST_CONFIG_FILES = ("pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg")
+_ADDOPTS_LINE = re.compile(r"^\s*addopts\s*=\s*(.*)$")
+# jest's operands are regexes and vitest's and `bun test`'s substring filters (bun's only when
+# not spelled as a path, `./x.test.ts`): `jest .+` or `vitest run .test.ts` runs every test
+# (round-4 review finding). Such an operand must be a literal test-file name (not `.test.ts`)
+# that exists here — or, where the directory is unknown or does not exist here (`cd sub && bun
+# test x.test.ts` from another checkout), just the literal name. Residual (round-5 review): a
+# filter is unanchored, so `a.test.ts` also runs `data.test.ts` and `src/a.test.js` also
+# `src/a.test.jsx` — a few more files, never the whole tree.
+_PATTERN_RUNNERS = frozenset({"jest", "vitest", "bun test"})
+_LITERAL_PATH = re.compile(r"^[\w./@-]+$")
+_JS_TEST_FILE = re.compile(r"^[\w@-][\w.@-]*\.[cm]?[jt]sx?$")
+# `cd`/`pushd` before the runner move where its operands resolve; a target that cannot be
+# resolved statically leaves only the extension rule (`_is_directory_operand` with no cwd). The
+# walk is linear, so it trusts only a leading chain of directory changes joined by `&&`/`;`. A
+# directory change anywhere else — in a subshell, a pipeline, the background, behind `||`, or
+# after another command that may fail and skip it (`false && cd sub; bun test x.test.ts`) —
+# leaves no telling where the runner runs: never small (round-4/6 review findings).
+_CHANGES_DIRECTORY = frozenset({"cd", "pushd", "popd"})
+_UNSEQUENCED = frozenset({"(", ")", "||", "|", "&", "|&"})
+_PYTHON_EXE = re.compile(r"^(?:python|pypy)(?:\d+(?:\.\d+)?)?$")
+_PYTHON_VALUE_OPTS = frozenset({"W", "X"})  # `-W ignore`, `-X dev`; every other short option is a boolean
+_MAX_LAUNCHER_NESTING = 8
+
+
+def _skip_options(rest: list[str], value_flags: frozenset[str]) -> int:
+    """Index of the first word of `rest` that is not an option: a value-taking option skips its
+    separate value; a glued `--flag=value` and any other `-x` skip one; `--` ends the options."""
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--":
+            return i + 1
+        if not tok.startswith("-"):
+            return i
+        if "=" not in tok and tok in value_flags:
+            i += 1
+        i += 1
+    return i
+
+
+def _python_module_argv(argv: list[str]) -> Optional[list[str]]:
+    """`<module> <args…>` for `python -m <module>` (`python3 -um pytest`, `python -Wignore -m
+    pytest`), else None: a script path, `-c code`, stdin or a bare interpreter."""
+    if not _PYTHON_EXE.match(_basename(argv[0])):
+        return None
+    rest = argv[1:]
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if not tok.startswith("-") or tok in ("-", "--"):
+            return None
+        if tok.startswith("--"):
+            i += 1
+            continue
+        for j, ch in enumerate(tok[1:]):
+            glued = tok[j + 2:]
+            if ch == "m":
+                return [glued, *rest[i + 1:]] if glued else (rest[i + 1:] or None)
+            if ch == "c":
+                return None
+            if ch in _PYTHON_VALUE_OPTS:
+                if not glued:
+                    i += 1
+                break
+        i += 1
+    return None
+
+
+def _peel_program(words: list[str]) -> list[str]:
+    """The argv a simple command runs: past `_program_index`'s prefixes and the
+    `_SMALL_RUN_WRAPPERS` it does not know (`nice -n19 ionice -c3 uv run …`)."""
+    for _ in range(_MAX_LAUNCHER_NESTING):
+        words = words[_program_index(words):]
+        if not words or _basename(words[0]) not in _SMALL_RUN_WRAPPERS:
+            return words
+        words = words[1:][_skip_options(words[1:], _SMALL_RUN_WRAPPERS[_basename(words[0])]):]
+    return words
+
+
+def _test_runner_operands(argv: list[str], depth: int = 0) -> Optional[tuple[str, list[str]]]:
+    """`(runner, arguments)` when `argv` runs pytest, `bun test`, vitest, jest or `go test` —
+    directly or through `uv run`/`poetry run`/`python -m` — else None."""
+    argv = _peel_program(argv)
+    if not argv or depth >= _MAX_LAUNCHER_NESTING:
+        return None
+    exe, rest = _basename(argv[0]), argv[1:]
+    if exe in ("pytest", "py.test"):
+        return "pytest", rest
+    if exe == "jest":
+        return "jest", rest
+    if exe == "vitest":
+        # Without `run`/`--run` vitest may start in watch mode and stay resident (round-3 review
+        # finding); `related`/`bench`/`watch`/`dev` never run just the files named.
+        if rest[:1] == ["run"]:
+            return "vitest", rest[1:]
+        if rest[:1] and rest[0] in _VITEST_OTHER_SUBCOMMANDS or "--run" not in rest:
+            return None
+        return "vitest", rest
+    if exe in ("bun", "go") and rest[:1] == ["test"]:
+        return f"{exe} test", rest[1:]
+    if exe in _SMALL_RUN_LAUNCHERS:
+        value_flags = _SMALL_RUN_LAUNCHERS[exe]
+        i = _skip_options(rest, value_flags)
+        if rest[i:i + 1] != ["run"]:
+            return None
+        inner = rest[i + 1:]
+        j = _skip_options(inner, value_flags)
+        if any(tok.split("=", 1)[0] in _LAUNCHER_CWD_FLAGS[exe] for tok in rest[:i] + inner[:j]):
+            return None
+        inner = inner[j:]
+        return _test_runner_operands(inner, depth + 1) if inner else None
+    module = _python_module_argv(argv)
+    return _test_runner_operands(module, depth + 1) if module else None
+
+
+def _file_operands(runner: str, rest: list[str]) -> Optional[list[str]]:
+    """The operands of a runner invocation, or None when it carries an option outside the
+    runner's `_RUNNER_OPTIONS` allowlist. `--` ends the options."""
+    allowed = _RUNNER_OPTIONS[runner]
+    out: list[str] = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        i += 1
+        if tok == "--":
+            return out + rest[i:]
+        if not tok.startswith("-") or tok == "-":
+            out.append(tok)
+            continue
+        if runner == "go test" or tok.startswith("--"):
+            name, glued = tok.split("=", 1)[0], "=" in tok
+            if runner == "go test":
+                name = name.lstrip("-")
+            if name in allowed.flags:
+                continue
+            if name not in allowed.values:
+                return None
+            i += 0 if glued else 1
+            continue
+        for j, ch in enumerate(tok[1:], start=2):  # a short-option cluster: `-xvs`, `-kslow`, `-rA`
+            if f"-{ch}" in allowed.flags:
+                continue
+            if f"-{ch}" not in allowed.values:
+                return None
+            i += 0 if tok[j:] else 1
+            break
+    return out
+
+
+def _is_directory_operand(operand: str, cwd: Optional[str]) -> bool:
+    """A test operand names a DIRECTORY (a whole tree) when it ends in `/`, exists as a directory
+    under `cwd`, or — for a path that does not exist there, or an unknown `cwd` — has no
+    extension in its last component. `tests/x.py::TestFoo::test_bar` is a file: the node-id
+    part is ignored."""
+    path = operand.split("::", 1)[0]
+    if not path or path.endswith("/"):
+        return True
+    if cwd is not None:
+        try:
+            full = os.path.join(cwd, os.path.expanduser(path))
+            if os.path.isdir(full):
+                return True
+            if os.path.isfile(full):
+                return False
+        except (OSError, ValueError):
+            pass
+    return "." not in _basename(path)
+
+
+def _addopts_open(value: list[str]) -> bool:
+    """Whether an `addopts` value continues on the next line: a TOML multiline string or array
+    not yet closed, or a trailing backslash (round-5 review finding)."""
+    joined, head = "\n".join(value), value[0].lstrip()
+    if head.startswith(('"""', "'''")):
+        return joined.count(head[:3]) < 2
+    if head.startswith("["):
+        return "]" not in joined
+    return joined.rstrip().endswith("\\")
+
+
+def _addopts_values(text: str) -> list[str]:
+    """Every word of every `addopts = …` setting in a pytest config file's `text`: the rest of the
+    line plus an INI continuation (indented lines), a TOML array or multiline string spanning
+    lines, or a backslash continuation."""
+    lines = text.splitlines()
+    words: list[str] = []
+    for n, line in enumerate(lines):
+        match = _ADDOPTS_LINE.match(line)
+        if not match:
+            continue
+        value = [match.group(1)]
+        for following in lines[n + 1:]:
+            if not (_addopts_open(value) or (following[:1].isspace() and following.strip())):
+                break
+            value.append(following)
+        words += re.sub(r"[\[\],\"'\\]", " ", " ".join(value)).split()
+    return words
+
+
+def _pytest_may_add_operands(files: list[str], cwd: Optional[str]) -> bool:
+    """True when pytest may collect more than `files` or fan out: `_PYTEST_ENV` set in this
+    environment, an unknown directory, or a config file at or above an operand whose `addopts`
+    holds an operand (`tests/`) or an option outside the pytest allowlist (`-n auto`, `-p x`).
+    An unreadable config file counts as one that adds."""
+    if any(os.environ.get(name, "").strip() for name in _PYTEST_ENV):
+        return True
+    if cwd is None:
+        return True
+    seen: set[str] = set()
+    for operand in files:
+        directory = os.path.dirname(os.path.normpath(os.path.join(cwd, operand.split("::", 1)[0])))
+        while directory not in seen:
+            seen.add(directory)
+            for name in _PYTEST_CONFIG_FILES:
+                path = os.path.join(directory, name)
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    text = Path(path).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    return True
+                # Held to the command line's allowlist: `addopts = tests/` adds a tree and
+                # `addopts = -n auto` an xdist worker per CPU (round-4/7 review findings).
+                if _file_operands("pytest", _addopts_values(text)) != []:
+                    return True
+            directory = os.path.dirname(directory)
+    return False
+
+
+def _is_pattern_operand_small(operand: str, cwd: Optional[str]) -> bool:
+    """A jest/vitest/`bun test` filter that names a literal test file (see `_PATTERN_RUNNERS`)."""
+    if not _LITERAL_PATH.match(operand) or not _JS_TEST_FILE.match(_basename(operand)):
+        return False
+    return cwd is None or os.path.isfile(os.path.join(cwd, operand))
+
+
+def _is_small_test_invocation(words: list[str], cwd: Optional[str]) -> bool:
+    """`cwd`: where the operands resolve, or None when unknown or not a directory here."""
+    found = _test_runner_operands(words)
+    if found is None:
+        return False
+    runner, rest = found
+    files = _file_operands(runner, rest)
+    if files is None or not 1 <= len(files) <= _SMALL_RUN_MAX_FILES:
+        return False
+    if any(_SHELL_EXPANSION_CHARS.intersection(f.split("::", 1)[0]) for f in files):
+        return False
+    if runner == "go test" and not all(f.endswith(".go") for f in files):
+        return False  # `./pkg`, `./...`, `example.com/mod/pkg`: packages, not files
+    if runner == "pytest" and _pytest_may_add_operands(files, cwd):
+        return False
+    for f in files:
+        is_path = runner == "bun test" and f.startswith(("./", "../", "/"))
+        if runner in _PATTERN_RUNNERS and not is_path and not _is_pattern_operand_small(f, cwd):
+            return False
+    return not any(_is_directory_operand(f, cwd) for f in files)
+
+
+def _directory_after(words: list[str], cwd: Optional[str]) -> Optional[str]:
+    """Where a `cd`/`pushd` simple command leaves the shell: a single literal target resolved
+    against `cwd`; None (unknown) for `popd`, `cd -`, a bare `cd`, options or an expansion."""
+    i = _program_index(words)
+    args = words[i + 1:]
+    if (
+        cwd is None or _basename(words[i]) == "popd" or len(args) != 1
+        or args[0].startswith("-") or _SHELL_EXPANSION_CHARS.intersection(args[0])
+    ):
+        return None
+    return os.path.normpath(os.path.join(cwd, os.path.expanduser(args[0])))
+
+
+def small_test_run(command: str, cwd: str) -> bool:
+    """True when the ONLY heavy simple command in `command` runs one or two test FILES (see the
+    block comment above): every other simple command and command substitution classifies as
+    not heavy. Operand paths are looked up in `cwd`, as moved by any `cd`/`pushd` before the
+    runner (`_directory_after`)."""
+    if _PYTEST_ENV_PREFIX in command:
+        return False
+    command = _strip_comments(_strip_heredocs(_drop_offloaded_commands(command)))
+    if any(classify_heavy_operation(body) is not None for body in _command_subs(command)):
+        return False
+    unsequenced = bool(_UNSEQUENCED.intersection(_shell_tokens(command)))
+    run_cwd: Optional[str] = cwd
+    leading = True  # only directory changes so far
+    heavy = []
+    for words in _simple_commands(command):
+        label = classify_heavy_operation(shlex.join(words))
+        changes_directory = (
+            label is None and _program_index(words) < len(words)
+            and _basename(_program_word(words)) in _CHANGES_DIRECTORY
+        )
+        if changes_directory:
+            if unsequenced or not leading:
+                return False
+            run_cwd = _directory_after(words, run_cwd)
+            continue
+        leading = False
+        if label is not None:
+            heavy.append((words, label, run_cwd))
+    if len(heavy) != 1:
+        return False
+    words, label, run_cwd = heavy[0]
+    if run_cwd is not None and not os.path.isdir(run_cwd):
+        run_cwd = None  # another checkout's path: nothing to look up here
+    return label in _SMALL_RUN_LABELS and _is_small_test_invocation(words, run_cwd)
+
+
 # ── memory-pressure reading ───────────────────────────────────────────────────
 _RunFn = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -1774,7 +2190,7 @@ def decide(
     max_live: int = DEFAULT_MAX_LIVE,
     costs: CostTable = CostTable(),
     headroom_mb: int = DEFAULT_HEADROOM_MB,
-    review_admission: bool = False,
+    emergency_only: bool = False,
 ) -> tuple[str, Optional[str]]:
     """Pure decision core — the seam every test in this suite exercises directly.
 
@@ -1784,10 +2200,10 @@ def decide(
     blocks; a missing signal (None) contributes no reason (fail-open per signal).
     The memory budget applies only with a live-runner scan (`live_runners` not None,
     Linux): without one it would turn the new operation's cost into a far higher
-    floor than macOS's own thresholds. `review_admission` (a review handed to
-    review-cli's admission controller, see `review_cli_handoff`) drops the budget, swap
-    and live-runner-ceiling checks — review-cli queues on those itself — and keeps the
-    emergency ones.
+    floor than macOS's own thresholds. `emergency_only` (a review handed to review-cli's
+    admission controller, see `review_cli_handoff`, or a run of one or two test files, see
+    `small_test_run`) drops the budget, swap and live-runner-ceiling checks and keeps the
+    emergency ones (MemAvailable floor, PSI, wired share, jetsam level, GPU slots).
     """
     if label is None:
         return "allow", None
@@ -1817,7 +2233,7 @@ def decide(
             f"(PSI some avg10; threshold {max_psi_some10:g}%, RIG_HEAVY_OP_MAX_PSI_SOME10) — "
             "the kernel is already reclaiming under load"
         )
-    if not review_admission and live_runners is not None and budget is not None and budget.left_mb < headroom_mb:
+    if not emergency_only and live_runners is not None and budget is not None and budget.left_mb < headroom_mb:
         reasons.append(
             f"the memory budget does not cover it: {budget.describe(label)} "
             "(RIG_HEAVY_OP_HEADROOM_MB, RIG_HEAVY_OP_COST_REVIEW_MB/_DOCKER_MB/_SUITE_MB)"
@@ -1826,7 +2242,7 @@ def decide(
     # roomy-looking budget proves nothing: the swap check then stays unconditional, as before
     # the budget existed (review finding). macOS has no scan either, but its snapshot carries
     # no swap figures (`swap_total_bytes` is Linux-only, 0), so this never fires there.
-    if not review_admission and memory is not None and memory.swap_total_bytes > 0 and (
+    if not emergency_only and memory is not None and memory.swap_total_bytes > 0 and (
         live_runners is None or budget is None or budget.left_mb < 2 * headroom_mb
     ):
         swap_free_pct = 100.0 * memory.swap_free_bytes / memory.swap_total_bytes
@@ -1842,7 +2258,7 @@ def decide(
                 f"RIG_HEAVY_OP_MIN_SWAP_FREE_PCT) {context} — a full swap leaves the next memory "
                 "burst nowhere to go"
             )
-    if not review_admission and live_runners is not None and len(live_runners) >= max_live:
+    if not emergency_only and live_runners is not None and len(live_runners) >= max_live:
         reasons.append(
             f"{len(live_runners)} heavy runner(s) are already live on the machine "
             f"(hard ceiling {max_live}, RIG_HEAVY_OP_MAX_LIVE; listed below)"
@@ -1865,13 +2281,21 @@ def decide(
         "on a full swap and thrashed the Linux workstation to a manual reset). There is no "
         "bypass for this check — wait for other concurrent work to finish or be reaped, then "
         "retry; memory, swap, pressure and the live-runner list are re-read fresh on every "
-        "attempt, so a retry after they genuinely free up will pass. A full test suite, mypy "
-        "or a docker-backed integration run belongs on a Runpod pod anyway "
-        "(`runpod-run -- <command>`, skill runpod-offload); locally run one test file at most. "
+        "attempt, so a retry after they genuinely free up will pass. "
+    )
+    if not emergency_only:
+        # Not for a review handed to review-cli or a 1-2 file run: the advice would name the very
+        # command just blocked on an emergency signal (round-3 review finding).
+        message += (
+            "A full test suite, mypy or a docker-backed integration run belongs on a Runpod pod "
+            "anyway (`runpod-run -- <command>`, skill runpod-offload); locally run one or two "
+            "test files at most. "
+        )
+    message += (
         "If it never clears even with nothing else obviously running, that itself is worth "
         "reporting to the machine's operator directly rather than working around this gate."
     )
-    if review_admission:
+    if emergency_only and label == REVIEW_LABEL:
         message += (
             " review-cli's admission controller would queue this review for CPU, RAM and "
             "provider capacity, but these are emergency signals: nothing new should start now."
@@ -1882,7 +2306,7 @@ def decide(
             f"slot wrapper, which waits for a free slot: `python3 {_GPU_SLOTS_PKG} run -- "
             f"<command>` (`python3 {_GPU_SLOTS_PKG} status` shows who holds the slots)."
         )
-    if not review_admission and live_runners is not None and budget is not None:
+    if not emergency_only and live_runners is not None and budget is not None:
         message += f"\nMemory budget: {budget.describe(label)}."
     if live_runners:
         # Who the agent is competing with — also when another signal blocked: the list is
@@ -1892,6 +2316,14 @@ def decide(
             f"{_format_live_runners(live_runners, costs)}"
         )
     return "block", message
+
+
+def _event_cwd(event: dict, args: dict) -> str:
+    """Where the command runs: the event's `cwd`, else this hook's own working directory."""
+    for cwd in (event.get("cwd"), args.get("cwd")):
+        if isinstance(cwd, str) and cwd:
+            return cwd
+    return os.getcwd()
 
 
 def main() -> int:
@@ -1924,7 +2356,7 @@ def main() -> int:
     if label is None:
         emit("allow")
         return 0
-    review_admission = False
+    emergency_only = False
     if label == REVIEW_LABEL:
         # Hand the review passes to review-cli's own admission controller when it is the
         # installed one. Anything else heavy in the same command starts next to the review
@@ -1934,11 +2366,13 @@ def main() -> int:
         if rest is not None:
             rest_label = classify_heavy_operation(rest) if rest else None
             if rest_label is None:
-                review_admission = True
+                emergency_only = True
             else:
                 costs = _cost_table()
                 # On a tie the rest's label wins: a GPU load's label is what turns on the slot check.
                 label = max((rest_label, label), key=lambda candidate: _expected_cost_mb(candidate, costs))
+    elif small_test_run(command, _event_cwd(event, args)):
+        emergency_only = True
 
     # A GPU load while every slot is taken is refused on the slot probe alone (a few
     # lock attempts, no subprocess), so the refusal can never wait on a memory read.
@@ -1959,7 +2393,7 @@ def main() -> int:
             max_live=_max_live(),
             costs=_cost_table(),
             headroom_mb=_headroom_mb(),
-            review_admission=review_admission,
+            emergency_only=emergency_only,
         )
         level, block_at = read_pressure_level(), _block_at_level()
         decision, message = decide(label, level, block_at, live_runners=live_runners, **signals)
