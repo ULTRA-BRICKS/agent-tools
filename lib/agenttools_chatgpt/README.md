@@ -72,7 +72,7 @@ chatgpt-guardian --workspace glide.vc live --cdp http://127.0.0.1:9223 \
 chatgpt-guardian --workspace glide.vc live --cdp http://127.0.0.1:9223 \
   --watch https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo/c/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
 chatgpt-guardian --workspace glide.vc live --cdp http://127.0.0.1:9223 \
-  --poll-interval 60 --max-pages 8 --min-available-mib 2048
+  --poll-interval 60 --max-pages 6 --min-available-mib 2048
 ```
 
 The endpoint must be exactly `http://127.0.0.1:<port>`. One OS owner lock per
@@ -90,17 +90,27 @@ redirected tabs stay missing across cycles and restarts. The service never opens
 navigates, reloads, foregrounds or closes a tab. Duplicate tabs fail closed.
 Unrelated history/settings tabs are ignored.
 
-The live service is read-only, including with `--apply`: it cannot open model or
-effort menus, focus, press keys, fill or send. Recovery reports
-`recovery-confirmation-disabled`; sparse polling cannot satisfy the core's
-20-second stability window with gaps of at most six seconds. No confirmation
-burst is implemented, so live recovery and automatic Sol fallback fail closed.
-Direct diagnostic adapter operations remain available separately.
+Idle polling is passive, including with `--apply`. Only a structurally confirmed
+latest `Thinking failed` on exactly one enrolled page can start a confirmation
+burst when apply is enabled. Each burst observes that same page about every three
+seconds for at most 35 seconds. Fresh model menu evidence is required; unavailable
+proof reports `confirmation-blocked` and ends the burst immediately. The existing
+Guardian requires 20 seconds of unchanged verified evidence with gaps of at most
+six seconds before reserving and sending. A burst stops after its first dispatch
+result, including an uncertain send; durable dedup and rate limits still apply.
+There is one burst at a time, at most one candidate per passive cycle, and at least
+60 seconds after a burst ends before another starts. Stops, drafts, running turns,
+identity/mode changes, duplicate pages, transport errors and resource changes abort
+recovery. Existing transport quarantine retains the dispatch lock on cancellation
+or lost mutation transport; operator recovery may be required to end that hold.
+The existing Sol selection helper is available only in a failure burst under the
+existing exact Astra quota and per-chat consent checks.
 
-`--poll-interval` defaults to 60 seconds and accepts finite values of at least 30.
-Failed reads with no chat identity wait at least 60 seconds. Model probes are
-disabled entirely in the live service. `--max-pages` defaults to 8 total
-open pages; `--min-available-mib` defaults to 2048 MiB of host MemAvailable.
+`--poll-interval` defaults to 60 seconds and accepts finite values of at least 30;
+the live loop always waits at least 60 seconds between passive cycles.
+Model probes occur only during a failure burst. `--max-pages` defaults to 6 total
+open pages and accepts only 1 through 6; more than six always suspends recovery.
+`--min-available-mib` defaults to 2048 MiB of host MemAvailable.
 Exceeding the page ceiling or falling below the memory floor suspends DOM reads;
 unavailable memory information also suspends them. Memory uses Linux
 `/proc/meminfo`; unsupported hosts fail closed. Chrome is never killed.
@@ -114,6 +124,39 @@ model switch bypasses it. Event listeners detach on service exit.
 
 `--once` performs one diagnostic cycle. `python -m agenttools_chatgpt.live` accepts the same live
 options (`--workspace` after the module; use the main CLI for global `--state`).
+
+The CLI and daemon use the same state resolver. Precedence is explicit `--state`,
+then `CHATGPT_GUARDIAN_STATE`, then the per-workspace deployment file
+`~/.config/agent-tools/chatgpt-guardian/<workspace>.json`, then the existing scoped
+default (which still refuses a legacy unscoped file). No database is moved,
+renamed, deleted or migrated. An operator can point the default command at an
+existing scoped database without putting its path into `pm chatgpt`:
+
+```json
+{"workspace":"glide.vc","state":"/absolute/existing/file.sqlite"}
+```
+
+Deployment JSON schema (both properties required; no additional properties):
+
+```json
+{
+  "type": "object",
+  "required": ["workspace", "state"],
+  "additionalProperties": false,
+  "properties": {
+    "workspace": {"enum": ["home", "glide.vc"]},
+    "state": {"type": "string", "pattern": "^/"}
+  }
+}
+```
+
+The workspace must match the filename and selected workspace. The configured
+database must already exist and contain the Guardian schema and matching persisted
+`account_scope`; malformed configuration, missing/empty databases or wrong scope
+refuse startup without creating a replacement. Store's account check also remains
+mandatory for explicit and environment-selected paths. `status` includes the
+effective absolute `state` path alongside the same controls and attempt history.
+`pm chatgpt` remains a delegator; installation/configuration is an operator step.
 
 This adapter is calibrated to the observed 2026-10-16 account UI: unique
 `data-turn-key` wrappers, exact leaf `Thinking failed` inside

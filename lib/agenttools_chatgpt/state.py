@@ -6,7 +6,9 @@ offline reconciliation so stops, budgets and uncertain sends cannot be lost.
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 from pathlib import Path
 
 
@@ -18,6 +20,39 @@ def state_path(
     override = explicit or os.environ.get("CHATGPT_GUARDIAN_STATE")
     if override:
         return Path(override)
+    config = (
+        Path.home() / ".config/agent-tools/chatgpt-guardian" / (workspace + ".json")
+    )
+    if config.exists() or config.is_symlink():
+        try:
+            selected = json.loads(config.read_text())
+            if (
+                not isinstance(selected, dict)
+                or set(selected) != {"workspace", "state"}
+                or selected["workspace"] != workspace
+                or not isinstance(selected["state"], str)
+            ):
+                raise ValueError("Invalid workspace state configuration")
+            path = Path(selected["state"])
+            if not path.is_absolute() or not path.is_file():
+                raise ValueError(
+                    "Configured state must be an absolute existing database file"
+                )
+            # Read-only validation cannot initialize an empty replacement. Store
+            # still enforces the persisted account identity before using it.
+            with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+                if db.execute("SELECT account FROM account_scope").fetchall() != [
+                    (workspace,)
+                ]:
+                    raise ValueError("Configured state belongs to a different account")
+                db.execute("SELECT key,value FROM controls LIMIT 0")
+                db.execute("SELECT chat FROM consent LIMIT 0")
+                db.execute(
+                    "SELECT chat,turn,generation,wall,state FROM attempts LIMIT 0"
+                )
+            return path
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise ValueError("Invalid configured workspace state: " + str(exc)) from exc
     root = (
         Path("/data/guardian-state")
         if ha

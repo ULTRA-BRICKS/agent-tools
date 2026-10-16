@@ -221,7 +221,7 @@ def main(argv=None) -> int:
     live.add_argument(
         "--apply",
         action="store_true",
-        help="Recovery requested, but live confirmation is disabled; remains read-only",
+        help="Authorize one bounded confirmation burst for a latest failed turn",
     )
     live.add_argument(
         "--once",
@@ -238,8 +238,9 @@ def main(argv=None) -> int:
     live.add_argument(
         "--max-pages",
         type=int,
-        default=8,
-        help="Suspend observation above this total open-page ceiling (default 8)",
+        choices=range(1, 7),
+        default=6,
+        help="Suspend observation above this total open-page ceiling (1..6, default 6)",
     )
     live.add_argument(
         "--min-available-mib",
@@ -305,7 +306,7 @@ def main(argv=None) -> int:
                 )
             )
         elif args.command == "status":
-            print(json.dumps(store.status()))
+            print(json.dumps({"state": str(store.path.absolute()), **store.status()}))
         elif args.command in ("stop", "resume"):
             getattr(store, args.command)(
                 canonical_chat(args.chat) if args.chat != "*" else "*"

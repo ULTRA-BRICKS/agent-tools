@@ -2,8 +2,8 @@
 
 Only explicitly enrolled pages are inspected. The OS lock covers the endpoint
 across workspaces; teardown disconnects the driver and never closes Chrome.
-Missing tabs stay missing. Service observation is read-only even with --apply:
-menu probes cannot safely maintain the core's stability window at idle cadence.
+Missing tabs stay missing. Idle observation is passive; explicit apply permits
+one bounded failure confirmation burst, with the core retaining dispatch policy.
 """
 
 from __future__ import annotations
@@ -89,10 +89,10 @@ def resource_pause(
     page_count: int,
     available_bytes: int | None,
     *,
-    max_pages: int = 8,
+    max_pages: int = 6,
     min_available_mib: int = 2048,
 ) -> str:
-    if page_count > max_pages:
+    if not 1 <= max_pages <= 6 or page_count > max_pages:
         return "page-ceiling"
     if available_bytes is None:
         return "memory-unavailable"
@@ -170,6 +170,143 @@ async def recover_live(
     return await guardian.run_once(adapter, initial=observed, observed_at=captured_at)
 
 
+def structural_failure(observed: Observation) -> bool:
+    return (
+        bool(observed.chat and observed.turn and observed.generation)
+        and observed.status == "Thinking failed"
+        and observed.active
+        and not any(
+            (observed.running, observed.draft, observed.challenge, observed.ambiguous)
+        )
+    )
+
+
+async def wait_stop(stop: asyncio.Event, delay: float) -> bool:
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=delay)
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
+async def confirm_failure(
+    guardian: Guardian,
+    page,
+    candidate: Observation,
+    context,
+    transport,
+    stop: asyncio.Event,
+    *,
+    max_pages: int,
+    min_available_mib: int,
+) -> str:
+    """Confirm one fixed page/turn; no idle probes or retry of a dispatch result."""
+    if not guardian.apply or not structural_failure(candidate):
+        return "observe-only"
+    started = time.monotonic()
+    url = page.url
+    page_count = len(context.pages)
+    expected: Observation | None = None
+
+    def allowed() -> bool:
+        controls = guardian.store.controls()
+        return (
+            not stop.is_set()
+            and time.monotonic() - started < 35
+            and not transport.reason
+            and not resource_pause(
+                len(context.pages),
+                available_memory(),
+                max_pages=max_pages,
+                min_available_mib=min_available_mib,
+            )
+            and len(context.pages) == page_count
+            and not page.is_closed()
+            and page.url == url
+            and enrolled_pages(context, {candidate.chat})[candidate.chat] == [page]
+            and controls.get("watch:" + candidate.chat) == "1"
+            and "stop:*" not in controls
+            and "stop:" + candidate.chat not in controls
+        )
+
+    active = LiveAdapter(page)
+    passive = LiveAdapter(page, allow_active_probe=False)
+    active.mutation_allowed = allowed
+
+    class ConfirmedAdapter:
+        async def observe(self):
+            if not allowed():
+                return Observation("", "", "")
+            structural = await passive.observe()
+            if (
+                not allowed()
+                or not structural_failure(structural)
+                or structural.identity != candidate.identity
+                or (
+                    expected is not None
+                    and structural.model
+                    and (structural.model, structural.effort)
+                    != (expected.model, expected.effort)
+                )
+            ):
+                guardian.record_safety(structural)
+                return Observation("", "", "")
+            observed = await active.observe()
+            guardian.record_safety(observed)
+            if (
+                not allowed()
+                or observed.identity != candidate.identity
+                or not observed.safe_failure()
+                or (expected is not None and observed != expected)
+            ):
+                return Observation("", "", "")
+            return observed
+
+        async def send(self, observed):
+            if not allowed():
+                return False
+            return await active.send(observed)
+
+    adapter = ConfirmedAdapter()
+
+    async def run():
+        nonlocal expected
+        previous_sample: float | None = None
+        while allowed():
+            observed = await adapter.observe()
+            if not observed.safe_failure():
+                return "confirmation-blocked"
+            if expected is None:
+                # This existing helper enforces exact quota and per-chat consent.
+                if observed.model == "Astra" and await active.select_sol(
+                    guardian.store, observed.chat, expected=observed
+                ):
+                    observed = await adapter.observe()
+                    if not observed.safe_failure():
+                        return "confirmation-blocked"
+                expected = observed
+            captured = time.monotonic()
+            if previous_sample is not None and not 0 <= captured - previous_sample <= 6:
+                return "confirmation-gap"
+            previous_sample = captured
+            result = await guardian.run_once(
+                adapter, initial=observed, observed_at=captured
+            )
+            if result != "stabilizing":
+                return result
+            if await wait_stop(stop, min(3, max(0, 35 - (time.monotonic() - started)))):
+                return "confirmation-stopped"
+        return "confirmation-blocked"
+
+    guardian.stability.pop(candidate.chat, None)
+    try:
+        return await asyncio.wait_for(run(), timeout=35)
+    except asyncio.TimeoutError:
+        return "confirmation-timeout"
+    finally:
+        guardian.stability.pop(candidate.chat, None)
+
+
 async def serve_live(args, store: Store) -> None:
     from playwright.async_api import Error as BrowserError
     from playwright.async_api import async_playwright
@@ -191,6 +328,8 @@ async def serve_live(args, store: Store) -> None:
     if not 30 <= poll_interval < float("inf"):
         raise ValueError("poll interval must be finite and at least 30 seconds")
     reports: dict[str, tuple[dict, float]] = {}
+    burst_ended = float("-inf")
+    last_burst_chat: str | None = None
 
     def report(key: str, payload: dict) -> None:
         previous = reports.get(key)
@@ -219,7 +358,7 @@ async def serve_live(args, store: Store) -> None:
             adapters: dict[object, LiveAdapter] = {}
             seeded: set[object] = set()
             while not stop.is_set():
-                delay = poll_interval
+                delay = max(60, poll_interval)
                 if not browser.is_connected():
                     raise RuntimeError(
                         "CDP browser disconnected; restart preserves uncertain sends"
@@ -238,7 +377,7 @@ async def serve_live(args, store: Store) -> None:
                     pause = resource_pause(
                         len(context.pages),
                         available_memory(),
-                        max_pages=getattr(args, "max_pages", 8),
+                        max_pages=getattr(args, "max_pages", 6),
                         min_available_mib=getattr(args, "min_available_mib", 2048),
                     )
                     seeded.intersection_update(adapters)
@@ -251,17 +390,45 @@ async def serve_live(args, store: Store) -> None:
                         record_safety=guardian.record_safety,
                     )
                     controls = await asyncio.to_thread(store.controls)
-                    for _, observed, _ in samples:
+                    burst_used = False
+                    for index, (_, observed, _) in enumerate(samples):
+                        if observed.chat == last_burst_chat:
+                            samples = samples[index + 1 :] + samples[: index + 1]
+                            break
+                    for sampled, observed, _ in samples:
                         state = "observe-only"
                         if not observed.chat:
-                            pause = "observation-unverified"
+                            state = "observation-unverified"
                             delay = max(60, poll_interval)
                         if "stop:*" in controls or "stop:" + observed.chat in controls:
                             state = "manual-stop"
-                        elif args.apply:
-                            # No verified confirmation burst is available: never
-                            # dispatch from sparse or menu-dependent observations.
-                            state = "recovery-confirmation-disabled"
+                        elif (
+                            args.apply
+                            and observed.chat
+                            and not pause
+                            and not transport.reason
+                            and not burst_used
+                            and time.monotonic() - burst_ended >= 60
+                            and structural_failure(observed)
+                            and pages.get(observed.chat) == [sampled.page]
+                        ):
+                            burst_used = True
+                            last_burst_chat = observed.chat
+                            try:
+                                state = await confirm_failure(
+                                    guardian,
+                                    sampled.page,
+                                    observed,
+                                    context,
+                                    transport,
+                                    stop,
+                                    max_pages=getattr(args, "max_pages", 6),
+                                    min_available_mib=getattr(
+                                        args, "min_available_mib", 2048
+                                    ),
+                                )
+                            finally:
+                                burst_ended = time.monotonic()
                         report(
                             observed.chat,
                             {
@@ -285,8 +452,10 @@ async def serve_live(args, store: Store) -> None:
                             "health": pause or "connected",
                             "workspace": args.workspace,
                             "watched": len(unique),
-                            "mode": "observe",
-                            "recovery": "confirmation-disabled",
+                            "mode": "apply" if args.apply else "observe",
+                            "recovery": "bounded-confirmation"
+                            if args.apply
+                            else "disabled",
                             "transport": transport.reason,
                         },
                     )
@@ -339,7 +508,11 @@ async def select_live_sol(args, store: Store) -> bool:
                 raise RuntimeError(
                     "Expected one dedicated ordinary Chrome account context"
                 )
-            pages = enrolled_pages(browser.contexts[0], {chat})[chat]
+            context = browser.contexts[0]
+            pause = resource_pause(len(context.pages), available_memory())
+            if pause:
+                raise ValueError("Sol helper paused: " + pause)
+            pages = enrolled_pages(context, {chat})[chat]
             if len(pages) != 1:
                 raise ValueError(
                     "Sol helper requires one already open matching chat; no navigation attempted"

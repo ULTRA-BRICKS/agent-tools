@@ -6,6 +6,7 @@ Mutations retain the inherited transport quarantine and core dispatch transactio
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -28,6 +29,7 @@ class LiveAdapter(PlaywrightAdapter):
         self.probed_at = 0.0
         self.probe_lock = probe_lock or asyncio.Lock()
         self.labels = {"GPT-6": "Astra", "GPT-5.6 Sol": "Sol"}
+        self.mutation_allowed: Callable[[], bool] = lambda: True
 
     async def probe_model(self) -> None:
         if not self.allow_active_probe:
@@ -46,6 +48,8 @@ class LiveAdapter(PlaywrightAdapter):
 
     async def _probe_model(self) -> None:
         await self._clear_probe()
+        if not self.mutation_allowed():
+            return
         structural = self._parse_observation(await self.page.evaluate(self.script, {}))
         if not replace(structural, verified=True).safe_failure():
             return
@@ -58,13 +62,15 @@ class LiveAdapter(PlaywrightAdapter):
                 return
             if (await self._menu_state())["open"]:
                 return
+            if not self.mutation_allowed():
+                return
             await trigger.click(timeout=1500)
             try:
                 if not (await self._menu_state())["selected"]:
                     full = self.page.locator(
                         '[role="menuitem"][aria-label="Select model"]:visible'
                     )
-                    if await full.count() == 1:
+                    if await full.count() == 1 and self.mutation_allowed():
                         await full.click(timeout=1500)
                 state = await self._menu_state()
                 model = (
@@ -79,6 +85,8 @@ class LiveAdapter(PlaywrightAdapter):
                 await self.page.keyboard.press("Escape")
             effort = ""
             if model == "Sol":
+                if not self.mutation_allowed():
+                    return
                 await trigger.click(timeout=1500)
                 try:
                     if (await self._menu_state())["effort"] == ["Extra High, 4 of 5."]:
@@ -113,7 +121,9 @@ class LiveAdapter(PlaywrightAdapter):
             if candidate is not None:
                 await candidate.dispose()
 
-    async def select_sol(self, store: Store, chat: str) -> bool:
+    async def select_sol(
+        self, store: Store, chat: str, expected: Observation | None = None
+    ) -> bool:
         """Consented quota fallback under the same Store dispatch guard as sends."""
         if not self.allow_active_probe:
             return False
@@ -136,6 +146,10 @@ class LiveAdapter(PlaywrightAdapter):
                     )
                     if (
                         observed.chat != chat
+                        or (
+                            expected is not None
+                            and observed.identity != expected.identity
+                        )
                         or not replace(observed, verified=True).safe_failure()
                     ):
                         return False
@@ -148,6 +162,8 @@ class LiveAdapter(PlaywrightAdapter):
                     deadline = time.time() * 1000 + 5000
 
                     async def step(target):
+                        if not self.mutation_allowed():
+                            return False
                         return await self.page.evaluate(
                             self.script,
                             {
@@ -189,8 +205,7 @@ class LiveAdapter(PlaywrightAdapter):
                         await self.page.evaluate(self.script, {"probe": self.probe})
                     )
                     verified = (
-                        final.chat == chat
-                        and final.turn == observed.turn
+                        final.identity == observed.identity
                         and final.model == "Sol"
                         and final.effort == "Extra High"
                         and final.verified
@@ -242,6 +257,8 @@ class LiveAdapter(PlaywrightAdapter):
         # The core wraps this complete two-phase operation in protected_dispatch.
         deadline = time.time() * 1000 + 5000
         await self.probe_model()
+        if not self.mutation_allowed():
+            return False
         payload = {
             "probe": self.probe,
             "expected": asdict(expected),
@@ -263,6 +280,8 @@ class LiveAdapter(PlaywrightAdapter):
                 if await self.page.locator('button[aria-label="Send"]:visible').count():
                     break
                 await asyncio.sleep(0.05)
+            if not self.mutation_allowed():
+                return False
             result = await self._mutate(
                 {**payload, "action": "send", "prepared": prepared}
             )
