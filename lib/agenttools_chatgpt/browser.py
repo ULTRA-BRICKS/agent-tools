@@ -13,14 +13,45 @@ import logging
 import os
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import TYPE_CHECKING, TextIO
+from typing import TYPE_CHECKING, TextIO, TypeVar
 
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext, Playwright
 
-from .core import MutationRefusal, Observation
+from .core import Adapter, MutationRefusal, Observation
+
+ObservedAdapter = TypeVar("ObservedAdapter", bound=Adapter)
+
+
+async def observe_tabs(
+    adapters: list[ObservedAdapter],
+    *,
+    record_safety: Callable[[Observation], None] | None = None,
+) -> list[tuple[ObservedAdapter, Observation, float]]:
+    """Settle bounded reads and persist every successful sample before errors."""
+    slots = asyncio.Semaphore(4)
+
+    async def snapshot(adapter: ObservedAdapter):
+        async with slots:
+            observed = await asyncio.wait_for(adapter.observe(), timeout=5)
+            return adapter, observed, time.monotonic()
+
+    results = await asyncio.gather(
+        *(snapshot(adapter) for adapter in adapters), return_exceptions=True
+    )
+    samples = []
+    for result in results:
+        if not isinstance(result, BaseException):
+            samples.append(result)
+            if record_safety is not None:
+                await asyncio.to_thread(record_safety, result[1])
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return samples
 
 
 @dataclass(frozen=True)

@@ -11,9 +11,9 @@ requires-python = ">=3.10"
 license = "MIT"
 
 [project.optional-dependencies]
-browser = ["playwright>=1.60,<2"]
-ha = ["playwright>=1.60,<2", "aiohttp>=3.13,<4"]
-test = ["pytest>=8,<10", "playwright>=1.60,<2"]
+browser = ["playwright>=1.63,<2"]
+ha = ["playwright>=1.63,<2", "aiohttp>=3.13,<4"]
+test = ["pytest>=8,<10", "playwright>=1.63,<2"]
 
 [project.scripts]
 chatgpt-guardian = "agenttools_chatgpt.cli:main"
@@ -23,4 +23,4 @@ packages = ["agenttools_chatgpt"]
 [tool.setuptools.package-dir]
 agenttools_chatgpt = "."
 [tool.setuptools.package-data]
-agenttools_chatgpt = ["dom.js", "README.md", "INTEGRATION.md"]
+agenttools_chatgpt = ["dom.js", "live_dom.js", "README.md", "INTEGRATION.md"]

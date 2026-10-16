@@ -57,7 +57,125 @@ chatgpt-guardian quota-clear                # human acknowledgement of account q
 
 ## UI calibration gate
 
-`Contract` in `browser.py` defines every required selector and identity attribute. `Contract.load` requires exactly those fields, explicit nonempty strings and a boolean `verified_account_ui`. There is no production selector/model mapping shipped because no logged-in account UI or prior bundle is available. The DOM test contract is **fixture-only** and must not be copied as a live configuration.
+### Observed ordinary Chrome adapter
+
+`live` attaches to an explicitly supplied, already running **dedicated ordinary
+Chrome** account profile. The operator must verify the account in that profile;
+workspace names remain operator assertions. It never launches/relaunches Chrome,
+reads cookies or closes Chrome on shutdown. The polling service never changes models. Do not point it at a
+personal browser. Keep the same dedicated profile and scoped SQLite state across
+restarts; do not clear uncertain attempts.
+
+```sh
+chatgpt-guardian --workspace glide.vc live --cdp http://127.0.0.1:9223 \
+  --watch https://chatgpt.com/c/CHAT_ID --once
+chatgpt-guardian --workspace glide.vc live --cdp http://127.0.0.1:9223 \
+  --watch https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo/c/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+chatgpt-guardian --workspace glide.vc live --cdp http://127.0.0.1:9223 \
+  --poll-interval 60 --max-pages 8 --min-available-mib 2048
+```
+
+The endpoint must be exactly `http://127.0.0.1:<port>`. One OS owner lock per
+endpoint lives under `~/.local/share/agent-tools/chatgpt-guardian`; it covers both
+workspaces. The authenticated control server uses the selected state's token and
+`--control-port` (default 8790). Use the same owner root for all service instances.
+Ctrl-C disconnects the driver and releases the owner lock, leaving Chrome open.
+JSON reports health/status changes and a five-minute heartbeat.
+Only explicitly watched pages are inspected. Repeated `--watch URL` arguments
+enroll new chats; durable `/watch`, `/unwatch` and CLI watch controls are reread
+each cycle. Stored watches work without startup `--watch`, and an explicit
+unwatch survives restart even if its URL remains in startup arguments. Existing
+project URLs are matched by canonical `/c/<id>` identity. Missing, closed or
+redirected tabs stay missing across cycles and restarts. The service never opens,
+navigates, reloads, foregrounds or closes a tab. Duplicate tabs fail closed.
+Unrelated history/settings tabs are ignored.
+
+The live service is read-only, including with `--apply`: it cannot open model or
+effort menus, focus, press keys, fill or send. Recovery reports
+`recovery-confirmation-disabled`; sparse polling cannot satisfy the core's
+20-second stability window with gaps of at most six seconds. No confirmation
+burst is implemented, so live recovery and automatic Sol fallback fail closed.
+Direct diagnostic adapter operations remain available separately.
+
+`--poll-interval` defaults to 60 seconds and accepts finite values of at least 30.
+Failed reads with no chat identity wait at least 60 seconds. Model probes are
+disabled entirely in the live service. `--max-pages` defaults to 8 total
+open pages; `--min-available-mib` defaults to 2048 MiB of host MemAvailable.
+Exceeding the page ceiling or falling below the memory floor suspends DOM reads;
+unavailable memory information also suspends them. Memory uses Linux
+`/proc/meminfo`; unsupported hosts fail closed. Chrome is never killed.
+
+Existing browser `response` events latch durable global manual stop on HTTP 429
+from exact `https://chatgpt.com` backend/auth paths, and HTTP 401/403 latch the
+human-challenge stop. Recent (five-minute) resource performance entries seed the
+same latch once per watched page attachment, if available. No private API request,
+response body, headers, cookies or tokens are read. No timer clears a stop, and no
+model switch bypasses it. Event listeners detach on service exit.
+
+`--once` performs one diagnostic cycle. `python -m agenttools_chatgpt.live` accepts the same live
+options (`--workspace` after the module; use the main CLI for global `--state`).
+
+This adapter is calibrated to the observed 2026-10-16 account UI: unique
+`data-turn-key` wrappers, exact leaf `Thinking failed` inside
+`group/activity-header`, a cancelled latest attempt, an empty contenteditable
+composer and no running/Stop indication. The stable turn key also identifies the
+generation, deliberately allowing at most one nudge per original user turn.
+The page must be at the bottom. Preparation uses synchronous native editor input;
+the final check waits for the rendered Send control, retains node/URL identity,
+checks a single shared deadline, then clicks synchronously. Missing user-turn
+acknowledgement leaves an uncertain intent. Human drafts are never cleared or
+restored. Transport loss during preparation or dispatch retains the existing
+mutation quarantine and dispatch transaction.
+
+The explicit account mapping is `GPT-6` → policy Astra and `GPT-5.6 Sol` → policy
+Sol. `Pro` and the trigger's `medium` attribute alone are never model evidence.
+A visible checked selected-model menu item is probed after explicitly exposing
+the full model panel when its inactive panel is aria-hidden. The signature is
+captured after closing the menu and observing a stable expected trigger label.
+Sol additionally requires visible exact `Extra High, 4 of 5.` effort status and
+closed `5.6 Extra High`, independently of the raw `max` attribute. Probe evidence
+is cached briefly and reprobed before dispatch. Structural safety is checked
+before any menu probe: running, drafted, stopped and completed chats never open
+the model menu. Historical `in_progress` turns
+do not make a cancelled latest failure running; a visible Stop still blocks.
+
+The live polling service never selects Sol. A visible Sol quota alert durably
+stops that chat. The separate diagnostic helper requires explicit per-chat Sol
+consent. To grant consent:
+
+```sh
+chatgpt-guardian --workspace glide.vc sol-opt-in https://chatgpt.com/c/CHAT_ID
+```
+
+The diagnostic `live-sol` helper remains available with the live service stopped
+(the same CDP owner lock applies):
+
+```sh
+chatgpt-guardian --workspace glide.vc live-sol --cdp http://127.0.0.1:9223 \
+  --chat https://chatgpt.com/c/CHAT_ID
+```
+
+`live-sol` never opens/navigates a chat or sends. It requires existing watch,
+per-chat consent and quota latch, no stop/unresolved intent, and an idle empty
+composer with stable URL/latest-turn/node identities before each selection step.
+It selects only exact `GPT-5.6 Sol`, then uses one bounded ArrowLeft key event on
+focused Power only from independently visible `Pro, 5 of 5.`; already Extra High
+needs no adjustment. Unknown effort refuses without substituting Pro or Medium.
+The helper reopens the full model panel to independently verify model identity,
+reads effort in the simple panel and closes/stabilizes the trigger. It holds the
+existing SQLite guard through protected dispatch; transport loss quarantines.
+A refusal after partial selection may leave Sol/its inherited effort selected;
+inspect manually before retrying. Synthetic DOM keyboard handling is fixture
+verified; the parent owns real UI acceptance of that event path. Restarting the
+service remains observe-only unless `--apply` is explicitly supplied.
+Conversation-level visible GPT-6/Astra limit alerts latch quota; unrelated
+WORK/CODEX Settings percentages cannot latch Chat quota. Further account UI
+calibration, including quota notice variants and attachment selectors, belongs
+to live verification. Sanitized Chromium fixture tests do not establish a real
+account send; the operator must verify disposable-chat recovery before arming
+valuable conversations.
+
+The generic/HA `Contract` in `browser.py` defines every required selector and identity attribute separately from the observed `live` adapter. `Contract.load` requires exactly those fields, explicit nonempty strings and a boolean `verified_account_ui`. Its DOM test contract is **fixture-only** and must not be copied as a live configuration.
 
 Before arming, manually inspect the logged-in account and record evidence for the conversation root, turn order, unique turn ID, generation ID, author role, active UI failure status, body exclusion, composer, send control, selected model/effort, logged-in marker, generation stop, attachments, human challenge and Astra quota. Selectors must identify actual dedicated UI controls and statuses, never arbitrary prose. Do not fabricate IDs or inject attributes to satisfy this contract. If the actual UI does not expose trustworthy status/generation/model/effort evidence, recovery remains blocked; it needs a reviewed adapter change. Keep the contract local and capture only non-secret selector evidence.
 

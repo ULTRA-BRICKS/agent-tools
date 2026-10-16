@@ -13,6 +13,7 @@ import logging
 import os
 import signal
 import time
+from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -77,22 +78,13 @@ def create_browser(bridge, lifecycle, mode: str, *args, guardian=None, contract=
             async with self.lock:
                 samples = []
                 if guardian is not None and contract is not None:
-                    from .browser import PlaywrightAdapter
+                    from .browser import PlaywrightAdapter, observe_tabs
 
                     # Quota is account-wide even when its tab is not opted into recovery.
-                    for page in self.ctx.pages:
-                        observed = await asyncio.wait_for(
-                            PlaywrightAdapter(page, contract).observe(), timeout=5
-                        )
-                        samples.append((page, observed, time.monotonic()))
-                        if observed.quota:
-                            await asyncio.to_thread(guardian.store.quota)
-                        if observed.challenge:
-                            await asyncio.to_thread(
-                                guardian.store.stop,
-                                observed.chat or "*",
-                                "human challenge",
-                            )
+                    samples = await observe_tabs(
+                        [PlaywrightAdapter(page, contract) for page in self.ctx.pages],
+                        record_safety=guardian.record_safety,
+                    )
                 await self.refresh_state()
                 if self.state in ("challenge_required", "signin_required"):
                     if guardian is not None:
@@ -103,19 +95,20 @@ def create_browser(bridge, lifecycle, mode: str, *args, guardian=None, contract=
                     return
                 if guardian is None or contract is None:
                     return
-                from .browser import PlaywrightAdapter
-
                 controls = await asyncio.to_thread(guardian.store.controls)
                 watched = {
                     key.removeprefix("watch:")
                     for key, value in controls.items()
                     if key.startswith("watch:") and value == "1"
                 }
-                for page, observed, captured_at in samples:
-                    if page_chat(page) in watched:
+                for adapter, observed, captured_at in samples:
+                    if (
+                        observed.chat in watched
+                        and page_chat(adapter.page) == observed.chat
+                    ):
                         await asyncio.wait_for(
                             guardian.run_once(
-                                PlaywrightAdapter(page, contract),
+                                adapter,
                                 initial=observed,
                                 observed_at=captured_at,
                             ),
@@ -193,8 +186,17 @@ def create_browser(bridge, lifecycle, mode: str, *args, guardian=None, contract=
             self.convs = live + [conv]
             return conv
 
-        async def answer_markdown(self, page, answer):
-            return await answer.evaluate(bridge.DOM_MARKDOWN)
+        async def reply_snapshot(self, page, action):
+            from .browser import PlaywrightAdapter
+
+            script = PlaywrightAdapter(page, contract).script
+            # URL, turn identity, text and rendered extraction share one JS task.
+            render = bridge.DOM_MARKDOWN if action == "reply" else "null"
+            return await page.evaluate(
+                "payload => { payload.render = (" + render + ");"
+                "return (" + script + ")(payload); }",
+                {"contract": asdict(contract), "action": action},
+            )
 
         async def enforce_quota(self, page=None, *, owned_draft=False):
             if guardian is None:
@@ -229,11 +231,37 @@ def create_browser(bridge, lifecycle, mode: str, *args, guardian=None, contract=
             )
 
         async def ask(self, page, prompt):
+            expected_chat = page_chat(page)
+            navigated = False
+
+            def navigation(frame):
+                nonlocal navigated
+                if frame == page.main_frame:
+                    navigated = True
+
+            def check_chat():
+                if navigated or page_chat(page) != expected_chat:
+                    raise bridge.BridgeError(
+                        "Chat navigation during API request; refusing result.",
+                        503,
+                        "busy",
+                    )
+
+            if hasattr(page, "on"):
+                page.on("framenavigated", navigation)
+            try:
+                return await self.ask_in_chat(page, prompt, expected_chat, check_chat)
+            finally:
+                if hasattr(page, "remove_listener"):
+                    page.remove_listener("framenavigated", navigation)
+
+        async def ask_in_chat(self, page, prompt, expected_chat, check_chat):
             if not page_chat(page):
                 raise bridge.BridgeError(
                     "Unsupported chat page; refusing input.", 503, "unsafe_origin"
                 )
             await self.enforce_quota(page)
+            check_chat()
             if guardian is None or contract is None or not contract.verified_account_ui:
                 raise bridge.BridgeError(
                     "Managed API requires an account-verified UI contract.",
@@ -246,6 +274,7 @@ def create_browser(bridge, lifecycle, mode: str, *args, guardian=None, contract=
                 PlaywrightAdapter(page, contract).observe_api(), timeout=5
             )
             await asyncio.to_thread(guardian.record_safety, initial)
+            check_chat()
             if (
                 not initial.verified
                 or initial.draft
@@ -256,7 +285,6 @@ def create_browser(bridge, lifecycle, mode: str, *args, guardian=None, contract=
                 raise bridge.BridgeError(
                     "Existing draft or unverified API UI; refusing input.", 503, "busy"
                 )
-            expected_chat = page_chat(page)
             if initial.chat.rstrip("/") != expected_chat.rstrip("/"):
                 raise bridge.BridgeError(
                     "API chat changed before preparation.", 503, "busy"
@@ -267,8 +295,14 @@ def create_browser(bridge, lifecycle, mode: str, *args, guardian=None, contract=
                     503,
                     "sol_consent_required",
                 )
-            answers = page.locator(bridge.ASSISTANT)
-            before = await asyncio.wait_for(answers.count(), timeout=5)
+            before = await asyncio.wait_for(
+                self.reply_snapshot(page, "reply-baseline"), timeout=5
+            )
+            check_chat()
+            if not before or before["chat"].rstrip("/") != expected_chat.rstrip("/"):
+                raise bridge.BridgeError(
+                    "Unverified conversation baseline.", 503, "busy"
+                )
             async with guardian.store.async_guard() as db:
                 allowed = guardian.store._api_allowed(
                     db, expected_chat, initial.model, initial.effort, initial.verified
@@ -296,13 +330,21 @@ def create_browser(bridge, lifecycle, mode: str, *args, guardian=None, contract=
                     "busy",
                 )
             send = page.locator(contract.send)
+            check_chat()
             await send.wait_for(state="visible", timeout=15000)
+            check_chat()
             await self.enforce_quota(page, owned_draft=True)
-            await self.dispatch_prompt(page, prompt)
+            check_chat()
+            await self.dispatch_prompt(
+                page, prompt, expected_chat=expected_chat, check_chat=check_chat
+            )
+            check_chat()
             deadline = time.monotonic() + self.reply_timeout
-            last, stable_since = None, 0.0
+            last, stable_since, submitted_turn = None, 0.0, None
             while time.monotonic() < deadline:
+                check_chat()
                 state = await bridge.readiness(page)
+                check_chat()
                 if state in ("challenge_required", "signin_required"):
                     await asyncio.to_thread(
                         guardian.store.stop,
@@ -312,23 +354,90 @@ def create_browser(bridge, lifecycle, mode: str, *args, guardian=None, contract=
                     await self.set_state(state)
                     raise bridge.NeedsHuman(state)
                 alerts = page.get_by_role("alert")
-                for index in range(min(await alerts.count(), 4)):
-                    if bridge.LIMIT.search(await alerts.nth(index).inner_text()):
+                alert_count = await alerts.count()
+                check_chat()
+                for index in range(min(alert_count, 4)):
+                    alert_text = await alerts.nth(index).inner_text()
+                    check_chat()
+                    if bridge.LIMIT.search(alert_text):
                         if guardian is not None:
                             await asyncio.to_thread(guardian.store.quota)
                         raise bridge.BridgeError(
                             "ChatGPT quota reached.", 429, "rate_limited"
                         )
-                if await bridge.visible(page.locator(contract.running)):
+                running = await bridge.visible(page.locator(contract.running))
+                check_chat()
+                reply = await self.reply_snapshot(
+                    page, "reply-identity" if running else "reply"
+                )
+                check_chat()
+                if not reply or reply["chat"].rstrip("/") != expected_chat.rstrip("/"):
+                    raise bridge.BridgeError(
+                        "Chat changed while reading answer.", 503, "busy"
+                    )
+                if reply["challenge"]:
+                    await asyncio.to_thread(
+                        guardian.store.stop,
+                        expected_chat,
+                        "API reply requires human attention",
+                    )
+                    raise bridge.NeedsHuman("challenge_required")
+                if reply["quota"]:
+                    await asyncio.to_thread(guardian.store.quota)
+                    raise bridge.BridgeError(
+                        "ChatGPT quota reached.", 429, "rate_limited"
+                    )
+                if running or reply["running"]:
                     last, stable_since = None, 0.0
-                elif await answers.count() > before:
-                    text = await answers.last.inner_text()
-                    if not text.strip():
-                        last, stable_since = None, 0.0
-                    elif text != last:
-                        last, stable_since = text, time.monotonic()
-                    elif time.monotonic() - stable_since > 1.5:
-                        return await self.answer_markdown(page, answers.last)
+                baseline, turns = before["turns"], reply["turns"]
+                identity = lambda turn: (
+                    turn["turn"],
+                    turn["generation"],
+                    turn["author"],
+                )
+                if [identity(turn) for turn in turns[: len(baseline)]] != [
+                    identity(turn) for turn in baseline
+                ]:
+                    raise bridge.BridgeError(
+                        "Conversation turns changed during reply.", 503, "busy"
+                    )
+                added = turns[len(baseline) :]
+                if not added:
+                    await asyncio.sleep(0.5)
+                    continue
+                if (
+                    len(added) > 2
+                    or added[0]["author"] != "user"
+                    or added[0]["text"] != prompt
+                ):
+                    raise bridge.BridgeError(
+                        "Conversation does not match submitted prompt.", 503, "busy"
+                    )
+                if len(added) < 2:
+                    await asyncio.sleep(0.5)
+                    continue
+                answer = added[1]
+                turn = identity(answer)
+                if (
+                    answer["author"] != "assistant"
+                    or not answer["generation"]
+                    or (submitted_turn is not None and turn != submitted_turn)
+                ):
+                    raise bridge.BridgeError(
+                        "Submitted assistant turn changed.", 503, "busy"
+                    )
+                submitted_turn = turn
+                if running or reply["running"]:
+                    await asyncio.sleep(0.5)
+                    continue
+                text = answer["text"]
+                if not text.strip():
+                    last, stable_since = None, 0.0
+                elif text != last:
+                    last, stable_since = text, time.monotonic()
+                elif time.monotonic() - stable_since > 1.5:
+                    check_chat()
+                    return reply["markdown"]
                 await asyncio.sleep(0.5)
             raise bridge.BridgeError(
                 "No complete answer before timeout; inspect preserved tab.",
@@ -336,8 +445,10 @@ def create_browser(bridge, lifecycle, mode: str, *args, guardian=None, contract=
                 "timeout",
             )
 
-        async def dispatch_prompt(self, page, prompt):
-            expected_chat = page_chat(page)
+        async def dispatch_prompt(
+            self, page, prompt, *, expected_chat=None, check_chat=None
+        ):
+            expected_chat = page_chat(page) if expected_chat is None else expected_chat
             if not expected_chat:
                 raise bridge.BridgeError(
                     "Unsupported chat page; refusing send.", 503, "unsafe_origin"
@@ -354,12 +465,7 @@ def create_browser(bridge, lifecycle, mode: str, *args, guardian=None, contract=
                 PlaywrightAdapter(page, contract).observe_api(owned_draft=prompt),
                 timeout=5,
             )
-            if observed.quota:
-                await asyncio.to_thread(guardian.store.quota)
-            if observed.challenge:
-                await asyncio.to_thread(
-                    guardian.store.stop, observed.chat or "*", "API human challenge"
-                )
+            await asyncio.to_thread(guardian.record_safety, observed)
             if observed.model == "Sol" and expected_chat == "https://chatgpt.com/":
                 raise bridge.BridgeError(
                     "Sol requires consent for a permanent chat.",
@@ -384,9 +490,13 @@ def create_browser(bridge, lifecycle, mode: str, *args, guardian=None, contract=
                 )
 
             async def final_click(db):
+                if check_chat is not None:
+                    check_chat()
                 current = await PlaywrightAdapter(page, contract).observe_api(
                     owned_draft=prompt
                 )
+                if check_chat is not None:
+                    check_chat()
                 guardian.record_safety(current, db)
                 if (
                     (

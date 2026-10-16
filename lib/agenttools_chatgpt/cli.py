@@ -5,15 +5,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import secrets
 import signal
 import sqlite3
-import time
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from .browser import BrowserLifecycle, Contract, PlaywrightAdapter
+from .browser import BrowserLifecycle, Contract, PlaywrightAdapter, observe_tabs
 from .core import Guardian, Store
 from .service import ControlServer
 from .state import state_path
@@ -105,11 +105,7 @@ async def serve(args, store: Store):
                 for page in context.pages
                 if not page.is_closed()
             ]
-            samples = []
-            for adapter in adapters:
-                observed = await asyncio.wait_for(adapter.observe(), timeout=5)
-                samples.append((adapter, observed, time.monotonic()))
-                await asyncio.to_thread(guardian.record_safety, observed)
+            samples = await observe_tabs(adapters, record_safety=guardian.record_safety)
             controls = await asyncio.to_thread(store.controls)
             for adapter, observed, captured_at in samples:
                 chat = observed.chat
@@ -136,6 +132,15 @@ async def serve(args, store: Store):
             await lifecycle.close()
         finally:
             control.close()
+
+
+def poll_interval(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value) or value < 30:
+        raise argparse.ArgumentTypeError(
+            "poll interval must be finite and at least 30 seconds"
+        )
+    return value
 
 
 def main(argv=None) -> int:
@@ -199,6 +204,61 @@ def main(argv=None) -> int:
     )
     run.add_argument("--control-port", type=int, default=8790)
     run.add_argument("--token-file", default=None)
+    live = subs.add_parser(
+        "live",
+        help="Observe explicit chats in an existing dedicated ordinary Chrome; never closes Chrome",
+    )
+    live.add_argument(
+        "--cdp", required=True, help="Exact http://127.0.0.1:<port> endpoint"
+    )
+    live.add_argument("--workspace", dest="run_workspace", choices=["home", "glide.vc"])
+    live.add_argument(
+        "--watch",
+        action="append",
+        default=[],
+        help="Enroll explicit permanent chat/project URL; repeat as needed; stored watch controls are also polled",
+    )
+    live.add_argument(
+        "--apply",
+        action="store_true",
+        help="Recovery requested, but live confirmation is disabled; remains read-only",
+    )
+    live.add_argument(
+        "--once",
+        action="store_true",
+        help="One observation cycle for diagnostics; stability still requires 20 seconds",
+    )
+    live.add_argument("--control-port", type=int, default=8790)
+    live.add_argument(
+        "--poll-interval",
+        type=poll_interval,
+        default=60,
+        help="Passive polling seconds (default 60, minimum 30); errors wait at least 60",
+    )
+    live.add_argument(
+        "--max-pages",
+        type=int,
+        default=8,
+        help="Suspend observation above this total open-page ceiling (default 8)",
+    )
+    live.add_argument(
+        "--min-available-mib",
+        type=int,
+        default=2048,
+        help="Suspend observation below host MemAvailable floor in MiB (default 2048)",
+    )
+    sol = subs.add_parser(
+        "live-sol",
+        help="Explicitly select/verify Sol Extra High for one consented idle enrolled chat after Astra quota; never sends",
+    )
+    sol.add_argument(
+        "--cdp",
+        required=True,
+        help="Exact http://127.0.0.1:<port>; stop live owner first",
+    )
+    sol.add_argument(
+        "--chat", required=True, help="Already open enrolled permanent chat/project URL"
+    )
     args = parser.parse_args(argv)
     try:
         run_workspace = getattr(args, "run_workspace", None)
@@ -208,7 +268,29 @@ def main(argv=None) -> int:
         args.state = state_path(args.workspace, args.state)
         store = Store(args.state, account=args.workspace)
         token_file = args.state.parent / "control.token"
-        if args.command == "run":
+        if args.command == "live-sol":
+            from .live import select_live_sol
+
+            if not asyncio.run(select_live_sol(args, store)):
+                raise ValueError(
+                    "Sol selection refused or unverified; inspect chat and controls before retrying"
+                )
+            print(
+                json.dumps(
+                    {
+                        "chat": canonical_chat(args.chat),
+                        "model": "Sol",
+                        "effort": "Extra High",
+                        "verified": True,
+                        "sent": False,
+                    }
+                )
+            )
+        elif args.command == "live":
+            from .live import serve_live
+
+            asyncio.run(serve_live(args, store))
+        elif args.command == "run":
             args.token_file = args.token_file or str(token_file)
             asyncio.run(serve(args, store))
         elif args.command == "init":

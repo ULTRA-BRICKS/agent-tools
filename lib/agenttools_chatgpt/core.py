@@ -410,6 +410,8 @@ class Guardian:
     ) -> None:
         if observation.quota:
             self.store.quota(db)
+        if observation.status == "Sol quota exhausted":
+            self.store.stop(observation.chat or "*", "Sol quota exhausted", db)
         if not observation.safe_failure():
             if not observation.chat:
                 self.stability.clear()

@@ -10,6 +10,194 @@ from unittest.mock import AsyncMock
 import pytest
 
 
+@pytest.mark.parametrize(
+    "during", ["send-wait", "reply-readiness", "answer-read", "extraction", "roundtrip"]
+)
+def test_api_navigation_never_sends_or_returns_other_chat(tmp_path, during):
+    from agenttools_chatgpt.core import Guardian, Store
+    from test_chatgpt_guardian_dom import CONTRACT, run
+
+    async def scenario(page, dom):
+        source = bridge()
+        source.ASSISTANT = '.turn[data-author="assistant"]'
+        source.DOM_MARKDOWN = "el => el.textContent"
+        source.LIMIT = SimpleNamespace(search=lambda text: False)
+        source.visible = lambda locator: locator.is_visible()
+        await page.locator(CONTRACT.send).evaluate("""el => el.onclick = () => {
+            window.sent = true;
+            document.querySelector('#composer').value = '';
+            document.querySelector('#conversation').insertAdjacentHTML('beforeend',
+              '<article class="turn" data-id="user-new" data-generation="u1" data-author="user"><div class="body">hello</div></article>' +
+              '<article class="turn" data-id="answer-new" data-generation="a1" data-author="assistant"><div class="body">right answer</div></article>');
+        }""")
+        original_locator, original_evaluate = page.locator, page.evaluate
+
+        async def navigate():
+            await original_evaluate("""() => {
+                history.pushState({}, '', '/c/other');
+                document.querySelector('#composer').value = 'hello';
+                document.querySelector('#conversation').insertAdjacentHTML('beforeend',
+                  '<article class="turn" data-id="wrong" data-generation="wrong-g" data-author="assistant"><div class="body">wrong existing answer</div></article>');
+            }""")
+
+        if during in ("send-wait", "roundtrip"):
+
+            def locator(selector):
+                result = original_locator(selector)
+                if selector == CONTRACT.send:
+                    original_wait = result.wait_for
+
+                    async def wait_for(**kwargs):
+                        await original_wait(**kwargs)
+                        await navigate()
+                        if during == "roundtrip":
+                            await original_evaluate(
+                                "history.pushState({}, '', '/c/fixture')"
+                            )
+
+                    result.wait_for = wait_for
+                return result
+
+            page.locator = locator
+        elif during == "reply-readiness":
+
+            async def readiness(page):
+                await navigate()
+                return "ready"
+
+            source.readiness = readiness
+        elif during == "answer-read":
+
+            async def visible(locator):
+                await navigate()
+                return False
+
+            source.visible = visible
+        else:
+            source.DOM_MARKDOWN = """el => {
+                history.pushState({}, '', '/c/other');
+                return 'wrong existing answer';
+            }"""
+        browser = adapter().create_browser(
+            source,
+            SimpleNamespace(),
+            "managed",
+            guardian=Guardian(Store(tmp_path / "state.sqlite")),
+            contract=CONTRACT,
+        )
+        browser.reply_timeout = 5
+        with pytest.raises(BridgeError, match="[Cc]hat|[Nn]avigation|[Cc]onversation"):
+            await browser.ask(page, "hello")
+        if during in ("send-wait", "roundtrip"):
+            assert not await original_evaluate("Boolean(window.sent)")
+
+    run(scenario)
+
+
+@pytest.mark.parametrize("attribute", ["data-id", "data-generation"])
+@pytest.mark.parametrize("while_running", [False, True])
+def test_api_reply_rejects_replaced_submitted_turn(tmp_path, attribute, while_running):
+    from agenttools_chatgpt.core import Guardian, Store
+    from test_chatgpt_guardian_dom import CONTRACT, run
+
+    async def scenario(page, dom):
+        source = bridge()
+        source.DOM_MARKDOWN = "el => el.textContent"
+        source.LIMIT = SimpleNamespace(search=lambda text: False)
+        polls = 0
+
+        async def visible(locator):
+            return while_running and polls == 1
+
+        source.visible = visible
+
+        async def readiness(page):
+            nonlocal polls
+            polls += 1
+            if polls == 2:
+                await page.locator('.turn[data-id="submitted-answer"]').evaluate(
+                    "(el, attribute) => el.setAttribute(attribute, 'different')",
+                    attribute,
+                )
+            return "ready"
+
+        source.readiness = readiness
+        await page.locator(CONTRACT.send).evaluate("""el => el.onclick = () => {
+            document.querySelector('#composer').value = '';
+            document.querySelector('#conversation').insertAdjacentHTML('beforeend',
+              '<article class="turn" data-id="submitted-user" data-author="user"><div class="body">hello</div></article>' +
+              '<article class="turn" data-id="submitted-answer" data-generation="generation" data-author="assistant"><div class="body">same text</div></article>');
+        }""")
+        browser = adapter().create_browser(
+            source,
+            SimpleNamespace(),
+            "managed",
+            guardian=Guardian(Store(tmp_path / "state.sqlite")),
+            contract=CONTRACT,
+        )
+        browser.reply_timeout = 4
+        with pytest.raises(BridgeError, match="assistant turn changed"):
+            await browser.ask(page, "hello")
+
+    run(scenario)
+
+
+def test_dispatch_intervening_draft_stop_survives_clear(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from agenttools_chatgpt.browser import Contract
+    from agenttools_chatgpt.core import Guardian, Observation, Store
+
+    async def scenario():
+        store = Store(tmp_path / "state.sqlite")
+        guardian = Guardian(store, apply=True)
+        chat = "https://chatgpt.com/c/draft"
+        safe = Observation(
+            chat,
+            "turn",
+            "generation",
+            model="Astra",
+            verified=True,
+            ambiguous=False,
+            active=True,
+            status="Thinking failed",
+        )
+        current = replace(safe, draft=True)
+
+        async def observe(page):
+            return current
+
+        page = api_page(monkeypatch, chat, observe_callback=observe)
+        browser = adapter().create_browser(
+            bridge(),
+            SimpleNamespace(),
+            "managed",
+            guardian=guardian,
+            contract=Contract(verified_account_ui=True),
+        )
+        with pytest.raises(BridgeError):
+            await asyncio.wait_for(browser.dispatch_prompt(page, "hello"), timeout=2)
+        assert Store(store.path).controls()["stop:" + chat] == "human draft"
+        current = safe
+        store.enroll(chat)
+        browser.ctx = SimpleNamespace(pages=[page])
+        browser.status_page = page
+        import time
+
+        now = time.monotonic()
+        guardian.stability[chat] = safe, now - 21
+        guardian.last_seen[chat] = now
+        await browser.monitor_once()
+        assert store.status()["attempts"] == []
+        guardian.stability[chat] = safe, 0
+        guardian.last_seen[chat] = 20
+        assert guardian.consider(safe, 21, None) == "stopped"
+        store.resume(chat)
+        assert guardian.consider(safe, 22, None) != "stopped"
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("operation", ["recovery", "prepare-api", "send-api"])
 @pytest.mark.parametrize("signal", ["quota", "draft", "challenge"])
 @pytest.mark.parametrize("cancelled", [False, True])
@@ -203,6 +391,37 @@ def test_reply_polling_skips_growing_answer_until_running_ends(tmp_path, monkeyp
             count=AsyncMock(side_effect=[0] + [1] * 20), last=answer
         )
         page = api_page(monkeypatch, "https://chatgpt.com/c/reply")
+        original_evaluate = page.evaluate
+
+        async def evaluate(script, payload):
+            if payload.get("action") in ("reply", "reply-identity"):
+                active = payload.get("action") == "reply-identity"
+                return {
+                    "chat": page.url,
+                    "running": active,
+                    "challenge": False,
+                    "quota": False,
+                    "turns": [
+                        {
+                            "turn": "user",
+                            "generation": "",
+                            "author": "user",
+                            "text": "hello",
+                        },
+                        {
+                            "turn": "answer",
+                            "generation": "generation",
+                            "author": "assistant",
+                            "text": "" if active else await answer.inner_text(),
+                        },
+                    ],
+                    "markdown": ""
+                    if active
+                    else await answer.evaluate(source.DOM_MARKDOWN),
+                }
+            return await original_evaluate(script, payload)
+
+        page.evaluate = AsyncMock(side_effect=evaluate)
         page.locator = lambda selector: (
             answers if selector == "answers" else SimpleNamespace(wait_for=AsyncMock())
         )
@@ -218,7 +437,7 @@ def test_reply_polling_skips_growing_answer_until_running_ends(tmp_path, monkeyp
         assert await browser.ask(page, "hello") == "complete answer"
         assert reads and min(reads) >= 4
         assert answer.inner_text.await_count >= 4
-        answer.evaluate.assert_awaited_once()
+        assert answer.evaluate.await_count >= 4
 
     asyncio.run(scenario())
 
@@ -276,7 +495,9 @@ def api_page(monkeypatch, chat, send_callback=None, observe_callback=None):
 
     async def evaluate(script, payload):
         action = payload.get("action")
-        if action == "observe-api":
+        if action == "reply-baseline":
+            return {"chat": page.url, "turns": []}
+        if action in ("observe-api", "observe"):
             if observe_callback is not None:
                 return asdict(await observe_callback(page))
             return asdict(
@@ -590,7 +811,10 @@ def test_ha_ask_uses_contract_when_legacy_selectors_diverge(tmp_path):
             document.querySelector('#composer').value = '';
             const answer = document.createElement('article');
             answer.className = 'turn'; answer.dataset.author = 'assistant';
-            answer.textContent = 'fixture answer';
+            answer.dataset.id = 'reply'; answer.dataset.generation = 'reply-generation';
+            answer.innerHTML = '<div class="body">fixture answer</div>';
+            document.querySelector('#conversation').insertAdjacentHTML('beforeend',
+              '<article class="turn" data-id="submitted-user" data-author="user"><div class="body">hello</div></article>');
             document.querySelector('#conversation').append(answer);
         }""")
         browser = adapter().create_browser(
@@ -662,6 +886,11 @@ def test_ha_startup_defaults_keep_home_quota_out_of_glide_account(
     monkeypatch.setattr(adapter(), "create_browser", inspect)
     monkeypatch.setenv("CHATGPT_WEB_API_KEY", "x" * 32)
     monkeypatch.setenv("CHATGPT_WEB_BROWSER_MODE", "managed")
+    # This test checks account-scoped startup, not aiohttp transport. The HA
+    # dependency is optional in the root project's minimal pytest CI environment.
+    import sys
+
+    monkeypatch.setitem(sys.modules, "aiohttp", SimpleNamespace(web=SimpleNamespace()))
     monkeypatch.delenv("CHATGPT_GUARDIAN_STATE", raising=False)
     monkeypatch.delenv("CHATGPT_GUARDIAN_CONTRACT", raising=False)
     for account in ("home", "glide.vc"):
@@ -1031,6 +1260,8 @@ def test_explicit_api_uses_ready_ui_without_failure_turn_and_allows_consented_so
         recovery = api_ready if quota else Observation("", "", "")
 
         async def evaluate(script, payload):
+            if payload.get("action") == "reply-baseline":
+                return {"chat": page.url, "turns": []}
             if payload.get("action") == "prepare-api":
                 return True
             if payload.get("action") == "send-api":
@@ -1500,7 +1731,7 @@ def test_human_typing_after_empty_snapshot_is_preserved(tmp_path):
         with pytest.raises(BridgeError) as error:
             await browser.ask(page, "hello")
         assert error.value.kind == "busy"
-        assert actions == ["observe-api", "prepare-api"]
+        assert actions == ["observe-api", "reply-baseline", "prepare-api"]
         assert await page.locator(CONTRACT.composer).input_value() == "human draft"
         assert not await original("Boolean(window.clicked)")
 
