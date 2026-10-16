@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- `deferred-findings-tracking` skill: new "Bugs in tools" section — every bug hit in a tool
+  (especially rig-ecosystem tools: rig, task-cli, tg-cli, review-cli, agent-tools hooks and
+  `gh ship`, dev-cli, smoo/nx-plugin, mem-sentinel) gets a ticket in that tool's own tracker
+  right away, with repro, expected vs actual and the workaround; dedupe first and comment on an
+  existing ticket; a workaround never replaces the ticket. Plus a Common mistakes section
+  (agent-tools#931).
+
 ### Fixed
 
 - `runpod-offload` (`runpod-run`): a reaper pass over a marker whose pid is gone no longer

@@ -30,3 +30,37 @@ This is the same principle as `promise-durable-action`: an intention without a
 mechanism evaporates. A tracked issue survives the context reset, is visible to the
 team, and can be prioritized. "I'll remember to come back to it" is how real bugs ship
 to production — the deferral was correct, the lack of a record was the mistake.
+
+## Bugs in tools
+
+Every bug you hit in a tool you use gets a ticket in **that tool's own tracker**, right
+away — not in the project you happened to be working on, and not "later". This applies
+most of all to our own tools and the rig ecosystem: `rig`, `task-cli`, `tg-cli`,
+`review-cli`, the agent-tools hooks and `gh ship`, `dev-cli`, `smoo`/`nx-plugin`,
+`mem-sentinel`. A tool bug you don't report gets hit again by every later session.
+
+- **Dedupe first.** Search the tool's tracker (`task find "<symptom>"` in the tool's repo).
+  If a ticket already exists, comment on it with your new evidence (version, command,
+  output) instead of opening a duplicate.
+- **Make it reproducible.** The ticket carries the exact command / repro, the expected
+  behavior vs the actual output, the tool version, and the workaround you used. Redact
+  secrets first — tokens, auth headers, env values and credential paths never go into a
+  ticket.
+- **A workaround never replaces the ticket.** Working around the bug to finish your task
+  is fine; file the ticket first, then continue with the workaround.
+- **The broken tool is the tracker client.** If `task` itself fails, do not route around
+  its gates with a raw tracker write. After any failure that is not a plain policy-gate
+  refusal (exit 9, or a backend error on exit 2: the create may have landed), search for it
+  by title (`task list`, `task find "<title>"`) before you
+  retry the create. If `task` keeps failing, queue the report durably (see
+  `queued-report-durability`), say in your report that it is queued, and file the
+  `task-cli` failure itself as a bug once `task` works again.
+
+## Common mistakes
+
+- **Worked around a tool bug and moved on.** You hit a broken `rig`/`task`/`gh ship`
+  behavior, found a workaround, and finished the task — with no ticket. The next agent
+  burns the same time rediscovering it. File it in the tool's tracker (repro, expected vs
+  actual, workaround) before you continue.
+- **Left the finding only in chat.** A note in a message or a final report is not a
+  tracking record; open the issue.
