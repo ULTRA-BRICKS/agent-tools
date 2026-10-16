@@ -9,28 +9,84 @@
 # once per machine; see SKILL.md).
 #
 #   runpod-run -- bun test ./tests                 # the repo of the cwd, on a 4-vCPU CPU pod
-#   runpod-run --cpu cpu3c-8 -- pytest -q          # another CPU flavor-vCPU pair
-#   runpod-run --gpu "NVIDIA GeForce RTX 4090" -- python bench.py
-#   runpod-run --ttl 45 -- pytest                  # keep the pod, terminate after 45 idle min
+#   runpod-run --cpu cpu3c-8 --reason "suite runs 8 workers" -- pytest -q   # a bigger flavor says why
+#   runpod-run --gpu "NVIDIA GeForce RTX 4090" --reason "cuda kernels" -- python bench.py
+#   runpod-run --ttl 10 -- pytest                  # keep the pod, terminate after 10 idle min
+#   runpod-run --sync-dir ~/src/app --sync-dir ~/src/lib -- make test   # lib travels along
 #   runpod-run --dry-run -- bun test               # print the plan; no pod, only a price lookup
-#   runpod-run --status                            # every pod on the account, $/h and age
+#   runpod-run --status                            # every pod on the account, $/h and age; pod slots
 #   runpod-run --stop [pod-id|all]                 # terminate them (default: this repo's)
+#   runpod-run --report [--day 2026-10-15]         # a day's spend: billed $ vs. the ledger
 #
 # What one run does:
-#   1. ensure a pod named rr-<host>-<repo> exists and answers ssh (reuse > start > create;
-#      the hourly price is printed before a create);
+#   1. ensure a pod named rr-<host>-<repo> exists and answers ssh within 3 minutes (reuse >
+#      start > create; the hourly price is printed before a create, and a create that finds
+#      no free machine of the flavor is retried up to 3 times, 15/30/60 s apart, never with
+#      another flavor); the pod holds one of the host's 3 pod slots, and a start or create
+#      must fit the daily budget (both below);
 #   2. rsync the checkout (tracked + untracked-not-ignored files; .git, node_modules and
-#      .venv never travel) to /workspace/<repo> on the pod;
+#      .venv never travel) to /workspace/<repo> on the pod, and every further --sync-dir the
+#      same way to /workspace/<its repo>;
 #   3. bootstrap the toolchain the lockfiles ask for (bun / uv / node+npm|pnpm|yarn), once
 #      per pod, matching the local version where it can;
 #   4. run the command there, streaming its output, and exit with ITS exit code;
 #   5. terminate the pod — unless --ttl N (a local timer terminates it after N minutes
-#      without a new run; --keep alone is refused: no pod bills without a deadline).
+#      without a new run, N at most 10; --keep alone is refused: no pod bills without a deadline);
+#   6. append one JSON line to ~/.cache/runpod-run/ledger.jsonl (every run, refusals and
+#      failures included; a --dry-run is no run). A --stop that terminates a pod, and the
+#      reaper ending a kept pod whose timer died, append an `event: terminate` line carrying
+#      the pod's idle time since its last run.
+#
+# Refused before any network call (exit 20): a no-op command (`true`, `:`, `exit 0`); a
+# single test-file invocation (`bun test x.test.ts`, `pytest tests/a.py`, `pytest -k foo`,
+# `go test -run TestX`) — run it locally — unless --remote-reason says why it needs a pod;
+# a flavor above 4 vCPU or 16 GB, or any --gpu, without --reason; a --gpu run whose command
+# shows no sign of CUDA (torch, nvcc, vllm, …) unless --reason mentions cuda/gpu.
+#
+# Daily budget (exit 21), checked before every create and every start of a stopped pod
+# (reusing a RUNNING pod is neither): today's billed $ (GET /billing from local midnight,
+# cached 5 min in ~/.cache/runpod-run/billing-today.json) + every live pod's $/h on the
+# account x this run's --timeout + the new pod's $/h x --timeout must stay below the cap;
+# billing or price unreadable also refuses (fail closed). Runs on this machine take the
+# check one at a time, each until the pod it starts or creates is listed. The cap is the
+# OWNER's, $6 per local day unless ~/.config/runpod-run/budget says `daily_usd = N`;
+# budget-override there (`YYYY-MM-DD N`) sets it for that day only. "~" is the account's
+# home from the passwd database: HOME and XDG_CONFIG_HOME are ignored, so no environment
+# variable moves or raises the cap. Agents never write these files: a refusal says to send
+# the owner a decision request (`tg --tag decision`).
+#
+# Pod slots (exit 22): at most 3 runpod-run pods are live on this host at once. A run takes a
+# slot before it reuses, starts or creates its pod (so before the budget check) and holds it
+# until the pod is terminated; a pod kept by --ttl holds its slot until its timer ends it,
+# and the next run of that repo reuses the pod and its slot. A run that finds 3 live queues
+# in FIFO order, printing `queued for a pod slot (position N of M; 3 live: …)` whenever its
+# position changes, and gives up after --queue-timeout minutes (default 60) with exit 22,
+# having started nothing. A slot is a marker ~/.cache/runpod-run/slots/<pod name> naming
+# the pid of the runpod-run that holds it, so a killed run's slot frees itself; --status
+# lists the slots.
+#
+# Account state: the ledger, the pod slots and their queue, the billing cache and the budget
+# lock live in ~/.cache/runpod-run of the account's passwd home (getent, else Python's pwd),
+# like the budget files: HOME and RUNPOD_RUN_STATE do not move them, so no environment
+# variable gives a run fresh slots, a free budget lock or an empty ledger.
+#
+# Dedup (24 h): a run identical to one that finished within 24 hours — the same files and
+# contents in every --sync-dir (what the sync sends), the same command, the same settings
+# (flavor, image, --root, --timeout, bootstrap, dirs) — prints that run's last 40 log lines
+# and `identical to the run at <ts> (exit N); no pod started — pass --rerun to run again`,
+# books an `event: dedup` ledger line and exits N,
+# with no API call, slot or pod. Checked after the refusals, before the slot and the budget.
+# Only runs whose command ran are recorded (not exits 2, 3, 20-23, 255), one per repo, in
+# ~/.cache/runpod-run/dedup/ of the account home.
 #
 # Options (before `--`):
 #   --cpu [FLAVOR-VCPUS]  CPU pod; default cpu3g-4 (4 vCPU, 16 GB). Flavors: cpu3c (2 GB/vCPU),
 #                         cpu3g (4 GB/vCPU), cpu3m (8 GB/vCPU); vCPUs a power of two, 2+.
-#   --gpu GPU_TYPE_ID     GPU pod with that catalog id (`runpodctl gpu list`), CUDA >= 12.8.
+#   --gpu GPU_TYPE_ID     GPU pod with that catalog id (`runpodctl gpu list`), CUDA >= 12.8;
+#                         needs --reason.
+#   --reason TEXT         why this run needs more than cpu3g-4 (any flavor above 4 vCPU or
+#                         16 GB, and every --gpu run).
+#   --remote-reason TEXT  why a single test file must run on a pod rather than locally.
 #   --image IMAGE         container image (default runpod/base:1.0.2-ubuntu2404 for CPU,
 #                         runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404 for GPU).
 #   --disk GB             container disk (default 40; a CPU pod is capped at 10 GB per vCPU, so
@@ -39,28 +95,56 @@
 #   --bootstrap CMD       replace the lockfile-detected bootstrap with this shell command
 #                         (runs in the synced tree, as root); --no-bootstrap skips it;
 #   --no-js / --no-python skip just that half (a bun repo with a heavy torch uv.lock).
-#   --sync-dir DIR        checkout to sync (default: git toplevel of the cwd).
+#   --sync-dir DIR        checkout to sync (default: git toplevel of the cwd); repeatable. The
+#                         first is the run's own (its pod, the command's cwd); each further
+#                         one goes to /workspace/<its repo tag> (a dir outside git:
+#                         <name>-<8 hex of its path>). The command finds them all, in order,
+#                         in RUNPOD_RUN_SYNC_DIRS (remote paths, `:`-joined). One run with two
+#                         --sync-dir replaces staging a dir with a separate run.
 #   --keep                keep the pod after the run; only together with --ttl so no kept
 #                         pod can bill forever (the kept-pod line prints its $/h).
 #   --ttl MINUTES         keep the pod; a detached local timer terminates it after that
-#                         many idle minutes unless another run refreshes it.
+#                         many idle minutes unless another run refreshes it. At most 10: a
+#                         larger value is clamped to 10. Only when you will run again soon.
 #   --timeout SECONDS     hard limit for the remote command (default 3600; exit 124 on hit).
+#   --queue-timeout MINUTES
+#                         how long a run waits for a pod slot while 3 pods are live
+#                         (default 60; exit 22 after it).
 #   --tty                 give the remote command a pty (ssh -tt) for tools that need one.
 #   --root                sync and run as root instead of the unprivileged `runner` user
 #                         (docker builds, apt inside the command).
 #   --name NAME           override the pod name (default rr-<host>-<repo>).
-#   --dry-run             print the plan and exit 0; creates nothing (the only network
-#                         call is the read-only price catalog, when a key is present).
+#   --rerun               run even when an identical run finished within 24 h (see "Dedup").
+#   --dry-run             print the plan and exit 0; creates nothing (with a key, it reads
+#                         the price catalog, the pod list and today's billing, read-only,
+#                         and shows the budget line a start or create would face). It also
+#                         shows the host's pod slots and whether this run would reuse one,
+#                         take one or queue, and `dedup: hit (would replay exit N from <ts>)`
+#                         or `dedup: miss`.
 #   --status / --stop     see above.  -h / --help: this text.
+#   --report [--day D]    one LOCAL day's spend (default today): the billed $ (billing API,
+#                         when a key is present) against the ledger's estimate, split into
+#                         A command (exit 0/1), B boot+sync+bootstrap, C idle (--ttl),
+#                         D failed before the command, E failed run (other exits), G
+#                         unattributed (billed - ledger); runs per repo and per agent,
+#                         trivial (<30 s) commands, refusals. A day without ledger lines is
+#                         read from the run logs instead (command time only).
 #
 # Environment: RUNPOD_API_KEY (else `apikey` in ~/.runpod/config.toml, which `runpodctl
 # doctor`/`flash login` write); RUNPOD_RUN_SSH_KEY (default ~/.runpod/ssh/runpodctl-ssh-key,
 # the key runpodctl registers on the account — the pod must be created AFTER the key is
 # registered, Runpod injects account keys at boot); RUNPOD_RUN_STATE (default
-# ~/.cache/runpod-run) for known_hosts, run logs and ttl timers.
+# ~/.cache/runpod-run) for known_hosts, run logs, ttl timers and per-pod locks, never the
+# account state above; RIG_AGENT_ID and the first of OMP_SESSION_ID / OMP_SESSION_DIR /
+# CLAUDE_SESSION_ID / CODEX_SESSION_ID are recorded in the ledger as the run's agent and
+# session.
 #
 # Exit codes: the remote command's own; 124 timeout; 2 usage/config (no API key, not a
-# git checkout); 3 the pod could not be created, started or bootstrapped; 255 ssh failure.
+# git checkout); 3 the pod could not be created (no capacity after 3 retries included),
+# started or bootstrapped; 255 ssh failure; 20 policy refusal (see "Refused" above); 21
+# daily budget reached or unverifiable (see "Daily budget"); 22 no pod slot came free within
+# --queue-timeout (see "Pod slots"); 23 the pod did not answer ssh within 3 minutes (it is
+# terminated, --ttl or not).
 # SC2016: the pod-side scripts are single-quoted on purpose (they expand on the pod);
 # SC2029: the ssh command strings expand client-side on purpose (every piece is %q-quoted).
 # shellcheck disable=SC2016,SC2029
@@ -74,6 +158,25 @@ GPU_IMAGE=runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404
 usage() { sed -n '2,/^set -uo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; }
 die() { echo "runpod-run: $1" >&2; exit "${2:-2}"; }
 log() { echo "runpod-run: $*" >&2; }
+# Test seam for the offline tests: RUNPOD_RUN_TEST_TIME_SCALE=0.01 runs the ssh wait and the
+# capacity backoff at 1/100. Only a factor below 1 is honoured, so it can make a run give up
+# sooner, never wait longer nor retry more often than the limits below allow.
+time_scale=1
+[[ "${RUNPOD_RUN_TEST_TIME_SCALE:-}" =~ ^0?\.[0-9]*[1-9][0-9]*$ ]] && time_scale=$RUNPOD_RUN_TEST_TIME_SCALE
+scaled() {   # <seconds> -> seconds x time_scale
+  if [ "$time_scale" = 1 ]; then printf '%s' "$1"; else awk -v s="$1" -v f="$time_scale" 'BEGIN { printf "%.2f", s * f }'; fi
+}
+# policy SUBCOMMAND ARGS...: the spend policy helper that ships next to this script. Resolved
+# through the symlink: the provisioned ~/.local/bin/runpod-run points into the skill dir.
+policy_helper="$(dirname "$(readlink -f "$0")")/runpod_run_policy.py"
+policy() { python3 "$policy_helper" "$@"; }
+# The account's home from the passwd database (getent, else the helper's pwd lookup), never
+# $HOME, which an agent can set: the owner's budget files and the account state (ledger,
+# pod slots, billing cache, budget lock) live there. Empty only when neither can say; every
+# mode but --help then stops (below).
+account_home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)
+[ -n "$account_home" ] || account_home=$(policy account-home 2>/dev/null)
+ACCOUNT_STATE=$account_home/.cache/runpod-run
 
 mode=run
 compute=cpu
@@ -86,15 +189,81 @@ bootstrap_cmd=""
 no_bootstrap=0
 no_js=0
 no_python=0
-sync_dir=""
+sync_dir=""          # the primary --sync-dir (sync_dirs[0]), resolved below
+sync_dirs=()         # every --sync-dir in argument order, absolute once resolved
 keep=0
 ttl=0
 timeout_s=3600
+queue_timeout=60
 tty=0
 as_root=0
 pod_name=""
 dry_run=0
 stop_target=""
+report_day=""
+reason=""
+remote_reason=""
+rerun=0
+# --- ledger: one JSON line per run in $ACCOUNT_STATE/ledger.jsonl ----------------------------
+# Written by the script itself on every exit path of run mode (refusals, usage errors and
+# Ctrl-C included) so that a caller who discards stderr still leaves a trace; --report reads
+# it. Armed before the options are parsed, so a malformed option is booked too; at exit it
+# writes only for run mode — a dry run rents nothing and leaves no line.
+cmd_quoted=""
+ledger_event=run      # a path that ends the run for a policy reason names it (refused, budget, …)
+ledger_written=0
+pod_id=""
+pod_cost=""
+idle_s=""             # set when this run reuses a pod that sat idle under --ttl
+# Phase start marks (epoch seconds): a phase lasts until the next mark, the last one until exit.
+t_boot="" t_sync="" t_bootstrap="" t_command="" t_done=""
+# shellcheck disable=SC2329  # called from the EXIT-trap functions below
+flavor_name() { if [ "$compute" = gpu ]; then echo "gpu:$gpu_id"; else echo "$cpu_spec"; fi; }
+# 2>/dev/null before the input redirect: redirections apply left to right, so a pid that is
+# gone (no /proc entry) must already have stderr silenced when bash opens the file.
+parent_cmdline() { tr '\0' ' ' 2>/dev/null <"/proc/$PPID/cmdline"; }
+# No account home: nowhere to book the line (the run stops at the check below anyway).
+ledger_tools() { [ -n "$account_home" ] && command -v jq >/dev/null && command -v python3 >/dev/null; }
+ledger_append() {   # <json object>
+  ledger_tools || return 0
+  policy ledger-append --state="$ACCOUNT_STATE" --json="$1" || log "could not append to $ACCOUNT_STATE/ledger.jsonl"
+}
+# shellcheck disable=SC2329  # invoked by the EXIT trap
+ledger_run() {   # <exit code>
+  if [ "$ledger_written" -eq 1 ] || [ "$mode" != run ] || [ "$dry_run" -eq 1 ] || ! ledger_tools; then return 0; fi
+  ledger_written=1
+  local marks=("$t_boot" "$t_sync" "$t_bootstrap" "$t_command" "$t_done") secs=() i j end
+  for i in 0 1 2 3; do
+    secs[i]=null
+    [ -n "${marks[i]}" ] || continue
+    end=$EPOCHSECONDS
+    for (( j = i + 1; j < 5; j++ )); do [ -n "${marks[j]}" ] && { end=${marks[j]}; break; }; done
+    secs[i]=$(( end - marks[i] ))
+  done
+  ledger_append "$(jq -cn --arg event "$ledger_event" --arg repo "${repo:-}" --arg repo_tag "${repo_tag:-}" \
+    --arg cmd "${cmd_quoted% }" --arg pod_id "$pod_id" --arg pod_name "$pod_name" --arg flavor "$(flavor_name)" \
+    --arg usd "$pod_cost" --argjson boot "${secs[0]}" --argjson sync "${secs[1]}" --argjson bootstrap "${secs[2]}" \
+    --argjson command "${secs[3]}" --arg idle "$idle_s" --argjson exit "$1" --arg parent "$(parent_cmdline)" \
+    --arg reason "$reason" --arg remote_reason "$remote_reason" \
+    '{event: $event, repo: $repo, repo_tag: $repo_tag, cmd: $cmd, pod_id: $pod_id, pod_name: $pod_name,
+      flavor: $flavor, usd_per_h: ($usd | tonumber? // null), boot_s: $boot, sync_s: $sync,
+      bootstrap_s: $bootstrap, command_s: $command, idle_s: ($idle | tonumber? // null), exit: $exit,
+      parent: $parent, reason: $reason, remote_reason: $remote_reason}')"
+}
+# A pod --stop terminated: its idle time since the last run (from the <id>.lastrun note the
+# run left when --ttl kept the pod) is billed time no run accounts for. repo, repo_tag,
+# flavor and the price come from that note (the piped object), not from this invocation.
+ledger_terminate() {   # <pod-id> <pod-name> <$/h from the API> <lastrun json, may be empty>
+  local lastrun=$4
+  printf '%s' "$lastrun" | jq -e 'type == "object"' >/dev/null 2>&1 || lastrun='{}'
+  ledger_append "$(printf '%s' "$lastrun" | jq -c --arg id "$1" --arg name "$2" --arg cost "$3" \
+    --argjson now "$EPOCHSECONDS" --arg parent "$(parent_cmdline)" \
+    '{event: "terminate", pod_id: $id, pod_name: (.pod_name // $name), repo: .repo, repo_tag: .repo_tag,
+      flavor: .flavor, usd_per_h: (.usd_per_h // ($cost | tonumber? // null)),
+      idle_s: (if (.ended | type) == "number" then $now - .ended else null end), parent: $parent}')"
+}
+trap 'ledger_run "$?"' EXIT
+
 need_arg() { [ "$#" -ge 2 ] || die "$1 needs a value (see --help)"; }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -111,30 +280,42 @@ while [ "$#" -gt 0 ]; do
     --no-bootstrap) no_bootstrap=1; shift ;;
     --no-js) no_js=1; shift ;;
     --no-python) no_python=1; shift ;;
-    --sync-dir) need_arg "$@"; sync_dir=$2; shift 2 ;;
+    --sync-dir) need_arg "$@"; sync_dirs+=("$2"); shift 2 ;;
     --keep) keep=1; shift ;;
     --ttl) need_arg "$@"; [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "--ttl must be a positive number of minutes (omit it to terminate right after the run)"; ttl=$2; keep=1; shift 2 ;;
+    --reason) need_arg "$@"; reason=$2; shift 2 ;;
+    --remote-reason) need_arg "$@"; remote_reason=$2; shift 2 ;;
     --timeout) need_arg "$@"; timeout_s=$2; shift 2 ;;
+    --queue-timeout) need_arg "$@"; [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "--queue-timeout must be a positive number of minutes"; queue_timeout=$2; shift 2 ;;
     --tty) tty=1; shift ;;
     --root) as_root=1; shift ;;
     --name) need_arg "$@"; pod_name=$2; shift 2 ;;
     --dry-run) dry_run=1; shift ;;
+    --rerun) rerun=1; shift ;;
     --status) mode=status; shift ;;
     --stop) mode=stop; if [ "$#" -ge 2 ] && [[ "$2" != -* ]]; then stop_target=$2; shift; fi; shift ;;
-    -h|--help) usage; exit 0 ;;
+    --report) mode=report; shift ;;
+    --day) need_arg "$@"; report_day=$2; shift 2 ;;
+    -h|--help) mode=help; usage; exit 0 ;;
     --) shift; break ;;
     -*) die "unknown option $1 (see --help)" ;;
     *) break ;;
   esac
 done
+[ -z "$report_day" ] || [ "$mode" = report ] || die "--day only goes with --report"
+cmd_quoted=$(printf '%q ' "$@")
 [[ "$timeout_s" =~ ^[1-9][0-9]*$ ]] || die "--timeout must be a positive number of seconds"
 [[ "$ttl" =~ ^[0-9]+$ ]] || die "--ttl must be a number of minutes"
+# An idle kept pod bills like a busy one; 10 minutes covers "the next run is coming". The
+# length test first: a value past bash's integer range must clamp, not fail the comparison.
+if [ "${#ttl}" -gt 2 ] || [ "$ttl" -gt 10 ]; then log "--ttl $ttl clamped to 10 min (max)"; ttl=10; fi
 [ -z "$disk" ] || [[ "$disk" =~ ^[1-9][0-9]*$ ]] || die "--disk must be a number of GB"
-[ "$keep" -eq 1 ] && [ "$ttl" -eq 0 ] && die "--keep needs --ttl MINUTES: a kept pod bills per second until terminated, so every kept pod carries a deadline (runpod-run --ttl 30 -- …)"
+[ "$keep" -eq 1 ] && [ "$ttl" -eq 0 ] && die "--keep needs --ttl MINUTES: a kept pod bills per second until terminated, so every kept pod carries a deadline (runpod-run --ttl 10 -- …)"
 [ "$mode" = run ] && [ "$#" -eq 0 ] && die "nothing to run: runpod-run [options] -- <command...>"
 
-for tool in curl jq rsync ssh git flock; do command -v "$tool" >/dev/null || die "needs $tool on PATH"; done
-mkdir -p "$STATE"
+for tool in curl jq rsync ssh git flock python3; do command -v "$tool" >/dev/null || die "needs $tool on PATH"; done
+[ -n "$account_home" ] || die "cannot find this account's home in the passwd database (getent, Python pwd): the ledger, pod slots and budget live there"
+mkdir -p "$STATE" "$ACCOUNT_STATE"
 
 # --- auth ---------------------------------------------------------------------------------
 api_key=${RUNPOD_API_KEY:-}
@@ -177,19 +358,41 @@ resolve_repo() {
   repo=$(basename "$common")
   repo_tag="$(printf '%s' "$repo" | slug)-$(printf '%s' "$common" | sha256sum | cut -c1-8)"
 }
+# sync_tag DIR: where a further --sync-dir lands, /workspace/<this>: its repo_tag in a git
+# checkout, else slug(basename)-<8 hex of its absolute path>. The subshell keeps repo and
+# repo_tag the primary's.
+sync_tag() {
+  if git -C "$1" rev-parse --git-dir >/dev/null 2>&1; then (resolve_repo "$1"; printf '%s' "$repo_tag")
+  else printf '%s-%s' "$(printf '%s' "${1##*/}" | slug)" "$(printf '%s' "$1" | sha256sum | cut -c1-8)"; fi
+}
 if [ "$mode" = run ]; then
-  if [ -z "$sync_dir" ]; then
+  if [ "${#sync_dirs[@]}" -eq 0 ]; then
     sync_dir=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git checkout; pass --sync-dir DIR"
+    sync_dirs=("$sync_dir")
   fi
-  sync_dir=$(cd "$sync_dir" 2>/dev/null && pwd) || die "no such directory: $sync_dir"
-  resolve_repo "$sync_dir"
+  # remote_dirs[i]: where sync_dirs[i] lands on the pod. The first dir is the primary: the
+  # pod's identity and the command's cwd.
+  remote_dirs=()
+  for i in "${!sync_dirs[@]}"; do
+    dir=$(cd "${sync_dirs[i]}" 2>/dev/null && pwd) || die "no such directory: ${sync_dirs[i]}"
+    sync_dirs[i]=$dir
+    if [ "$i" -eq 0 ]; then resolve_repo "$dir"; dest="/workspace/$repo_tag"; else dest="/workspace/$(sync_tag "$dir")"; fi
+    # Two dirs in one remote dir would rsync --delete over each other.
+    for j in "${!remote_dirs[@]}"; do
+      [ "${remote_dirs[j]}" != "$dest" ] ||
+        die "--sync-dir ${sync_dirs[j]} and $dir both sync to $dest (one checkout: the same dir, a dir inside it, or another worktree of its clone); name it once"
+    done
+    remote_dirs+=("$dest")
+  done
+  sync_dir=${sync_dirs[0]}
+  remote_dir=${remote_dirs[0]}
+  sync_dirs_env=$(IFS=:; printf '%s' "${remote_dirs[*]}")   # RUNPOD_RUN_SYNC_DIRS on the pod
   if [ -n "$pod_name" ]; then
     # A custom name keeps the managed prefix so --status/--stop still find the pod.
     case "$pod_name" in "$prefix"*) ;; *) pod_name="$prefix$(printf '%s' "$pod_name" | slug)" ;; esac
   else
     pod_name="$prefix$repo_tag"
   fi
-  remote_dir="/workspace/$repo_tag"
 fi
 
 ssh_key=${RUNPOD_RUN_SSH_KEY:-}
@@ -206,6 +409,20 @@ if [ -z "$disk" ]; then
   [ "$compute" = cpu ] && [ $((cpu_vcpus * 10)) -lt 40 ] && disk=$((cpu_vcpus * 10))
 elif [ "$compute" = cpu ] && [ "$disk" -gt $((cpu_vcpus * 10)) ]; then
   die "--disk $disk exceeds Runpod's cap of 10 GB per vCPU ($((cpu_vcpus * 10)) GB for $cpu_vcpus vCPUs); use more vCPUs or less disk"
+fi
+# --- policy: refuse a run that should not rent a pod, before any network call -------------
+if [ "$mode" = run ]; then
+  if [ "$compute" = gpu ]; then shape="gpu:$gpu_id"; else shape=$cpu_spec; fi
+  # --cwd: the command runs in the pod's copy of $sync_dir (the git toplevel unless --sync-dir
+  # names another checkout), so its operands resolve there. `--opt=value`: a reason that
+  # starts with a dash ("-j8 is too slow") must stay a value.
+  policy check --cwd="$sync_dir" --shape="$shape" --reason="$reason" --remote-reason="$remote_reason" -- "$@"
+  code=$?
+  case "$code" in
+    0) ;;
+    20) ledger_event=refused; exit 20 ;;
+    *) die "policy helper failed (exit $code): $policy_helper" ;;
+  esac
 fi
 describe_compute() {
   if [ "$compute" = gpu ]; then echo "GPU $gpu_id x1 (CUDA >= 12.8)"; else echo "CPU $cpu_flavor, $cpu_vcpus vCPU"; fi
@@ -283,9 +500,9 @@ terminate_pod() {
   local i err
   for i in 1 2 3 4 5; do
     if err=$( (api DELETE "/pods/$1" >/dev/null) 2>&1 ); then
-      log "pod $1 terminated"; rm -f "$STATE/$1.ttl"; return 0
+      log "pod $1 terminated"; rm -f "$STATE/$1.ttl" "$STATE/$1.lastrun"; return 0
     fi
-    case "$err" in *"failed (404)"*) log "pod $1 is already gone"; rm -f "$STATE/$1.ttl"; return 0 ;; esac
+    case "$err" in *"failed (404)"*) log "pod $1 is already gone"; rm -f "$STATE/$1.ttl" "$STATE/$1.lastrun"; return 0 ;; esac
     [ "$i" -lt 5 ] && { log "terminate $1 attempt $i failed (${err#runpod-run: }); retrying"; sleep $(( i * 3 )); }
   done
   log "COULD NOT terminate pod $1 after 5 attempts — it is STILL BILLING: runpod-run --stop $1"
@@ -306,7 +523,7 @@ ttl_timer_pid() {   # <pod-id> -> pid on stdout when the timer is alive
   local pid deadline
   read -r pid deadline < <(ttl_fields "$1") || return 1
   [ -n "$pid" ] && [ "$pid" != "$$" ] || return 1
-  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q -- "--stop $1" || return 1
+  tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" | grep -q -- "--stop $1" || return 1
   printf '%s' "$pid"
 }
 cancel_ttl_timer() {   # <pod-id>
@@ -314,29 +531,68 @@ cancel_ttl_timer() {   # <pod-id>
   pid=$(ttl_timer_pid "$1") && kill "$pid" 2>/dev/null
   rm -f "$STATE/$1.ttl"
 }
+# arm_ttl_timer <pod-id> <pod-name> <seconds>: the detached `sleep N && runpod-run --stop <id>`
+# that ends a kept pod, its "<pid> <deadline>" file, and the pod's slot handed to it (the kept
+# pod still counts as live until that --stop terminates it, or the next run takes it over).
+# 9>&-: the timer must not inherit (and hold) a run's per-pod lock. Absolute script path: the
+# timer must still find this script after a relative-path caller's cwd (or worktree) is gone.
+# shellcheck disable=SC2329  # invoked by cleanup, from the EXIT trap
+arm_ttl_timer() {
+  [[ "$3" =~ ^[0-9]+$ ]] || die "arm_ttl_timer: '$3' is no number of seconds"
+  nohup bash -c "sleep $3 && exec $(printf '%q' "$(readlink -f "$0")") --stop $(printf '%q' "$1")" >>"$STATE/ttl.log" 2>&1 </dev/null 9>&- &
+  echo "$! $(( $(date +%s) + $3 ))" >"$STATE/$1.ttl"
+  slot_update handover "$2" "$!"
+}
 # A pid is "a live runpod-run" only while its command line still says so, so a recycled pid
 # never passes for the run that wrote a marker.
-runpod_run_alive() { tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null | grep -q 'runpod-run'; }
+runpod_run_alive() { tr '\0' ' ' 2>/dev/null <"/proc/$1/cmdline" | grep -q 'runpod-run'; }
 # Reconcile what earlier runs on this machine left behind, before doing anything else:
 #   <id>.ttl         a --ttl deadline that passed while no timer is alive (reboot, kill);
 #   creating.<pid>   a run killed between POST /pods and learning the id (holds the name);
-#   running.<pid>    a run killed (SIGKILL, OOM, power) while its pod was up (holds the id).
+#   running.<pid>    a run killed (SIGKILL, OOM, power) while its pod was up, or one whose
+#                    final terminate failed (holds the id).
 # Every candidate is checked against list_pods first: only a pod this machine's runpod-run
-# created is ever terminated here, whatever a stale or edited state file says.
+# created is ever terminated here, whatever a stale or edited state file says. A pod whose
+# lock (locks/<name>.lock) another runpod-run holds is in use by that run: it and its marker
+# are left for that run and a later reaper.
 reap_leftovers() {
-  local f id pid deadline now mine name
+  local f id pid deadline now mine name lastrun pod
   now=$(date +%s)
   mine=$(list_pods) || return 0
   owned() { printf '%s\n' "$mine" | jq -e --arg id "$1" 'select(.id==$id)' >/dev/null; }
+  # claim <name> <id>: a flock -n on the pod's lock, on the spare fd 6, held only while that
+  # one pod is judged and terminated (unclaim), so no run can start on it in between. Fails
+  # when a live runpod-run holds the lock. This run's own pod needs no claim: its lock is
+  # this run's fd 9, so nobody else is on it.
+  claim() {
+    [ -n "$1" ] && [ "$1" != "$pod_name" ] || return 0
+    mkdir -p "$STATE/locks"
+    exec 6>"$STATE/locks/$1.lock"
+    flock -n 6 && return 0
+    exec 6>&-
+    log "pod $2 ($1) is in use by a runpod-run on this machine; not reaping it"
+    return 1
+  }
+  unclaim() { exec 6>&-; }
   for f in "$STATE"/*.ttl; do
     [ -f "$f" ] || continue
     id=$(basename "$f" .ttl)
     read -r pid deadline < <(ttl_fields "$id") || { rm -f "$f"; continue; }
+    # This is the pod's own --ttl timer firing its --stop, which ends the pod below.
+    [ "$pid" != "$$" ] || continue
     [ "$deadline" -gt 0 ] && [ "$deadline" -le "$now" ] || continue
     ttl_timer_pid "$id" >/dev/null && continue
     if owned "$id"; then
+      pod=$(printf '%s\n' "$mine" | jq -c --arg id "$id" 'select(.id==$id)' | head -1)
+      name=$(printf '%s' "$pod" | jq -r .name)
+      claim "$name" "$id" || continue
       log "pod $id passed its --ttl deadline with no timer alive (reboot?); terminating it"
-      terminate_pod "$id" || true
+      # It idled (past its deadline, too) with no timer left to book that: book it here.
+      lastrun=$(cat "$STATE/$id.lastrun" 2>/dev/null)
+      if terminate_pod "$id"; then
+        ledger_terminate "$id" "$name" "$(printf '%s' "$pod" | jq -r '.cost // empty')" "$lastrun"
+      fi
+      unclaim
     else
       rm -f "$f"
     fi
@@ -347,41 +603,53 @@ reap_leftovers() {
     [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" != "$$" ] || continue
     runpod_run_alive "$pid" && continue
     if [ "${f##*/}" = "creating.$pid" ]; then
-      name=$(head -1 "$f"); rm -f "$f"
+      name=$(head -1 "$f")
       id=$(printf '%s\n' "$mine" | jq -r --arg n "$name" 'select(.name==$n) | .id' | head -1)
-      [ -n "$id" ] || continue
+      [ -n "$id" ] || { rm -f "$f"; continue; }
+      claim "$name" "$id" || continue
+      rm -f "$f"
       log "pod $id ($name) was created by runpod-run pid $pid, which died before it could track it; terminating it"
     else
-      id=$(head -1 "$f"); rm -f "$f"
-      owned "$id" || continue
+      id=$(head -1 "$f")
+      owned "$id" || { rm -f "$f"; continue; }
+      name=$(printf '%s\n' "$mine" | jq -r --arg id "$id" 'select(.id==$id) | .name' | head -1)
+      claim "$name" "$id" || continue
+      rm -f "$f"
       log "pod $id was in use by runpod-run pid $pid, which died without tearing it down; terminating it"
     fi
-    [ -f "$STATE/$id.ttl" ] && continue   # it was kept on purpose; its own deadline rules
-    terminate_pod "$id" || true
+    # A pod kept on purpose (<id>.ttl) is left to its own deadline.
+    [ -f "$STATE/$id.ttl" ] || terminate_pod "$id" || true
+    unclaim
   done
 }
 # Block until the pod reports RUNNING with a direct ssh endpoint that answers. A fresh pod
 # (created or restarted) may reuse an address a previous pod had: drop that stale host key.
-# Progress is logged every 30 s so a slow pull or a missing port mapping is visible.
+# Progress is logged every 30 s so a slow pull or a missing port mapping is visible. A pod
+# that does not answer within 3 minutes bills for nothing: exit 23, and cleanup terminates
+# it (ready=0), --ttl or not; the ledger books a run that failed before its command.
 wait_ready() {   # <pod-id> <fresh|reused>
-  local id=$1 fresh=$2 t0 deadline pod status ssh_err="" tick=0
-  t0=$(date +%s); deadline=$(( t0 + 600 ))
+  local id=$1 fresh=$2 t0 deadline pod status ssh_err="" tick=0 wait_s
+  wait_s=$(scaled 180)
+  t0=$(date +%s); deadline=$(( t0 + ${wait_s%.*} ))
   while :; do
     pod=$(get_pod "$id") || exit $?
+    # The price is known before ssh answers: a run that dies booting is still costed.
+    pod_cost=$(printf '%s' "$pod" | jq -r '.cost // empty')
     status=$(printf '%s' "$pod" | jq -r .status)
     case "$status" in
       ERROR|TERMINATED) die "pod $id went $status" 3 ;;
     esac
     if [ "$status" = RUNNING ] && set_ssh_target "$pod"; then
       if [ "$fresh" = fresh ]; then ssh-keygen -R "[$ssh_host]:$ssh_port" -f "$known_hosts" >/dev/null 2>&1; fresh=reused; fi
-      if ssh_err=$(remote root 'true' 2>&1 >/dev/null); then pod_cost=$(printf '%s' "$pod" | jq -r '.cost // empty'); return 0; fi
+      if ssh_err=$(remote root 'true' 2>&1 >/dev/null); then return 0; fi
     else
       ssh_err="no direct ssh endpoint published yet (ports 22/tcp)"
     fi
-    [ "$(date +%s)" -lt "$deadline" ] || die "pod $id not reachable over ssh after 10 min (status $status; last: ${ssh_err:-?})" 3
+    [ "$(date +%s)" -lt "$deadline" ] ||
+      die "pod $id not reachable over ssh within 3 min (status $status; last: ${ssh_err:-?}); terminating it" 23
     tick=$(( tick + 1 ))
     [ $(( tick % 6 )) -eq 0 ] && log "still waiting ($(( $(date +%s) - t0 ))s): status $status, ${ssh_err:-ssh refused}"
-    sleep 5
+    sleep "$(scaled 5)"
   done
 }
 # The requested shape, as the API reports it back on a pod: "cpu <flavor> <n>" / "gpu <id>".
@@ -391,41 +659,180 @@ wanted_shape() {
 pod_shape() {   # <pod-json>
   printf '%s' "$1" | jq -r 'if .gpu then "gpu \(.gpu.id)" else "cpu \(.cpu.id) \(.cpu.vcpuCount)" end'
 }
-# Find (and start) or create the pod for this repo; prints "<id> fresh|reused".
-ensure_pod() {
-  local existing id status price shape
-  existing=$(list_pods | jq -c --arg n "$pod_name" 'select(.name==$n)' | head -1) || exit $?
-  if [ -n "$existing" ]; then
-    id=$(printf '%s' "$existing" | jq -r .id)
-    status=$(printf '%s' "$existing" | jq -r .status)
-    shape=$(pod_shape "$existing")
-    if [ "$shape" != "$(wanted_shape)" ]; then
-      # A --gpu job must not land on last run's CPU pod (and vice versa): replace it.
-      log "pod $id ($pod_name) is a '$shape' pod, this run wants '$(wanted_shape)'; terminating it and creating a fresh one"
-      cancel_ttl_timer "$id"; terminate_pod "$id" || die "pod $id is still there; not creating a second $pod_name next to it" 3
-    else
-      case "$status" in
-        RUNNING|STARTING|PROVISIONING)
-          log "reusing pod $id ($pod_name, $status, \$$(printf '%s' "$existing" | jq -r .cost)/h)"
-          printf '%s reused' "$id"; return 0 ;;
-        EXITED)
-          log "starting stopped pod $id ($pod_name)"; pod_action "$id" start || exit $?
-          printf '%s fresh' "$id"; return 0 ;;
-        *) log "pod $id ($pod_name) is $status; terminating it and creating a fresh one"; terminate_pod "$id" || die "pod $id is still there; not creating a second $pod_name next to it" 3 ;;
-      esac
+# --- daily budget (R3) ----------------------------------------------------------------------
+# budget_check <new pod $/h, may be empty>: every pod on the account (JSON lines) on stdin;
+# prints the budget line; exit 21 when billed today + (live pods' + this pod's $/h) x
+# --timeout reaches the owner's daily cap, or when billing/price cannot be read. The owner's
+# budget files and the billing cache are the ACCOUNT's (passwd home, see account_home),
+# never under $HOME or $XDG_CONFIG_HOME: an agent can set those, and the cap must not move.
+budget_check() {
+  RUNPOD_API_KEY=$api_key policy budget --api="$API" --state="$ACCOUNT_STATE" --price="$1" \
+    --timeout-s="$timeout_s" --live-json=/dev/stdin --config-dir="$account_home/.config/runpod-run"
+}
+# budget_pods <id of a pod this run replaces, or empty>: every pod on the account but that
+# one (it is terminated before the create), as JSON lines.
+budget_pods() { all_pods | jq -c --arg x "$1" 'select(.id != $x)'; }
+# budget_gate <new pod $/h> <id of a pod this run replaces, or empty>: runs inside
+# ensure_pod's subshell, so a refusal tells the parent on stdout ("budget") rather than
+# through a variable, and exits 21. On "ok" it returns HOLDING the machine-wide budget lock
+# (fd 7, in the account state, so no RUNPOD_RUN_STATE skips it): two runs must not both pass
+# on the same snapshot, so the caller keeps it until its start/create is done and listed
+# (release_budget_lock).
+budget_gate() {
+  local code=0 pods
+  exec 7>"$ACCOUNT_STATE/budget.lock"
+  flock -w 300 7 || die "another runpod-run held the budget lock for 5 min; not starting a pod unchecked" 3
+  # Listed under the lock, so a pod another run just started or created counts.
+  pods=$(budget_pods "$2") || exit $?
+  budget_check "$1" <<<"$pods" >&2 || code=$?
+  case "$code" in
+    0) ;;
+    21) printf 'budget'; exit 21 ;;
+    *) die "policy helper failed (exit $code): $policy_helper" ;;
+  esac
+}
+# release_budget_lock <pod id>: the next run's check must count the pod this run just started
+# or created, so the lock stays held until GET /pods lists it as live (10 looks 2 s apart;
+# past that the pod is left to the API and the lock goes anyway).
+release_budget_lock() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    all_pods 2>/dev/null | jq -e --arg id "$1" 'select(.id == $id and .status != "EXITED" and .status != "TERMINATED")' \
+      >/dev/null && break
+    [ "$i" -lt 10 ] && sleep 2
+  done
+  exec 7>&-
+}
+# pod_plan: what ensure_pod does with this repo's pod, decided without doing anything. Sets
+# plan_pod (the pod's JSON, empty when there is none), plan_id, and plan_action: reuse (same
+# shape, RUNNING/STARTING/PROVISIONING), start (same shape, EXITED), replace (another shape,
+# or a state no run can use) or create.
+pod_plan() {
+  plan_pod=$(list_pods | jq -c --arg n "$pod_name" 'select(.name==$n)' | head -1) || exit $?
+  plan_id="" plan_action=create
+  [ -n "$plan_pod" ] || return 0
+  plan_id=$(printf '%s' "$plan_pod" | jq -r .id)
+  # A --gpu job must not land on last run's CPU pod (and vice versa).
+  if [ "$(pod_shape "$plan_pod")" != "$(wanted_shape)" ]; then plan_action=replace; return 0; fi
+  case "$(printf '%s' "$plan_pod" | jq -r .status)" in
+    RUNNING|STARTING|PROVISIONING) plan_action=reuse ;;
+    EXITED) plan_action=start ;;
+    *) plan_action=replace ;;
+  esac
+}
+# plan_price <catalog $/h, may be empty>: what the budget charges for the pod this run
+# starts or creates; a stopped pod's own listed $/h when the catalog cannot be read.
+plan_price() {
+  if [ -z "$1" ] && [ "$plan_action" = start ]; then printf '%s' "$plan_pod" | jq -r '.cost // empty'; else printf '%s' "$1"; fi
+}
+# create_pod: POST /pods, the new pod's id on stdout. Runpod answers 400 "no longer any
+# instances" / "no instances available" when the flavor has no free machine right now: the
+# SAME request is retried up to 3 times, 15/30/60 s apart. Another flavor is never tried,
+# since that would change what the run pays for. Any other failure ends the run with the
+# API's message (exit 3; 2 for a rejected key). The caller keeps the budget lock across the
+# retries: the check admitted this one create, and nothing else is re-checked for it.
+create_pod() {
+  local body out code attempt=0 delays=(15 30 60)
+  body=$(create_body)
+  while :; do
+    code=0
+    out=$(api POST /pods "$body" 2>&1) || code=$?
+    [ "$code" -ne 0 ] || { printf '%s' "$out" | jq -r .id; return 0; }
+    case "${out,,}" in
+      *"failed (400)"*"no longer any instances"* | *"failed (400)"*"no instances available"*) ;;
+      *) printf '%s\n' "$out" >&2; exit "$code" ;;
+    esac
+    if [ "$attempt" -eq 3 ]; then
+      printf '%s\n' "$out" >&2
+      die "no capacity for $(flavor_name) after 3 retries; no other flavor is tried (pick another --cpu/--gpu, or run later)" 3
     fi
+    log "no capacity for $(flavor_name); retry $(( attempt + 1 ))/3 in ${delays[attempt]}s (same flavor)"
+    sleep "$(scaled "${delays[attempt]}")"
+    attempt=$(( attempt + 1 ))
+  done
+}
+# Find (and start) or create the pod for this repo; prints "<id> fresh|reused", or "budget"
+# (exit 21) when the daily budget refuses the start or create.
+ensure_pod() {
+  local id status price replace=""
+  pod_plan
+  status=$(printf '%s' "$plan_pod" | jq -r '.status // empty')
+  case "$plan_action" in
+    reuse)
+      # Already billing: a reuse is no start or create, so the budget does not gate it.
+      log "reusing pod $plan_id ($pod_name, $status, \$$(printf '%s' "$plan_pod" | jq -r .cost)/h)"
+      printf '%s reused' "$plan_id"; return 0 ;;
+    replace)
+      log "pod $plan_id ($pod_name) is a $status '$(pod_shape "$plan_pod")' pod, this run wants '$(wanted_shape)'; replacing it with a fresh one"
+      replace=$plan_id ;;
+  esac
+  price=$(plan_price "$(price_per_hour)")
+  # The one gate before anything that starts billing (a start or a create). It comes before
+  # the replaced pod is terminated, so a refused run leaves that pod as it was.
+  budget_gate "$price" "$replace"
+  if [ -n "$replace" ]; then
+    cancel_ttl_timer "$replace"
+    terminate_pod "$replace" || die "pod $replace is still there; not creating a second $pod_name next to it" 3
   fi
-  price=$(price_per_hour)
+  if [ "$plan_action" = start ]; then
+    log "starting stopped pod $plan_id ($pod_name)"; pod_action "$plan_id" start || exit $?
+    release_budget_lock "$plan_id"
+    printf '%s fresh' "$plan_id"; return 0
+  fi
   log "creating pod $pod_name: $(describe_compute), image $image, ${disk} GB disk — \$${price:-?}/h (secure cloud), billed per second until terminated"
   # The create runs in a subshell, so the parent learns the id only from our stdout. A
   # marker survives a Ctrl-C or a dropped response in that window: cleanup then resolves
   # the pod by its deterministic name and terminates it instead of leaking it.
   printf '%s\n' "$pod_name" >"$STATE/creating.$$" || die "cannot write $STATE (full? read-only?): refusing to create a pod the cleanup could not track" 3
-  id=$(api POST /pods "$(create_body)" | jq -r .id) || exit $?
+  id=$(create_pod) || exit $?
   [ -n "$id" ] && [ "$id" != null ] || die "create returned no pod id" 3
   log "pod $id created"
+  release_budget_lock "$id"
   printf '%s fresh' "$id"
 }
+
+# --- pod slots (R2) -------------------------------------------------------------------------
+# At most 3 runpod-run pods are live on this host. The helper keeps the rules (the markers
+# $ACCOUNT_STATE/slots/<pod name> naming their holder's pid, the FIFO queue, a kept pod's
+# slot passing to its --ttl timer and back); this script says when.
+#
+# acquire_slot: one of the host's pod slots for this run's pod, or a FIFO wait for one; exit
+# 22 (booked as queue-timeout) after --queue-timeout minutes. A pod this repo kept under --ttl
+# holds its slot already: the run takes that slot over and uses no new one. Called holding
+# only this pod's lock, never another pod's nor the budget lock. The helper runs in the
+# background because bash runs a trap only once a foreground child returns, and a queued run
+# must end at once on a signal; a helper left behind gives up at its next poll (this pid gone)
+# and, with 9>&-, never holds this pod's lock meanwhile.
+acquire_slot() {
+  local code=0
+  policy slots acquire --state="$ACCOUNT_STATE" --name="$pod_name" --pid="$$" --timeout-min="$queue_timeout" 9>&- &
+  wait "$!" || code=$?
+  case "$code" in
+    0) ;;
+    22) ledger_event=queue-timeout; exit 22 ;;
+    *) die "policy helper failed (exit $code): $policy_helper" ;;
+  esac
+}
+# slot_update handover|release <pod name> <pid>: the slot passes to <pid> (the --ttl timer that
+# keeps the pod), or <pid> gives it up. Never fatal: cleanup and --stop call it.
+slot_update() {
+  policy slots "$1" --state="$ACCOUNT_STATE" --name="$2" --pid="$3" || log "could not $1 the pod slot of $2 in $ACCOUNT_STATE/slots"
+}
+
+# --- report --------------------------------------------------------------------------------
+# The helper reads the day's billed $ itself (GET /billing, today's figure cached), and only
+# when a key is present: without one, no network call and "billed: unknown". The ledger is
+# the account's; a day without ledger lines falls back to the run logs, which stay in
+# $STATE/runs.
+if [ "$mode" = report ]; then
+  [ -n "$report_day" ] || report_day=$(date +%F)
+  { [[ "$report_day" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && date -d "$report_day" >/dev/null 2>&1; } ||
+    die "--day wants a date as YYYY-MM-DD, not '$report_day'"
+  api_arg=()
+  [ -n "$api_key" ] && api_arg=(--api="$API")
+  RUNPOD_API_KEY=$api_key policy report --state="$ACCOUNT_STATE" --runs="$STATE/runs" --day="$report_day" "${api_arg[@]}"
+  exit $?
+fi
 
 # --- status / stop -----------------------------------------------------------------------
 if [ "$mode" = status ]; then
@@ -466,6 +873,8 @@ if [ "$mode" = status ]; then
   printf 'account total: $%s/h across %s pod(s)\n' \
     "$(printf '%s\n' "$all" | jq -s '[.[] | select(.status != "EXITED") | .cost] | add // 0 | (. * 100 | round) / 100')" \
     "$(printf '%s\n' "$all" | jq -s 'length')"
+  echo
+  policy slots list --state="$ACCOUNT_STATE"
   exit 0
 fi
 if [ "$mode" = stop ]; then
@@ -493,8 +902,19 @@ if [ "$mode" = stop ]; then
       log "pod $id ($name) is in use by a runpod-run on this machine; not stopping it (it re-arms its own --ttl)"
       exec 8>&-; continue
     fi
+    # The pod's slot holder: its --ttl timer, cancelled right below, or this very --stop when
+    # the timer fired it. Named now so the release never depends on how fast the kill lands.
+    holder=$(ttl_timer_pid "$id") || holder=$$
+    # The timer is `sleep N && exec runpod-run --stop <id>`: <id>.ttl names this very process.
+    read -r timer_pid _ < <(ttl_fields "$id") && [ "$timer_pid" = "$$" ] &&
+      log "pod $id reached its --ttl deadline; terminating it"
     cancel_ttl_timer "$id"
-    terminate_pod "$id"
+    # Read before terminate_pod removes it: the run that kept this pod noted when it ended.
+    lastrun=$(cat "$STATE/$id.lastrun" 2>/dev/null)
+    if terminate_pod "$id"; then
+      ledger_terminate "$id" "$name" "$(printf '%s\n' "$mine" | jq -r --arg id "$id" 'select(.id==$id) | .cost // empty')" "$lastrun"
+      slot_update release "$name" "$holder"   # the pod no longer counts as live
+    fi
     exec 8>&-
   done
   exit 0
@@ -539,18 +959,22 @@ fi
 # PREP (root, every run): the unprivileged `runner` user that owns the synced tree and runs
 # the command — as root, permission tests (chmod 000 -> EACCES) cannot fail the way they
 # must, and a stray `rm -rf` cannot take the pod with it. root's authorized_keys (the account
-# keys Runpod injected at boot) are copied so rsync/ssh can log in as runner directly.
+# keys Runpod injected at boot) are copied so rsync/ssh can log in as runner directly. Args:
+# the user, then every remote dir a --sync-dir lands in.
 PREP_SCRIPT='
 set -euo pipefail
-dir=$1 user=$2
+user=$1
+shift
 if [ "$user" != root ]; then
   id -u "$user" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "$user"
   install -d -o "$user" -g "$user" -m 700 "/home/$user/.ssh"
   install -o "$user" -g "$user" -m 600 /root/.ssh/authorized_keys "/home/$user/.ssh/authorized_keys"
 fi
-mkdir -p "$dir"
-# A workspace left root-owned by a --root run is handed over whole when the user changes.
-[ "$(stat -c %U "$dir")" = "$user" ] || chown -R "$user:$user" "$dir"
+for dir in "$@"; do
+  mkdir -p "$dir"
+  # A workspace left root-owned by a --root run is handed over whole when the user changes.
+  [ "$(stat -c %U "$dir")" = "$user" ] || chown -R "$user:$user" "$dir"
+done
 # The sync that follows needs rsync on this end and the snapshot needs git; a slim --image
 # may ship neither, and the toolchain bootstrap only runs after the sync.
 if ! command -v rsync >/dev/null || ! command -v git >/dev/null; then
@@ -639,30 +1063,99 @@ done
 '
 
 # RUN (as the run user): the command in the tree, under `timeout`, with the toolchains and
-# the tree's own bin dirs on PATH.
+# the tree's own bin dirs on PATH, and every synced dir in RUNPOD_RUN_SYNC_DIRS. Args: the
+# primary's remote dir, the `:`-joined remote dirs, then the timeout and the command.
 RUN_SCRIPT='
 cd "$1" || exit 3
-shift
+export RUNPOD_RUN_SYNC_DIRS=$2
+shift 2
 export PATH=/opt/bun/bin:/opt/node/bin:/opt/uv:$PWD/node_modules/.bin:$PWD/.venv/bin:$HOME/.local/bin:$PATH
 export LANG=C.UTF-8 LC_ALL=C.UTF-8 CI=${CI:-1} RUNPOD_RUN=1
 exec timeout --foreground -k 30 "$@"
 '
 
+# --- dedup (R7): an identical run of the last 24 h is replayed, not re-run ----------------
+# After the policy refusals, before any slot, budget check or API call, and once more under
+# the per-pod lock (a run that waited there for an identical one replays its result). The key
+# covers every synced dir's files, the command and the run's shape: the compute shape plus
+# what else changes what the command sees (remote dirs, image, user, timeout, bootstrap).
+# --rerun skips the lookup, but its result is still stored for the next identical run. A key
+# that cannot be computed only disables the cache.
+dedup_key="" dedup_hit=""
+dedup_lookup() {
+  [ -n "$dedup_key" ] && [ "$rerun" -eq 0 ] || return 0
+  dedup_hit=$(policy dedup-lookup --state="$ACCOUNT_STATE" --repo-tag="$repo_tag" --key="$dedup_key")
+}
+dedup_replay() {
+  [ -n "$dedup_hit" ] || return 0
+  local n ts file
+  read -r n ts file < <(jq -r '"\(.exit) \(.ts) \(.log)"' <<<"$dedup_hit")
+  if [ -f "$file" ]; then tail -n 40 "$file"; else log "(its log $file is gone)"; fi
+  log "identical to the run at $ts (exit $n); no pod started — pass --rerun to run again"
+  ledger_event=dedup
+  exit "$n"
+}
+if [ "$mode" = run ]; then
+  dedup_dirs=()
+  for d in "${sync_dirs[@]}"; do dedup_dirs+=("--dir=$d"); done
+  run_shape=$(printf '%s|dirs=%s|image=%s|disk=%s|root=%s|tty=%s|timeout=%s|plan=%s|apt=%s|bootstrap=%s' \
+    "$(wanted_shape)" "$sync_dirs_env" "$image" "$disk" "$as_root" "$tty" "$timeout_s" "${plan[*]}" "$apt_pkgs" \
+    "$bootstrap_cmd")
+  dedup_key_of_tree() {
+    policy dedup-key --shape="$run_shape" --cmd="${cmd_quoted% }" "${dedup_dirs[@]}"
+  }
+  if ! dedup_key=$(dedup_key_of_tree); then
+    log "could not compute the dedup key; this run neither replays nor records a result"
+    dedup_key=""
+  fi
+  dedup_lookup
+fi
+[ "$dry_run" -eq 1 ] || dedup_replay
+
 # --- plan / dry-run ------------------------------------------------------------------------
-cmd_quoted=$(printf '%q ' "$@")
 if [ "$dry_run" -eq 1 ]; then
   price=""
-  [ -n "$api_key" ] && price=$(price_per_hour)
+  budget_plan="not read (no API key); a run checks it before a start or create"
+  if [ -n "$api_key" ]; then
+    price=$(price_per_hour)
+    # Read-only: the same decision and figures a run's start/create would face (a reuse is
+    # not checked; a replaced pod does not count). Every `exit` here leaves only this
+    # command substitution, never the dry run.
+    budget_plan=$(
+      pod_plan 2>/dev/null
+      [ "$plan_action" != reuse ] || { echo "not checked: this run reuses running pod $plan_id"; exit 0; }
+      replace=""
+      [ "$plan_action" != replace ] || replace=$plan_id
+      pods=$(budget_pods "$replace" 2>/dev/null) || { echo "unverifiable (the pod list could not be read) → REFUSE"; exit 0; }
+      budget_check "$(plan_price "$price")" <<<"$pods" 2>/dev/null)
+    budget_plan=${budget_plan#budget: }
+    budget_plan=${budget_plan:-unverifiable (the pod list or the policy helper failed) → REFUSE}
+  fi
+  # Local state only (no key, no lock): the host's live pod slots and what this run would do.
+  slots_plan=$(policy slots list --state="$ACCOUNT_STATE" --name="$pod_name" 2>/dev/null | head -1)
+  if [ -n "$dedup_hit" ]; then
+    dedup_plan=$(jq -r '"hit (would replay exit \(.exit) from \(.ts))"' <<<"$dedup_hit")
+  elif [ "$rerun" -eq 1 ]; then dedup_plan="skipped (--rerun)"
+  elif [ -n "$dedup_key" ]; then dedup_plan=miss
+  else dedup_plan="unknown (the dedup key could not be computed)"
+  fi
+  slots_plan=${slots_plan#slots: }
+  case "$slots_plan" in *"→ queue"*) slots_plan+="; exit 22 after $queue_timeout min" ;; esac
+  sync_pairs=""
+  for i in "${!sync_dirs[@]}"; do sync_pairs+=$'\n'"              ${sync_dirs[i]} -> ${remote_dirs[i]}"; done
   cat <<EOF
 runpod-run plan (dry run — nothing created)
   checkout:   $sync_dir  (repo "$repo", $(git -C "$sync_dir" rev-parse --abbrev-ref HEAD 2>/dev/null) @ $(git -C "$sync_dir" rev-parse --short HEAD 2>/dev/null))
   pod:        $pod_name  (reuse if RUNNING, start if EXITED, else create)
   compute:    $(describe_compute), image $image, ${disk} GB disk, secure cloud
   price:      \$${price:-? (no API key / offline)}/h — billed per second while the pod exists
-  sync:       rsync tracked + untracked-not-ignored files -> $( [ "$as_root" -eq 1 ] && echo root || echo runner )@<pod>:$remote_dir (excludes .git node_modules .venv), then a git snapshot there
+  sync:       rsync as $( [ "$as_root" -eq 1 ] && echo root || echo runner ), tracked + untracked-not-ignored files of each (excludes .git node_modules .venv), then a git snapshot of the first:$sync_pairs
   bootstrap:  ${plan[*]:-none}
-  command:    cd $remote_dir && timeout ${timeout_s}s $cmd_quoted
+  command:    cd $remote_dir && RUNPOD_RUN_SYNC_DIRS=$sync_dirs_env timeout ${timeout_s}s $cmd_quoted
   afterwards: $( if [ "$ttl" -gt 0 ]; then echo "keep pod; terminate after $ttl idle minutes"; else echo "terminate pod"; fi )
+  slots:      ${slots_plan:-unreadable (the policy helper failed)}
+  dedup:      $dedup_plan
+  budget:     $budget_plan
   auth:       $( [ -n "$api_key" ] && echo "API key found" || echo "NO API KEY (set RUNPOD_API_KEY)" ); ssh key ${ssh_key:-<none: run runpodctl doctor>}
 EOF
   exit 0
@@ -681,10 +1174,37 @@ if ! flock -n 9; then
   log "another runpod-run is using $pod_name; waiting for it to finish…"
   flock 9
 fi
-pod_id=""
-pod_cost=""
 finished=0
 ready=0
+# A --ttl timer that fires while this run holds the pod lock skips the kept pod and trusts
+# this run to re-arm it. A run that ends before taking the pod over (budget refusal, queue
+# timeout, Ctrl-C) must do so: a timer for what is left of the deadline, or the terminate the
+# timer would have done once the deadline has passed.
+# shellcheck disable=SC2329  # invoked by cleanup, from the EXIT trap
+rearm_skipped_kept_pod() {
+  local f id deadline now lastrun mine
+  now=$(date +%s)
+  for f in "$STATE"/*.lastrun; do
+    [ -f "$f" ] && [ "$(jq -r '.pod_name // empty' "$f" 2>/dev/null)" = "$pod_name" ] || continue
+    id=$(basename "$f" .lastrun)
+    read -r _ deadline < <(ttl_fields "$id") || continue
+    ttl_timer_pid "$id" >/dev/null && continue
+    if [ "$deadline" -gt "$now" ]; then
+      log "pod $id's --ttl timer fired while this run held it; re-arming it for the $(( deadline - now ))s left"
+      arm_ttl_timer "$id" "$pod_name" $(( deadline - now ))
+    elif ! mine=$(list_pods 2>/dev/null); then
+      # The API cannot say whether the pod is ours: its state stays for the next reaper.
+      log "pod $id passed its --ttl deadline, but the pod list is unreadable; the next runpod-run reaps it"
+    elif jq -e --arg id "$id" 'select(.id==$id)' >/dev/null <<<"$mine"; then
+      # Only a pod this machine's runpod-run created, as the reaper checks: never on a state file's word.
+      log "pod $id passed its --ttl deadline while this run held it; terminating it"
+      lastrun=$(cat "$f" 2>/dev/null)
+      terminate_pod "$id" && ledger_terminate "$id" "$pod_name" "" "$lastrun"
+    else
+      rm -f "$STATE/$id.ttl" "$f"
+    fi
+  done
+}
 # shellcheck disable=SC2329  # invoked by the EXIT trap
 cleanup() {
   [ "$finished" -eq 1 ] && return
@@ -695,63 +1215,134 @@ cleanup() {
     [ -n "$pod_id" ] && log "pod $pod_id was created before the run was cut short; terminating it"
   fi
   rm -f "$STATE/running.$$"
-  [ -n "$pod_id" ] || return
+  # No pod (refused, timed out queueing, failed before one): the slot goes — back to the --ttl
+  # timer when this run took over a kept pod's slot and never reached that pod. A re-armed
+  # timer takes the slot over first, so it is never free in between for another pod.
+  [ -n "$pod_id" ] || { rearm_skipped_kept_pod; slot_update release "$pod_name" "$$"; return; }
   # A pod that never answered ssh is useless to the next run too: it goes, --ttl or not.
   if [ "$ttl" -eq 0 ] || [ "$ready" -eq 0 ]; then
-    terminate_pod "$pod_id"
+    if terminate_pod "$pod_id"; then
+      slot_update release "$pod_name" "$$"
+    else
+      # Still billing, and no process of this run outlives it to hold the slot: running.<pid>
+      # does, so the next runpod-run on this host reaps the pod before it takes a slot.
+      printf '%s\n' "$pod_id" >"$STATE/running.$$"
+    fi
   else
     cancel_ttl_timer "$pod_id"
-    # 9>&-: the timer must not inherit (and hold) this run's per-pod lock.
-    # Absolute script path: the timer must still find this script after a relative-path
-    # caller's cwd (or worktree) is gone — otherwise the pod outlives its deadline.
-    nohup bash -c "sleep $(( ttl * 60 )) && exec $(printf '%q' "$(readlink -f "$0")") --stop $(printf '%q' "$pod_id")" >>"$STATE/ttl.log" 2>&1 </dev/null 9>&- &
-    echo "$! $(( $(date +%s) + ttl * 60 ))" >"$STATE/$pod_id.ttl"
+    # When the pod went idle and at what price: the next run that reuses it, or the --stop
+    # that ends it, books the idle time to the ledger.
+    jq -cn --argjson ended "$EPOCHSECONDS" --arg usd "$pod_cost" --arg repo "$repo" --arg repo_tag "$repo_tag" \
+      --arg pod_name "$pod_name" --arg flavor "$(flavor_name)" \
+      '{ended: $ended, usd_per_h: ($usd | tonumber? // null), repo: $repo, repo_tag: $repo_tag,
+        pod_name: $pod_name, flavor: $flavor}' >"$STATE/$pod_id.lastrun"
+    arm_ttl_timer "$pod_id" "$pod_name" $(( ttl * 60 ))
     log "pod $pod_id kept at \$${pod_cost:-?}/h; terminates in $ttl min unless a new run refreshes it (runpod-run --stop $pod_id to end it now)"
   fi
 }
-trap cleanup EXIT
+# The ledger line first: it is quick, and a second Ctrl-C during a slow terminate must not
+# lose it. `$?` here is the exit status the script is leaving with.
+trap 'ledger_run "$?"; cleanup' EXIT
 trap 'echo; log "interrupted"; exit 130' INT TERM HUP
 
-start=$(date +%s)
+# The checkout may have changed during the lock wait: look up the tree as it is now. Under the
+# cleanup trap: a kept pod's timer that skipped it while this run held the lock is re-armed
+# even when the run ends here with a replay.
+if [ -n "$dedup_key" ] && ! dedup_key=$(dedup_key_of_tree); then
+  log "could not recompute the dedup key after the lock wait; this run neither replays nor records a result"
+  dedup_key=""
+fi
+dedup_hit=""
+dedup_lookup
+dedup_replay
+
+# The slot comes before ensure_pod, which runs the budget check: a run that queued sees the
+# spend as of the moment it may start a pod, and the wait is not counted as boot time. The
+# reaper runs once the slot is held: a slot that freed because its run was killed may still
+# have that run's pod billing, and it must be gone before this run starts or creates one.
+acquire_slot
 reap_leftovers
-ensured=$(ensure_pod) || exit $?
+t_boot=$EPOCHSECONDS
+start=$t_boot
+# "budget" on stdout is ensure_pod's explicit word for a budget refusal (exit 21); an exit
+# code alone could not tell it from anything else.
+ensured=$(ensure_pod) || { code=$?; [ "$ensured" = budget ] && ledger_event=budget; exit "$code"; }
 pod_id=${ensured%% *}
 rm -f "$STATE/creating.$$"
 printf '%s\n' "$pod_id" >"$STATE/running.$$"
+# A reused pod that sat idle under --ttl since its last run: that idle time is this run's to book.
+if [ "${ensured##* }" = reused ] && [ -f "$STATE/$pod_id.lastrun" ]; then
+  idle_s=$(jq -r --argjson t "$t_boot" 'if (.ended | type) == "number" and .ended < $t then $t - .ended else 0 end' \
+    "$STATE/$pod_id.lastrun" 2>/dev/null)
+fi
+rm -f "$STATE/$pod_id.lastrun"
 cancel_ttl_timer "$pod_id"
 log "waiting for pod $pod_id to answer ssh…"
 wait_ready "$pod_id" "${ensured##* }"
 ready=1
 log "pod ready at $ssh_host:$ssh_port ($(( $(date +%s) - start ))s)"
+# The dedup key from launch time may predate a long queue or lock wait: the result belongs to
+# the tree synced now, so it is stored under that tree's key, never the stale one.
+if [ -n "$dedup_key" ]; then
+  launch_key=$dedup_key
+  if ! dedup_key=$(dedup_key_of_tree); then
+    log "could not recompute the dedup key after the wait; this run records no result"
+    dedup_key=""
+  elif [ "$dedup_key" != "$launch_key" ]; then
+    log "the checkout changed while this run waited; its result is recorded for the tree synced now"
+  fi
+fi
 
+t_sync=$EPOCHSECONDS
 run_user=runner
 [ "$as_root" -eq 1 ] && run_user=root
-remote root "$PREP_SCRIPT" "$remote_dir" "$run_user" || die "could not prepare $remote_dir for $run_user on the pod" 3
+remote root "$PREP_SCRIPT" "$run_user" "${remote_dirs[@]}" || die "could not prepare ${remote_dirs[*]} for $run_user on the pod" 3
 
 # Tracked + untracked-but-not-ignored files: what is on disk in this checkout, uncommitted
 # work included. git itself lists what is ignored (every .gitignore, .git/info/exclude and
 # the global ignore file), so the exclude list matches what `git status` would hide;
 # node_modules/.venv stay excluded even when a repo forgot to ignore them. --delete mirrors
 # removals on a reused pod; excluded paths on the pod (its .git snapshot, node_modules,
-# .venv) survive.
-log "syncing $sync_dir -> $run_user@pod:$remote_dir"
+# .venv) survive. Every --sync-dir goes the same way (a dir outside git: only the fixed
+# excludes), each to its own remote dir, and a further git checkout gets its git snapshot
+# right after its sync (the primary's comes with its dependency install below).
 # rsync re-splits -e as a shell-style string; these two paths are the only tokens that could
 # carry a quote or a space, and refusing them beats rebuilding a shell quoter here.
 case "$known_hosts$ssh_key" in *\'*|*[[:space:]]*) die "ssh key / state paths must not contain quotes or whitespace (RUNPOD_RUN_STATE, RUNPOD_RUN_SSH_KEY): '$known_hosts' '$ssh_key'" ;; esac
 rsync_rsh=ssh
 for opt in "${ssh_opts[@]}"; do rsync_rsh+=" '$opt'"; done
 excludes=$(mktemp)
-# Ignored paths: untracked-ignored AND tracked files that match an ignore rule (a force-added
-# .env is tracked, yet "everything git ignores stays local" has to hold for it too).
-{ printf '.git\0node_modules\0.venv\0/.worktrees\0'
-  { git -C "$sync_dir" ls-files -z --others --ignored --exclude-standard --directory
-    git -C "$sync_dir" ls-files -z --cached --ignored --exclude-standard; } |
-    sed -z 's/[][*?\\]/\\&/g; s#^#/#'; } >"$excludes"
-rsync -a --delete --from0 --exclude-from="$excludes" -e "$rsync_rsh" "$sync_dir/" "$run_user@$ssh_host:$remote_dir/"
-code=$?
+for i in "${!sync_dirs[@]}"; do
+  dir=${sync_dirs[i]} dest=${remote_dirs[i]}
+  log "syncing $dir -> $run_user@pod:$dest"
+  # Ignored paths: untracked-ignored AND tracked files that match an ignore rule (a
+  # force-added .env is tracked, yet "everything git ignores stays local" has to hold for it).
+  in_git=0
+  git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 && in_git=1
+  { printf '.git\0node_modules\0.venv\0/.worktrees\0'
+    if [ "$in_git" -eq 1 ]; then
+      { git -C "$dir" ls-files -z --others --ignored --exclude-standard --directory
+        git -C "$dir" ls-files -z --cached --ignored --exclude-standard; } |
+        sed -z 's/[][*?\\]/\\&/g; s#^#/#'
+    fi; } >"$excludes"
+  rsync -a --delete --from0 --exclude-from="$excludes" -e "$rsync_rsh" "$dir/" "$run_user@$ssh_host:$dest/"
+  code=$?
+  [ "$code" -eq 0 ] || { rm -f "$excludes"; die "rsync of $dir to $ssh_host:$ssh_port failed (exit $code)" 255; }
+  [ "$i" -gt 0 ] && [ "$in_git" -eq 1 ] || continue
+  remote "$run_user" "$DEPS_SCRIPT" "$dest"
+  code=$?
+  [ "$code" -eq 255 ] && { rm -f "$excludes"; die "ssh to $ssh_host:$ssh_port failed during the git snapshot of $dest" 255; }
+  [ "$code" -eq 0 ] || { rm -f "$excludes"; die "git snapshot of $dest failed (exit $code)" 3; }
+done
 rm -f "$excludes"
-[ "$code" -eq 0 ] || die "rsync to $ssh_host:$ssh_port failed (exit $code)" 255
+# A file that changed while rsync read the tree: the pod may have a mix of both versions, so
+# the result is recorded under neither key.
+if [ -n "$dedup_key" ] && [ "$(dedup_key_of_tree 2>/dev/null)" != "$dedup_key" ]; then
+  log "the checkout changed during the sync; this run records no dedup result"
+  dedup_key=""
+fi
 
+t_bootstrap=$EPOCHSECONDS
 log "bootstrap: ${plan[*]:-base packages only}"
 marker=$(printf '%s|%s|%s|%s|%s' "${plan[*]}" "$local_bun" "$local_node" "$apt_pkgs" "$bootstrap_cmd" | sha256sum | cut -c1-16)
 remote root "$BOOTSTRAP_SCRIPT" "$marker" "${local_bun:-latest}" "${local_node:-22}" "$apt_pkgs" "$bootstrap_cmd" "$remote_dir" "${plan[@]}"
@@ -772,13 +1363,21 @@ run_log=$STATE/runs/$(date +%Y%m%d-%H%M%S)-$repo_tag.log
 mkdir -p "$(dirname "$run_log")"
 tty_opt=()
 [ "$tty" -eq 1 ] && tty_opt=(-tt)
+t_command=$EPOCHSECONDS
 ssh "${ssh_opts[@]}" "${tty_opt[@]}" "$run_user@$ssh_host" \
-  "bash -c $(printf '%q' "$RUN_SCRIPT") runpod-run $(printf '%q' "$remote_dir") ${timeout_s}s $cmd_quoted" 2>&1 | tee "$run_log"
+  "bash -c $(printf '%q' "$RUN_SCRIPT") runpod-run $(printf '%q' "$remote_dir") $(printf '%q' "$sync_dirs_env") ${timeout_s}s $cmd_quoted" 2>&1 | tee "$run_log"
 code=${PIPESTATUS[0]}
+t_done=$EPOCHSECONDS
 elapsed=$(( $(date +%s) - start ))
 case "$code" in
   124) log "command hit the ${timeout_s}s timeout" ;;
   255) log "ssh connection to $ssh_host:$ssh_port lost" ;;
 esac
 log "exit $code after ${elapsed}s (log: $run_log)"
+# A command that ran (the helper skips exits that mean it did not) is the result the next
+# identical run within 24 h replays.
+if [ -n "$dedup_key" ]; then
+  policy dedup-store --state="$ACCOUNT_STATE" --repo-tag="$repo_tag" --key="$dedup_key" --exit="$code" --log="$run_log" ||
+    log "could not record this run in $ACCOUNT_STATE/dedup"
+fi
 exit "$code"

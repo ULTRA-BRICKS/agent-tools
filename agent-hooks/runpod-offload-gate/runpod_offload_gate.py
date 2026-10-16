@@ -894,7 +894,7 @@ def block_message(command: str, label: str, opt_in: Path) -> str:
         "shared machine to a manual reset on 2026-10-10 and 2026-10-11. Run the same command on "
         f"a pod instead — same checkout synced, output streamed back, pod deleted after:\n"
         f"  {offload}\n"
-        "(`runpod-run --dry-run -- …` prints the plan and price; `runpod-run --ttl 30 -- …` keeps "
+        "(`runpod-run --dry-run -- …` prints the plan and price; `runpod-run --ttl 10 -- …` keeps "
         "the pod warm for the next run; skill runpod-offload.) Locally, ONE test file is fine "
         "(`pytest tests/unit/test_x.py`, `bun test tests/x.test.ts`, `mypy src/mod.py`). There "
         "is NO self-service bypass. For a genuine exception, ASK the human, or request a one-time "

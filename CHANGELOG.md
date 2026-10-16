@@ -4,6 +4,19 @@
 
 ### Fixed
 
+- `runpod-offload` (`runpod-run`): a reaper pass over a marker whose pid is gone no longer
+  prints `/proc/<pid>/cmdline: No such file or directory` (agent-tools#910).
+- `runpod-offload` (`runpod-run`): failures that billed for nothing, and staging runs
+  (agent-tools#910). A pod that does not answer ssh within 3 minutes (was 10) is terminated
+  and the run exits 23. A create that Runpod answers with "no longer any instances" / "no
+  instances available" is retried up to 3 times, 15/30/60 s apart, with the same flavor, then
+  exits 3; another flavor is never tried. `--sync-dir` is repeatable: the first is the run's
+  checkout, each further one is synced the same way to `/workspace/<its repo tag>`, the plan
+  and the log print `<local> -> <remote>` for each, and the command gets them in
+  `RUNPOD_RUN_SYNC_DIRS`, so a second checkout no longer needs its own staging run. The reaper
+  never terminates a pod whose per-pod lock a live run holds, and a `--ttl` timer's own
+  `--stop` now logs `reached its --ttl deadline` (once) instead of `no timer alive (reboot?)`.
+
 - `ci/ship`: post-merge cleanup no longer deletes a PR worktree that installed agent hooks still
   execute code from (agent-tools#905). A `rig apply` run from a worktree to dogfood a hook
   writes that worktree's path into the hook descriptors; deleting the tree left
@@ -60,6 +73,48 @@
 
 ### Added
 
+- `runpod-offload` (`runpod-run`): a spend ledger and `--report` (agent-tools#910). Every
+  run-mode invocation (refusals, usage errors and Ctrl-C included; not `--dry-run`) appends one
+  JSON line to `~/.cache/runpod-run/ledger.jsonl`, written by the script itself so a caller
+  that discards stderr still leaves it: event, repo, command, pod, flavor and $/h, the boot /
+  sync / bootstrap / command / idle seconds, exit code, estimated $, `RIG_AGENT_ID`, the
+  session id, the parent command line and the `--reason`s. A `--stop` (or the reaper) that
+  terminates a pod kept by `--ttl` appends an `event: terminate` line with its idle time.
+  `runpod-run --report [--day YYYY-MM-DD]` prints a local day's billed $ (billing API, when a
+  key is present) against the ledger split into A command / B boot+sync+bootstrap / C idle /
+  D failed before the command / E failed run / G unattributed, runs per repo and per agent,
+  trivial (<30 s) commands and refusal counts; a day from before the ledger is read from the
+  run logs.
+- `runpod-offload` (`runpod-run`): a daily $ budget (agent-tools#910). Before every pod create
+  and every start of a stopped pod, today's billed $ (billing API from local midnight, cached
+  5 min) + every live pod's $/h × the run's `--timeout` + the new pod's $/h × `--timeout` must
+  stay below the owner's cap ($6 per local day; `~/.config/runpod-run/budget` `daily_usd = N`,
+  `budget-override` `YYYY-MM-DD N` for one day; `~` is the account's passwd home, so `HOME` and
+  `XDG_CONFIG_HOME` cannot move the files). Otherwise, or when billing or the price cannot
+  be read, the run exits 21 before any pod bills, books an `event: budget` ledger line and
+  tells the agent to send the owner a decision request (`tg --tag decision --title …`, in the
+  decision-request format). `--dry-run` prints the budget line;
+  `--report` now reads the billed $ through the same helper.
+- `runpod-offload` (`runpod-run`): at most 3 live pods per host, with a FIFO queue
+  (agent-tools#910). A run takes a pod slot before it reuses, starts or creates its pod (so
+  before the budget check) and holds it until the pod is terminated; a pod kept by `--ttl`
+  keeps its slot until its timer ends it, and the next run of that repo reuses it without a
+  new slot. Further runs queue, print `queued for a pod slot (position N of M; 3 live: …)`
+  when their position changes, and exit 22 after `--queue-timeout MINUTES` (default 60) with
+  an `event: queue-timeout` ledger line. A slot is a marker `~/.cache/runpod-run/slots/<pod>`
+  naming its holder's pid, so a killed run's slot frees itself; `--status` lists the slots
+  and `--dry-run` says whether the run would reuse a slot, take one or queue. The ledger, the
+  slots and their queue, the billing cache and the budget lock live in `~/.cache/runpod-run`
+  of the account's passwd home (like the budget files), so `HOME` or `RUNPOD_RUN_STATE`
+  cannot give a run fresh slots or an empty ledger; `RUNPOD_RUN_STATE` now moves only
+  known_hosts, run logs, `--ttl` timers and per-pod locks.
+- `runpod-offload` (`runpod-run`): an identical run within 24 h is replayed, not re-run
+  (agent-tools#910). Same files and contents in every `--sync-dir`, same command, same
+  settings (flavor, image, `--root`, `--timeout`, bootstrap, dirs): the run prints the
+  earlier run's last 40 log lines and exits with its code, with an `event: dedup` ledger
+  line and no API call, slot or pod. `--rerun` runs it anyway;
+  `--dry-run` prints `dedup: hit …` or `dedup: miss`. Records live in
+  `~/.cache/runpod-run/dedup/` of the account home.
 - `decision-request-discipline`: effort saved is never an option's pro (no do-nothing /
   leave-as-is options padded with "zero work"), and keep-or-close of still-needed work is
   not a decision under a "finish everything" standing goal — finish it, split if large.
@@ -186,6 +241,16 @@
   local gate are unchanged; missing or malformed evidence refuses.
 
 ### Changed
+
+- `runpod-offload` (`runpod-run`): spend policy (agent-tools#910). Before any network call,
+  `--dry-run` included, it refuses with exit 20 a no-op command (`true`, `:`, `exit 0`), a
+  single test-file invocation (`bun test x.test.ts`, `pytest tests/a.py`, `pytest -k foo`,
+  `go test -run TestX`, also via `uv run`/`python -m`/`poetry run`/`npx`/`bunx`/`pnpm exec`)
+  unless `--remote-reason` says why it needs a pod, any flavor above 4 vCPU or 16 GB and any
+  `--gpu` without `--reason`, and a `--gpu` run whose command shows no sign of CUDA. `--ttl`
+  is capped at 10 idle minutes (a larger value is clamped, with a note on stderr). The policy
+  lives in the stdlib helper `runpod_run_policy.py` next to the script (now needs `python3`);
+  exit codes 21-23 belong to the daily budget, slot queue and ssh-wait limits.
 
 - `agent-hooks/orchestrator-stays-thin`: the block/warn message is five structured lines —
   `TRIGGER` (the exact rule that fired, quoting the offending segment(s): `chain of 4 segments;

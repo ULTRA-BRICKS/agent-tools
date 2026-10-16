@@ -369,8 +369,8 @@ Heavy here: `uv run --with pytest pytest tests/` (the whole suite — 6,000+ tes
 ```bash
 runpod-run --apt nodejs -- uv run --with 'pytest>=8,<9' --with pyyaml --with jsonschema pytest tests -q
                                         # full suite on a 4-vCPU CPU pod ($0.16/h), pod deleted when done
-runpod-run --apt nodejs --ttl 30 -- uv run --with 'pytest>=8,<9' --with pyyaml --with jsonschema pytest tests -q
-                                        # same, keeping the pod 30 idle minutes between runs
+runpod-run --apt nodejs --ttl 10 -- uv run --with 'pytest>=8,<9' --with pyyaml --with jsonschema pytest tests -q
+                                        # same, keeping the pod 10 idle minutes between runs
 uv run --with pytest pytest tests/test_<one>.py -q    # local: one file, that's the limit
 ```
 
