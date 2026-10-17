@@ -27,6 +27,14 @@ MANIFEST = _REPO_ROOT / "lib" / "contracts" / "models.yaml"
 SCHEMA = _REPO_ROOT / "lib" / "contracts" / "models.schema.json"
 
 
+@pytest.fixture(autouse=True)
+def _no_real_harness_catalogs(monkeypatch):
+    """run() reads the machine's harness catalogs (omp, ~/.codex, ~/.claude, models.dev) by
+    default; keep every test hermetic unless it injects its own sources."""
+    monkeypatch.setattr(mf, "HARNESS_SOURCES", {})
+    monkeypatch.setattr(mf, "FALLBACK_SOURCES", {})
+
+
 # ── manifest load + validate (against the REAL shipped manifest) ────────────────────────
 def test_real_manifest_loads_and_validates():
     m = mf.load_manifest(MANIFEST)
@@ -45,13 +53,15 @@ def test_vision_role_resolves_to_a_vision_capable_model():
     assert "vision" in entry.capabilities
 
 
-def test_kimi_code_has_no_vision_kimi_turbo_has_vision():
-    """The two Kimi models are the canonical vision-flag example from #3681."""
+def test_vision_tags_on_real_manifest():
+    """#3681: vision only on models with real image input (models.dev modalities)."""
     m = mf.load_manifest(MANIFEST)
-    code = m.entry("moonshotai/Kimi-K2.7-Code")
+    deepseek = m.entry("deepseek/deepseek-v4-pro")
+    kimi = m.entry("moonshotai/Kimi-K3")
     turbo = m.entry("kimi-k2p6-turbo")
-    assert code is not None and turbo is not None
-    assert "vision" not in code.capabilities, "Kimi-K2.7-Code is code-only, no vision"
+    assert deepseek is not None and kimi is not None and turbo is not None
+    assert "vision" not in deepseek.capabilities, "deepseek-v4-pro is text-only, no vision"
+    assert "vision" in kimi.capabilities, "Kimi-K3 takes images"
     assert "vision" in turbo.capabilities, "kimi-k2p6-turbo has vision"
 
 
@@ -152,6 +162,14 @@ def test_load_manifest_context_bool_not_coerced_to_int(tmp_path: Path):
         ("gpt-5.4", "gpt-5.5", False),
         ("glm-5.3", "glm-5.2", True),
         ("claude-opus-4-9", "claude-opus-4-8", True),
+        # Anthropic writes minor versions with a hyphen: these are one family (#934)…
+        ("claude-fable-5-1", "claude-fable-5", True),
+        ("claude-opus-5", "claude-opus-4-8", True),
+        ("claude-opus-5-5", "claude-opus-5", True),
+        ("claude-sonnet-5", "claude-sonnet-5-5", False),
+        # …but a different VARIANT is never auto-proposed.
+        ("gpt-6.1-sol", "gpt-5.5", False),
+        ("moonshotai/Kimi-K3", "moonshotai/Kimi-K2.7-Code", False),
         # different family is never "newer" — guards against cross-family proposals
         ("gemini-3.0", "gpt-5.5", False),
         ("claude-fable-6", "claude-opus-4-8", False),
@@ -166,6 +184,9 @@ def test_load_manifest_context_bool_not_coerced_to_int(tmp_path: Path):
         ("gpt-5.5-preview", "gpt-5.5", False),
         # …and an OLDER dated snapshot is never newer.
         ("claude-opus-4-7-20260201", "claude-opus-4-8", False),
+        # a 5-6 digit snapshot must not extend a hyphen-joined version past its pin
+        ("claude-opus-4-8-250902", "claude-opus-4-8", False),
+        ("claude-opus-4-9-250902", "claude-opus-4-8", True),
         # kimi-code k3: a next-major IS a bump…
         ("k4", "k3", True),
         # …but k3-256k is a CONTEXT VARIANT of the same generation (`-256k` is not a
@@ -193,8 +214,8 @@ def test_model_family_strips_version():
     assert mf.model_family("gpt-5.5") != mf.model_family("gemini-2.5-flash")
     # a dated snapshot shares the family of its bare pin (the whole point)
     assert mf.model_family("claude-opus-4-8-20260101") == mf.model_family("claude-opus-4-9")
-    # a different segment count is a DIFFERENT family (next-major not auto-proposed)
-    assert mf.model_family("claude-opus-4-8") != mf.model_family("claude-opus-5")
+    # a hyphen-joined version is ONE run: Opus 4.8 and Opus 5 share a family (#934)
+    assert mf.model_family("claude-opus-4-8") == mf.model_family("claude-opus-5")
 
 
 def test_compute_proposals_picks_newest_dated_snapshot(tmp_path: Path):
@@ -863,3 +884,544 @@ def _load_factory(path: Path):
 
 # Capture the genuine parser once, before any test monkeypatches mf.load_manifest.
 _REAL_LOAD_MANIFEST = mf.load_manifest
+
+
+# ── keyless harness catalogs (#934) ─────────────────────────────────────────────────────
+def test_omp_catalog_groups_by_provider(monkeypatch):
+    import subprocess as _sp
+
+    payload = {"models": [
+        {"provider": "anthropic", "id": "claude-opus-5-5"},
+        {"provider": "anthropic", "id": "claude-opus-5-5"},  # duplicate collapses
+        {"provider": "openai-codex", "id": "gpt-6.1-sol"},  # mapped onto the manifest name
+        {"provider": "anthropic"},  # malformed rows are skipped
+    ]}
+
+    def fake_run(cmd, **kwargs):
+        assert cmd == ["omp", "models", "--json"]
+        return _sp.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(mf.subprocess, "run", fake_run)
+    assert mf._omp_catalog(5) == {"anthropic": ["claude-opus-5-5"], "openai": ["gpt-6.1-sol"]}
+
+
+@pytest.mark.parametrize(
+    "behaviour,reason",
+    [("missing", "not installed"), ("exit", "exited 1"), ("garbage", "invalid JSON")],
+)
+def test_omp_catalog_unavailable(monkeypatch, behaviour, reason):
+    import subprocess as _sp
+
+    def fake_run(cmd, **kwargs):
+        if behaviour == "missing":
+            raise FileNotFoundError("omp")
+        if behaviour == "exit":
+            return _sp.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+        return _sp.CompletedProcess(cmd, 0, stdout="not json", stderr="")
+
+    monkeypatch.setattr(mf.subprocess, "run", fake_run)
+    with pytest.raises(mf.CatalogUnavailable, match=reason):
+        mf._omp_catalog(5)
+
+
+def test_codex_catalog_reads_models_cache(tmp_path: Path, monkeypatch):
+    (tmp_path / "models_cache.json").write_text(json.dumps({"models": [
+        {"slug": "gpt-6.1-sol", "priority": 1}, {"slug": "gpt-6-luna"}, {"display_name": "no slug"},
+    ]}))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    assert mf._codex_catalog(5) == {"openai": ["gpt-6.1-sol", "gpt-6-luna"]}
+
+
+def test_codex_catalog_missing_file_is_unavailable(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    with pytest.raises(mf.CatalogUnavailable, match="not found"):
+        mf._codex_catalog(5)
+
+
+def test_codex_catalog_older_than_a_week_is_unavailable(tmp_path: Path, monkeypatch):
+    """An old cache must not stand in for the account's current list (review finding):
+    the provider then falls through to models.dev."""
+    (tmp_path / "models_cache.json").write_text(json.dumps({
+        "fetched_at": "2026-01-02T03:04:05.123456789Z", "models": [{"slug": "gpt-6-sol"}],
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    with pytest.raises(mf.CatalogUnavailable, match="stale"):
+        mf._codex_catalog(5)
+
+
+def test_codex_catalog_fresh_timestamp_is_accepted(tmp_path: Path, monkeypatch):
+    now = mf._dt.datetime.now(mf._dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.123456789Z")
+    (tmp_path / "models_cache.json").write_text(json.dumps({
+        "fetched_at": now, "models": [{"slug": "gpt-6.1-sol"}],
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    assert mf._codex_catalog(5) == {"openai": ["gpt-6.1-sol"]}
+
+
+def test_claude_catalog_skips_a_broken_or_stale_file_and_keeps_the_good_one(tmp_path: Path, monkeypatch):
+    cache = tmp_path / "cache" / "model-catalog"
+    cache.mkdir(parents=True)
+    (cache / "a-truncated.json").write_text('{"catalog": ')
+    (cache / "b-old.json").write_text(json.dumps({
+        "fetchedAt": 1_700_000_000_000, "catalog": {"config": {"models": [{"id": "claude-opus-4-8"}]}},
+    }))
+    (cache / "c-good.json").write_text(json.dumps({"catalog": {"config": {"models": [{"id": "claude-opus-5-5"}]}}}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    assert mf._claude_catalog(5) == {"anthropic": ["claude-opus-5-5"]}
+
+
+def test_claude_catalog_reads_models_and_alias_table(tmp_path: Path, monkeypatch):
+    cache = tmp_path / "cache" / "model-catalog"
+    cache.mkdir(parents=True)
+    (cache / "org-cc.json").write_text(json.dumps({"catalog": {"config": {
+        "models": [{"id": "claude-opus-5-5"}, {"id": "claude-fable-5"}],
+        "provider_alias_targets": {
+            "fable": {"default": "claude-fable-5-1", "per_provider": {"gateway": "claude-fable-5"}},
+            "opus": {"default": "claude-opus-5"},
+        },
+    }}}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    assert mf._claude_catalog(5) == {
+        "anthropic": ["claude-opus-5-5", "claude-fable-5", "claude-fable-5-1", "claude-opus-5"]
+    }
+
+
+def test_claude_catalog_absent_is_unavailable(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    with pytest.raises(mf.CatalogUnavailable, match="no Claude Code model catalog"):
+        mf._claude_catalog(5)
+
+
+@pytest.mark.parametrize("payload", [
+    {"catalog": None},
+    {"catalog": {"config": "not a mapping"}},
+    {"catalog": {"config": {"models": "nope", "provider_alias_targets": ["not", "a", "map"]}}},
+    ["not", "a", "mapping"],
+    # an out-of-range fetch time is an unknown age, not a crash
+    {"fetchedAt": 1e100, "catalog": None},
+])
+def test_malformed_claude_catalog_is_a_recorded_error_not_a_crash(tmp_path: Path, monkeypatch, payload):
+    """One malformed optional cache must not abort the daily run (review finding)."""
+    cache = tmp_path / "cache" / "model-catalog"
+    cache.mkdir(parents=True)
+    (cache / "bad-cc.json").write_text(json.dumps(payload))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    [catalog] = mf.load_catalogs({"claude": mf._claude_catalog}, 5)
+    assert catalog.ids == {} and "lists no models" in catalog.error
+
+
+def test_codex_catalog_impossible_timestamp_is_unknown_age(tmp_path: Path, monkeypatch):
+    (tmp_path / "models_cache.json").write_text(json.dumps({
+        "fetched_at": "2026-99-17T00:00:00Z", "models": [{"slug": "gpt-6.1-sol"}],
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    assert mf._codex_catalog(5) == {"openai": ["gpt-6.1-sol"]}
+
+
+def test_models_dev_catalog_maps_provider_names(monkeypatch):
+    seen = {}
+
+    def fake_get(url, headers, timeout):
+        seen["url"] = url
+        return {
+            "google": {"models": {"gemini-3.8-flash": {}}},
+            "zai-coding-plan": {"models": {"glm-5.3": {}}},
+            "xai": {"models": {"grok-4.7": {}}},
+            "broken": "not a mapping",
+        }
+
+    monkeypatch.delenv("MODELS_DEV_URL", raising=False)
+    monkeypatch.setattr(mf, "_http_get_json", fake_get)
+    assert mf._models_dev_catalog(5) == {
+        "gemini": ["gemini-3.8-flash"], "zai": ["glm-5.3"], "xai": ["grok-4.7"],
+    }
+    assert seen["url"] == mf.MODELS_DEV_URL
+
+
+def test_models_dev_catalog_network_error_is_unavailable(monkeypatch):
+    def fake_get(url, headers, timeout):
+        raise mf.urllib.error.URLError("403")
+
+    monkeypatch.setattr(mf, "_http_get_json", fake_get)
+    with pytest.raises(mf.CatalogUnavailable, match="models.dev unreachable"):
+        mf._models_dev_catalog(5)
+
+
+def test_catalog_ids_outside_the_model_id_shape_are_dropped(monkeypatch):
+    """models.dev ids reach the markdown report; markup or spaces must never be echoed."""
+    def fake_get(url, headers, timeout):
+        return {"openai": {"models": {"gpt-9-<img src=x>": {}, "gpt 9": {}, "gpt-6.1-sol": {}}}}
+
+    monkeypatch.setattr(mf, "_http_get_json", fake_get)
+    assert mf._models_dev_catalog(5) == {"openai": ["gpt-6.1-sol"]}
+
+
+def test_run_stale_local_cache_falls_through_to_models_dev(tmp_path: Path, monkeypatch):
+    (tmp_path / "models_cache.json").write_text(json.dumps({
+        "fetched_at": "2026-01-02T03:04:05Z", "models": [{"slug": "gpt-6-sol"}],
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    data = {"version": 1, "models": [{"id": "gpt-6-sol", "provider": "openai", "capabilities": ["code"]}]}
+    result = mf.run(
+        manifest_path=_write_manifest(tmp_path, data),
+        pollers={"openai": _skip_poller("openai", "no OPENAI_API_KEY")},
+        gh_available=lambda: False,
+        dry_run=True,
+        harness_sources={"codex": mf._codex_catalog},
+        fallback_sources={"models.dev": lambda timeout: {"openai": ["gpt-6-sol", "gpt-6.1-sol"]}},
+    )
+    assert result.polls["openai"].sources == ["models.dev"]
+    assert [p.new_id for p in result.proposals] == ["gpt-6.1-sol"]
+
+
+def test_http_get_json_sends_a_user_agent(monkeypatch):
+    """Cloudflare-fronted hosts 403 urllib's default UA (models.dev, commandcode)."""
+    import io
+
+    captured = {}
+
+    class FakeOpener:
+        def open(self, req, timeout):
+            captured["ua"] = req.get_header("User-agent")
+            captured["auth"] = req.get_header("Authorization")
+            return io.BytesIO(b'{"data": []}')
+
+    monkeypatch.setattr(mf.urllib.request, "build_opener", lambda *handlers: FakeOpener())
+    mf._http_get_json("https://example.test/models", {"Authorization": "Bearer k"}, 5)
+    assert captured["ua"] == mf.USER_AGENT
+    assert captured["auth"] == "Bearer k"
+
+
+def test_run_polls_anthropic_and_openai_keyless_through_harness_catalogs(tmp_path: Path):
+    """The OAuth-only machine: both keyed pollers skip, the harness catalogs answer."""
+    data = {"version": 1, "models": [
+        {"id": "claude-fable-5", "provider": "anthropic", "capabilities": ["vision", "code"]},
+        {"id": "gpt-6-sol", "provider": "openai", "capabilities": ["code"]},
+    ]}
+    fallback_calls = []
+
+    def models_dev(timeout):
+        fallback_calls.append(timeout)
+        return {}
+
+    result = mf.run(
+        manifest_path=_write_manifest(tmp_path, data),
+        pollers={
+            "anthropic": _skip_poller("anthropic", "no ANTHROPIC_API_KEY"),
+            "openai": _skip_poller("openai", "no OPENAI_API_KEY"),
+        },
+        gh_available=lambda: False,
+        dry_run=True,
+        harness_sources={
+            "omp": lambda timeout: {"anthropic": ["claude-fable-5", "claude-opus-5-5"]},
+            "codex": lambda timeout: {"openai": ["gpt-6.1-sol", "gpt-6-sol"]},
+            "claude": lambda timeout: {"anthropic": ["claude-fable-5-1"]},
+        },
+        fallback_sources={"models.dev": models_dev},
+    )
+    assert result.polls["anthropic"].ok and result.polls["anthropic"].sources == ["omp", "claude"]
+    assert result.polls["openai"].ok and result.polls["openai"].sources == ["codex"]
+    assert fallback_calls == [], "models.dev is fetched only when no local catalog answers"
+    assert {(p.current_id, p.new_id) for p in result.proposals} == {
+        ("claude-fable-5", "claude-fable-5-1"),
+        ("gpt-6-sol", "gpt-6.1-sol"),
+    }
+
+
+def test_run_lists_pins_whose_successor_is_a_different_variant(tmp_path: Path, monkeypatch):
+    """gpt-5.5 -> gpt-6.1-sol is never auto-proposed, but the stale pin must not be silent."""
+    data = {"version": 1, "models": [{"id": "gpt-5.5", "provider": "openai", "capabilities": ["code"]}]}
+    monkeypatch.setattr(mf, "REPORTS_DIR", tmp_path / "reports")
+    result = mf.run(
+        manifest_path=_write_manifest(tmp_path, data),
+        pollers={"openai": _fake_poller("openai", ["gpt-5.5", "gpt-6-luna", "gpt-6.1-sol"])},
+        gh_available=lambda: True,
+    )
+    assert result.proposals == []
+    assert result.pin_variants == {"gpt-5.5": ["gpt-6.1-sol", "gpt-6-luna"]}
+    assert "`gpt-5.5`: `gpt-6.1-sol`, `gpt-6-luna`" in result.report_path.read_text()
+
+
+def test_run_falls_back_to_models_dev_once(tmp_path: Path):
+    data = {"version": 1, "models": [
+        {"id": "gemini-3.7-flash", "provider": "gemini", "capabilities": ["code"]},
+        {"id": "glm-5.2", "provider": "zai", "capabilities": ["code"]},
+    ]}
+    calls = []
+
+    def models_dev(timeout):
+        calls.append(timeout)
+        return {"gemini": ["gemini-3.8-flash"], "zai": ["glm-5.3"]}
+
+    result = mf.run(
+        manifest_path=_write_manifest(tmp_path, data),
+        pollers={"gemini": _skip_poller("gemini"), "zai": _skip_poller("zai")},
+        gh_available=lambda: False,
+        dry_run=True,
+        harness_sources={},
+        fallback_sources={"models.dev": models_dev},
+    )
+    assert len(calls) == 1
+    assert result.polls["gemini"].sources == ["models.dev"]
+    assert {p.new_id for p in result.proposals} == {"gemini-3.8-flash", "glm-5.3"}
+
+
+def test_merge_poll_keeps_the_keyed_skip_reason_when_nothing_answers():
+    api = mf.PollResult("anthropic", False, skipped="no ANTHROPIC_API_KEY")
+    merged = mf.merge_poll(api, [mf.HarnessCatalog("codex", ids={"openai": ["gpt-6.1-sol"]}),
+                                 mf.HarnessCatalog("omp", error="omp is not installed")])
+    assert merged is api
+
+
+def test_an_empty_keyed_answer_still_falls_back_to_models_dev():
+    """`{"data": []}` from a keyed endpoint is not coverage (review finding)."""
+    calls = []
+
+    def models_dev(timeout):
+        calls.append(timeout)
+        return {"openai": ["gpt-6.1-sol"]}
+
+    catalogs = mf.CatalogSet([], {"models.dev": models_dev}, 5)
+    merged = catalogs.poll(mf.PollResult("openai", True, model_ids=[]))
+    assert merged.model_ids == ["gpt-6.1-sol"] and merged.sources == ["models.dev"]
+    assert len(calls) == 1
+
+
+def test_merge_poll_unions_api_and_catalog_ids():
+    api = mf.PollResult("zai", True, model_ids=["glm-5.2"])
+    merged = mf.merge_poll(api, [mf.HarnessCatalog("omp", ids={"zai": ["glm-5.2", "glm-5.3"]})])
+    assert merged.model_ids == ["glm-5.2", "glm-5.3"]
+    assert merged.sources == ["api", "omp"]
+
+
+def test_newest_same_family_prefers_the_bare_id_on_a_tie():
+    ids = ["Qwen/Qwen3.8-Max-0902", "Qwen/Qwen3.8-Max", "Qwen/Qwen3.7-Max"]
+    assert mf.newest_same_family("Qwen/Qwen3.7-Max", ids) == "Qwen/Qwen3.8-Max"
+
+
+def test_newer_variants_lists_the_line_successors_newest_first():
+    ids = ["gpt-5.6-terra", "gpt-6-luna", "gpt-6.1-sol", "gpt-5.5-pro", "gpt-image-2"]
+    assert mf.newer_variants("gpt-5.6-terra", ids) == ["gpt-6.1-sol", "gpt-6-luna"]
+    assert mf.newer_variants("moonshotai/Kimi-K2.7-Code", ["moonshotai/Kimi-K3"]) == [
+        "moonshotai/Kimi-K3"
+    ]
+    # a hyphenated SIZE (`-27B`) is not a minor version: Qwen3.8-27B is not newer than 3.8-Max
+    sizes = ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-1.7B", "Qwen/Qwen3.8-0.6B"]
+    assert mf.newer_variants("Qwen/Qwen3.8-Max", sizes) == []
+    assert mf.model_family("Qwen/Qwen3.8-1.7B") == "Qwen/Qwen#-#B"
+    assert mf.model_family("Qwen/Qwen3.8-27B") == "Qwen/Qwen#-#B"
+    assert mf.model_family("claude-3-5-sonnet") == "claude-#-sonnet"
+
+
+# ── review-cli seats (#934) ─────────────────────────────────────────────────────────────
+_REVIEW_CLI_CONFIG_PY = '''\
+SONNET_SEAT: str = "claude:claude-sonnet-5"
+# FABLE_SEAT used to be "claude:claude-fable-4"
+TERRA_SEAT = "codex:gpt-5.6-terra"
+GLM_SEAT = "oc:zai/glm-5.2"
+MODEL_ALIASES = {
+    "opus": "claude:claude-opus-4-8",
+    "opus48": "claude:claude-opus-4-8",
+    "sonnet5": SONNET_SEAT,
+    "glm52": (
+        GLM_SEAT
+    ),
+}
+DEFAULT_MODELS = ("codex", "gemini", SONNET_SEAT)
+EXOTIC = "oc:nowhere/model-1"
+'''
+
+_REVIEW_CLI_CONFIG_YAML = '''\
+models:
+  - "claude:claude-opus-4-8"
+  - zai:glm-5.2  # bare value
+# - "claude:claude-sonnet-5" commented out
+board:
+  - { model: "omp:anthropic/claude-sonnet-5", role: quality }
+'''
+
+_CATALOG = {
+    "anthropic": ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"],
+    "openai": ["gpt-6-luna", "gpt-5.6-terra"],
+    "zai": ["glm-5.3"],
+}
+
+
+def _review_cli_files(tmp_path: Path) -> "mf.ReviewCliFiles":
+    code = tmp_path / "review-cli" / "reviewlib" / "config.py"
+    code.parent.mkdir(parents=True)
+    code.write_text(_REVIEW_CLI_CONFIG_PY)
+    user = tmp_path / "config.yaml"
+    user.write_text(_REVIEW_CLI_CONFIG_YAML)
+    return mf.ReviewCliFiles(code_defaults=code, user_config=user)
+
+
+def test_scan_review_cli_names_stale_code_default_and_config_seats(tmp_path: Path):
+    files = _review_cli_files(tmp_path)
+    report = mf.scan_review_cli(files, lambda provider: _CATALOG.get(provider, []))
+    stale = {(pin.path.name, pin.line, pin.seat, pin.new_seat) for pin in report.stale if pin.newer}
+    assert stale == {
+        ("config.py", 1, "claude:claude-sonnet-5", "claude:claude-sonnet-5-5"),
+        ("config.py", 4, "oc:zai/glm-5.2", "oc:zai/glm-5.3"),
+        ("config.py", 6, "claude:claude-opus-4-8", "claude:claude-opus-5-5"),
+        ("config.yaml", 2, "claude:claude-opus-4-8", "claude:claude-opus-5-5"),
+        ("config.yaml", 3, "zai:glm-5.2", "zai:glm-5.3"),
+        ("config.yaml", 6, "omp:anthropic/claude-sonnet-5", "omp:anthropic/claude-sonnet-5-5"),
+    }
+    # the version-pinned alias (line 7), the comments and bare `codex` are not seats to bump
+    assert not any(pin.line == 7 and pin.path.name == "config.py" for pin in report.stale)
+    variants = [pin for pin in report.stale if not pin.newer]
+    assert [(pin.seat, pin.variants) for pin in variants] == [("codex:gpt-5.6-terra", ["gpt-6-luna"])]
+    assert report.unchecked == ["oc:nowhere/model-1"]
+
+
+def test_review_cli_patch_bumps_only_code_default_same_family_seats(tmp_path: Path):
+    files = _review_cli_files(tmp_path)
+    report = mf.scan_review_cli(files, lambda provider: _CATALOG.get(provider, []))
+    patch = mf.review_cli_patch(report)
+    assert patch.startswith("--- a/reviewlib/config.py\n+++ b/reviewlib/config.py\n")
+    added = [line for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++")]
+    assert added == [
+        '+SONNET_SEAT: str = "claude:claude-sonnet-5-5"',
+        '+GLM_SEAT = "oc:zai/glm-5.3"',
+        '+    "opus": "claude:claude-opus-5-5",',
+        # a version-pinned alias pointing at a bumped constant keeps its release
+        '+    "sonnet5": "claude:claude-sonnet-5",',
+        # …also when the alias value is wrapped over several lines
+        '+        "oc:zai/glm-5.2"',
+    ]
+    # the patch applies cleanly in the review-cli checkout
+    import subprocess as _sp
+
+    root = files.code_defaults.parent.parent
+    _sp.run(["git", "init", "-q"], cwd=root, check=True)
+    applied = _sp.run(["git", "apply", "-"], cwd=root, input=patch, text=True, capture_output=True)
+    assert applied.returncode == 0, applied.stderr
+    text = files.code_defaults.read_text()
+    assert '"opus48": "claude:claude-opus-4-8"' in text  # pinned alias untouched
+    assert files.user_config.read_text() == _REVIEW_CLI_CONFIG_YAML  # user config never patched
+
+
+def test_review_cli_patch_empty_when_nothing_is_stale(tmp_path: Path):
+    files = _review_cli_files(tmp_path)
+    report = mf.scan_review_cli(files, lambda provider: [])
+    assert mf.review_cli_patch(report) == ""
+
+
+def test_scan_review_cli_unparseable_python_is_unchecked_not_a_crash(tmp_path: Path):
+    files = _review_cli_files(tmp_path)
+    files.code_defaults.write_text('SONNET_SEAT = "claude:claude-sonnet-5"\nthis is not python(\n')
+    report = mf.scan_review_cli(files, lambda provider: _CATALOG.get(provider, []))
+    assert any("not parseable" in entry for entry in report.unchecked)
+    assert all(pin.path == files.user_config for pin in report.stale)
+    assert mf.review_cli_patch(report) == ""
+
+
+def test_unreadable_review_cli_config_does_not_cost_the_run(tmp_path: Path, monkeypatch):
+    files = _review_cli_files(tmp_path)
+    files.user_config.write_bytes(b"models:\n  - \"claude:claude-opus-4-8\"\n\xff\xfe\n")
+    monkeypatch.setattr(mf, "REPORTS_DIR", tmp_path / "reports")
+    data = {"version": 1, "models": [{"id": "glm-5.2", "provider": "zai", "capabilities": ["code"]}]}
+    result = mf.run(
+        manifest_path=_write_manifest(tmp_path, data),
+        pollers={"zai": _fake_poller("zai", ["glm-5.3"])},
+        gh_available=lambda: False,
+        dry_run=True,
+        review_cli=files,
+    )
+    assert [p.new_id for p in result.proposals] == ["glm-5.3"]
+    assert any("unreadable" in entry for entry in result.review_cli.unchecked)
+
+
+def test_seat_ids_with_suffixes_are_read_whole(tmp_path: Path):
+    """`:free` / `@x` suffixes are part of the id in both file formats (review finding)."""
+    files = _review_cli_files(tmp_path)
+    files.code_defaults.write_text('FREE_SEAT = "oc:openrouter/vendor/model-1:free"\n')
+    files.user_config.write_text('models:\n  - oc:openrouter/vendor/model-1:free\n')
+    catalog = {"openrouter": ["vendor/model-2", "vendor/model-2:free"]}
+    report = mf.scan_review_cli(files, lambda provider: catalog.get(provider, []))
+    assert sorted((pin.path.name, pin.new_seat) for pin in report.stale) == [
+        ("config.py", "oc:openrouter/vendor/model-2:free"),
+        ("config.yaml", "oc:openrouter/vendor/model-2:free"),
+    ]
+
+
+def test_main_dry_run_never_writes_a_patch_file(tmp_path: Path, monkeypatch, capsys):
+    files = _review_cli_files(tmp_path)
+    monkeypatch.setattr(mf, "REVIEW_CLI_CONFIG", files.user_config)
+    monkeypatch.setattr(mf, "_gh_available", lambda: False)
+    monkeypatch.setattr(mf, "POLLERS", {})
+    monkeypatch.setattr(mf, "HARNESS_SOURCES", {"claude": lambda timeout: {"anthropic": _CATALOG["anthropic"]}})
+    target = tmp_path / "out.patch"
+    root = str(tmp_path / "review-cli")
+    assert mf.main(["--dry-run", "--review-cli-root", root, "--review-cli-patch", str(target)]) == 0
+    assert not target.exists()
+    assert "dry-run: would write review-cli patch" in capsys.readouterr().out
+
+
+def test_main_rejects_json_with_patch_on_stdout(capsys):
+    with pytest.raises(SystemExit) as exc:
+        mf.main(["--json", "--review-cli-patch", "-"])
+    assert exc.value.code == 2
+    assert "drop --json" in capsys.readouterr().err
+
+
+def test_main_no_patch_file_when_nothing_is_stale(tmp_path: Path, monkeypatch, capsys):
+    files = _review_cli_files(tmp_path)
+    monkeypatch.setattr(mf, "REVIEW_CLI_CONFIG", files.user_config)
+    monkeypatch.setattr(mf, "_gh_available", lambda: False)
+    monkeypatch.setattr(mf, "POLLERS", {})
+    monkeypatch.setattr(mf, "REPORTS_DIR", tmp_path / "reports")
+    target = tmp_path / "out.patch"
+    root = str(tmp_path / "review-cli")
+    assert mf.main(["--review-cli-root", root, "--review-cli-patch", str(target)]) == 0
+    assert not target.exists()
+    assert "no patch written" in capsys.readouterr().out
+
+
+def test_find_review_cli_files_from_explicit_root(tmp_path: Path, monkeypatch):
+    files = _review_cli_files(tmp_path)
+    monkeypatch.setattr(mf, "REVIEW_CLI_CONFIG", files.user_config)
+    found = mf.find_review_cli_files(tmp_path / "review-cli")
+    assert found == files
+    assert mf.find_review_cli_files(tmp_path / "missing").code_defaults is None
+
+
+def test_run_reports_stale_review_cli_seats_and_writes_the_patch(tmp_path: Path, monkeypatch):
+    """Even with gh available (models.yaml bumps go out as PRs) the review-cli findings,
+    which have no PR path here, land in the dated report plus a patch file."""
+    files = _review_cli_files(tmp_path)
+    reports = tmp_path / "reports"
+    monkeypatch.setattr(mf, "REPORTS_DIR", reports)
+    data = {"version": 1, "models": [
+        {"id": "claude-opus-5-5", "provider": "anthropic", "capabilities": ["code"]},
+    ]}
+    result = mf.run(
+        manifest_path=_write_manifest(tmp_path, data),
+        pollers={"anthropic": _skip_poller("anthropic")},
+        gh_available=lambda: True,
+        harness_sources={"claude": lambda timeout: {"anthropic": _CATALOG["anthropic"]}},
+        fallback_sources={"models.dev": lambda timeout: _CATALOG},
+        review_cli=files,
+    )
+    assert result.proposals == []
+    body = result.report_path.read_text()
+    assert "STALE `claude:claude-sonnet-5` -> `claude:claude-sonnet-5-5`" in body
+    assert "newer variants for `codex:gpt-5.6-terra`: gpt-6-luna" in body
+    patches = list(reports.glob("*-review-cli.patch"))
+    assert len(patches) == 1 and "claude:claude-opus-5-5" in patches[0].read_text()
+
+
+def test_main_review_cli_patch_to_stdout(tmp_path: Path, monkeypatch, capsys):
+    files = _review_cli_files(tmp_path)
+    monkeypatch.setattr(mf, "REVIEW_CLI_CONFIG", files.user_config)
+    monkeypatch.setattr(mf, "_gh_available", lambda: False)
+    monkeypatch.setattr(mf, "POLLERS", {})
+    monkeypatch.setattr(mf, "HARNESS_SOURCES", {"claude": lambda timeout: {"anthropic": _CATALOG["anthropic"]}})
+    code = mf.main([
+        "--dry-run", "--review-cli-root", str(tmp_path / "review-cli"), "--review-cli-patch", "-",
+    ])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert out.startswith("--- a/reviewlib/config.py")
+    assert '+SONNET_SEAT: str = "claude:claude-sonnet-5-5"' in out

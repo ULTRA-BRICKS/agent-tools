@@ -4,6 +4,26 @@
 
 ### Changed
 
+- `model-freshness` checker (`lib/checker/model_freshness.py`) works on an OAuth-only machine
+  (agent-tools#934). Each provider poll is merged with the keyless catalogs the logged-in
+  harnesses cache — `omp models --json`, codex's `$CODEX_HOME/models_cache.json`, Claude
+  Code's model-catalog cache with its `fable`/`opus`/`sonnet` alias table — and, for a
+  provider none of those list, `https://models.dev/api.json`; `--json` shows each provider's
+  `sources`. Every request now sends a `User-Agent`, which fixes the HTTP 403 from
+  commandcode and models.dev. Anthropic's hyphenated versions are one version run, so
+  `claude-fable-5` -> `claude-fable-5-1` and `claude-opus-4-8` -> `claude-opus-5-5` are
+  proposed; a different variant (`gpt-5.5` -> `gpt-6.1-sol`) is not proposed but listed as a
+  pin with newer variants (output, `--json` `pin_variants`, report). The checker also
+  reports stale seats in review-cli's code defaults (`reviewlib/config.py`) and
+  `~/.config/review-cli/config.yaml`, lists newer variants it will not choose, and writes a
+  `git apply`-able patch for the code defaults (`--review-cli-patch`, and next to the report);
+  the user config is only reported. New flags: `--review-cli-root`, `--no-review-cli`,
+  `--review-cli-patch`.
+- `lib/contracts/models.yaml` pins the 2026-10-17 catalog ids: `claude-fable-5-1`,
+  `claude-opus-5-5`, `gpt-6.1-sol`, `gemini-3.8-flash`, `moonshotai/Kimi-K3` (replaces
+  Kimi-K2.7-Code, has vision), `Qwen/Qwen3.8-Max` (has vision) and `glm-5.3`, with the
+  catalogs' context windows; roles and `<provider>:latest` aliases follow.
+
 - `deferred-findings-tracking` skill: new "Bugs in tools" section — every bug hit in a tool
   (especially rig-ecosystem tools: rig, task-cli, tg-cli, review-cli, agent-tools hooks and
   `gh ship`, dev-cli, smoo/nx-plugin, mem-sentinel) gets a ticket in that tool's own tracker
