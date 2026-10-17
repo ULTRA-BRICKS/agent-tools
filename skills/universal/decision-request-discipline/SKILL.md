@@ -109,6 +109,28 @@ Anything verifiable, you verify yourself. **If the answer is one shell command, 
 A question whose answer you could have grepped in ten seconds is the most common form of this
 failure. Run the check first.
 
+## Search recorded decisions before you offer any option
+
+Before you put options in front of the human, search what they have **already decided**:
+the project's `ROADMAP.md` (north-star and "decided" notes), ADRs / `docs/decisions/`,
+`AGENTS.md`, and the ticket that carries the ask. `grep -rni '<topic>\|decided\|do not
+re-litigate' ROADMAP.md AGENTS.md docs/` takes seconds.
+
+- **A recorded owner decision is the answer.** Implement it; do not turn it back into a
+  question. Never list an option that contradicts it, and never recommend one, however much
+  cheaper it looks today ("keep it as is for now", "do it gradually when touched").
+- **The human repeating a decided rule is not a new question.** It means the rule was not
+  carried out. Act on it at once, and find out why it slipped.
+- **If you think the decision is wrong,** say so as a separate, evidence-backed concern that
+  quotes the recorded decision verbatim, and keep executing it meanwhile. A recorded decision
+  does not come back as option B in a menu.
+
+Real failure (2026-10-17): the owner wrote "this tool must be in Python too". The roadmap
+already said "the whole ecosystem is Python-only (decided twice — don't re-ask)". The agent
+replied with options A/B/C, recommended keeping the tool in TypeScript, and then listed it twice
+as "waiting for your answer". The owner had to restate the rule a third time. One `grep` of
+the roadmap would have turned that into "porting now".
+
 ## Consult before you escalate
 
 Before sending anything upward, exhaust the cheaper advisors:
@@ -351,6 +373,8 @@ Escalate only work whose *need* is genuinely unknown, with the evidence above.
   or B?" anyway. Implement and report, don't ask.
 - **A grepable question.** "Does it deploy from main?" when one `grep` answers it. Self-check
   first.
+- **Offering an option that contradicts a recorded decision.** The roadmap or an ADR already
+  answers it; you made it option B again. Search first, then execute the decision.
 - **A bare "which one?".** Options with no real pros/cons, no recommendation, no "where to
   look" — the human can't answer without opening the repo. That's a malformed request.
 - **Risk-washing a feature.** Calling a normal product behavior a "vuln/leak/hazard" to force

@@ -325,8 +325,8 @@ them to *every* project and user. If you want the catalog of always-apply behavi
   generalized from `riglib.config`) — so the dependency direction is `rig-cli` → `lib/`, never
   the reverse. They are **stdlib-only at import time** (heavy deps like PyYAML are lazy) so
   importing one never pulls a toolchain.
-- **`rig.yaml` here is REPO-level only.** It declares this repo's own CI gates (currently just
-  `ci.items.tests`, tier `block`). The machine-wide installs (skills, agent-hooks, the
+- **`rig.yaml` here is REPO-level only.** It declares this repo's own CI gates (`ci.items.tests`
+  and `ci.items.python-only`, both tier `block`). The machine-wide installs (skills, agent-hooks, the
   git-hook dispatcher, MCP, harness auto-mode) live in the **global** layer
   (`~/.config/rig/config.yaml`) and are intentionally *not* repeated in the committed file. The
   cascade is by location: global is global, this committed file is the repo and overrides it.
@@ -377,6 +377,43 @@ uv run --with pytest pytest tests/test_<one>.py -q    # local: one file, that's 
 `--apt nodejs` because the opencode-bridge tests shell out to `node`. `runpod-run --dry-run
 -- …` prints the plan and price; `runpod-run --status` / `--stop` list and terminate the
 pods this machine created — leave none behind.
+
+---
+
+## Python-only tools (owner decision, enforced)
+
+**Decision (settled, do not re-ask or offer alternatives):** every rig-ecosystem tool is written
+in Python. The owner approved it on **2026-06-14** ("Okay, we're moving the tools to Python") and
+restated it on **2026-10-17** ("all rig-ecosystem tools must be in Python"), after an agent had
+offered to keep tg-cli in TypeScript. The only exemption is code whose **host forces** another
+language: omp/opencode/pi extensions (TS/JS), browser assets, the oxlint plugin and config API,
+VS Code extension-host code, GNOME extensions, a macOS-native Swift helper.
+
+- **Scope.** A rig-ecosystem tool repo is one whose `origin` is in an owner namespace
+  (`git.hyperide.ai/ultrabricks`, `github.com/alex-mextner`, `github.com/ultrabricks`) and whose
+  name ends in `-cli` or is listed in the checker's `REPOS` (agent-tools, text-lint,
+  claude-accounts). Apps, sites and bots are out of scope.
+- **What fails.** Added or changed files in TS/JS/Go/Rust/Ruby/Swift/…, extensionless
+  node/bun/deno scripts, and shell scripts over **40 lines**. Short shell glue is fine.
+- **Enforced, not advised.** [`ci/python-only/python_only.py`](ci/python-only/README.md) runs as
+  the global pre-commit fragment `20-python-only` (every repo on a rig-managed machine) and as
+  the `ci/python-only` CI slot (enabled in this repo's `rig.yaml`). Exemptions (`Allow` with a
+  mandatory reason) and the warn tier live centrally in its `REPOS`; change them only through an
+  agent-tools PR, never from the repo being checked.
+- **tg-cli is warn-only** until its port,
+  [tg-cli#768](https://git.hyperide.ai/ultrabricks/tg-cli/issues/768), lands; then flip it to
+  block. Every other ecosystem repo blocks.
+- **This repo is in scope.** Its remaining shell (`ci/ship/ship.sh`, `runpod-run`, the git-hook
+  dispatcher, the `ci/*` gate scripts, `ops/*/install.sh`, the `rig-detached-*` launchers,
+  `ghgql`) blocks on its next edit; port tickets:
+  [#946](https://git.hyperide.ai/ultrabricks/agent-tools/issues/946),
+  [#947](https://git.hyperide.ai/ultrabricks/agent-tools/issues/947),
+  [#948](https://git.hyperide.ai/ultrabricks/agent-tools/issues/948),
+  [#951](https://git.hyperide.ai/ultrabricks/agent-tools/issues/951),
+  [#949](https://git.hyperide.ai/ultrabricks/agent-tools/issues/949),
+  [#950](https://git.hyperide.ai/ultrabricks/agent-tools/issues/950),
+  [#952](https://git.hyperide.ai/ultrabricks/agent-tools/issues/952). Porting the file you need
+  to touch is the fix; an exemption is not.
 
 ---
 

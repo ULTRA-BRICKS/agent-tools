@@ -24,7 +24,8 @@ automatically takes effect everywhere, with zero per-repo changes.
 ├── run-global-hooks                 # THE DISPATCHER (one entry point)
 ├── global-hooks.d/                  # the single source of truth — drop hooks here
 │   ├── pre-commit/
-│   │   └── 10-secret-scan           # gitleaks tiered staged-diff gate (block + warn)
+│   │   ├── 10-secret-scan           # gitleaks tiered staged-diff gate (block + warn)
+│   │   └── 20-python-only           # rig-ecosystem tools are Python (twin of ci/python-only/python_only.py)
 │   ├── commit-msg/
 │   └── pre-push/
 │       └── 10-protect-main          # block direct pushes to main/master (audited PUSH_MAIN_OK escape)

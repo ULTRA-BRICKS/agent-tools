@@ -32,6 +32,9 @@ ci:
     # The repo's own test gate (ci/tests/) — the green/red signal gh ship + the ruleset
     # wait on. Everything else in ci/ is governance and stays opt-in.
     tests: { enabled: true, tier: block }
+    # Rig-ecosystem tools are Python (owner decision 2026-06-14; AGENTS.md "Python-only
+    # tools", agent-tools#945). The checker is this repo's own ci/python-only/python_only.py.
+    python-only: { enabled: true, tier: block }
 
 # Explicit rules block so Rig plans Oxc policy even without stack: typescript.
 # preview: true prints before/after finding counts on apply.

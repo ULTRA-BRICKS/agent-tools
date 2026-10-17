@@ -308,12 +308,13 @@ that nobody is required to stop at — see #543.
   lefthook.yml) — plus a global dispatcher (`global-dispatcher/`: `run-global-hooks`,
   `install-local-hooks.sh`, `hooks-sweep`, and a `global-hooks.d/` drop-in tree) that runs
   every global hook in every repo regardless of lefthook/husky `core.hooksPath` overrides.
-- **CI:** 12 slots — secret-scan (gitleaks), codeql (incl. private-repo self-gate), sast
-  (semgrep), dependency-review (+ license + multi-ecosystem audit), ai-review (configurable
+- **CI:** 15 slots (see the [`ci/README.md`](ci/README.md) table) — secret-scan (gitleaks), codeql (incl. private-repo self-gate), sast
+  (semgrep), dependency-review (+ multi-ecosystem audit), license-policy, trivy, ai-review (configurable
   reviewer), copilot-findings (surface + optional gate), review-threads (unresolved-comment
   block), pr-checklist (unchecked-checkbox block), screenshots (mandatory image on UI PRs),
   pr-title-lint (Conventional Commits), leftover-grep (no `.only`/`debugger`/`console`/
-  untracked-TODO), ship (green-CI-gated merge + cleanup). Plus a backlog of net-new ideas in
+  untracked-TODO), python-only (rig-ecosystem tools stay Python; also a global pre-commit
+  fragment), ship (green-CI-gated merge + cleanup). Plus a backlog of net-new ideas in
   `ci/README.md` (coverage-delta, bundle-size, doc-link-check, CODEOWNERS, stale-PR,
   size-label).
 - **MCP:** a code-search slot (`review` is a CLI+skill, not an MCP — see [`mcp/README.md`](mcp/README.md)).

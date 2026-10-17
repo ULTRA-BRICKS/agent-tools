@@ -21,19 +21,27 @@ it.
 | [`screenshots/`](screenshots/) | Require an embedded image on UI-touching PRs (at open AND merge) — front-end repos | `gh` PR metadata + path glob | workflow + shell script |
 | [`pr-title-lint/`](pr-title-lint/) | Enforce Conventional Commits on the PR title — repos that squash-merge | dependency-free inline check (amannn/action-semantic-pull-request's rules, no API call) | workflow (runs on GitHub and Forgejo) |
 | [`leftover-grep/`](leftover-grep/) | Fail on `.only`/`debugger`/`console.log`/untracked-TODO/conflict-markers in added code — any repo | dependency-free grep on the diff | workflow + shell script |
+| [`python-only/`](python-only/) | Fail on new/changed non-Python tool code (TS/JS/Go/Rust, node/bun scripts, shell over 40 lines) — rig-ecosystem tool repos | dependency-free Python checker on the diff (also the global pre-commit fragment) | workflow + Python checker |
 | [`ship/`](ship/) | Green-CI-gated PR merge + cleanup, with the above preflights — a client-side merge command | `gh` + git | portable ship script (all project coupling optional) |
 
 ## Conventions for slots in here
 
 - **Name the standard engine** in the README's first lines — don't make the reader guess
   (secret scanning = gitleaks, not a hand-rolled regex).
-- Ship **both** a GitHub Actions workflow (`*.yml`) and a **generic shell** entry
-  (`*.sh`) so non-GitHub CI is a first-class path, not an afterthought.
+- Ship **both** a GitHub Actions workflow (`*.yml`) and a **generic script** entry so
+  non-GitHub CI is a first-class path, not an afterthought. A new script is **Python**
+  (`*.py`, stdlib only): agent-tools is a rig-ecosystem tool repo, and the
+  [`python-only/`](python-only/) gate blocks new shell over 40 lines here. The existing
+  `*.sh` entries are being ported ([agent-tools#951](https://git.hyperide.ai/ultrabricks/agent-tools/issues/951)).
+- **Gate scripts are never test-shaped.** Don't name a slot script `test_*.py`, `*_test.py`
+  or `conftest.py`: rig vendors `ci/**/*.py` companions but skips test-shaped files by that
+  naming contract, so a test-shaped gate would silently never reach consuming repos.
 - **Pin** third-party actions to a commit SHA (supply-chain hygiene), with the version in
   a trailing comment.
 - Document **how to extend** (rules/config) and the **escape hatch** for false positives.
 - State the **tiers** (block vs warn) explicitly — CI defaults to block; warn is opt-in.
-- A workflow that calls a sibling script does so as `bash ci/<gate>/<script>.sh` — so that
+- A workflow that calls a sibling script does so as `python3 ci/<gate>/<script>.py` (older
+  slots: `bash ci/<gate>/<script>.sh`) — so that
   path must exist in the consuming repo. **Vendor the `ci/` dir**, or copy the script into
   `.github/scripts/` and adjust the workflow's `run:` path. Each slot README's quick-start
   spells this out.

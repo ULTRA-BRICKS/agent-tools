@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- `ci/python-only` gate (agent-tools#945): rig-ecosystem tools are written in Python (owner
+  decision 2026-06-14, restated 2026-10-17). One stdlib checker,
+  `ci/python-only/python_only.py`, runs as the global pre-commit fragment `20-python-only` and
+  as a CI slot. In an ecosystem tool repo (owner namespace, name `*-cli` or listed) it fails on
+  added or changed TS/JS/Go/Rust/... files, node/bun scripts and shell scripts over 40 lines,
+  except host-forced paths on a central allowlist with a reason. tg-cli is warn-only until
+  tg-cli#768. Enabled for this repo in `rig.yaml`; AGENTS.md "Python-only tools" records the
+  decision.
+- `decision-request-discipline` skill: search recorded decisions (ROADMAP, ADRs, AGENTS.md)
+  before offering options; never offer an option that contradicts a recorded owner decision.
+
 ### Changed
 
 - `model-freshness` checker (`lib/checker/model_freshness.py`) works on an OAuth-only machine

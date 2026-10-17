@@ -1,6 +1,6 @@
 # Agent CLI Ecosystem — Roadmap
 
-Status snapshot: **2026-08-15** (newest session block first, right below the north-star). This is
+Status snapshot: **2026-10-17** (newest session block first, right below the north-star). This is
 the handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig-cli`,
 `draw-cli`, `3d-cli`, `task-cli`) + the `agent-tools` umbrella.
 
@@ -24,18 +24,44 @@ the handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, 
 > precise per-item count, tally the §Open-ticket ledger and newest dated block only.
 
 > **Reading order:** the AUTHORITATIVE current state is the **newest dated session block at the very
-> top** (currently **2026-08-15**), then **§Remaining work (prioritized)** and the **§Open-ticket
+> top** (currently **2026-10-17**), then **§Remaining work (prioritized)** and the **§Open-ticket
 > ledger** below. ⚠️ The dated session blocks lead; the lower §Remaining-work / §Open-ticket ledger lag
 > behind the newest block and may still list items the top block has since shipped — when they disagree,
 > the newest dated block wins. The two collapsed `📜 …` blocks are older dated transcript (2026-06-15 →
 > 06-17), kept for history; a folded section is not an assertion that it shipped.
 
 > **North-star architecture (DECIDED — do not re-litigate):** the whole CLI ecosystem is
-> **Python-only**. `tg-cli` (currently Bun/TS) migrates to Python **LAST**. The shared
+> **Python-only** (owner decisions **2026-06-14** "Okay, we're moving the tools to Python" and
+> **2026-10-17** "all rig-ecosystem tools must be in Python"). `tg-cli` (still Bun/TS) is being
+> ported now ([tg-cli#768](https://git.hyperide.ai/ultrabricks/tg-cli/issues/768)); the 2026-06
+> "migrates LAST" ordering is superseded. The shared
 > `agent-tools/lib` is a **plain Python library** (NO `lib/ts`, NO cross-language contracts).
 > New tools are built in Python on that lib so a new tool spins up fast on one architecture.
+> **Enforced** since 2026-10-17 by the `python-only` gate (pre-commit fragment + CI slot,
+> AGENTS.md "Python-only tools", [agent-tools#945](https://git.hyperide.ai/ultrabricks/agent-tools/issues/945));
+> only host-forced code (omp/opencode/pi extensions, browser assets, linter plugin APIs) is exempt.
 > `rig` is the front door (`rig init` onboarding, `rig apply` reconcile — two distinct commands,
 > interactivity orthogonal). `agent-tools` = WHAT (the catalog), `rig` = HOW (installs it).
+
+---
+
+## 2026-10-17 — the Python-only rule is enforced (🔮 building)
+
+*The owner had to restate a June decision because nothing enforced it: tg-cli kept growing in
+TypeScript, agent-tools gained a 1,383-line bash script, and an agent offered him "keep tg-cli in
+TS" as an option.*
+
+- 🔮 **agent-tools#945** — `ci/python-only` gate: global pre-commit fragment + CI slot; blocks
+  new/changed non-Python tool code in ecosystem repos; tg-cli warn-only until tg-cli#768.
+- 🔮 **rig-cli** — vendor `.py` CI companions so the slot installs in any repo.
+- ⏳ Port tickets for the remaining non-Python tool code: agent-tools #946 (ship.sh), #947
+  (runpod-run), #948 (git-hook dispatcher), #949 (ops installers), #950 (rig-detached-*
+  launchers), #951 (ci gate scripts), #952 (ghgql); rig-cli#724, task-cli#281, review-cli#652,
+  qa-cli#43, text-lint#8, stt-cli#146, pm-cli#41, research-cli#27, 3d-cli#398 (GitHub),
+  dev-cli HYP-1742, router-cli HYP-1743, draw-cli HYP-1744. harness-cli is already Python;
+  claude-rotate was retired, not ported (tg-cli PR #543, review-cli PR #606).
+- 📋 Lesson recorded in `decision-request-discipline`: search recorded decisions before offering
+  options; never offer one that contradicts a recorded owner decision.
 
 ---
 
@@ -1160,7 +1186,8 @@ packaging systemic), #33 (lib-advertise). SYSTEMIC TODO → `lib/pyproject.toml`
 
 ## Key constraints / lessons (read before continuing)
 
-- 📋 **Python-only ecosystem; tg migrates last; lib is plain Python.** (Decided twice — don't re-ask.)
+- 📋 **Python-only ecosystem; lib is plain Python; enforced by the `python-only` gate since
+  2026-10-17.** (Decided 2026-06-14, restated 2026-10-17 — don't re-ask, don't offer a non-Python option.)
 - 📋 **Every provider/harness write-up should be GENERAL, not special-cased** (no "opencode does X" when
   every harness does X). Models marked by **capabilities**, not just version.
 - 📋 **auto-mode `bypassPermissions` = COMMITTED `.claude/settings.json`** (CC's shared slot → turns on by
