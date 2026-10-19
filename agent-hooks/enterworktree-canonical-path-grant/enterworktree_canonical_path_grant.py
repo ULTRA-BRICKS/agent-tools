@@ -55,7 +55,7 @@ Detection reuses (SYNC, copied — NOT imported; every agent-hook in this family
 script by convention) ``repo_root`` / ``_worktrees_dir_escapes_repo`` / `_target_is_sanctioned``
 from ``agent-hooks/block-raw-worktree-add/block_raw_worktree_add.py`` (agent-tools#608, commit
 f827442) — the same primitives that already decide "is this path the one sanctioned worktree
-location" for the raw ``git worktree add``/``remove``/``move`` case, so the two never drift into
+location" for the raw ``git worktree add``/``move`` case, so the two never drift into
 disagreeing about what counts as canonical. TRIMMED relative to the source: that file's
 ``repo_root``/``_git``/``_git_path`` accept an optional ``git_dir`` override captured off a
 parsed ``git -C ... --git-dir ...`` Bash command — there is no such thing to parse here

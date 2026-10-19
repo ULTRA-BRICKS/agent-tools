@@ -24,7 +24,7 @@ An earlier draft of this fix (corrected before it landed) considered pre-approvi
 `EnterWorktree` broadly. That would have been wrong: `EnterWorktree(path=...)` can switch into
 ANY worktree already registered in `git worktree list`, not only the canonical location — a
 blanket grant would let a caller route around the exact same worktree-location-bypass concern
-`block-raw-worktree-add` (agent-tools#608) closes for the raw `git worktree add`/`remove`/`move`
+`block-raw-worktree-add` (agent-tools#608) closes for the raw `git worktree add`/`move`
 Bash path, just via a different tool. This hook is PATH-SCOPED instead:
 
 - `args.path` resolves under `<repo-root>/.worktrees/<name>` → **GRANT** (suppress the prompt).

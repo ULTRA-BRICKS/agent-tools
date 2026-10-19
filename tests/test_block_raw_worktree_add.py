@@ -1,6 +1,6 @@
 """Tests for the block-raw-worktree-add agent-hook (pre-bash).
 
-Covers the doctrine (agent-tools#608): a raw `git worktree add`/`git worktree remove` whose
+Covers the doctrine (agent-tools#608): a raw `git worktree add`/`git worktree move` whose
 target does NOT resolve under `<repo-root>/.worktrees/` is DENIED; the same command targeting
 `.worktrees/<name>` is ALLOWED; `-b`/`-B` is recognized in either flag order so its value is
 never mistaken for the target path; a `git -C <other-repo>` cross-repo call is judged against
@@ -228,13 +228,14 @@ def test_target_with_dollar_var_not_sanctioned(tmp_path, monkeypatch):
     assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-# ── `git worktree remove` mirrors `add` ──────────────────────────────────────────────────────
+# ── `git worktree remove` is NOT gated here — block-unlanded-removal owns it ──────────────────
 
-def test_remove_outside_worktrees_blocks(tmp_path, monkeypatch):
+def test_remove_outside_worktrees_not_gated_here(tmp_path, monkeypatch):
+    """Removal safety (landed + clean) is decided by block-unlanded-removal; this hook only
+    enforces the `.worktrees/` LOCATION rule for `add` and `move`."""
     repo = _make_repo(tmp_path)
     out, code = _run(repo, "git worktree remove ../elsewhere", monkeypatch)
-    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
-    assert "rig worktree remove" in json.loads(out)["message"]
+    assert code == 0 and _decision(out) == "allow"
 
 
 def test_remove_inside_worktrees_allows(tmp_path, monkeypatch):
@@ -243,10 +244,10 @@ def test_remove_inside_worktrees_allows(tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
 
 
-def test_remove_force_flag_does_not_confuse_target(tmp_path, monkeypatch):
+def test_remove_force_outside_not_gated_here(tmp_path, monkeypatch):
     repo = _make_repo(tmp_path)
     out, code = _run(repo, "git worktree remove -f ../elsewhere", monkeypatch)
-    assert code == brwa.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert code == 0 and _decision(out) == "allow"
 
 
 # ── `git worktree move` relocates a worktree — gated on its DESTINATION (review finding) ────

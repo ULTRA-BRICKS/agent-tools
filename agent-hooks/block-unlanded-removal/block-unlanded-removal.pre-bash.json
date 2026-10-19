@@ -1,0 +1,9 @@
+{
+  "id": "block-unlanded-removal",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/block-unlanded-removal/block_unlanded_removal.py",
+  "priority": 41,
+  "timeout_ms": 150000,
+  "on_error": "closed",
+  "description": "Allows removing a worktree or deleting a branch (git worktree remove/rm, git branch -d/-D/--delete, git push --delete/--mirror/--prune/:ref, any git update-ref, rig worktree remove) ONLY when the work is landed and the tree is clean; denies anything that could destroy unmerged or uncommitted work. A cheap, deliberately loose prefilter (shell-style normalization of `$'..'`/`${IFS}`, quote/backslash stripping, delete-flag prefixes, `git update-ref -d`, and shell expansion syntax in any command mentioning git/branch/push/worktree/update-ref) decides whether a command is removal-shaped; only then does the hook shell out to `rig worktree guard --cwd <cwd>` (command on stdin), the single brain that parses the command and checks real git plus the forge PR state. rig answers pass (not a removal → silent allow), allow (every target proven landed + clean → allow) or deny (an unsafe target, or a form that is not safely parseable → block with rig's reason, which names the rescue). Fails CLOSED: rig missing from PATH, nonzero exit, a timeout beyond 120s, unparseable/foreign JSON or an unknown decision all deny with a clear message. No env/inline/Telegram bypass — the sanctioned alternatives are `rig worktree verdict <target>` to inspect, pushing/merging the work, or rescuing it with `git diff --binary HEAD > ~/.cache/<repo>-recovery/<wt>-<ts>.patch` plus pushing a followup branch. timeout_ms 150000 outlasts rig's 120s budget. on_error=closed: this guards irreversible data loss. Replaces the removal gating that block-raw-worktree-add used to do for `git worktree remove`."
+}

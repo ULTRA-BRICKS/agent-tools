@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""agents-hooks/v1 pre-bash hook — block a raw git worktree add/remove/move outside .worktrees/.
+"""agents-hooks/v1 pre-bash hook — block a raw git worktree add/move outside .worktrees/.
+
+`git worktree remove` is NOT gated here any more: whether a removal is safe (work landed, tree
+clean) is decided by the `block-unlanded-removal` hook via `rig worktree guard`; the location rule
+below is about where a worktree is created or relocated to, which says nothing about removal.
 
 Incident this closes (agent-tools#608, Alex, 2026-09-07): rig-cli's own AGENTS.md documents
 `rig worktree create <name>` as "the ONLY way an agent (or a human) should create a worktree in
@@ -13,12 +17,12 @@ exact five-conventions problem was confirmed still happening, live, the same day
 written (`git worktree list` in `~/xp/rig-cli` showed worktrees in `/private/tmp`, a sibling
 `-worktrees/` dir, a `-wt-*` dir, and `.claude/worktrees/agent-*`).
 
-This hook closes that gap directly: it inspects `git worktree add` / `git worktree remove` /
+This hook closes that gap directly: it inspects `git worktree add` /
 `git worktree move` invocations and BLOCKS one whose target path does not resolve under the
 repo's `<repo-root>/.worktrees/` — the one location rig's own reconciler (`rig worktree gc`) and
 sibling commands (`rig worktree create`/`remove`) know about. `move` relocates an EXISTING
 worktree (`git worktree move <worktree> <new-path>`) and is gated on its destination (the second
-positional) exactly like `add`/`remove` are gated on their single path argument — a legitimate
+positional) exactly like `add` is gated on its single path argument — a legitimate
 migration INTO `.worktrees/` (`git worktree move /tmp/old .worktrees/old`) stays allowed; only a
 destination outside `.worktrees/` is blocked. `git worktree list`, `lock`/`unlock`/`repair`, and
 `git worktree prune` are all unaffected (see "Deliberately out of scope" below).
@@ -47,7 +51,7 @@ REMOVES stale administrative state, it doesn't create sprawl). Gating it would a
 detection shape for zero benefit against GH-329's actual failure mode (worktrees landing in the
 wrong PLACE), and it would fight `rig worktree gc`'s own remediation path. `git worktree
 lock`/`unlock`/`repair`/`list` don't create or relocate a worktree relative to the repo root the
-way `add`/`remove`/`move` do and are likewise out of scope. (`move` was originally grouped with
+way `add`/`move` do and are likewise out of scope. (`move` was originally grouped with
 these as "doesn't relocate a worktree" — that premise was WRONG, `move` is exactly a relocate
 primitive, and it is now gated; see the review note in git history/PR discussion if this class
 of mistake recurs — the fix here was to actually re-derive, not assume, what each subcommand
@@ -60,10 +64,10 @@ Detection is ARGV-BASED (shlex, chain-aware — `_split_chain` is copied from
 `--git-dir`/`GIT_DIR=` override — see its own docstring) finds the real `git` invocation past
 any leading `VAR=value` assignments and global git options (`-C`, `-c`, `--git-dir`, ...),
 honoring a `-C <dir>` override so a cross-repo `git -C <other-repo> worktree add ...` is judged
-against THAT repo. `_worktree_target` then walks the `worktree add`/`remove`/`move` argv via
+against THAT repo. `_worktree_target` then walks the `worktree add`/`move` argv via
 `_worktree_positionals`, skipping recognized flags (`-b`/`-B`/`--reason` for `add`, which take a
 value; `-f`/`--force` and every other boolean flag for all three), to find the checked path —
-the FIRST positional for `add`/`remove`, the SECOND for `move` — in EITHER flag order
+the FIRST positional for `add`, the SECOND for `move` — in EITHER flag order
 (`git worktree add -b feat path` and `git worktree add path -b feat` both resolve the same
 target).
 
@@ -123,7 +127,7 @@ QUOTED path — an unquoted one IS shell-expanded before this hook ever sees it)
 target spelled with `~` resolves to a literal `<cwd>/~/...` and is over-blocked (safe direction,
 but costs a real Telegram round-trip for a false positive).
 
-A chained command with MORE THAN ONE gate-worthy `worktree add`/`remove`/`move` segment gets at
+A chained command with MORE THAN ONE gate-worthy `worktree add`/`move` segment gets at
 most ONE Telegram hatch round-trip for the whole invocation — the second (and any later) such
 segment is blocked outright, without its own hatch call: `tg-ctl ask` legitimately runs up to
 ~900s; two sequential hatch calls could together exceed this hook's `timeout_ms` manifest budget
@@ -135,7 +139,7 @@ parameter. Split a multi-worktree-op chain into separate Bash calls so each gets
 Known, DELIBERATELY UNCLOSED bypasses (documented, not silently accepted — a reviewer or a future
 change should see these named, not discover them):
 
-- A `git worktree add`/`remove`/`move` hidden behind a shell interpreter or `eval` — `bash -c
+- A `git worktree add`/`move` hidden behind a shell interpreter or `eval` — `bash -c
   'git worktree add /tmp/x'`, `sh -c "..."`, `eval "git worktree add /tmp/x"` — is NOT detected:
   `_classify_git_segment` sees `bash`/`sh`/`eval` as the invoked head, not `git`, and this hook
   (unlike `block-raw-pr-merge`, which re-scans a wrapper/`-c`-string body for its narrower merge
@@ -375,7 +379,7 @@ def _split_chain(command: str) -> list[str]:
     return [s for s in segs if s.strip()]
 
 
-# ── git worktree add/remove classification ───────────────────────────────────────────────────
+# ── git worktree add/move classification ───────────────────────────────────────────────────
 
 _GIT_GLOBAL_OPT_ARG = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
@@ -447,15 +451,13 @@ def _classify_git_segment(
 # (`-f`/`--force`, `--detach`, `--checkout`/`--no-checkout`, `--lock`, `--orphan`,
 # `--guess-remote`/`--no-guess-remote`, `--track`/`--no-track`, `-q`/`--quiet`, ...).
 _ADD_VALUE_FLAGS = frozenset({"-b", "-B", "--reason"})
-# `worktree remove` has no value-taking flags of its own (`-f`/`--force` is boolean).
-_REMOVE_VALUE_FLAGS: frozenset[str] = frozenset()
 # `worktree move <worktree> <new-path>` — RELOCATES an existing worktree, exactly the sprawl
-# move `add`/`remove` already gate. The ONLY flag it takes is `-f`/`--force`, no value.
+# move that `add` already gates. The ONLY flag it takes is `-f`/`--force`, no value.
 _MOVE_VALUE_FLAGS: frozenset[str] = frozenset()
 
 
 def _worktree_positionals(toks: list[str], value_flags: frozenset[str]) -> list[str]:
-    """Every bare positional token in `toks` (the args after `worktree add`/`remove`/`move`), in
+    """Every bare positional token in `toks` (the args after `worktree add`/`move`), in
     order. Skips a recognized value flag and its following token, a `--long=value` glued flag,
     and any other `-`-prefixed boolean flag; a literal `--` ends flag scanning (everything after
     is positional)."""
@@ -481,8 +483,8 @@ def _worktree_positionals(toks: list[str], value_flags: frozenset[str]) -> list[
 
 
 def _worktree_target(kind: str, toks: list[str], value_flags: frozenset[str]) -> str | None:
-    """The target path this hook must check for `kind` (`add`/`remove`/`move`), in EITHER flag
-    order. For `add`/`remove` that's the FIRST positional (the worktree path itself). For `move`
+    """The target path this hook must check for `kind` (`add`/`move`), in EITHER flag
+    order. For `add` that's the FIRST positional (the worktree path itself). For `move`
     it's the SECOND positional (`<worktree> <new-path>` — the source isn't gated, only where it
     ends up; a legitimate migration `git worktree move /tmp/old .worktrees/old` stays allowed).
     Returns None when there aren't enough positionals (an invalid/incomplete invocation git
@@ -563,13 +565,12 @@ def _target_is_sanctioned(root: Path, raw_target: str, resolved_target: Path) ->
         return False
 
 
-# The next-step guidance for each `kind`, appended to `MESSAGE`. `add`/`remove` map straight onto
-# their `rig worktree` counterpart; `move` fully relocates an existing worktree — the exact
+# The next-step guidance for each `kind`, appended to `MESSAGE`. `add` maps straight onto
+# its `rig worktree` counterpart; `move` fully relocates an existing worktree — the exact
 # GH-329 failure mode — but has no direct rig equivalent (rig-cli doesn't offer a relocate verb),
 # so it gets a two-step recipe instead.
 _GUIDANCE = {
     "add": "    rig worktree create <name>\n",
-    "remove": "    rig worktree remove <name>\n",
     "move": (
         "    rig worktree create <name>   # at the destination\n"
         "    rig worktree remove <old-name>   # retire the old one\n"
@@ -627,18 +628,18 @@ def _resolve_and_check_target(
     return str(resolved_target), sanctioned, None
 
 
-_WORKTREE_VALUE_FLAGS = {"add": _ADD_VALUE_FLAGS, "remove": _REMOVE_VALUE_FLAGS, "move": _MOVE_VALUE_FLAGS}
+_WORKTREE_VALUE_FLAGS = {"add": _ADD_VALUE_FLAGS, "move": _MOVE_VALUE_FLAGS}
 
 
 def _classify_worktree_call(
     segment: str, base_cwd: str
 ) -> tuple[str, Path, str, str] | None:
-    """If `segment` is a `git worktree add`/`remove`/`move` invocation with a resolvable target,
+    """If `segment` is a `git worktree add`/`move` invocation with a resolvable target,
     return `(kind, root, raw_target, eff_cwd)` — deliberately the RAW, unresolved target string,
     not a resolved `Path` (see `_evaluate_worktree_segment`, which resolves it itself inside a
     try/except so a resolution failure blocks rather than silently escaping to the host's
     `on_error` policy). Returns None when nothing needs gating — not `git`, not
-    `worktree add`/`remove`/`move`, no resolvable target, or repo root undetermined (this last
+    `worktree add`/`move`, no resolvable target, or repo root undetermined (this last
     one — an unresolvable/non-git/bare-repo cwd — is the one legitimate "nothing to gate" case
     left; everything AFTER this point in the pipeline is "yes, this is a worktree op with a
     target" and must fail toward block, not open)."""
@@ -666,7 +667,7 @@ def _evaluate_worktree_segment(
     segment: str, base_cwd: str, full_command: str, *, allow_hatch: bool
 ) -> tuple[str, str] | None:
     """Evaluate ONE chained-command segment. Returns None if it needs no gating (not `git`, not
-    `worktree add`/`remove`/`move`, no resolvable target, repo root undetermined, or the target
+    `worktree add`/`move`, no resolvable target, repo root undetermined, or the target
     already resolves under `<repo-root>/.worktrees/`). Returns `("block", message)` when it must
     block, `("approved", note)` when a hatch escalation approved it.
 

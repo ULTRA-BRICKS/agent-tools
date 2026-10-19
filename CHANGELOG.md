@@ -4,6 +4,12 @@
 
 ### Added
 
+- `block-unlanded-removal` agent-hook (pre-bash, priority 41, fail-closed): removing a worktree or
+  deleting a branch is allowed only when the work is landed and the tree is clean. A loose,
+  quote-stripping prefilter (`git worktree remove/rm`, `git branch -d/-D/--delete`,
+  `git push --delete/--mirror/--prune/:ref`) hands the command to `rig worktree guard --cwd <cwd>`,
+  which answers pass/allow/deny; deny, or rig missing/nonzero/timeout/garbage output, blocks. No
+  bypass; the deny text names `rig worktree verdict <target>` and the patch-rescue recipe.
 - `ci/python-only` gate (agent-tools#945): rig-ecosystem tools are written in Python (owner
   decision 2026-06-14, restated 2026-10-17). One stdlib checker,
   `ci/python-only/python_only.py`, runs as the global pre-commit fragment `20-python-only` and
@@ -17,6 +23,9 @@
 
 ### Changed
 
+- `block-raw-worktree-add` no longer gates `git worktree remove`: removal safety is decided by
+  `block-unlanded-removal`, so a safe removal outside `.worktrees/` is allowed. The location rule
+  still applies to `add` and `move`.
 - `model-freshness` checker (`lib/checker/model_freshness.py`) works on an OAuth-only machine
   (agent-tools#934). Each provider poll is merged with the keyless catalogs the logged-in
   harnesses cache — `omp models --json`, codex's `$CODEX_HOME/models_cache.json`, Claude

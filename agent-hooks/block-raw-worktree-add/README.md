@@ -3,8 +3,10 @@
 **Point:** `pre-bash` · **Fail policy:** `open` · **Priority:** 40
 
 Enforces `<repo-root>/.worktrees/` as the **ONLY** sanctioned worktree location: BLOCKS a
-`git worktree add` / `remove` / `move` whose target does not resolve there, and points the
-agent at `rig worktree create` / `rig worktree remove` / `rig worktree gc` instead.
+`git worktree add` / `move` whose target does not resolve there, and points the
+agent at `rig worktree create` / `rig worktree gc` instead. `git worktree remove` is **not**
+gated here — whether a removal is safe (work landed, tree clean) is decided by
+[`block-unlanded-removal`](../block-unlanded-removal/README.md).
 (agent-tools#608, Alex, 2026-09-07.)
 
 ## The gap this closes
@@ -28,8 +30,7 @@ and `.claude/worktrees/agent-*` — the five-conventions problem, unguarded.
 - `git worktree add -b <branch> <path>` / `git worktree add <path> -b <branch>` — either flag
   order; `-b`/`-B`/`--reason` are recognized as value-taking flags so their argument is never
   mistaken for the target path.
-- `git worktree remove <path>` — same check, same rationale (the sanctioned inverse is
-  `rig worktree remove`, or `rig worktree gc` for a worktree that predates this convention).
+- `git worktree remove <path>` — **not gated by this hook**; see `block-unlanded-removal`.
 - `git worktree move <worktree> <new-path>` — gated on the DESTINATION (the second positional);
   the source isn't checked, so a legitimate migration `git worktree move /tmp/old .worktrees/old`
   still works. `move` fully relocates an existing worktree — exactly the GH-329 failure mode —
@@ -43,8 +44,8 @@ and `.claude/worktrees/agent-*` — the five-conventions problem, unguarded.
   segment blocks the whole chain. At most ONE segment in a single chained command gets a Telegram
   hatch round-trip (see "No self-service bypass" below) — a second gate-worthy segment in the
   same chain is blocked outright, no hatch call.
-- **Allowed, unaffected:** `git worktree add`/`remove`/`move` targeting anything already under
-  `<repo-root>/.worktrees/` (i.e. what `rig worktree create`/`remove` themselves produce, or a
+- **Allowed, unaffected:** `git worktree add`/`move` targeting anything already under
+  `<repo-root>/.worktrees/` (i.e. what `rig worktree create` itself produces, or a
   destination `.worktrees/<name>` migration lands at — but NOT `.worktrees` itself with no
   `<name>`, which is not a valid `rig worktree create` shape and is still blocked);
   `git worktree list` / `lock` / `unlock` / `repair`; `git worktree prune` (see "Deliberately out
@@ -92,7 +93,7 @@ out of scope — undetermined, fails open.
   GH-329's actual failure mode (a worktree landing in the wrong *place*), and would fight
   `rig worktree gc`'s own remediation path.
 - **`git worktree list`/`lock`/`unlock`/`repair`** — none of these create or relocate a worktree
-  relative to the repo root the way `add`/`remove`/`move` do.
+  relative to the repo root the way `add`/`move` do.
 
 ## No opt-in flag
 
@@ -120,7 +121,7 @@ pattern (see that hook's README for the full mechanics: trusted absolute `tg-ctl
 audit sink, inline-vs-exported precedence).
 
 **At most one hatch round-trip per invocation.** `tg-ctl ask` legitimately runs up to ~900s. A
-chained command with two or more gate-worthy `worktree add`/`remove`/`move` segments could sum
+chained command with two or more gate-worthy `worktree add`/`move` segments could sum
 past this hook's `timeout_ms` manifest budget (sized for ONE such call), which would let the
 dispatcher's own timeout-kill resolve to `on_error: open`'s silent allow for the WHOLE chain —
 including a segment that was never actually approved. So only the FIRST gate-worthy segment in a
@@ -141,9 +142,8 @@ agent's ability to run an unrelated Bash command.
 
 - A `cd other-repo && git worktree add X` chain is judged against the **original** cwd's repo
   root unless the segment itself carries `git -C <dir>` (which IS honored).
-- An unrecognized *future* `git worktree add`/`remove`/`move` flag that happens to take a value
-  not in this hook's known value-flag set (`-b`/`-B`/`--reason` for `add`; none for `remove`/
-  `move`) could be misread as the target path, or vice versa — the same class of residual every
+- An unrecognized *future* `git worktree add`/`move` flag that happens to take a value
+  not in this hook's known value-flag set (`-b`/`-B`/`--reason` for `add`; none for `move`) could be misread as the target path, or vice versa — the same class of residual every
   argv-heuristic hook in this family accepts and documents rather than hand-parsing git's full
   option grammar.
 - A **repeated** `-C`/`--git-dir` (`git -C a -C b ...`) is not composed the way real git composes
@@ -164,7 +164,7 @@ agent's ability to run an unrelated Bash command.
 
 Named explicitly rather than left for a reviewer to rediscover:
 
-- **`bash -c '...'` / `sh -c "..."` / `eval "..."`** hiding a `git worktree add`/`remove`/`move`
+- **`bash -c '...'` / `sh -c "..."` / `eval "..."`** hiding a `git worktree add`/`move`
   is NOT detected — this hook does not re-scan interpreter argument strings the way `block-raw-pr-merge`
   does for its narrower merge detector. Same residual `pin-primary-worktree` already accepts for
   `checkout`/`switch`. A follow-up could port `block-raw-pr-merge`'s
