@@ -52,9 +52,12 @@ hook event. `timeout_ms` is 150000 so the host never kills the hook before its o
 No env var, inline prefix, or Telegram hatch. The sanctioned ways forward are in the deny text:
 
 - inspect with `rig worktree verdict <target>`;
-- push the work or merge it, then retry;
-- rescue it: `git diff --binary HEAD > ~/.cache/<repo>-recovery/<wt>-<ts>.patch` and push a
-  followup branch.
+- merge it, then retry; or push the commits to a branch that is not being deleted
+  (`git push origin <branch>:refs/heads/archive/<name>`) and retry — a commit held by another remote
+  branch that stays counts as preserved (rig's `preserved` proof), so a PR closed as superseded can
+  be cleared once its commits are archived;
+- rescue uncommitted work: `git diff --binary HEAD > ~/.cache/<repo>-recovery/<wt>-<ts>.patch`, commit
+  it and push it to such a branch too.
 
 ## Relation to `block-raw-worktree-add`
 

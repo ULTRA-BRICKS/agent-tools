@@ -35,9 +35,10 @@ so `g''it branch -D x` / `git wor\\ktree remove x` / `git${IFS}branch${IFS}-D` c
 A payload whose ``args``/command has the wrong type is a DENY, not an allow.
 
 There is NO env/inline/Telegram escape hatch: deny-by-default. The sanctioned alternatives are in
-the deny text — inspect with `rig worktree verdict <target>`, push/merge the work, or rescue it
-with `git diff --binary HEAD > ~/.cache/<repo>-recovery/<wt>-<ts>.patch` plus pushing a followup
-branch.
+the deny text — inspect with `rig worktree verdict <target>`, merge the work, or push the commits to
+a branch that is not being deleted (`archive/<name>`: a commit held by another remote branch that
+stays counts as preserved), plus `git diff --binary HEAD > ~/.cache/<repo>-recovery/<wt>-<ts>.patch`
+for uncommitted work.
 
 Knobs (tests only): ``AGENT_TOOLS_REMOVAL_GUARD_TIMEOUT_S`` overrides the 120 s rig timeout.
 
@@ -89,9 +90,11 @@ _QUOTES_ONLY = re.compile(r"[\"'\\]")
 _LINE_CONTINUATION = re.compile(r"\\\n")
 
 _RESCUE_HINT = (
-    "Inspect with `rig worktree verdict <target>`. Sanctioned ways forward: push the work or "
-    "merge it (then retry), or rescue it — `git diff --binary HEAD > "
-    "~/.cache/<repo>-recovery/<wt>-<ts>.patch` and push a followup branch. "
+    "Inspect with `rig worktree verdict <target>`. Sanctioned ways forward: merge it (then retry), "
+    "or push the commits to a branch that is not being deleted — `git push origin "
+    "<branch>:refs/heads/archive/<name>` — and retry (a commit held by another remote branch that "
+    "stays counts as preserved); uncommitted work: `git diff --binary HEAD > "
+    "~/.cache/<repo>-recovery/<wt>-<ts>.patch`, commit it and push it to such a branch. "
     "There is NO bypass for this guard."
 )
 

@@ -23,6 +23,10 @@
 
 ### Changed
 
+- `block-unlanded-removal` deny text names the route that works for a PR closed as superseded
+  (agent-tools#963): push the commits to a branch that is not being deleted
+  (`git push origin <branch>:refs/heads/archive/<name>`), then retry. rig's verdict counts a commit
+  held by another live remote branch as preserved (rig-cli#737); the hook only forwards rig's answer.
 - `block-raw-worktree-add` no longer gates `git worktree remove`: removal safety is decided by
   `block-unlanded-removal`, so a safe removal outside `.worktrees/` is allowed. The location rule
   still applies to `add` and `move`.
