@@ -115,6 +115,12 @@ the action proceeds.
 > and a bare/relative command would let the executed bytes differ from the hashed bytes.
 > Installers substitute the real absolute path at install time; the descriptors here ship
 > a `/ABSOLUTE/PATH/TO/...` placeholder.
+>
+> **`args` may carry a second placeholder, `/ABSOLUTE/PATH/TO/rig`.** A hook that must run `rig`
+> itself (`block-unlanded-removal`) ships `"args": ["--rig", "/ABSOLUTE/PATH/TO/rig"]`. Installing
+> `rig` replaces any `args` element equal to that exact literal with the absolute path of the rig
+> launcher that ran `rig apply`, so the hook runs a pinned rig and never resolves one through
+> `PATH`. An un-substituted placeholder is not an existing file, so the hook fails closed.
 
 ## Hook points used here
 

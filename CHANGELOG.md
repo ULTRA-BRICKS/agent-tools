@@ -23,6 +23,18 @@
 
 ### Changed
 
+- `block-unlanded-removal` runs a PINNED rig and degrades on a stale one (agent-tools#961). The
+  descriptor gains `"args": ["--rig", "/ABSOLUTE/PATH/TO/rig"]` (`rig apply` substitutes the
+  launcher's absolute path); the hook never resolves `rig` through PATH, requires an absolute
+  executable regular file whose `--version` prints `rig X.Y.Z` with X.Y.Z >= 0.64.0 (integer-tuple
+  compare), and otherwise fails closed (denies every matched command: absent/relative/missing/
+  non-executable pin, unverifiable version). The prefilter now has two classes: STRICT
+  (removal-shaped) and LOOSE (only `$`/`{`/backtick next to a git word, e.g. every heredoc commit).
+  A rig older than 0.64.0 (no `worktree guard`) denies STRICT with an "upgrade rig" message and
+  allows LOOSE with a stderr warning, so a stale rig no longer wedges every heredoc commit. New
+  STRICT shapes for rig-cli#740: `git branch` with `-f/-M/-C/-m/-c` (or `--f…/--m…/--c…`), `git
+  checkout -B`, `git switch -C/--force-create`, and `rm` with a recursive flag as a command word.
+  Other #961 items (aliases, xargs, rescue hint) are unchanged.
 - `block-unlanded-removal` deny text names the route that works for a PR closed as superseded
   (agent-tools#963): push the commits to a branch that is not being deleted
   (`git push origin <branch>:refs/heads/archive/<name>`), then retry. rig's verdict counts a commit
