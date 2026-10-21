@@ -95,6 +95,7 @@ class RepoPolicy:
 _BROWSER = "browser code: the browser only runs JavaScript"
 _OMP_HOST = "runs inside the omp extension host, which loads JavaScript/TypeScript"
 _OMP_HOST_TESTS = "tests of the code that runs inside the omp extension host"
+_CHROMIUM_PAGE = "browser-injected DOM adapter executed by Chromium in the page; Python cannot run there"
 
 # Repos by name. A repo in an owner namespace whose name ends in -cli is in scope even when it
 # is not listed here (block, no exemptions); list it only to add exemptions or a warn grant.
@@ -111,6 +112,12 @@ REPOS: dict[str, RepoPolicy] = {
                 Allow("oxlint.config.ts", "oxlint config: oxlint reads its config as TypeScript"),
                 Allow("linters/oxc/oxlint.config.ts", "oxlint config template shipped to TS repos"),
                 Allow("skills/by-stack/**", "code samples inside stack-specific skills for projects in that language"),
+                # Guardian (#891): DOM adapters injected into the ChatGPT page and run by Chromium.
+                # Exact paths on purpose: any other JS in the package stays blocked.
+                Allow("lib/agenttools_chatgpt/dom.js", _CHROMIUM_PAGE),
+                Allow("lib/agenttools_chatgpt/live_dom.js", _CHROMIUM_PAGE),
+                Allow("lib/agenttools_chatgpt/monitor_dom.js", _CHROMIUM_PAGE),
+                Allow("lib/agenttools_chatgpt/conversation_root.js", _CHROMIUM_PAGE),
             ),
         ),
         RepoPolicy("text-lint"),
