@@ -49,6 +49,10 @@ checker refuses to run with an empty one), land it as an agent-tools PR, then `r
 The registry is central on purpose: the repo being checked cannot exempt itself, and the CI
 job runs the base-branch copy.
 
+Prefer exact paths over globs for a single package's assets: agent-tools allows only
+`lib/agenttools_chatgpt/{dom,live_dom,monitor_dom,conversation_root}.js` (Guardian's
+browser-injected DOM adapters, run by Chromium), so any other JS beside them still blocks.
+
 GNOME Shell extensions laid out as installed (`**/gnome-shell/extensions/<uuid>/**`) and the
 oxlint files rig generates in a repo that enables `linters.rules` (root `oxlint.config.ts`,
 `tools/oxlint/anti-slop/**`) are exempt in every repo (`HOST_FORCED_ALLOW`). Host files rig

@@ -260,6 +260,63 @@ def test_host_forced_code_is_exempt(po, repo, path, exempt):
     assert po.allowed(policy, path) is exempt
 
 
+GUARDIAN_ASSETS = (
+    "lib/agenttools_chatgpt/dom.js",
+    "lib/agenttools_chatgpt/live_dom.js",
+    "lib/agenttools_chatgpt/monitor_dom.js",
+    "lib/agenttools_chatgpt/conversation_root.js",
+)
+
+
+@pytest.mark.parametrize("path", GUARDIAN_ASSETS)
+def test_guardian_browser_assets_are_allowed_in_agent_tools_by_exact_path(po, path):
+    policy = po.policy_for("https://git.hyperide.ai/ultrabricks/agent-tools.git")
+    assert po.allowed(policy, path) is True
+    assert policy.mode == "block"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "lib/agenttools_chatgpt/other.js",
+        "lib/agenttools_chatgpt/sub/dom.js",
+        "lib/agenttools_chatgpt/dom.ts",
+        "lib/agenttools_chatgpt/service.ts",
+        "lib/other_pkg/dom.js",
+    ],
+)
+def test_other_js_near_the_guardian_assets_stays_blocked(po, path):
+    policy = po.policy_for("https://git.hyperide.ai/ultrabricks/agent-tools.git")
+    assert po.allowed(policy, path) is False
+
+
+def test_guardian_asset_paths_are_not_allowed_in_other_repos(po):
+    policy = po.policy_for("https://git.hyperide.ai/ultrabricks/demo-cli.git")
+    assert po.allowed(policy, GUARDIAN_ASSETS[0]) is False
+
+
+def test_staged_guardian_assets_pass_but_unrelated_js_in_the_package_is_refused(tmp_path):
+    ok = _repo(tmp_path / "ok", AGENT_TOOLS_ORIGIN)
+    for rel in GUARDIAN_ASSETS:
+        _put(ok, rel, "export const x = 1;\n")
+    proc = _run(ok)
+    assert proc.returncode == 0, proc.stderr
+
+    bad = _repo(tmp_path / "bad", AGENT_TOOLS_ORIGIN)
+    _put(bad, GUARDIAN_ASSETS[0], "export const x = 1;\n")
+    _put(bad, "lib/agenttools_chatgpt/extra.js", "export const y = 2;\n")
+    proc = _run(bad)
+    assert proc.returncode == 1
+    assert "extra.js" in proc.stderr
+
+
+def test_non_python_tool_code_in_the_guardian_package_still_blocks(tmp_path):
+    repo = _repo(tmp_path, AGENT_TOOLS_ORIGIN)
+    _put(repo, "lib/agenttools_chatgpt/cli.ts", "export const z = 3;\n")
+    proc = _run(repo)
+    assert proc.returncode == 1 and "cli.ts" in proc.stderr
+
+
 # --- pre-commit (staged) end to end -------------------------------------------------------
 
 

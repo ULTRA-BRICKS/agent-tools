@@ -4,6 +4,9 @@
 
 ### Added
 
+- `python-only`: exact-path Allow entries for the four Guardian browser-injected DOM adapters
+  (`lib/agenttools_chatgpt/{dom,live_dom,monitor_dom,conversation_root}.js`, run by Chromium in
+  the ChatGPT page; agent-tools#969, Refs #891). No glob: other JS in that package still blocks.
 - `block-unlanded-removal` agent-hook (pre-bash, priority 41, fail-closed): removing a worktree or
   deleting a branch is allowed only when the work is landed and the tree is clean. A loose,
   quote-stripping prefilter (`git worktree remove/rm`, `git branch -d/-D/--delete`,
