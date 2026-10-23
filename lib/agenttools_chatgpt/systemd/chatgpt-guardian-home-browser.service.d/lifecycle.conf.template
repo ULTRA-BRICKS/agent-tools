@@ -1,0 +1,12 @@
+# Drop-in template; render @VENV_PYTHON@ and @CDP_PORT@ (the --remote-debugging-port of the browser unit) then install as
+# ~/.config/systemd/user/chatgpt-guardian-home-browser.service.d/lifecycle.conf
+# and run: systemctl --user daemon-reload
+# Restart=always + RestartMode=direct (systemd >= 254; docs: https://www.freedesktop.org/software/systemd/man/259/systemd.service.html)
+# restarts after an unexpected clean exit or crash without a transient stop
+# job, so BindsTo= dependents (the Guardian) are not stopped. An explicit
+# `systemctl --user stop` still leaves the unit stopped. RestartSec=60 and the
+# StartLimit* settings stay as in the base unit.
+[Service]
+Restart=always
+RestartMode=direct
+ExecStartPost=-@VENV_PYTHON@ -m agenttools_chatgpt.startup --workspace home --cdp-port @CDP_PORT@ --apply

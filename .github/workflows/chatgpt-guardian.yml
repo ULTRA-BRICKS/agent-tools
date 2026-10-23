@@ -1,0 +1,95 @@
+# ChatGPT Guardian package check — runs the eleven Guardian test files in one pytest
+# invocation against a real Chromium, so the browser-fixture tests execute instead of
+# skipping (the generic `tests` workflow has no browser installed).
+#
+# The fixture tests locate the browser with `shutil.which("google-chrome")`; this job
+# installs Playwright's Chromium and exposes it under that name. The job fails when any
+# test is skipped, errored or failed, or when the collected count is zero, so a
+# skip-only run can never pass as green.
+#
+# Read-only, secretless `pull_request` context (never pull_request_target). Actions are
+# pinned to commit SHAs, same pins as tests.yml.
+
+name: chatgpt-guardian
+
+on:
+  pull_request:
+    paths:
+      - "lib/agenttools_chatgpt/**"
+      - "tests/test_chatgpt_guardian*.py"
+      - ".github/workflows/chatgpt-guardian.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chatgpt-guardian-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  guardian:
+    name: guardian
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTEST_SPEC: "pytest>=8,<9"
+      PLAYWRIGHT_SPEC: "playwright>=1.63,<2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Install Chromium
+        run: |
+          set -euo pipefail
+          uv run --with "${PLAYWRIGHT_SPEC}" playwright install --with-deps chromium
+          chromium="$(uv run --with "${PLAYWRIGHT_SPEC}" python -c \
+            'from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              print(p.chromium.executable_path)')"
+          test -x "${chromium}"
+          mkdir -p "${RUNNER_TEMP}/bin"
+          printf '#!/bin/sh\nexec "%s" "$@"\n' "${chromium}" > "${RUNNER_TEMP}/bin/google-chrome"
+          chmod +x "${RUNNER_TEMP}/bin/google-chrome"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: Run Guardian package tests
+        run: |
+          set -euo pipefail
+          command -v google-chrome
+          uv run --with "${PYTEST_SPEC}" --with "${PLAYWRIGHT_SPEC}" pytest \
+            tests/test_chatgpt_guardian.py \
+            tests/test_chatgpt_guardian_dom.py \
+            tests/test_chatgpt_guardian_ha.py \
+            tests/test_chatgpt_guardian_live.py \
+            tests/test_chatgpt_guardian_live_limits.py \
+            tests/test_chatgpt_guardian_monitor.py \
+            tests/test_chatgpt_guardian_monitor_dom.py \
+            tests/test_chatgpt_guardian_operator.py \
+            tests/test_chatgpt_guardian_operator_dom.py \
+            tests/test_chatgpt_guardian_polling.py \
+            tests/test_chatgpt_guardian_service.py \
+            tests/test_chatgpt_guardian_startup.py \
+            -q -rs -p no:cacheprovider --junitxml="${RUNNER_TEMP}/guardian-junit.xml"
+
+      - name: Require a full non-skipped run
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - "${RUNNER_TEMP}/guardian-junit.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          counts["passed"] = counts["tests"] - counts["failures"] - counts["errors"] - counts["skipped"]
+          print("JUNIT " + " ".join(f"{k}={v}" for k, v in counts.items()))
+          if counts["tests"] == 0 or counts["failures"] or counts["errors"] or counts["skipped"]:
+              sys.exit("Guardian run is not a full pass: failures, errors, skips or zero tests")
+          PY

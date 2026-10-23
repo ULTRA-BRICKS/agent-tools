@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TEST_PATHS: tests
-      TEST_EXTRA_DEPS: "pyyaml jsonschema"
+      TEST_EXTRA_DEPS: "pyyaml jsonschema playwright>=1.63,<2"
       # Pin the test runner so a new pytest major can't flip a green PR red on its own; bump
       # deliberately. Override PYTEST_SPEC to track a different line.
       PYTEST_SPEC: "pytest>=8,<9"
