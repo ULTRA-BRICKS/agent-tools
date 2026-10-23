@@ -177,6 +177,51 @@ VISUAL_EXT = re.compile(
     re.IGNORECASE,
 )
 VISUAL_DIR = re.compile(r"(?:^|/)(?:components|ui|pages|app|views|public|assets)/", re.IGNORECASE)
+# The directory rule only applies to files that can render. Extensions already in VISUAL_EXT
+# match on their own; this adds the renderable kinds that are NOT in it (markup-bearing
+# templates, icons, fonts, video). A plain .ts/.js/.json/.md under src/app/ renders nothing.
+VISUAL_DIR_EXT = re.compile(
+    r"\.(?:astro|mdx|htm|ico|avif|bmp|tiff?|woff2?|ttf|otf|eot|mp4|webm)$", re.IGNORECASE
+)
+# `public/` and `assets/` are served verbatim (copy in a .json, a manifest, a .txt), so EVERY
+# file under them stays gated, as before. A markdown file is a rendered route only under pages/.
+SERVED_DIR = re.compile(r"(?:^|/)(?:public|assets)/", re.IGNORECASE)
+PAGES_MARKDOWN = re.compile(r"(?:^|/)pages/.*\.md$", re.IGNORECASE)
+# Test and story files are never shipped UI, whatever their extension: `*.test.*` (covers
+# `*.bun.test.ts`), `*.spec.*`, `*.stories.*`/`*.story.*`, and anything under `__tests__/`,
+# `__mocks__/`, `__fixtures__/`. A commit that changes a component AND its test is still gated
+# by the component. A plain `test/`/`tests/` dir counts too, but ONLY when no routing or asset
+# root (`app/ pages/ public/ assets/ views/ components/ ui/`) precedes it: `src/app/test/page.tsx`
+# is a real `/test` route (see `_is_non_rendering_path`).
+NON_RENDERING_PATH = re.compile(
+    r"(?:\.(?:test|spec|stories|story)\.[^/]+$|(?:^|/)(?:__tests__|__mocks__|__fixtures__)/)",
+    re.IGNORECASE,
+)
+_TEST_DIR_NAMES = frozenset({"test", "tests"})
+_ROUTING_DIR_NAMES = frozenset({"app", "pages", "public", "assets", "views", "components", "ui"})
+# Files whose staged content is inspected for JSX. `.js`/`.mjs`/`.cjs` count because JSX-in-.js
+# codebases exist; `.ts` cannot contain JSX and is never inspected.
+JSX_CAPABLE_EXT = re.compile(r"\.(?:tsx|jsx|js|mjs|cjs)$", re.IGNORECASE)
+_PLAIN_JS_EXT = re.compile(r"\.(?:js|mjs|cjs)$", re.IGNORECASE)
+
+
+def _inspect_for_jsx(path: str) -> bool:
+    """`.tsx`/`.jsx` anywhere; plain `.js`/`.mjs`/`.cjs` only where the directory rule used to
+    gate them (HTML in a build script's template string is not a rendering change)."""
+    if not JSX_CAPABLE_EXT.search(path) or STYLE_IN_CODE.search(path):
+        return False
+    return not _PLAIN_JS_EXT.search(path) or bool(VISUAL_DIR.search(path))
+# Styling and copy that live in code/data files: vanilla-extract `Button.css.ts`, `*.styled.ts`,
+# `*.styles.ts`, and locale/i18n message JSON are user-visible even though they hold no markup.
+STYLE_IN_CODE = re.compile(r"\.(?:css|styles?|styled)\.[jt]s$", re.IGNORECASE)
+COPY_JSON = re.compile(r"(?:^|/)(?:locales?|i18n|messages|translations)/.*\.json$", re.IGNORECASE)
+# A JSX tag opening or closing: `<div`, `<Foo.Bar`, `</div`, or a fragment `<>`.
+# The name may be Unicode, and a generic element (`<Table<Row> />`) continues with another `<`.
+_JSX_TAG = re.compile(r"<(?:>|/?(?:[^\W\d]|\$)[\w.:$-]*(?=[\s/><]))")
+# A word right before `<` that still leaves the `<` in expression position (so it opens JSX);
+# any other preceding word means a generic (`useQuery<Foo>`) or a comparison.
+_JSX_AFTER_WORD = frozenset({"return", "yield", "default", "case", "else", "do", "await"})
+_PREV_TOKEN = re.compile(r"(\w+|\S)\s*$")
 
 # Canonical hook id for the shared Telegram hatch (RIG_HATCH_REQUEST_VISUAL_PROOF_GATE).
 HOOK_ID = "visual-proof-gate"
@@ -712,21 +757,31 @@ def staged_files(cwd: str) -> list[str] | None:
     """Names of files staged for commit, or None if git could not be queried (→ fail open)."""
     try:
         proc = subprocess.run(  # noqa: S603,S607 — fixed git argv, trusted
-            ["git", "-C", cwd, "diff", "--cached", "--name-only"],
+            [
+                "git", "-C", cwd,
+                "-c", "diff.relative=false",  # ignored by git < 2.28; keeps paths repo-root-relative
+                "diff", "--cached", "--name-only", "--no-renames", "-z",
+            ],
             capture_output=True,
-            text=True,
             timeout=GIT_DIFF_TIMEOUT_S,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         warn(f"could not list staged files: {exc} — allowing (fail-open)")
         return None
     if proc.returncode != 0:
-        warn(f"git diff --cached exited {proc.returncode}: {proc.stderr.strip()} — allowing")
+        warn(
+            f"git diff --cached exited {proc.returncode}: "
+            f"{proc.stderr.decode('utf-8', 'replace').strip()} — allowing"
+        )
         return None
-    return [line for line in proc.stdout.splitlines() if line.strip()]
+    # NUL-separated (-z) so special characters in a name are not octal-quoted; bytes are decoded
+    # with surrogateescape so a non-UTF-8 name round-trips instead of crashing the hook.
+    return [
+        name for name in proc.stdout.decode("utf-8", "surrogateescape").split("\0") if name
+    ]
 
 
-def _resolve_staged_files(cwd: str, session_cwd: str) -> list[str] | None:
+def _resolve_staged_files(cwd: str, session_cwd: str) -> tuple[list[str] | None, str]:
     """`staged_files(cwd)`, but falling back to `session_cwd` specifically when `cwd` is a
     `cd`/`-C` target that DOESN'T EXIST ON DISK — the one case where we can be sure a real
     shell's `cd` would not have landed there either (whatever the surrounding operator,
@@ -747,15 +802,145 @@ def _resolve_staged_files(cwd: str, session_cwd: str) -> list[str] | None:
     files (which could produce an unrelated false BLOCK, or mask the real target's error
     behind an unrelated false ALLOW). A LEGITIMATE `cd <valid-other-repo> && git commit` with
     nothing staged there returns `[]` (not `None`) from `staged_files`, so this fallback
-    never fires for it either way."""
+    never fires for it either way.
+
+    Returns `(files, queried_dir)`: the directory the listing really came from, so file
+    CONTENT is read from the same repo (a fallback must not read blobs from `cwd`)."""
     files = staged_files(cwd)
     if files is None and cwd != session_cwd and not os.path.isdir(cwd):
-        files = staged_files(session_cwd)
-    return files
+        return staged_files(session_cwd), session_cwd
+    return files, cwd
 
 
-def visual_staged(files: list[str]) -> list[str]:
-    return [f for f in files if VISUAL_EXT.search(f) or VISUAL_DIR.search(f)]
+_LOOKBACK_CHARS = 200
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+# A `//` right after a word char is inside a string or URL (`"a//b"`, `https://`), not a comment.
+_LINE_COMMENT = re.compile(r"(?<![\w:/])//[^\n]*")
+
+
+def _is_non_rendering_path(path: str) -> bool:
+    if NON_RENDERING_PATH.search(path):
+        return True
+    for seg in path.lower().split("/")[:-1]:
+        if seg in _ROUTING_DIR_NAMES:
+            return False
+        if seg in _TEST_DIR_NAMES:
+            return True
+    return False
+
+
+def contains_jsx(source: str) -> bool:
+    """True if `source` has JSX markup. A heuristic that errs toward True: generics and
+    comparisons are told apart from tags by the token before the `<` (an identifier, `)` or `]`
+    means generic/comparison, unless it is `return`-like); anything ambiguous counts as JSX, so
+    the gate over-blocks rather than under-blocks. Only a bounded window before each `<` is
+    inspected (comments dropped), so the scan stays linear on large generated files."""
+    for m in _JSX_TAG.finditer(source):
+        lo = max(0, m.start() - _LOOKBACK_CHARS)
+        window = source[lo : m.start()]
+        if lo > 0:
+            close, open_ = window.find("*/"), window.find("/*")
+            if close >= 0 and (open_ < 0 or close < open_):
+                window = window[close + 2 :]  # the window starts inside a block comment
+            else:
+                nl = window.find("\n")
+                if nl >= 0:
+                    window = window[nl + 1 :]  # the first line may be the tail of a comment
+                # No newline: the `<` sits on one long line (generated types), and a `//` comment
+                # earlier on that line would have swallowed the `<` itself, so the window is safe.
+        if "/" in window:  # comments can only hide the previous token if a `/` is present
+            window = _LINE_COMMENT.sub("", _BLOCK_COMMENT.sub("", window))
+        prev = _PREV_TOKEN.search(window)
+        if prev is None:
+            return True
+        tok = prev.group(1)
+        if tok in _JSX_AFTER_WORD or not (tok[0].isalnum() or tok[0] in "_$)]"):
+            return True
+    return False
+
+
+def _blobs(cwd: str, specs: list[str]) -> dict[str, str | None]:
+    """Content for each git object spec (`:path` = staged, `HEAD:path`) via ONE
+    `git cat-file --batch` process. A spec git cannot resolve, or any failure, maps to None."""
+    result: dict[str, str | None] = dict.fromkeys(specs)
+    if not specs:
+        return result
+    try:
+        proc = subprocess.run(  # noqa: S603,S607 — fixed git argv, trusted
+            ["git", "-C", cwd, "cat-file", "--batch"],
+            input="".join(f"{spec}\n" for spec in specs).encode("utf-8", "surrogateescape"),
+            capture_output=True,
+            timeout=GIT_DIFF_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return result
+    if proc.returncode != 0:
+        return result
+    out, pos = proc.stdout, 0
+    for spec in specs:
+        eol = out.find(b"\n", pos)
+        if eol < 0:
+            break
+        header = out[pos:eol].split()
+        pos = eol + 1
+        if len(header) == 3 and header[2].isdigit():
+            size = int(header[2])
+            if header[1] == b"blob":
+                result[spec] = out[pos : pos + size].decode("utf-8", "replace")
+            pos += size + 1  # any object body is followed by a newline; a tree/commit stays None
+        elif len(header) < 2 or header[-1] not in (b"missing", b"ambiguous"):
+            return dict.fromkeys(specs)  # unexpected framing: trust nothing, all unreadable
+    return result
+
+
+def _worktree_text(top: str | None, path: str) -> str | None:
+    """The on-disk content of a repo-relative `path`, or None (also for symlinks). `git commit
+    -a` / `git commit <path>` commit the WORKTREE version, which can differ from the index."""
+    if top is None:
+        return None
+    full = os.path.join(top, path)
+    try:
+        if os.path.islink(full) or not os.path.isfile(full):
+            return None
+        with open(full, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def visual_staged(cwd: str, files: list[str]) -> list[str]:
+    """The staged files that can change what a user sees. A .tsx/.jsx counts when its staged, HEAD OR
+    worktree content has JSX (so removing the last element of a component is still a visual
+    change); content git cannot read back at all counts as visible."""
+    served = {f for f in files if SERVED_DIR.search(f)}  # served verbatim: nothing is exempt
+    candidates = [f for f in files if f not in served and not _is_non_rendering_path(f)]
+    # A name with a newline cannot be framed in `cat-file --batch`'s line protocol: such a file
+    # is never inspected, so it counts as visible (fail toward gating).
+    jsx_paths = [
+        f for f in candidates if _inspect_for_jsx(f) and "\n" not in f
+    ]
+    blobs = _blobs(cwd, [f":{f}" for f in jsx_paths] + [f"HEAD:{f}" for f in jsx_paths])
+    top = _repo_toplevel(cwd) if jsx_paths else None
+    visible = list(served)
+    for f in candidates:
+        if STYLE_IN_CODE.search(f) or COPY_JSON.search(f) or (_inspect_for_jsx(f) and "\n" in f):
+            visible.append(f)
+        elif _inspect_for_jsx(f):
+            in_git = [blobs.get(f":{f}"), blobs.get(f"HEAD:{f}")]
+            versions = [*in_git, _worktree_text(top, f)]
+            # Neither git version readable (failed read, or odd object): gate, whatever the disk says.
+            if all(v is None for v in in_git) or any(
+                v is not None and contains_jsx(v) for v in versions
+            ):
+                visible.append(f)
+        elif (
+            VISUAL_EXT.search(f)
+            or PAGES_MARKDOWN.search(f)
+            or (VISUAL_DIR.search(f) and VISUAL_DIR_EXT.search(f))
+        ):
+            visible.append(f)
+    keep = set(visible)
+    return [f for f in files if f in keep]
 
 
 # Every path this hook reads MARKER CONTENT from — a file in the shared PROOF_DIR, or a
@@ -1241,12 +1426,12 @@ def main() -> int:
     # repo than the session's own cwd — check staged files in THAT repo, not session_cwd.
     cwd = effective_cwd(command, session_cwd)
 
-    files = _resolve_staged_files(cwd, session_cwd)
+    files, queried_dir = _resolve_staged_files(cwd, session_cwd)
     if files is None:
         emit("allow")  # git could not be queried anywhere → fail open
         return 0
 
-    visual = visual_staged(files)
+    visual = visual_staged(queried_dir, files)
     if not visual:
         emit("allow")  # no user-visible files staged → nothing to prove
         return 0

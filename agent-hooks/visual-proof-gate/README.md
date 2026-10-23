@@ -9,13 +9,49 @@ claim on a UI change with no screenshot you actually looked at is the failure th
 
 ## What counts as user-visible (staged file inspection)
 
-The gate shells out to `git -C <cwd> diff --cached --name-only` and flags a staged file if:
+The gate shells out to `git -C <cwd> diff --cached --name-only` and flags a staged file when
+it **can render** (agent-tools#973) and is not a test or story:
 
-- its extension matches `\.(tsx|jsx|vue|svelte|css|scss|less|html|svg|png|jpg|jpeg|gif|webp)$`, **or**
-- its path is under `components/`, `ui/`, `pages/`, `app/`, `views/`, `public/`, `assets/`.
+- **never visible** (checked after the `public/`/`assets/` rule below): `*.test.*` (incl. `*.bun.test.ts`), `*.spec.*`,
+  `*.stories.*`, `*.story.*`, anything under `__tests__/`, `__mocks__/`, `__fixtures__/`, and a
+  `test/` or `tests/` directory that is NOT below a routing/asset root (`app/ pages/ public/
+  assets/ views/ components/ ui/`): `src/app/test/page.tsx` is a real `/test` route and stays
+  gated. A commit that touches a component AND its test is still gated by the component. (A
+  stories-only commit is not gated; the CI story screenshots are its proof.)
+- `.tsx` / `.jsx` (anywhere) and `.js` / `.mjs` / `.cjs` (only under the directories below):
+  visible only if the **staged, HEAD or worktree content contains JSX markup** (the worktree copy of a STAGED file is included because `git commit -a`/`<pathspec>` commits it; a file that is not staged at all is never listed, as before) (so
+  removing the last element of a component still counts). The check is a heuristic that errs
+  toward "visible": generics like `useQuery<Foo>` and comparisons are told apart from tags by the
+  token before the `<`, anything ambiguous counts as markup. A `.tsx` React Query hook with no
+  markup renders nothing and passes. Content git cannot read back counts as visible. All
+  contents are read with one `git cat-file --batch`.
+- other extensions matching `\.(vue|svelte|css|scss|less|html|svg|png|jpg|jpeg|gif|webp)$`;
+- **everything** under `public/` or `assets/` (served verbatim: copy in a `.json`, manifests),
+  even test-named files; a style-in-code file (`*.css.ts`, `*.styled.ts`, `*.styles.ts`) and
+  locale/i18n message JSON (`locales/ i18n/ messages/ translations/`);
+- a `.md` under `pages/` (a rendered route);
+- a path under `components/`, `ui/`, `pages/`, `app/`, `views/` **and** an extension that can
+  render (`astro`, `mdx`, `htm`, `ico`, `avif`, `bmp`, `tif(f)`, `woff(2)`, `ttf`, `otf`, `eot`,
+  `mp4`, `webm`). A plain `.ts`/`.js`/`.json` under `src/app/` is not visible.
+
+**Known boundary (not detected, by design of the #973 ask that plain `.ts` must not block):** code
+that renders without JSX markup: Angular inline templates and Lit `html\`` in `.ts`,
+`React.createElement`/`h()` calls, and a route that only re-exports another component. Commit
+those with a real capture; the gate cannot see them from the path or from JSX syntax. Renames are
+listed as delete + add (`--no-renames`), so turning a component into a markup-free hook still
+counts via its HEAD content.
 
 If **no** user-visible file is staged → **allow** (nothing to prove). If git can't be queried
 (not a repo, timeout, error), the lister returns nothing and the gate **fails open**.
+
+## Order of operations: the marker and the commit are separate calls
+
+This is a `pre-bash` hook: it judges the command line BEFORE any part of it runs. So
+`visual_proof_gate.py --write-marker && git commit ...` in ONE bash call is blocked: when the
+hook inspects it no marker exists yet, and the `--write-marker` inside the same command never got
+to run. Write the marker (or `dev shot`) in one call, then commit in the next. This is inherent
+to a pre-execution hook (and the reason the gate cannot be satisfied by a self-attesting
+one-liner); it is pinned by `test_marker_written_in_the_same_command_does_not_satisfy_the_gate`.
 
 ## The marker contract (how it knows a screenshot was looked at)
 

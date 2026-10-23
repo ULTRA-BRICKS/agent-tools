@@ -55,7 +55,21 @@ def _mk_repo_with_staged(tmp_path: Path, *files: str) -> Path:
     for rel in files:
         p = repo / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("x")
+        p.write_text(_JSX_BODY if rel.endswith((".tsx", ".jsx")) else "x")
+        _git(repo, "add", rel)
+    return repo
+
+
+# A rendering component body, so staged .tsx/.jsx fixtures count as user-visible (#973).
+_JSX_BODY = "export const Button = () => <button type=\"button\">ok</button>;\n"
+
+
+def _mk_repo_with_contents(tmp_path: Path, contents: dict[str, str]) -> Path:
+    repo = _mk_repo_with_staged(tmp_path)
+    for rel, body in contents.items():
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
         _git(repo, "add", rel)
     return repo
 
@@ -687,6 +701,269 @@ def test_block_commit_with_staged_component_and_no_proof(tmp_path, monkeypatch):
 def test_block_commit_with_staged_css_under_components_dir(tmp_path, monkeypatch):
     repo = _mk_repo_with_staged(tmp_path, "components/card.css")
     out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+# ── #973: test-only and non-rendering files are not user-visible ─────────────────────
+
+_HOOK_TSX = (
+    "import { useQuery } from '@tanstack/react-query';\n"
+    "export function usePage(id: string) {\n"
+    "  const q = useQuery<Page, Error>({ queryKey: ['page', id], queryFn: () => load(id) });\n"
+    "  return q.data !== undefined && id.length < 3 ? q.data : undefined;\n"
+    "}\n"
+)
+
+
+@pytest.mark.parametrize("path", [
+    "targets/conloca-app/src/app/slots/org-settings/build-token-runtime.bun.test.ts",
+    "targets/conloca-app/src/app/auth/use-auth.test.tsx",
+    "packages/cms-spa/test/dashboard-new-page.test.tsx",
+    "src/components/Card.spec.tsx",
+    "src/app/__tests__/helper.tsx",
+    "packages/cms-spa/src/components/editor/PageEditorDrop.stories.tsx",
+    "packages/cms-spa/test/fixtures.css",
+])
+def test_allow_test_and_story_files_even_under_visual_dirs_or_tsx(path, tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(tmp_path, {path: _JSX_BODY})
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow", out
+
+
+@pytest.mark.parametrize("path", [
+    "targets/conloca-app/src/app/lib/editor-bundle-schemas.ts",
+    "targets/conloca-app/src/app/test-utils/host-schema-fixture.ts",
+    "src/components/useThing.js",
+    "src/app/package.json",
+    "src/pages/api/handler.ts",
+])
+def test_allow_plain_non_rendering_files_under_visual_dirs(path, tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(tmp_path, {path: "export const x = 1;\n"})
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow", out
+
+
+def test_allow_tsx_hook_without_jsx(tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(
+        tmp_path, {"packages/content-api-client/src/hooks.tsx": _HOOK_TSX})
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow", out
+
+
+def test_block_tsx_component_under_src_app_still_blocked(tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(
+        tmp_path, {"targets/conloca-app/src/app/Panel.tsx": _JSX_BODY})
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and "Panel.tsx" in json.loads(out)["message"]
+
+
+def test_block_component_staged_together_with_its_test(tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(tmp_path, {
+        "src/app/Panel.tsx": _JSX_BODY, "src/app/Panel.test.tsx": _JSX_BODY})
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    msg = json.loads(out)["message"]
+    assert c == vpg.BLOCK_EXIT_CODE and "Panel.tsx" in msg and "Panel.test.tsx" not in msg
+
+
+@pytest.mark.parametrize("body", [
+    "export const A = () => (\n  <div>hi</div>\n);\n",
+    "export function A() {\n  return <Foo.Bar x={1} />;\n}\n",
+    "export const A = () => <>text</>;\n",
+    "const a = cond ? <b>x</b> : null;\n",
+    "export const A = () => <Table<Row> rows={r} />;\n",
+    "export const App = () => <$Button />;\n",
+    "export const A = () => <\u00dcbersicht />;\n",
+    "export const A = () => ( // " + "long comment word " * 30 + "\n  <div/>\n);\n",
+    "export const A = () => (/* " + "long comment word\n" * 30 + "*/ <div/>);\n",
+])
+def test_jsx_detection_flags_markup(body):
+    assert vpg.contains_jsx(body)
+
+
+@pytest.mark.parametrize("body", [
+    "const q = useQuery<Page, Error>({});\n",
+    "const m = new Map<string, number>();\n",
+    "if (a < b && c > d) {}\n",
+    "export const x: Array<string> = [];\n",
+])
+def test_jsx_detection_ignores_generics_and_comparisons(body):
+    assert not vpg.contains_jsx(body)
+
+
+def test_tsx_contents_are_read_in_one_git_process(tmp_path, monkeypatch):
+    """No N+1: classifying many staged .tsx files costs one `git cat-file --batch`."""
+    repo = _mk_repo_with_contents(tmp_path, {f"src/hook{i}.tsx": _HOOK_TSX for i in range(6)})
+    calls = []
+    real = vpg.subprocess.run
+
+    def spy(argv, *a, **kw):
+        calls.append(argv)
+        return real(argv, *a, **kw)
+
+    monkeypatch.setattr(vpg.subprocess, "run", spy)
+    assert vpg.visual_staged(str(repo), [f"src/hook{i}.tsx" for i in range(6)]) == []
+    assert sum("cat-file" in c for c in calls) == 1 and len(calls) <= 2  # + one rev-parse
+
+
+def _commit_base(repo: Path) -> None:
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base")
+
+
+def test_deleting_a_jsx_component_is_visible(tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(tmp_path, {"src/Gone.tsx": _JSX_BODY})
+    _commit_base(repo)
+    _git(repo, "rm", "-q", "src/Gone.tsx")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE, out
+
+
+def test_deleting_a_markup_free_tsx_hook_is_not_visible(tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(tmp_path, {"src/useGone.tsx": _HOOK_TSX})
+    _commit_base(repo)
+    _git(repo, "rm", "-q", "src/useGone.tsx")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow", out
+
+
+def test_removing_the_last_jsx_from_a_component_is_visible(tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(tmp_path, {"src/Panel.tsx": _JSX_BODY})
+    _commit_base(repo)
+    (repo / "src/Panel.tsx").write_text("export const Panel = () => null;\n")
+    _git(repo, "add", "src/Panel.tsx")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE, out
+
+
+@pytest.mark.parametrize("path", [
+    "src/app/test/page.tsx",
+    "src/pages/tests/index.tsx",
+    "public/test/banner.png",
+    "public/locales/en.json",
+    "public/manifest.json",
+    "src/pages/blog/post.md",
+])
+def test_routes_and_served_files_named_like_tests_or_data_stay_gated(path, tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(tmp_path, {path: _JSX_BODY})
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE, out
+
+
+def test_html_in_a_build_script_string_is_not_a_rendering_change(tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(
+        tmp_path, {"scripts/build.mjs": "export const t = `<p>Hello</p>`;\n"})
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow", out
+
+
+def test_jsx_after_a_line_comment_is_still_jsx():
+    assert vpg.contains_jsx("return ( // wrapper\n  <div/>\n)\n")
+    assert vpg.contains_jsx("return (/* wrapper */ <div/>)\n")
+
+
+def test_jsx_scan_is_linear_on_large_generic_heavy_files():
+    body = "const a: Array<Foo> = [];\n" * 50_000
+    start = time.monotonic()
+    assert not vpg.contains_jsx(body)
+    assert time.monotonic() - start < 5
+
+
+def test_blob_dir_follows_the_staged_listing_fallback(tmp_path, monkeypatch):
+    """The listing falls back to session_cwd (nonexistent `cd` target); a markup-free hook staged
+    there is only judged non-rendering if its content was read from THAT repo."""
+    repo = _mk_repo_with_contents(tmp_path, {"src/hooks.tsx": _HOOK_TSX})
+    out, _e, c = _run(f"cd {tmp_path / 'nope'} ; git commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow", out
+
+
+@pytest.mark.parametrize("path", [
+    "src/components/Button.js",
+    "src/app/page.js",
+    "src/components/Button.css.ts",
+    "src/components/Button.styled.ts",
+    "src/app/locales/en.json",
+    "src/app/i18n/de/common.json",
+    "public/__mocks__/x.json",
+    "public/img/hero.story.png",
+    "src/components/\u00dcber.tsx",
+])
+def test_other_rendering_or_styling_files_stay_gated(path, tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(tmp_path, {path: _JSX_BODY})
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE, out
+
+
+def test_renaming_a_component_into_a_markup_free_hook_is_visible(tmp_path, monkeypatch):
+    shared = "".join(f"export const v{i} = {i};\n" for i in range(40))
+    repo = _mk_repo_with_contents(tmp_path, {"src/Panel.tsx": shared + _JSX_BODY})
+    _commit_base(repo)
+    _git(repo, "mv", "src/Panel.tsx", "src/usePanel.tsx")
+    (repo / "src/usePanel.tsx").write_text(shared)  # >50% similar: git would call it a rename
+    _git(repo, "add", "src/usePanel.tsx")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE, out
+
+
+def test_newline_in_a_filename_is_gated_not_misframed(tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(tmp_path, {
+        "a\nb.tsx": _HOOK_TSX, "src/useHook.tsx": _HOOK_TSX})
+    assert vpg.visual_staged(str(repo), ["a\nb.tsx", "src/useHook.tsx"]) == ["a\nb.tsx"]
+
+
+def test_non_utf8_filename_does_not_crash_the_listing(tmp_path):
+    repo = _mk_repo_with_staged(tmp_path)
+    name = b"caf\xe9.tsx"
+    try:
+        (Path(os.fsdecode(bytes(repo))) / os.fsdecode(name)).write_text(_JSX_BODY)
+    except OSError:
+        pytest.skip("filesystem rejects non-UTF-8 names (e.g. APFS)")
+    _git(repo, "add", "-A")
+    files = vpg.staged_files(str(repo))
+    assert files is not None and len(files) == 1 and files[0].endswith(".tsx")
+
+
+def test_worktree_only_jsx_is_gated_for_commit_dash_a(tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(tmp_path, {"src/useThing.tsx": _HOOK_TSX})
+    _commit_base(repo)
+    (repo / "src/useThing.tsx").write_text(_HOOK_TSX + "// edit\n")
+    _git(repo, "add", "src/useThing.tsx")
+    (repo / "src/useThing.tsx").write_text(_HOOK_TSX + _JSX_BODY)  # unstaged, `-a` commits it
+    out, _e, c = _run("git commit -am x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE, out
+
+
+def test_diff_relative_config_does_not_misresolve_nested_paths(tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(tmp_path, {"Panel.tsx": _HOOK_TSX, "src/Panel.tsx": _JSX_BODY})
+    _commit_base(repo)
+    (repo / "src/Panel.tsx").write_text(_JSX_BODY + "// changed\n")
+    _git(repo, "add", "src/Panel.tsx")
+    _git(repo, "config", "diff.relative", "true")
+    out, _e, c = _run("git commit -m x", repo / "src", monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE, out
+
+
+def test_failed_git_read_gates_even_when_worktree_is_markup_free(tmp_path, monkeypatch):
+    repo = _mk_repo_with_contents(tmp_path, {"src/Panel.tsx": _JSX_BODY})
+    (repo / "src/Panel.tsx").write_text(_HOOK_TSX)  # worktree differs from the staged JSX
+    monkeypatch.setattr(vpg, "_blobs", lambda cwd, specs: dict.fromkeys(specs))
+    assert vpg.visual_staged(str(repo), ["src/Panel.tsx"]) == ["src/Panel.tsx"]
+
+
+def test_long_single_line_generated_types_are_not_markup():
+    line = "export type Q = { " + "items: Array<Maybe<Item>>, " * 30 + "};\n"
+    assert not vpg.contains_jsx(line)
+
+
+def test_double_slash_inside_a_string_does_not_hide_jsx():
+    assert vpg.contains_jsx('const el = ok && "a//b" && <Banner />;\n')
+
+
+def test_marker_written_in_the_same_command_does_not_satisfy_the_gate(tmp_path, monkeypatch):
+    """The gate runs BEFORE the command, so a `--write-marker && git commit` one-liner is judged
+    with no marker present (#973: documented behaviour, not a bug)."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    cmd = f"python3 {_HOOK} --write-marker && git commit -m x"
+    out, _e, c = _run(cmd, repo, monkeypatch, proof_dir=tmp_path / "proof")
     assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 

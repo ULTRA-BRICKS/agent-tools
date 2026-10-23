@@ -79,6 +79,14 @@
 
 ### Fixed
 
+- `visual-proof-gate`: test and story files (`*.test.*`, `*.spec.*`, `*.stories.*`,
+  `__tests__/`, a `test/` dir outside routing roots), plain `.ts`/`.js`/`.json` under
+  `components/ ui/ pages/ app/ views/`, and `.tsx`/`.jsx` files whose staged and HEAD content
+  have no JSX are no longer classified user-visible; the directory rule there now applies only
+  to extensions that can render (`public/` and `assets/` stay fully gated). A component
+  staged with its test is still gated. Documented that `--write-marker && git commit` in one
+  call stays blocked (the hook judges the command before it runs). agent-tools#973.
+
 - `gh ship` post-merge cleanup (agent-tools#974, Refs #925, #962, #809): the base branch is the
   PR's `baseRefName` (`SHIP_DEFAULT_BRANCH` is only the fallback), so a repo whose base is not
   `main` no longer gets `pathspec 'main' did not match`; the local base ref is fast-forwarded
