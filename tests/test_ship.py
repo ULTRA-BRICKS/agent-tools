@@ -16,6 +16,7 @@ Requires bash + git. Run from the repo root::
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import re
@@ -23,6 +24,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -6706,21 +6708,38 @@ def _make_repo_with_branch(tmp_path: Path, branch: str):
     return main, wt
 
 
-def _minimal_hermetic_path(*bindirs) -> str:
-    """A PATH built ONLY from the given fake-binary dirs plus the real dirs holding bash/git/jq
-    — deliberately excluding the ambient PATH. The quorum gate's "review CLI missing" test needs
-    this: this dev machine has a REAL `review` (review-cli) installed, and if the ambient PATH
-    were appended it would shadow the intended absence and the test would exercise the wrong
-    code path (a live query against the real store instead of a missing-binary refusal)."""
-    dirs = [str(d) for d in bindirs if d is not None]
+_HERMETIC_TOOL_DIRS: list[str] = []
+
+
+def _hermetic_tool_dir() -> str:
+    """A fresh dir holding symlinks to ONLY the tools ship.sh needs (bash/git/jq/python3), so the
+    PATH never has to include the real directory those tools live in. On a workstation `git` can
+    sit in ~/.local/bin next to a real `review` (review-cli); putting that directory on PATH
+    would leak `review` into the "review CLI missing" test."""
+    d = tempfile.mkdtemp(prefix="hermetic-tools-")
+    _HERMETIC_TOOL_DIRS.append(d)
     # python3 is needed by the review-quorum hatch escalation bridge (ship.sh shells out to it
-    # to call the shared agenttools_hatch_escalation lib), so it must be on the hermetic PATH.
+    # to call the shared agenttools_hatch_escalation lib), so it must be available too.
     for tool in ("bash", "git", "jq", "python3"):
         found = shutil.which(tool)
         if found:
-            d = str(Path(found).resolve().parent)
-            if d not in dirs:
-                dirs.append(d)
+            os.symlink(found, os.path.join(d, tool))
+    return d
+
+
+@atexit.register
+def _cleanup_hermetic_tool_dirs() -> None:
+    for d in _HERMETIC_TOOL_DIRS:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _minimal_hermetic_path(*bindirs) -> str:
+    """A PATH built ONLY from the given fake-binary dirs plus a temp dir of symlinks to the few
+    real tools ship.sh needs — deliberately excluding the ambient PATH. The quorum gate's
+    "review CLI missing" test needs this: a dev machine may have a REAL `review` (review-cli)
+    installed, and if its directory were on PATH it would shadow the intended absence."""
+    dirs = [str(d) for d in bindirs if d is not None]
+    dirs.append(_hermetic_tool_dir())
     for d in ("/usr/bin", "/bin", "/usr/sbin", "/sbin"):
         if d not in dirs:
             dirs.append(d)
