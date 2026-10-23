@@ -109,14 +109,14 @@ def rig_ctx(config_path, tmp_path, gh, **env):
     ctx = Ctx(str(MODULE.parent))
     ctx.env.update(XDG_CONFIG_HOME=str(config_path.parent.parent), **env)
     ctx.root = str(tmp_path / 'checkout')
-    ctx.extrev_enabled = 1
+    ctx.extrev_enabled = True
     ctx.gh = gh
     return ctx
 
 
 def test_real_ship_policy_block_uses_actual_target(config_path, tmp_path):
     write(config_path)
-    for target, expected in [('alex-mextner/project', '0:1'), ('foreign/project', '1:0'), ('', '1:0')]:
+    for target, expected in [('alex-mextner/project', 'False:True'), ('foreign/project', 'True:False'), ('', 'True:False')]:
         ctx = rig_ctx(config_path, tmp_path, lambda *args, _target=target, **kw: Result(0, _target), SHIP_EXTERNAL_REVIEW='0')
         extrev_ticket._extrev_rig_policy(ctx)
         assert f'{ctx.extrev_enabled}:{ctx.extrev_rig_source}' == expected
@@ -136,7 +136,7 @@ def test_foreign_repo_is_passed_positionally_not_only_as_gh_repo_env(config_path
     ctx.effective_target = 'foreign/project'
     ctx.cwd_origin_repo = 'alex-mextner/local'
     extrev_ticket._extrev_rig_policy(ctx)
-    assert str(ctx.extrev_enabled) == '1'
+    assert ctx.extrev_enabled is True
 
 
 def test_canonical_rig_path_contract(policy, tmp_path, monkeypatch):
@@ -175,9 +175,9 @@ def test_preexisting_optout_does_not_query_github(config_path, tmp_path):
         return Result(91)
 
     ctx = rig_ctx(config_path, tmp_path, gh)
-    ctx.extrev_enabled = 0
+    ctx.extrev_enabled = False
     extrev_ticket._extrev_rig_policy(ctx)
-    assert f'{ctx.extrev_enabled}:{ctx.extrev_rig_source}' == '0:0'
+    assert f'{ctx.extrev_enabled}:{ctx.extrev_rig_source}' == 'False:False'
     assert not sentinel.exists()
 
 
@@ -185,8 +185,8 @@ def test_machine_branch_emits_distinct_audit_event(monkeypatch):
     audits = []
     monkeypatch.setattr(extrev_ticket, 'external_review_audit_log', lambda ctx, event, detail: audits.append(f'AUDIT:{event}:{detail}'))
     ctx = Ctx(str(MODULE.parent))
-    ctx.extrev_enabled = 0
-    ctx.extrev_rig_source = 1
+    ctx.extrev_enabled = False
+    ctx.extrev_rig_source = True
     ctx.extrev_rig_target = 'alex-mextner/project'
     extrev_ticket._extrev_gate(ctx)
     assert audits == ['AUDIT:external-review:disabled:rig-policy:alex-mextner/project']
@@ -253,7 +253,7 @@ def test_ship_block_passes_the_rejection_reason_through(config_path, tmp_path, c
     config_path.chmod(0o666)
     ctx = rig_ctx(config_path, tmp_path, lambda *args, **kw: Result(0, 'alex-mextner/project'))
     extrev_ticket._extrev_rig_policy(ctx)
-    assert str(ctx.extrev_enabled) == '1'
+    assert ctx.extrev_enabled is True
     assert 'not applied (unsafe_config' in capfd.readouterr().err
 
 
@@ -295,7 +295,7 @@ def test_cli_prints_evidence_and_ship_block_sets_the_evidence_flag(config_path, 
     env = dict(os.environ, XDG_CONFIG_HOME=str(config_path.parent.parent))
     result = subprocess.run([sys.executable, '-I', str(MODULE), 'o-maan/psyfroggybot', str(tmp_path / 'checkout')], capture_output=True, text=True, env=env)
     assert (result.stdout.strip(), result.stderr) == ('evidence', '')
-    for target, expected in [('o-maan/psyfroggybot', '1:0:1'), ('foreign/project', '1:0:0')]:
+    for target, expected in [('o-maan/psyfroggybot', 'True:False:True'), ('foreign/project', 'True:False:False')]:
         ctx = rig_ctx(config_path, tmp_path, lambda *args, _target=target, **kw: Result(0, _target))
         extrev_ticket._extrev_rig_policy(ctx)
         assert f'{ctx.extrev_enabled}:{ctx.extrev_rig_source}:{ctx.extrev_evidence_policy}' == expected

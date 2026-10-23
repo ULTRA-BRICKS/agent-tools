@@ -26,6 +26,15 @@
 
 ### Changed
 
+- `gh ship` Python port, structure only (agent-tools#976): `Ctx` declares every
+  shared attribute with one type (no more `getattr(ctx, name, default)`); one `ctx.which`,
+  `ctx.append_audit`/`audit_file`, `ctx.run_gh` and `sum_first_fields` instead of per-module
+  copies; `cleanup()` loops over `plan_checkout` (decides, changes nothing) and
+  `execute_checkout_plan` (prints the keep reasons, then acts); cross-module imports hoisted to
+  module level; the acceptance-gate message helpers use plain isinstance checks. One deliberate
+  difference: every audit writer now falls back to `~/.config/agent-tools/ship-audit.jsonl` when
+  `HOME` is unset or empty (two of them used a cwd-relative path).
+
 - `gh ship` (`ci/ship/ship.sh`) is now Python (agent-tools#946, forced by the python-only gate on
   the edit #974 needed). `ship.sh` is a short launcher for `ci/ship/ship.py` + the
   `ci/ship/shiplib/` package; flags, messages, env knobs, audit lines and exit codes are those of

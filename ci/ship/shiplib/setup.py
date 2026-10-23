@@ -314,7 +314,7 @@ def _count_lines(path: str, accept: tuple[str, ...]) -> int:
 
 def forgejo_cleanup(ctx, code: int) -> None:
     """EXIT handler: let started calls record their outcome (bounded), summarize on refusal, remove the ledger."""
-    d = getattr(ctx, "ship_forgejo_state_dir", "")
+    d = ctx.ship_forgejo_state_dir
     if not d or not os.path.isdir(d):
         return
     i = 0
@@ -407,7 +407,7 @@ def _dispatch_provider(ctx) -> None:
     ctx.ship_origin_url_raw = origin.out.rstrip("\n") if origin.rc == 0 else ""
     if not provider_wants_forgejo_probe(ctx):
         return
-    if shutil.which("python3", path=ctx.env.get("PATH")) is None:
+    if ctx.which("python3") is None:
         raise ctx.refuse("Refusing: python3 is required for the Forgejo provider.")
     detect = ctx.cmd(
         [ctx.python, "-I", ctx.ship_forgejo_py, "detect"],
@@ -527,7 +527,7 @@ def run(ctx) -> None:
     _dispatch_provider(ctx)
 
     # Under Forgejo the `gh` shell function shadows the binary, so the presence check always passes.
-    if ctx.provider_resolved != "forgejo" and shutil.which("gh", path=ctx.env.get("PATH")) is None:
+    if ctx.provider_resolved != "forgejo" and ctx.which("gh") is None:
         raise ctx.refuse("gh CLI not found")
 
     _derive_cwd_origin_repo(ctx)

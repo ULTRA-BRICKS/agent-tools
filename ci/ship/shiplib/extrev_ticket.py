@@ -9,10 +9,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 from datetime import datetime, timezone
 
 from shiplib.ctx import Ctx, Result, ShipExit
+from shiplib.ci_fallback import ship_config_load
+from shiplib.quorum_skipci import review_capacity_all_exhausted, review_quorum_extract_ticket
 
 _EXTREV_BASE_BAD = re.compile(r"[^A-Za-z0-9._/-]")
 _DIGITS = re.compile(r"[0-9]+")
@@ -46,26 +47,6 @@ def _esc(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _audit_file(ctx: Ctx) -> str:
-    return ctx.env.get("SHIP_AUDIT_FILE") or os.path.join(
-        ctx.env.get("HOME", ""), ".config/agent-tools/ship-audit.jsonl"
-    )
-
-
-def _append_audit(file: str, line: str) -> bool:
-    """mkdir -p the parent; False when that fails (bash `|| return 0`). Write errors are ignored."""
-    try:
-        os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
-    except OSError:
-        return False
-    try:
-        with open(file, "a", encoding="utf-8", errors="surrogateescape") as fh:
-            fh.write(line)
-    except OSError:
-        pass
-    return True
-
-
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -89,27 +70,19 @@ def external_review_audit_log(ctx: Ctx, decision: str, reason: str = "") -> None
     if ctx.dry_run:
         ctx.err(f"[dry-run] would append external-review audit: decision={decision}")
         return
-    file = _audit_file(ctx)
-    parent_ok = True
-    try:
-        os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
-    except OSError:
-        parent_ok = False
-    if not parent_ok:
-        return
     ts = _now()
     esc_pr, esc_branch, esc_reason = _esc(ctx.pr), _esc(ctx.branch), _esc(reason)
     if reason:
         line = (
             f'{{"ts":"{ts}","pr":"{esc_pr}","branch":"{esc_branch}","gate":"external-review",'
-            f'"decision":"{decision}","override_reason":"{esc_reason}"}}\n'
+            f'"decision":"{decision}","override_reason":"{esc_reason}"}}'
         )
     else:
         line = (
             f'{{"ts":"{ts}","pr":"{esc_pr}","branch":"{esc_branch}","gate":"external-review",'
-            f'"decision":"{decision}"}}\n'
+            f'"decision":"{decision}"}}'
         )
-    _append_audit(file, line)
+    ctx.append_audit(line)
 
 
 def external_review_hatch_check(ctx: Ctx) -> Result:
@@ -202,27 +175,26 @@ def _extrev_base_offswitch_lookup(ctx: Ctx) -> None:
     )
     if verify.rc != 0:
         return
-    from shiplib.ci_fallback import ship_config_load
 
     ship_config_load(ctx, ctx.root, ctx.extrev_base_ref)
     # Snapshot: ship_config_load's cfg globals are shared with the HEAD-scoped callers.
     ctx.extrev_cfg_value = ctx.ship_cfg_external_review
     if ctx.extrev_cfg_value in ("0", "false", "no"):
-        ctx.extrev_enabled = 0
+        ctx.extrev_enabled = False
 
 
 def _extrev_rig_policy(ctx: Ctx) -> None:
     """Rig machine policy: may disable the gate or switch a zero-review PR to the evidence decision."""
-    ctx.extrev_rig_source = 0
-    # 1 = target owner is in external_review_evidence_owners: zero-review defers to the evidence decision.
-    ctx.extrev_evidence_policy = 0
-    ctx.extrev_evidence_pending = 0
-    if ctx.extrev_enabled != 1:
+    ctx.extrev_rig_source = False
+    # True = target owner is in external_review_evidence_owners: zero-review defers to the evidence decision.
+    ctx.extrev_evidence_policy = False
+    ctx.extrev_evidence_pending = False
+    if not ctx.extrev_enabled:
         return
     if ctx.provider_resolved == "forgejo":
         res = ctx.gh("repo", "view", "", "--json", "nameWithOwner", "-q", ".nameWithOwner", stderr="devnull")
     else:
-        target = getattr(ctx, "effective_target", "") or getattr(ctx, "cwd_origin_repo", "")
+        target = ctx.effective_target or ctx.cwd_origin_repo
         res = ctx.gh(
             "repo", "view", target, "--json", "nameWithOwner,url", "-q",
             'select(.url | startswith("https://github.com/")) | .nameWithOwner',
@@ -236,15 +208,15 @@ def _extrev_rig_policy(ctx: Ctx) -> None:
     )
     ctx.extrev_rig_decision = dec.out.rstrip("\n") if dec.rc == 0 else "enabled"
     if ctx.extrev_rig_decision == "disabled":
-        ctx.extrev_enabled = 0
-        ctx.extrev_rig_source = 1
+        ctx.extrev_enabled = False
+        ctx.extrev_rig_source = True
     elif ctx.extrev_rig_decision == "evidence":
-        ctx.extrev_evidence_policy = 1
+        ctx.extrev_evidence_policy = True
 
 
 def _extrev_gate(ctx: Ctx) -> None:
-    if ctx.extrev_enabled == 0:
-        if ctx.extrev_rig_source == 1:
+    if not ctx.extrev_enabled:
+        if ctx.extrev_rig_source:
             ctx.out(
                 f"[ship] external-review gate disabled by Rig machine policy for {ctx.extrev_rig_target}. "
                 "Other gates remain enabled."
@@ -259,7 +231,6 @@ def _extrev_gate(ctx: Ctx) -> None:
     # A gh failure must reach the friendly fail-closed refusal, never abort the script unguarded.
     res = ctx.gh("pr", "view", ctx.pr, "--json", "reviews", "-q", "(.reviews // []) | length", stderr="devnull")
     count = res.out.rstrip("\n") if res.rc == 0 else ""
-    ctx.review_count = count
     if not _DIGITS.fullmatch(count):
         ctx.err(f"Refusing: could not query PR #{ctx.pr} reviews (gh api failed) — refusing to merge rather than fail open.")
         external_review_audit_log(ctx, "external-review:refused", "gh query failed")
@@ -268,7 +239,6 @@ def _extrev_gate(ctx: Ctx) -> None:
         ctx.out(f"[ship] external-review gate OK — PR #{ctx.pr} has {count} GitHub review(s).")
         return
     # Zero reviews AND every review-cli provider confirmed exhausted: nobody could have reviewed.
-    from shiplib.quorum_skipci import review_capacity_all_exhausted
 
     cap_out = review_capacity_all_exhausted(ctx).rstrip("\n")
     cap_flag = 0
@@ -276,7 +246,6 @@ def _extrev_gate(ctx: Ctx) -> None:
     if cap_out.startswith("1"):
         cap_flag = 1
         cap_evidence = cap_out[2:] if cap_out.startswith("1\t") else cap_out
-    ctx.cap_out, ctx.cap_flag, ctx.cap_evidence = cap_out, cap_flag, cap_evidence
     if cap_flag == 1:
         ctx.out(
             f"[ship] external-review gate — PR #{ctx.pr} has zero GitHub reviews, but review-cli confirms EVERY "
@@ -284,9 +253,9 @@ def _extrev_gate(ctx: Ctx) -> None:
             "auto-proceeding without a manual hatch prompt. Recorded to $SHIP_AUDIT_FILE."
         )
         external_review_audit_log(ctx, "external-review:auto-proceed:capacity-outage", cap_evidence)
-    elif ctx.extrev_evidence_policy == 1:
+    elif ctx.extrev_evidence_policy:
         # Deferred, not waived: the acceptance verdict is only known after the ticket gates below.
-        ctx.extrev_evidence_pending = 1
+        ctx.extrev_evidence_pending = True
         ctx.out(
             f"[ship] external-review gate — PR #{ctx.pr} has zero GitHub reviews; Rig evidence policy for "
             f"{ctx.extrev_rig_target} defers the decision until after the acceptance gate (passes on green CI, "
@@ -339,7 +308,6 @@ def ship_task_code_candidate_ok(ctx: Ctx, candidate: str, source: str) -> bool:
 
 def ship_derive_task_code_for_notify(ctx: Ctx) -> str:
     """Ticket code from $TASK_CODE -> branch -> PR title -> PR body (each validated); "" when none."""
-    from shiplib.quorum_skipci import review_quorum_extract_ticket
 
     candidate = ctx.task_code
     if ship_task_code_candidate_ok(ctx, candidate, "$TASK_CODE"):
@@ -382,25 +350,20 @@ def ticket_gate_audit_log(ctx: Ctx, gate: str, decision: str, code: str = "", de
         suffix = (f" task={code}" if code else "") + (f" detail={detail}" if detail else "")
         ctx.err(f"[dry-run] would append {gate} audit: decision={decision}{suffix}")
         return
-    file = _audit_file(ctx)
-    try:
-        os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
-    except OSError:
-        return
     ts = _now()
-    if shutil.which("jq", path=ctx.env.get("PATH")):
+    if ctx.which("jq"):
         obj: dict[str, str] = {"ts": ts, "pr": ctx.pr, "gate": gate, "decision": decision}
         if code:
             obj["task_code"] = code
         if detail:
             obj["detail"] = detail
-        line = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+        line = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     else:
         esc_code, esc_detail = _esc(code), _esc(detail)
         code_part = (',"task_code":"' + esc_code + '"') if esc_code else ""
         detail_part = (',"detail":"' + esc_detail + '"') if esc_detail else ""
-        line = f'{{"ts":"{ts}","pr":"{_esc(ctx.pr)}","gate":"{gate}","decision":"{decision}"{code_part}{detail_part}}}\n'
-    _append_audit(file, line)
+        line = f'{{"ts":"{ts}","pr":"{_esc(ctx.pr)}","gate":"{gate}","decision":"{decision}"{code_part}{detail_part}}}'
+    ctx.append_audit(line)
 
 
 # --- magic-close keyword gate -----------------------------------------------------------------
@@ -539,13 +502,7 @@ def magic_close_rewrite_pr(
         ticket_gate_audit_log(ctx, "magic-close", "refused", "", f"rewrite-incomplete: {residual}")
         raise ShipExit(1)
     ctx.out(f"[ship] magic-close gate: --rewrite-magic-close — rewriting to Refs in #{ctx.pr}: {tb_hits}")
-    argv = ["gh", "pr", "edit", ctx.pr, *edit_args]
-    if ctx.dry_run:
-        ctx.out("[dry-run] " + " ".join(argv))
-        rc = 0
-    else:
-        rc = ctx.gh("pr", "edit", ctx.pr, *edit_args, stdout="inherit").rc
-    if rc != 0:
+    if ctx.run_gh("pr", "edit", ctx.pr, *edit_args, check=False) != 0:
         ctx.err(f"Refusing: magic-close gate — 'gh pr edit {ctx.pr}' failed while rewriting the keyword(s) to Refs ({tb_hits}).")
         ctx.err('  Fix the title/body by hand (write "Refs <ref>"), then re-run ship.')
         ticket_gate_audit_log(ctx, "magic-close", "refused", "", f"rewrite-failed: {tb_hits}")
@@ -556,21 +513,14 @@ def magic_close_rewrite_pr(
 
 
 def run(ctx: Ctx) -> None:
-    # Defaults every later reader may consult, set before the lookups that can change them.
-    ctx.extrev_enabled = 1
-    ctx.extrev_base = ""
-    ctx.extrev_cfg_value = ""
-    ctx.extrev_rig_target = ""
-    ctx.extrev_rig_decision = ""
+    # The Ctx defaults (enabled, empty strings) hold until the lookups below change them.
     _extrev_base_offswitch_lookup(ctx)
     _extrev_rig_policy(ctx)
     _extrev_gate(ctx)
 
-    ctx.magic_close_enabled = 1
     gate_env = ctx.env.get("SHIP_MAGIC_CLOSE_GATE", "1") or "1"
-    if gate_env in ("0", "false", "no"):
-        ctx.magic_close_enabled = 0
-    if ctx.magic_close_enabled == 0:
+    ctx.magic_close_enabled = gate_env not in ("0", "false", "no")
+    if not ctx.magic_close_enabled:
         ctx.out(f"[ship] magic-close gate disabled (SHIP_MAGIC_CLOSE_GATE={ctx.env.get('SHIP_MAGIC_CLOSE_GATE', '')}).")
     else:
         magic_close_gate(ctx)

@@ -7,18 +7,16 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 
 from shiplib.ci_gate import THREAD_Q
-from shiplib.ctx import ShipExit
-
-
-def _which(ctx, name):
-    return shutil.which(name, path=ctx.env.get("PATH", ""))
+from shiplib.ctx import ShipExit, sum_first_fields
+from shiplib.ci_fallback import known_flake_audit_log, ship_config_load
+from shiplib.extrev_ticket import external_review_audit_log, external_review_hatch_or_refuse, ship_derive_task_code_for_notify, ticket_gate_audit_log
+from shiplib.quorum_skipci import skip_ci_hatch_gate
 
 
 def _have_jq(ctx):
-    return _which(ctx, "jq") is not None
+    return ctx.which("jq")
 
 
 def _flat(text):
@@ -26,13 +24,8 @@ def _flat(text):
     return text.replace("\n", " ")
 
 
-def _flag(value):
-    """A bash 0/1 flag that another module may store as bool or as "1"/"0"."""
-    return value is True or value == 1 or value == "1"
-
-
-def _jq_parse(text):
-    """`jq -e .`: the parsed value, or None when it is not valid JSON or is null/false."""
+def _parse_gate_json(text):
+    """The parsed `task gate --json` document, or None when it is not valid JSON or is null/false."""
     try:
         value = json.loads(text)
     except ValueError:
@@ -42,17 +35,15 @@ def _jq_parse(text):
     return value
 
 
-def _jq_str(value):
-    """jq string interpolation / tostring."""
+def _show(value):
+    """A JSON value as the text a message shows: strings as is, null as `null`, the rest compact."""
     if isinstance(value, str):
         return value
-    if value is None:
-        return "null"
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
-def _jq_items(value):
-    """`.[]?`: array elements, object values, nothing for scalars/null."""
+def _entries(value):
+    """The elements of a JSON array (or the values of an object); nothing for anything else."""
     if isinstance(value, list):
         return value
     if isinstance(value, dict):
@@ -64,13 +55,13 @@ def _field(item, key):
     return item.get(key) if isinstance(item, dict) else None
 
 
-def _jq_default(value, fallback):
-    """`value // fallback`."""
+def _or(value, fallback):
+    """`value`, or `fallback` when it is null/false/absent (0 and "" are real values)."""
     return fallback if value is None or value is False else value
 
 
 def _parsed_when_jq(ctx, text):
-    return _jq_parse(text) if _have_jq(ctx) else None
+    return _parse_gate_json(text) if _have_jq(ctx) else None
 
 
 def acceptance_gate_print_gaps(ctx, gate_json):
@@ -81,15 +72,15 @@ def acceptance_gate_print_gaps(ctx, gate_json):
         return
     if not isinstance(data, dict):
         return
-    for item in _jq_items(data.get("unchecked")):
-        ctx.err(f"    [{_jq_str(_field(item, 'index'))}] {_jq_str(_field(item, 'text'))}  (unchecked)")
-    for item in _jq_items(data.get("proofless")):
-        ctx.err(f"    [{_jq_str(_field(item, 'index'))}] {_jq_str(_field(item, 'text'))}  (checked without a proof)")
-    criteria = _jq_default(data.get("criteria"), 1)
+    for item in _entries(data.get("unchecked")):
+        ctx.err(f"    [{_show(_field(item, 'index'))}] {_show(_field(item, 'text'))}  (unchecked)")
+    for item in _entries(data.get("proofless")):
+        ctx.err(f"    [{_show(_field(item, 'index'))}] {_show(_field(item, 'text'))}  (checked without a proof)")
+    criteria = _or(data.get("criteria"), 1)
     if criteria == 0 and criteria is not False:
         ctx.err("    (the ticket has no acceptance criteria at all — nothing can be accepted)")
-    elif _jq_default(data.get("below_minimum"), False):
-        ctx.err(f"    (only {_jq_str(criteria)} acceptance criteria — below this repo's configured minimum, even with every one it has proven)")
+    elif _or(data.get("below_minimum"), False):
+        ctx.err(f"    (only {_show(criteria)} acceptance criteria — below this repo's configured minimum, even with every one it has proven)")
 
 
 def acceptance_gate_detail(ctx, gate_json):
@@ -99,18 +90,17 @@ def acceptance_gate_detail(ctx, gate_json):
         return _flat(gate_json)
     if not isinstance(data, dict):
         return ""
-    unchecked = ",".join(_jq_str(_field(i, "index")) for i in _jq_items(data.get("unchecked")))
-    proofless = ",".join(_jq_str(_field(i, "index")) for i in _jq_items(data.get("proofless")))
+    unchecked = ",".join(_show(_field(i, "index")) for i in _entries(data.get("unchecked")))
+    proofless = ",".join(_show(_field(i, "index")) for i in _entries(data.get("proofless")))
     return (
-        f"criteria={_jq_str(_jq_default(data.get('criteria'), 0))} "
-        f"below_minimum={_jq_str(_jq_default(data.get('below_minimum'), False))} "
+        f"criteria={_show(_or(data.get('criteria'), 0))} "
+        f"below_minimum={_show(_or(data.get('below_minimum'), False))} "
         f"unchecked={unchecked} proofless={proofless}"
     )
 
 
 def acceptance_gate_refuse(ctx, code, gate_json):
     """Print the refusal block, audit it, and exit 1 (raises ShipExit)."""
-    from shiplib.extrev_ticket import ticket_gate_audit_log
 
     ctx.err(f"Refusing: acceptance gate — ticket {code} is NOT accepted (task gate {code} exit 1); merging now would close it behind task-cli with these criteria unproven:")
     acceptance_gate_print_gaps(ctx, gate_json)
@@ -127,7 +117,7 @@ def acceptance_gate_fully_accepted(ctx, gate_json):
     """Exit-0 payload safe to auto-close on (proven, not opt-out/cancelled/done/disabled) -> "1" or ""."""
     if not _have_jq(ctx):
         return ""
-    data = _jq_parse(gate_json)
+    data = _parse_gate_json(gate_json)
     if not isinstance(data, dict):
         return ""
     ok = (
@@ -151,13 +141,12 @@ def acceptance_gate_strict(ctx):
 
 def acceptance_gate_strict_verify(ctx, code, gate_json):
     """Strict path only: exit 0 counts only with ok=true, gate_enabled=true, not cancelled."""
-    from shiplib.extrev_ticket import ticket_gate_audit_log
 
     where = acceptance_gate_strict(ctx)
     if not where:
         return
     if _have_jq(ctx):
-        data = _jq_parse(gate_json)
+        data = _parse_gate_json(gate_json)
         if (
             isinstance(data, dict)
             and data.get("ok") is True
@@ -173,15 +162,14 @@ def acceptance_gate_strict_verify(ctx, code, gate_json):
 
 def acceptance_gate_pass(ctx, code, gate_json):
     """Exit-0 verdict: records the code/fully-accepted evidence for the notify step."""
-    from shiplib.extrev_ticket import ticket_gate_audit_log
 
     acceptance_gate_strict_verify(ctx, code, gate_json)
     have_jq = _have_jq(ctx)
     reason = ""
     if have_jq:
-        data = _jq_parse(gate_json)
+        data = _parse_gate_json(gate_json)
         if isinstance(data, dict):
-            reason = _jq_str(_jq_default(data.get("post_merge_acceptance"), "")).rstrip("\n")
+            reason = _show(_or(data.get("post_merge_acceptance"), "")).rstrip("\n")
     ctx.acceptance_gate_code = code
     if reason:
         ctx.out(f"[ship] acceptance gate: {code} passes on a recorded post-merge-acceptance opt-out — reason: {reason}")
@@ -220,7 +208,6 @@ def acceptance_gate_is_task_cli(ctx):
 
 def acceptance_gate_unavailable(ctx, code, detail, warning):
     """Logged skip on GitHub (returns None); refusal (ShipExit) on the strict path."""
-    from shiplib.extrev_ticket import ticket_gate_audit_log
 
     where = acceptance_gate_strict(ctx)
     if where:
@@ -244,19 +231,17 @@ def acceptance_gate_looks_like_task_cli_json(ctx, text):
 
 
 def acceptance_gate(ctx):
-    from shiplib.ci_fallback import ship_config_load
-    from shiplib.extrev_ticket import ship_derive_task_code_for_notify, ticket_gate_audit_log
 
     gate = ctx.env.get("SHIP_ACCEPTANCE_GATE") or "1"
     if gate in ("0", "false", "no"):
         ctx.out(f"[ship] acceptance gate disabled (SHIP_ACCEPTANCE_GATE={gate}).")
         return
     ship_config_load(ctx, ctx.root)
-    cfg = getattr(ctx, "ship_cfg_acceptance_gate", "")
+    cfg = ctx.ship_cfg_acceptance_gate
     if cfg in ("0", "false", "no"):
         ctx.out(f"[ship] acceptance gate disabled by the committed .ship-config (SHIP_ACCEPTANCE_GATE={cfg}).")
         return
-    task_path = _which(ctx, "task")
+    task_path = ctx.which("task")
     if not task_path:
         acceptance_gate_unavailable(
             ctx, "", "task-cli not on PATH",
@@ -327,22 +312,9 @@ def external_review_unaddressed_comments(ctx):
     return res.out.rstrip("\n")
 
 
-def _awk_sum_first_fields(text):
-    total = 0.0
-    for line in text.split("\n"):
-        fields = line.split()
-        if not fields:
-            continue
-        m = re.match(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", fields[0])
-        if m:
-            total += float(m.group(0))
-    return str(int(total)) if total == int(total) else ("%.6g" % total)
-
-
 def external_review_evidence_gate(ctx):
-    from shiplib.extrev_ticket import external_review_audit_log, external_review_hatch_or_refuse
 
-    if not _flag(getattr(ctx, "extrev_evidence_pending", "0")):
+    if not ctx.extrev_evidence_pending:
         return
     missing = []
     if ctx.ci_evidence not in ("green", "skip-ci"):
@@ -357,7 +329,8 @@ def external_review_evidence_gate(ctx):
         "--jq", "[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length",
         stderr="devnull")
     if res.rc == 0:
-        threads = _awk_sum_first_fields(res.out)
+        total = sum_first_fields(res.out)
+        threads = str(int(total)) if total == int(total) else ("%.6g" % total)
         if threads != "0":
             missing.append(f"{threads} unresolved review thread(s)")
     else:
@@ -396,7 +369,7 @@ def ship_forgejo_final_preflight(ctx):
     if (ctx.provider_resolved or "github") != "forgejo":
         return
     ctx.gh("pr", "view", ctx.pr, "--json", "headRefOid", "-q", ".headRefOid", stdout="devnull", stderr="devnull")
-    state_dir = getattr(ctx, "ship_forgejo_state_dir", "")
+    state_dir = ctx.ship_forgejo_state_dir
     fatal = os.path.join(state_dir, "fatal.log")
     calls = os.path.join(state_dir, "calls.log")
     problem = ""
@@ -436,7 +409,6 @@ def _run_task_from_root(ctx, argv, cd_failure_msg):
 
 def ship_auto_close_accepted_ticket(ctx, code):
     """`task done` when the pre-merge gate fully accepted exactly this ticket; warning on failure."""
-    from shiplib.extrev_ticket import ticket_gate_audit_log
 
     if not ctx.acceptance_gate_fully_accepted:
         return
@@ -454,13 +426,12 @@ def ship_auto_close_accepted_ticket(ctx, code):
 
 def ship_notify_task_cli(ctx):
     """Best-effort `task mark-shipped` for the merged PR; every failure is a logged skip/warning."""
-    from shiplib.extrev_ticket import ship_derive_task_code_for_notify
 
     notify = ctx.env.get("SHIP_TASK_NOTIFY_ENABLED") or "1"
     if notify in ("0", "false", "no"):
         ctx.err(f"[ship] task-cli notify disabled (SHIP_TASK_NOTIFY_ENABLED={notify}).")
         return
-    if not _which(ctx, "task"):
+    if not ctx.which("task"):
         ctx.err("[ship] task-cli not on PATH — skipping ticket notify.")
         return
     if ctx.foreign_repo_invoke:
@@ -498,17 +469,10 @@ def ship_notify_task_cli(ctx):
 def _merge(ctx, extra):
     """`run gh pr merge ...` through ctx.gh so Forgejo routing applies; dry-run only prints."""
     args = ["pr", "merge", ctx.pr, f"--{ctx.merge_method}", *extra, *ctx.merge_message_args]
-    if ctx.dry_run:
-        ctx.out("[dry-run] gh " + " ".join(args))
-        return
-    rc = ctx.gh(*args, stdout="inherit").rc
-    if rc != 0:
-        raise ShipExit(rc)
+    ctx.run_gh(*args)
 
 
 def run(ctx):
-    from shiplib.ci_fallback import known_flake_audit_log
-    from shiplib.quorum_skipci import skip_ci_hatch_gate
 
     acceptance_gate(ctx)
     external_review_evidence_gate(ctx)

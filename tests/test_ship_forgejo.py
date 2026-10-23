@@ -1235,7 +1235,7 @@ def _list_prefix(node, func):
 
 
 def _ship_gh_calls() -> list[tuple[str, int, list]]:
-    """Every `ctx.gh(...)` call in shiplib/*.py as (file, line, leading literal argv items; None where
+    """Every `ctx.gh(...)` / `ctx.run_gh(...)` call in shiplib/*.py as (file, line, leading literal argv items; None where
     an item is not a literal). A `*splat` argument is resolved to the list literal it was built from."""
     calls = []
     for path in sorted(SHIPLIB.glob("*.py")):
@@ -1243,7 +1243,7 @@ def _ship_gh_calls() -> list[tuple[str, int, list]]:
         funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
         for func in funcs:
             for node in ast.walk(func):
-                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "gh"
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("gh", "run_gh")
                         and isinstance(node.func.value, ast.Name) and node.func.value.id == "ctx"):
                     continue
                 argv = []

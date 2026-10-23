@@ -17,7 +17,6 @@ import datetime
 import json
 import os
 import re
-import shutil
 import time
 
 _WS = " \t\n\v\f\r"  # bash [[:space:]]
@@ -117,24 +116,14 @@ def known_flake_audit_log(ctx, decision, checks) -> None:
     if ctx.dry_run:
         ctx.err(f"[dry-run] would append known-flake audit: decision={decision} checks={checks}")
         return
-    file = ctx.env.get("SHIP_AUDIT_FILE") or os.path.join(
-        ctx.env.get("HOME", os.path.expanduser("~")), ".config/agent-tools/ship-audit.jsonl"
-    )
-    try:
-        os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
-    except OSError:
-        return
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    line = json.dumps(
-        {"ts": ts, "pr": ctx.pr, "gate": "known-flake", "decision": decision, "checks": checks},
-        separators=(",", ":"),
-        ensure_ascii=False,
+    ctx.append_audit(
+        json.dumps(
+            {"ts": ts, "pr": ctx.pr, "gate": "known-flake", "decision": decision, "checks": checks},
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
     )
-    try:
-        with open(file, "a", encoding="utf-8", errors="surrogateescape") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass
 
 
 # ---------------------------------------------------------------------------------------------
@@ -389,7 +378,7 @@ def local_test_try_dir(ctx, dir, mode="auto"):
         pytest_args = ["tests/", "-q"]
         if mode != "root" and not os.path.isdir(os.path.join(dir, "tests")):
             pytest_args = ["-q"]
-        if shutil.which("uv", path=ctx.env.get("PATH")):
+        if ctx.which("uv"):
             return True, _run_in(ctx, ["uv", "run", "--with", "pytest", "pytest", *pytest_args], dir)
         return True, _run_in(ctx, [ctx.python, "-m", "pytest", *pytest_args], dir)
     if os.path.isfile(os.path.join(dir, "package.json")):
@@ -451,10 +440,9 @@ def local_test_runner(ctx, root) -> int:
         return status
 
     # Priority 3: rig.yaml + `dev` CLI probe, root-only.
-    path = ctx.env.get("PATH")
     if (
         os.path.isfile(os.path.join(root, "rig.yaml"))
-        and shutil.which("dev", path=path)
+        and ctx.which("dev")
         and ctx.cmd(["dev", "--agenttools-dev-probe"], stdout="devnull", stderr="devnull").rc == 0
     ):
         dev_status = ctx.cmd(

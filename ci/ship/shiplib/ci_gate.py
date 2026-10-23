@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import time
 from datetime import datetime, timezone
 
-from shiplib.ctx import ShipExit
+from shiplib.ctx import ShipExit, sum_first_fields
+from shiplib.ci_fallback import ci_appears_structurally_down, empty_rollup_is_ci_outage, known_flake_audit_log, known_flake_confirmed, run_local_ci_gate
+from shiplib.setup import abort_if_core_bare
 
 RESOLVE_THREAD_Q = 'query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated comments(first:100){totalCount nodes{author{login} body}}}}}}}'
 
@@ -171,7 +172,6 @@ def _int_or_zero(s: str) -> int:
 
 def _known_flake_gate(ctx, rollup: list, failed: int) -> tuple[bool, str]:
     """Known-flake gate; returns (KNOWN_FLAKE_GATE_OK, KF_BASE). Positive confirmation only."""
-    from shiplib.ci_fallback import known_flake_confirmed
 
     kf_base = ""
     if not ctx.known_flakes:
@@ -230,14 +230,8 @@ def _poll_sleep(ctx, interval: str) -> None:
 
 
 def green_ci_gate(ctx) -> None:
-    from shiplib.ci_fallback import (
-        ci_appears_structurally_down,
-        empty_rollup_is_ci_outage,
-        known_flake_audit_log,
-        run_local_ci_gate,
-    )
 
-    if shutil.which("jq", path=ctx.env.get("PATH")) is None:
+    if ctx.which("jq") is None:
         raise ctx.refuse("Refusing: jq is required for the CI gate (install jq — or --skip-ci only if CI is genuinely N/A).")
     ci_wait_s = ctx.env.get("SHIP_CI_WAIT") or "900"
     ci_poll_s = ctx.env.get("SHIP_CI_POLL") or "20"
@@ -323,19 +317,6 @@ def green_ci_gate(ctx) -> None:
             raise ShipExit(1)
 
 
-def _awk_sum_first_fields(text: str) -> int:
-    """awk '{s+=$1} END{print s+0}': non-numeric first fields count as 0."""
-    total = 0.0
-    for line in text.split("\n"):
-        fields = line.split()
-        if not fields:
-            continue
-        m = re.match(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", fields[0])
-        if m:
-            total += float(m.group(0))
-    return int(total)
-
-
 def unresolved_threads_gate(ctx) -> None:
     """Fail-closed: an API failure refuses rather than reading as zero unresolved threads."""
     r = ctx.gh(
@@ -346,7 +327,7 @@ def unresolved_threads_gate(ctx) -> None:
     )
     if r.rc != 0:
         raise ctx.refuse(f"Refusing: could not query review threads for PR #{ctx.pr} (gh api failed) — refusing to merge rather than fail open. Fix gh access and retry.")
-    unresolved = _awk_sum_first_fields(r.out.rstrip("\n"))
+    unresolved = int(sum_first_fields(r.out.rstrip("\n")))
     if unresolved != 0:
         raise ctx.refuse(f"Refusing: PR #{ctx.pr} has {unresolved} unresolved review thread(s) — resolve them (or re-run with --resolve-addressed-threads to auto-close outdated bot-nit threads), then re-run.")
 
@@ -406,7 +387,6 @@ def review_dwell_gate(ctx) -> None:
 
 def local_branch_sanity(ctx) -> None:
     """Collect every worktree holding the PR branch (ctx.wts); refuse dirty trees / unpushed commits."""
-    from shiplib.setup import abort_if_core_bare
 
     cwd = ctx.root or None
     r = ctx.git("worktree", "list", "--porcelain", cwd=cwd, stderr="devnull")
@@ -417,7 +397,7 @@ def local_branch_sanity(ctx) -> None:
             w = line[9:]
         if line == f"branch refs/heads/{ctx.branch}" and w:
             wts.append(w)
-    ctx.wts = wts  # worktrees checking out the PR branch (read again by cleanup)
+    ctx.wts = wts  # read again by cleanup
     for wt in wts:
         # A worktree-scoped core.bare makes `status` exit 128 with its fatal swallowed below (reads "clean").
         abort_if_core_bare(ctx, wt, "PR worktree")

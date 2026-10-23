@@ -21,6 +21,7 @@ import os
 import re
 import shlex
 import shutil
+from dataclasses import dataclass, field
 
 from shiplib.ctx import Ctx, Result
 
@@ -29,7 +30,7 @@ from shiplib.ctx import Ctx, Result
 def ship_hook_refs(ctx: Ctx, wt: str) -> Result:
     """Scan the installed hook wiring for references to `wt` (hook_refs.py: rc 0 none / 3 found /
     4 incomplete). A missing scanner is incomplete, never "none"."""
-    if not getattr(ctx, "ship_hook_refs_src", ""):
+    if not ctx.ship_hook_refs_src:
         return Result(4, f"{os.path.join(ctx.self_dir, 'hook_refs.py')}: missing or unreadable\n")
     repos = [ctx.main_checkout] if os.path.isdir(ctx.main_checkout) else []
     res = ctx.cmd([ctx.python, "-I", "-c", ctx.ship_hook_refs_src, wt, *repos], stderr="stdout")
@@ -57,11 +58,9 @@ def ship_report_hook_refs(ctx: Ctx, wt: str, res: Result, found_msg: str, incomp
         ctx.err(f"[ship]     python3 {shell_quote(checker)} {shell_quote(wt)} {main_q}")
 
 
-def ship_keep_hook_backed_worktree(ctx: Ctx, wt: str) -> bool:
-    """True when `wt` must be KEPT (reports why + the fix). Any scanner failure keeps the tree."""
-    res = ship_hook_refs(ctx, wt)
-    if res.rc == 0:
-        return False
+def report_keep_hook_backed_worktree(ctx: Ctx, wt: str, res: Result) -> None:
+    """Say why `wt` is KEPT (installed hooks still run code from it, or the scan was incomplete)
+    and how to remove it once that is fixed. Any scanner failure keeps the tree."""
     ship_report_hook_refs(
         ctx, wt, res,
         f"[ship] keeping worktree {wt}: installed agent hooks still execute code from it — removing it would break them (an on_error: open gate would stop gating machine-wide, agent-tools#905):",
@@ -74,7 +73,6 @@ def ship_keep_hook_backed_worktree(ctx: Ctx, wt: str) -> bool:
     else:
         ctx.err(f"[ship]     git -C {shell_quote(ctx.main_checkout)} worktree remove {shell_quote(wt)}")
         ctx.err(f"[ship]     git -C {shell_quote(ctx.main_checkout)} branch -D {shell_quote(ctx.branch)}")
-    return True
 
 
 def ship_warn_hooks_left_dangling(ctx: Ctx, wt: str) -> None:
@@ -295,10 +293,139 @@ def park_on_base(ctx: Ctx, wt: str, base: str) -> bool:
     return False
 
 
+@dataclass
+class CheckoutPlan:
+    """What to do with one checkout that holds the PR branch, decided without changing anything.
+
+    `notices` are the reasons and warnings to print (stream, text) before acting; every `keep`
+    plan has at least one, so no checkout is left behind silently."""
+
+    wt: str
+    wt_real: str
+    action: str  # "keep" | "keep_hook_backed" | "remove_clone" | "park" | "remove_worktree"
+    notices: list[tuple[str, str]] = field(default_factory=list)
+    kept_branch_reason: str = ""  # why the local branch must stay too ("" = no objection)
+    hook_refs: Result | None = None  # the failing scan, for "keep_hook_backed"
+    inside: bool = False  # ship was launched from inside this checkout
+    is_clean: bool = False
+    reroot_target: str = ""  # main checkout to chdir into before removing a worktree we are inside
+
+
+@dataclass
+class CheckoutOutcome:
+    self_removed: str = ""  # directory to cd into when the checkout we launched from is gone
+    kept_branch_reason: str = ""
+
+
+def plan_checkout(ctx: Ctx, wt: str, state: str, head_oid: str) -> CheckoutPlan:
+    """Decide how to handle `wt`. Inspects git state; mutates nothing and prints nothing."""
+    wt_real = os.path.realpath(wt) if os.path.isdir(wt) else wt
+    st = ctx.git("-C", wt, "status", "--porcelain", stderr="devnull")
+    is_clean = st.rc == 0 and not st.out.strip()
+
+    scan = ship_hook_refs(ctx, wt)
+    if scan.rc != 0:
+        return CheckoutPlan(wt, wt_real, "keep_hook_backed", hook_refs=scan)
+
+    inside = ctx.orig_pwd == wt_real or ctx.orig_pwd.startswith(wt_real + "/")
+    main_real = os.path.realpath(ctx.main_checkout) if os.path.isdir(ctx.main_checkout) else ""
+    sole = len(worktree_paths(ctx, wt)) == 1
+    common = {"wt": wt, "wt_real": wt_real, "inside": inside, "is_clean": is_clean}
+
+    if not is_clean and (inside or sole):
+        # Never re-root into, force away or delete a tree whose state cannot be proven clean.
+        return CheckoutPlan(
+            **common, action="keep",
+            notices=[("err", f"[ship] WARNING: PR worktree {wt_real} has uncommitted/unverifiable changes — leaving it in place (refusing to --force-remove unshipped work).")],
+        )
+
+    reason = "" if (ctx.dry_run or not is_clean) else unmerged_reason(ctx, wt, state, head_oid)
+    if reason:
+        return CheckoutPlan(**common, action="keep", kept_branch_reason=reason,
+                            notices=[("err", f"[ship] keeping {wt}: {reason}.")])
+
+    if sole:
+        # The PR checkout is the only worktree of its repository: nothing to re-root into.
+        if is_disposable_clone(wt_real):
+            leftover = "" if ctx.dry_run else (other_local_work(ctx, wt) or ignored_data(ctx, wt))
+            if leftover:
+                return CheckoutPlan(**common, action="keep", kept_branch_reason=leftover,
+                                    notices=[("err", f"[ship] keeping clone {wt}: {leftover}.")])
+            return CheckoutPlan(**common, action="remove_clone")
+        # A plain clone is somebody's working copy: never deleted, only moved off the dead branch.
+        return CheckoutPlan(**common, action="park")
+
+    reroot_target = ""
+    if inside:
+        if not main_real or main_real == wt_real or main_real.startswith(wt_real + "/"):
+            return CheckoutPlan(
+                **common, action="keep",
+                notices=[("err", f"[ship] running inside the PR's worktree ({wt_real}) and no separate main checkout to re-root into — leaving it in place; remove it manually.")],
+            )
+        reroot_target = main_real
+    return CheckoutPlan(**common, action="remove_worktree", reroot_target=reroot_target)
+
+
+def execute_checkout_plan(ctx: Ctx, plan: CheckoutPlan, base: str) -> CheckoutOutcome:
+    """Carry out one `CheckoutPlan`: print its notices, then act. Only warns, never raises."""
+    wt, wt_real = plan.wt, plan.wt_real
+    outcome = CheckoutOutcome(kept_branch_reason=plan.kept_branch_reason)
+    if plan.action == "keep_hook_backed":
+        report_keep_hook_backed_worktree(ctx, wt, plan.hook_refs)
+        return outcome
+    for stream, text in plan.notices:
+        (ctx.err if stream == "err" else ctx.out)(text)
+    if plan.action == "keep":
+        return outcome
+
+    if plan.action == "remove_clone":
+        parent = os.path.dirname(wt_real)
+        if plan.inside:
+            ctx.out(f"[ship] inside the PR's clone ({wt_real}) — leaving it for {parent} to remove it ...")
+            os.chdir(parent)
+        ctx.out(f"[ship] removing clone {wt} ...")
+        if remove_clone_directory(ctx, wt):
+            if plan.inside and not ctx.dry_run:
+                outcome.self_removed = parent
+            if not ctx.dry_run:
+                ship_warn_hooks_left_dangling(ctx, wt)
+        else:
+            outcome.kept_branch_reason = "clone could not be removed"
+        return outcome
+
+    if plan.action == "park":
+        ctx.out(f"[ship] {wt} is a standalone clone — keeping the directory, moving it off {ctx.branch} ...")
+        if not park_on_base(ctx, wt, base):
+            outcome.kept_branch_reason = f"could not move {wt} off {ctx.branch}"
+            ctx.err(f"[ship] WARNING: {outcome.kept_branch_reason} — switch branches and delete {ctx.branch} manually.")
+        return outcome
+
+    # remove_worktree
+    if plan.inside:
+        ctx.out(f"[ship] inside the PR's worktree ({wt_real}) — re-rooting into {plan.reroot_target} to remove it ...")
+        try:
+            os.chdir(plan.reroot_target)
+        except OSError:
+            ctx.err(f"[ship] WARNING: could not cd into {plan.reroot_target} — leaving worktree {wt_real} in place.")
+            return outcome
+    ctx.out(f"[ship] removing worktree {wt} ...")
+    head = ctx.git("-C", wt, "symbolic-ref", "--quiet", "--short", "HEAD", stderr="devnull").out.strip()
+    if plan.is_clean and head == ctx.branch:
+        ctx.run(["git", "-C", wt, "checkout", "--detach", "--quiet"], check=False)
+    if remove_worktree(ctx, wt, plan.is_clean):
+        if plan.reroot_target and not ctx.dry_run:
+            outcome.self_removed = plan.reroot_target
+        if not ctx.dry_run:
+            ship_warn_hooks_left_dangling(ctx, wt)
+    else:
+        ctx.err(f"[ship] WARNING: could not remove worktree {wt} — remove it manually (git worktree remove --force).")
+    return outcome
+
+
 def cleanup(ctx: Ctx) -> None:
     if ctx.foreign_repo_invoke:
         # --repo targets a foreign remote: every action below would hit THIS checkout's repo.
-        origin = f" {ctx.cwd_origin_repo}" if getattr(ctx, "cwd_origin_repo", "") else ""
+        origin = f" {ctx.cwd_origin_repo}" if ctx.cwd_origin_repo else ""
         gh_repo = ctx.env.get("GH_REPO", "")
         ctx.out(
             f"[ship] --repo targets {gh_repo} (not this checkout's origin{origin}) — skipping remote branch deletion AND all local branch/worktree cleanup: any local '{ctx.branch}' here belongs to this checkout, not {gh_repo}. GitHub auto-deletes {ctx.branch} in {gh_repo} if auto-delete-head-branch is enabled; otherwise delete it manually."
@@ -327,83 +454,16 @@ def cleanup(ctx: Ctx) -> None:
 
     self_removed = ""
     kept_branch_reason = ""
-    wts = [] if fork else list(getattr(ctx, "wts", []))
+    wts = [] if fork else list(ctx.wts)
     for wt in wts:
         if not wt:
             continue
-        wt_real = os.path.realpath(wt) if os.path.isdir(wt) else wt
-        st = ctx.git("-C", wt, "status", "--porcelain", stderr="devnull")
-        is_clean = st.rc == 0 and not st.out.strip()
-
-        if ship_keep_hook_backed_worktree(ctx, wt):
-            continue
-
-        inside = ctx.orig_pwd == wt_real or ctx.orig_pwd.startswith(wt_real + "/")
-        main_real = os.path.realpath(ctx.main_checkout) if os.path.isdir(ctx.main_checkout) else ""
-        sole = len(worktree_paths(ctx, wt)) == 1
-
-        if not is_clean and (inside or sole):
-            # Never re-root into, force away or delete a tree whose state cannot be proven clean.
-            ctx.err(f"[ship] WARNING: PR worktree {wt_real} has uncommitted/unverifiable changes — leaving it in place (refusing to --force-remove unshipped work).")
-            continue
-
-        reason = "" if (ctx.dry_run or not is_clean) else unmerged_reason(ctx, wt, state, head_oid)
-        if reason:
-            kept_branch_reason = reason
-            ctx.err(f"[ship] keeping {wt}: {reason}.")
-            continue
-
-        if sole:
-            # The PR checkout is the only worktree of its repository: nothing to re-root into.
-            if is_disposable_clone(wt_real):
-                leftover = "" if ctx.dry_run else (other_local_work(ctx, wt) or ignored_data(ctx, wt))
-                if leftover:
-                    kept_branch_reason = leftover
-                    ctx.err(f"[ship] keeping clone {wt}: {leftover}.")
-                    continue
-                parent = os.path.dirname(wt_real)
-                if inside:
-                    ctx.out(f"[ship] inside the PR's clone ({wt_real}) — leaving it for {parent} to remove it ...")
-                    os.chdir(parent)
-                ctx.out(f"[ship] removing clone {wt} ...")
-                if remove_clone_directory(ctx, wt):
-                    if inside and not ctx.dry_run:
-                        self_removed = parent
-                    if not ctx.dry_run:
-                        ship_warn_hooks_left_dangling(ctx, wt)
-                else:
-                    kept_branch_reason = "clone could not be removed"
-                continue
-            # A plain clone is somebody's working copy: never deleted, only moved off the dead branch.
-            ctx.out(f"[ship] {wt} is a standalone clone — keeping the directory, moving it off {ctx.branch} ...")
-            if not park_on_base(ctx, wt, base):
-                kept_branch_reason = f"could not move {wt} off {ctx.branch}"
-                ctx.err(f"[ship] WARNING: {kept_branch_reason} — switch branches and delete {ctx.branch} manually.")
-            continue
-
-        reroot_target = ""
-        if inside:
-            if not main_real or main_real == wt_real or main_real.startswith(wt_real + "/"):
-                ctx.err(f"[ship] running inside the PR's worktree ({wt_real}) and no separate main checkout to re-root into — leaving it in place; remove it manually.")
-                continue
-            ctx.out(f"[ship] inside the PR's worktree ({wt_real}) — re-rooting into {main_real} to remove it ...")
-            try:
-                os.chdir(main_real)
-            except OSError:
-                ctx.err(f"[ship] WARNING: could not cd into {main_real} — leaving worktree {wt_real} in place.")
-                continue
-            reroot_target = main_real
-        ctx.out(f"[ship] removing worktree {wt} ...")
-        head = ctx.git("-C", wt, "symbolic-ref", "--quiet", "--short", "HEAD", stderr="devnull").out.strip()
-        if is_clean and head == ctx.branch:
-            ctx.run(["git", "-C", wt, "checkout", "--detach", "--quiet"], check=False)
-        if remove_worktree(ctx, wt, is_clean):
-            if reroot_target and not ctx.dry_run:
-                self_removed = reroot_target
-            if not ctx.dry_run:
-                ship_warn_hooks_left_dangling(ctx, wt)
-        else:
-            ctx.err(f"[ship] WARNING: could not remove worktree {wt} — remove it manually (git worktree remove --force).")
+        # Plan and execute ONE checkout at a time: removing the first one changes what the next
+        # looks like (`sole` in plan_checkout), so the plans cannot all be made up front.
+        plan = plan_checkout(ctx, wt, state, head_oid)
+        outcome = execute_checkout_plan(ctx, plan, base)
+        self_removed = outcome.self_removed or self_removed
+        kept_branch_reason = outcome.kept_branch_reason or kept_branch_reason
 
     repo = ctx.main_checkout if os.path.isdir(ctx.main_checkout) else ""
     if repo:

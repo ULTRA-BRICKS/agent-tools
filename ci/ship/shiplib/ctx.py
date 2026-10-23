@@ -18,13 +18,14 @@ Naming rules (the port contract every module follows):
 * messages keep their exact wording and their stream (tests assert on them): `ctx.out` is stdout,
   `ctx.err` is stderr.
 
-State a gate needs that is not declared below is assigned as a new attribute on `ctx` by the module
-that owns it, with a one-line comment where it is first set; always read such an attribute through
-`getattr(ctx, "name", default)` unless the owning step has certainly run.
+Every attribute a gate shares is declared in `Ctx.__init__` with one type; a gate reads it as a
+plain `ctx.name` (never `getattr(ctx, "name", default)`) and the module that owns it assigns it.
 """
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -39,6 +40,19 @@ class ShipExit(Exception):
     def __init__(self, code: int = 1):
         super().__init__(code)
         self.code = code
+
+
+def sum_first_fields(text: str) -> float:
+    """`awk '{s+=$1} END{print s+0}'`: the sum of every line's first field, non-numeric counting 0."""
+    total = 0.0
+    for line in text.split("\n"):
+        fields = line.split()
+        if not fields:
+            continue
+        m = re.match(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", fields[0])
+        if m:
+            total += float(m.group(0))
+    return total
 
 
 @dataclass
@@ -101,6 +115,60 @@ class Ctx:
         self.task_code = self.env.get("TASK_CODE", "")  # bash: an exported TASK_CODE is inherited
         self.acceptance_gate_code = ""
         self.acceptance_gate_fully_accepted = ""
+
+        # --- state owned by one gate module, declared here so every read is a plain typed attribute ---
+        # setup.py
+        self.cwd_origin_url = ""
+        self.cwd_origin_repo = ""  # "owner/repo" of the checkout's origin
+        self.effective_target = ""  # explicit gh target: --repo, else GH_SHIP_REPO / GH_REPO
+        self.ship_origin_url_raw = ""
+        self.ship_forgejo_id = ""
+        self.ship_forgejo_py = ""
+        self.ship_forgejo_state_dir = ""  # per-run Forgejo evidence ledger; "" = none
+        self.ship_hatch_py = ""
+        self.ship_skip_ci_hatch_py = ""
+        self.ship_external_review_hatch_py = ""
+        self.usage = ""
+        # ci_fallback.py (ship_config_load)
+        self.ship_cfg_dir = ""
+        self.ship_cfg_cmd = ""
+        self.ship_cfg_acceptance_gate = ""
+        self.ship_cfg_external_review = ""
+        # ci_gate.py / cleanup.py
+        self.wts: list[str] = []  # worktrees checking out the PR branch
+        self.ship_hook_refs_src = ""  # hook_refs.py source, read before the PR worktree can vanish
+        # extrev_ticket.py
+        self.extrev_enabled = True
+        self.extrev_rig_source = False  # the gate was disabled by Rig machine policy
+        self.extrev_evidence_policy = False  # zero-review PRs defer to the evidence decision
+        self.extrev_evidence_pending = False
+        self.extrev_pr_base = ""
+        self.extrev_base = ""
+        self.extrev_base_ref = ""
+        self.extrev_cfg_value = ""
+        self.extrev_rig_target = ""
+        self.extrev_rig_decision = ""
+        self.magic_close_enabled = True
+        # quorum_skipci.py (numeric floors/counts are digit strings, as the review CLI prints them)
+        self.quorum_enabled = True
+        self.min_iter = "0"
+        self.min_models = "0"
+        self.min_roles = "0"
+        self.min_models_explicit = False
+        self.audit_min_models = "0"
+        self.qiter = "0"
+        self.qmodels_n = "0"
+        self.qmodels = ""
+        self.qroles_n = "0"
+        self.qroles = ""
+        self.qerr = ""
+        self.review_check_args: list[str] = []
+        self.own_repo_slugs: list[str] = []
+        self.own_repo_slugs_resolved = False
+        # version_shot.py
+        self.pr_diff = ""
+        self.posted_image = False
+        self.ui_touching = False
 
         self._exit_handlers: list[Callable[[int], None]] = []
 
@@ -173,6 +241,42 @@ class Ctx:
 
             return forgejo_gh(self, list(args), **kw)
         return self.cmd(["gh", *args], **kw)
+
+    def run_gh(self, *args: str, check: bool = True) -> int:
+        """`run gh ...`: under --dry-run print `[dry-run] gh <args>` instead of executing, else the
+        (Forgejo-aware) `gh` with inherited stdout. `check=True` is `set -e`."""
+        if self.dry_run:
+            self.out("[dry-run] gh " + " ".join(args))
+            return 0
+        rc = self.gh(*args, stdout="inherit").rc
+        if check and rc != 0:
+            raise ShipExit(rc)
+        return rc
+
+    def which(self, name: str) -> str | None:
+        """Where `name` resolves on the PATH the children inherit (`ctx.env`, not os.environ)."""
+        return shutil.which(name, path=self.env.get("PATH", os.defpath))
+
+    def audit_file(self) -> str:
+        """The JSONL audit ledger: $SHIP_AUDIT_FILE, else ~/.config/agent-tools/ship-audit.jsonl."""
+        return self.env.get("SHIP_AUDIT_FILE") or os.path.join(
+            self.env.get("HOME") or os.path.expanduser("~"), ".config/agent-tools/ship-audit.jsonl"
+        )
+
+    def append_audit(self, line: str) -> bool:
+        """Append one audit line (the newline is added here). Best effort: False when the ledger's
+        directory cannot be created; a failed write is ignored (an audit must never block a ship)."""
+        file = self.audit_file()
+        try:
+            os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
+        except OSError:
+            return False
+        try:
+            with open(file, "a", encoding="utf-8", errors="surrogateescape") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+        return True
 
     def run(self, argv: Sequence[str], *, check: bool = True, **kw) -> int:
         """bash `run`: under --dry-run print `[dry-run] <argv>` instead of executing, else execute

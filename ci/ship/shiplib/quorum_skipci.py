@@ -12,7 +12,6 @@ import json
 import math
 import os
 import re
-import shutil
 import tempfile
 import time
 
@@ -31,10 +30,6 @@ def _lower(s: str) -> str:
 
 def _upper(s: str) -> str:
     return s.translate(_LOWER_TO_UPPER)
-
-
-def _which(ctx, name: str) -> bool:
-    return shutil.which(name, path=ctx.env.get("PATH", os.defpath)) is not None
 
 
 # ---- ticket extraction -----------------------------------------------------------------------
@@ -115,19 +110,19 @@ def ship_own_repo_slugs(ctx) -> list[str]:
     """Every lowercase "owner/repo" slug naming the PR's own repo (explicit gh target, checkout
     origin, live PR URL), sorted unique; resolved once per run. A renamed repo keeps the old origin
     slug while the live PR carries the new one, so all three are kept."""
-    if not getattr(ctx, "own_repo_slugs_resolved", False):
+    if not ctx.own_repo_slugs_resolved:
         ctx.own_repo_slugs_resolved = True
         res = ctx.gh("pr", "view", ctx.pr, "--json", "url", "-q", '.url // ""', stderr="devnull")
         live = res.out.rstrip("\n") if res.rc == 0 else ""
         live = "\n".join(re.sub(r"/pull/[0-9]+.*$", "", ln) for ln in live.split("\n"))
         live = live.rstrip("\n")
         found: set[str] = set()
-        for raw in (ctx.env.get("GH_REPO", ""), getattr(ctx, "cwd_origin_repo", ""), live):
+        for raw in (ctx.env.get("GH_REPO", ""), ctx.cwd_origin_repo, live):
             slug = ship_normalize_repo_slug(ctx, raw)
             if slug:
                 found.add(slug)
         ctx.own_repo_slugs = sorted(found)
-    return list(getattr(ctx, "own_repo_slugs", []))
+    return list(ctx.own_repo_slugs)
 
 
 _SLUG_SUBS = (
@@ -157,8 +152,8 @@ def ship_normalize_repo_slug(ctx, ref: str) -> str:
 def ship_target_is_checkout_origin(ctx) -> bool:
     """True when the gh target names this checkout's own github.com origin (both normalized);
     False when either side does not normalize."""
-    target = ship_normalize_repo_slug(ctx, getattr(ctx, "effective_target", ""))
-    origin = ship_normalize_repo_slug(ctx, getattr(ctx, "cwd_origin_url", ""))
+    target = ship_normalize_repo_slug(ctx, ctx.effective_target)
+    origin = ship_normalize_repo_slug(ctx, ctx.cwd_origin_url)
     return bool(target) and target == origin
 
 
@@ -190,30 +185,6 @@ def _json_safe(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _audit_file(ctx) -> str:
-    return ctx.env.get("SHIP_AUDIT_FILE") or os.path.join(
-        ctx.env.get("HOME") or os.path.expanduser("~"), ".config/agent-tools/ship-audit.jsonl"
-    )
-
-
-def _append_audit(file: str, line: str) -> None:
-    try:
-        with open(file, "a", encoding="utf-8", errors="surrogateescape") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass
-
-
-def _audit_target(ctx):
-    """Audit file path after mkdir -p of its directory, or None (best effort: failures swallowed)."""
-    file = _audit_file(ctx)
-    try:
-        os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
-    except OSError:
-        return None
-    return file
-
-
 def _utc_ts() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -233,11 +204,8 @@ def review_quorum_audit_log(
             f"iter={iterations} models={models} (floor {min_models}) roles={roles}/{min_roles}"
         )
         return
-    file = _audit_target(ctx)
-    if file is None:
-        return
     ts = _utc_ts()
-    if _which(ctx, "jq"):
+    if ctx.which("jq"):
         nums = (iterations, models, roles, min_roles, min_models)
         if not all(_DIGITS.fullmatch(n) for n in nums):
             return  # jq --argjson rejects a non-JSON number and `|| true` drops the line
@@ -254,7 +222,7 @@ def review_quorum_audit_log(
         }
         if reason != "":
             obj["override_reason"] = reason
-        _append_audit(file, json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
+        ctx.append_audit(json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
         return
     head = (
         f'{{"ts":"{ts}","pr":"{_json_safe(ctx.pr)}","task_code":"{_json_safe(code)}",'
@@ -265,24 +233,20 @@ def review_quorum_audit_log(
         line = head + f',"override_reason":"{_json_safe(reason)}"}}'
     else:
         line = head + "}"
-    _append_audit(file, line)
+    ctx.append_audit(line)
 
 
 # ---- review-quorum hatch / capacity / refusal ------------------------------------------------
-
-def _q(ctx, name: str, default="0"):
-    return getattr(ctx, name, default) or default
-
 
 def review_quorum_hatch_check(ctx):
     """Ask Alex live on Telegram via review_quorum_hatch.py (`python3 -I`); returns the Result
     (stdout = verdict sentinel + reason, rc 0 approved / 1 not approved / 3 lib import failed)."""
     env = dict(ctx.env)
     env["SHIP_HATCH_PR"] = ctx.pr
-    env["SHIP_HATCH_CODE"] = getattr(ctx, "task_code", "") or ""
-    env["SHIP_HATCH_ITER"] = str(_q(ctx, "qiter"))
-    env["SHIP_HATCH_MODELS"] = str(_q(ctx, "qmodels_n"))
-    env["SHIP_HATCH_ROLES"] = str(_q(ctx, "qroles_n"))
+    env["SHIP_HATCH_CODE"] = ctx.task_code
+    env["SHIP_HATCH_ITER"] = ctx.qiter
+    env["SHIP_HATCH_MODELS"] = ctx.qmodels_n
+    env["SHIP_HATCH_ROLES"] = ctx.qroles_n
     env["SHIP_DRY_RUN"] = "1" if ctx.dry_run else "0"
     return ctx.cmd([ctx.python, "-I", ctx.ship_hatch_py], stdout="capture", stderr="devnull", env=env)
 
@@ -303,7 +267,7 @@ def _truthy(v) -> bool:
 def review_capacity_all_exhausted(ctx) -> str:
     """`review capacity-check --json` verdict: "1\\t<evidence>\\n" when review-cli confirms EVERY
     board seat is exhausted, else "0\\n". Fails CLOSED on any problem."""
-    if not _which(ctx, "review") or not _which(ctx, "jq"):
+    if not ctx.which("review") or not ctx.which("jq"):
         return "0\n"
     res = ctx.cmd(["review", "capacity-check", "--json"], stdout="capture", stderr="devnull")
     raw = res.out.rstrip("\n")
@@ -355,9 +319,9 @@ def _split_verdict(hout: str) -> tuple[str, str]:
 def review_quorum_refuse_or_hatch(ctx, summary: str) -> None:
     """Terminal handler for a quorum refusal: returns None when ship may proceed (capacity outage
     confirmed, or the hatch was APPROVED); otherwise audits and raises ShipExit(1)."""
-    task_code = getattr(ctx, "task_code", "") or ""
-    qiter, qmodels_n, qroles_n = _q(ctx, "qiter"), _q(ctx, "qmodels_n"), _q(ctx, "qroles_n")
-    min_roles, audit_min_models = _q(ctx, "min_roles"), _q(ctx, "audit_min_models")
+    task_code = ctx.task_code
+    qiter, qmodels_n, qroles_n = ctx.qiter, ctx.qmodels_n, ctx.qroles_n
+    min_roles, audit_min_models = ctx.min_roles, ctx.audit_min_models
     cap_out = review_capacity_all_exhausted(ctx).rstrip("\n")
     if cap_out.startswith("1"):
         cap_evidence = cap_out[2:] if cap_out.startswith("1\t") else cap_out
@@ -419,8 +383,8 @@ def review_quorum_refuse_setup(ctx, summary: str, fix: str) -> None:
     ctx.err(f"Refusing: review-quorum gate — {summary}.")
     ctx.err(f"  {fix}")
     review_quorum_audit_log(
-        ctx, "refused", getattr(ctx, "task_code", "") or "", _q(ctx, "qiter"), _q(ctx, "qmodels_n"), summary,
-        _q(ctx, "qroles_n"), _q(ctx, "min_roles"), _q(ctx, "audit_min_models"),
+        ctx, "refused", ctx.task_code, ctx.qiter, ctx.qmodels_n, summary,
+        ctx.qroles_n, ctx.min_roles, ctx.audit_min_models,
     )
     raise ShipExit(1)
 
@@ -433,9 +397,6 @@ def skip_ci_audit_log(ctx, decision: str, reason: str = "") -> None:
     if ctx.dry_run:
         ctx.err(f"[dry-run] would append skip-ci audit: decision={decision}")
         return
-    file = _audit_target(ctx)
-    if file is None:
-        return
     head = (
         f'{{"ts":"{_utc_ts()}","pr":"{_json_safe(ctx.pr)}","branch":"{_json_safe(ctx.branch or "")}",'
         f'"gate":"skip-ci","decision":"{decision}"'
@@ -444,7 +405,7 @@ def skip_ci_audit_log(ctx, decision: str, reason: str = "") -> None:
         line = head + f',"override_reason":"{_json_safe(reason)}"}}'
     else:
         line = head + "}"
-    _append_audit(file, line)
+    ctx.append_audit(line)
 
 
 def skip_ci_hatch_check(ctx):
@@ -619,18 +580,18 @@ def run(ctx) -> None:
             "branch name or PR body)",
         )
         return
-    if not _which(ctx, "review"):
+    if not ctx.which("review"):
         review_quorum_refuse_or_hatch(
             ctx, f"'review' CLI not found on PATH — cannot verify the bar for {task_code} (install review-cli)"
         )
         return
-    if not _which(ctx, "jq"):
+    if not ctx.which("jq"):
         review_quorum_refuse_or_hatch(ctx, f"jq not found — cannot evaluate the gate for {task_code} (install jq)")
         return
     if ctx.foreign_repo_invoke and not ship_target_is_checkout_origin(ctx):
         # The query counts only reviews recorded in THIS checkout's repository.
-        target = getattr(ctx, "effective_target", "")
-        origin_url = getattr(ctx, "cwd_origin_url", "") or "unset"
+        target = ctx.effective_target
+        origin_url = ctx.cwd_origin_url or "unset"
         review_quorum_refuse_setup(
             ctx,
             f"the PR is in {target}, but this checkout's origin is {origin_url}, and review history is "

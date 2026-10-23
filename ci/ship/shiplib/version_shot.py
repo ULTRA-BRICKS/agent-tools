@@ -291,7 +291,7 @@ def diff_section_of(ctx, file: str) -> list[str]:
     insec = False
     inhdr = False
     out: list[str] = []
-    for line in getattr(ctx, "pr_diff", "").split("\n"):
+    for line in ctx.pr_diff.split("\n"):
         if line.startswith("diff --git "):
             insec = False
             inhdr = True
@@ -569,13 +569,7 @@ def _screenshot_gate(ctx) -> None:
                 body = body + "\n\n" + "**" + desc + "**" + "\n" + "_Local path: `" + png + "` — upload manually._"
         ctx.out("[ship] posting visual-proof comment to PR #%s ..." % ctx.pr)
         # bash `run gh ...`: dry-run echo, else the (Forgejo-aware) gh, set -e on failure.
-        argv = ["gh", "pr", "comment", ctx.pr, "--body", body]
-        if ctx.dry_run:
-            ctx.out("[dry-run] " + " ".join(argv))
-        else:
-            rc = ctx.gh(*argv[1:], stdout="inherit").rc
-            if rc != 0:
-                raise ShipExit(rc)
+        ctx.run_gh("pr", "comment", ctx.pr, "--body", body)
 
     ui_touching = False
     if ctx.ui_path_regex:
