@@ -259,8 +259,9 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
 Then it squash-merges and tidies up (best-effort, never masking the merge): it deletes the remote
 branch; reads the PR back and, only if it is MERGED and the local branch carries nothing the merge
 did not take, removes the PR's checkout (a linked worktree, re-rooting into the main checkout when
-launched from inside it, or a per-PR `git clone --shared` clone) and its local branch, never a dirty
-tree and never a plain clone; and fast-forwards the local ref of the PR's own base (`baseRefName`,
+launched from inside it, or a per-PR `git clone --shared` clone whose creator marked it with
+`git config --local agent-tools.disposableClone true`) and its local branch, never a dirty
+tree and never a plain or unmarked clone (agent-tools#979); and fast-forwards the local ref of the PR's own base (`baseRefName`,
 not an assumed `main`) only when that is safe (no checkout switch, no stash). It is
 repo-agnostic: nothing about an org/tracker/path layout is hard-coded, and knobs are env-driven
 — most notably **`SHIP_MAIN_CHECKOUT`** (the primary checkout to refresh post-merge; defaults

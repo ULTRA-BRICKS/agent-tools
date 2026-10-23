@@ -47,14 +47,27 @@ or masks the merge) and follows the PR, not an assumption:
   answer, keeps checkout and branch and says why. A dirty tree is never removed or forced.
   - A **linked worktree** is removed from the main checkout; launched from inside it, ship first
     re-roots there and tells you its cwd is gone.
-  - A **per-PR `git clone --shared` clone** (the only worktree of its own repository, borrowing its
-    objects through `objects/info/alternates` from a sibling local working checkout that still
-    exists) has no other checkout to re-root into, so ship removes the directory itself, and only
-    when, after a `git fetch --prune origin`, it holds no other local branch, stash or tag that
-    exists on no remote, no ignored file that a rebuild would not bring back (`.env*`, local notes;
-    `node_modules`, `dist`, caches and the like do not count), and no installed hook points into
-    it. A clone whose alternates name a bare repository (a mirror) is not a per-PR clone.
-  - A **plain clone** is somebody's working copy and is never deleted; if it is merged and tidy
+  - A **marked per-PR `git clone --shared` clone** (the only worktree of its own repository,
+    borrowing its objects through `objects/info/alternates` from a sibling local working checkout
+    that still exists, **and** carrying the positive marker `agent-tools.disposableClone = true` in
+    its own `.git/config`) has no other checkout to re-root into, so ship removes the directory
+    itself, and only when, after a `git fetch --prune origin`, it holds no other local branch,
+    stash or tag that exists on no remote, no ignored file that a rebuild would not bring back
+    (`.env*`, local notes; `node_modules`, `dist`, caches and the like do not count), and no
+    installed hook points into it. A clone whose alternates name a bare repository (a mirror) is
+    not a per-PR clone. The alternates alone prove nothing: a developer's own long-lived
+    `git clone --reference/--shared` has them too (agent-tools#979), so without the marker such a
+    clone is treated as a plain clone below, and ship says how to mark one.
+    **Creators write the marker** right after cloning:
+    `git clone -q --shared --no-checkout --branch <base> <primary> <dir> && git -C <dir> config --local agent-tools.disposableClone true`.
+    Pass `--branch <base>`: without it git creates a local branch for whatever the primary has checked
+    out, and when that branch is unpushed (a stray branch in the primary) every fresh clone carries
+    it and ship keeps the clone as holding "commits that exist on no remote branch".
+    Only the clone's own config counts (`--local`): `git config --global` cannot mark every clone,
+    and a clone made from a marked clone does not inherit it. Per-PR clones made before the marker
+    existed are unmarked and are therefore kept (moved onto the base); mark one by hand to let ship
+    remove it. Linked worktrees (what `rig worktree create` makes) are not clones and need no marker.
+  - A **plain or unmarked clone** is somebody's working copy and is never deleted; if it is merged and tidy
     it is moved onto the base branch and the merged branch is dropped.
 - **Base refresh.** The local base ref is fast-forwarded to `origin/<base>` only when it exists and
   is safe to move: ship never switches the branch of the primary checkout, never stashes, and skips

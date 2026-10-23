@@ -88,6 +88,12 @@
 
 ### Fixed
 
+- `gh ship` no longer deletes a developer's own long-lived `git clone --reference/--shared`
+  checkout after a merge (agent-tools#979). A clone is removed as a directory only when its creator
+  marked it disposable (`git config --local agent-tools.disposableClone true`, read from the
+  clone's own config only) on top of the existing alternates and keep-guards; an unmarked clone is
+  kept and moved onto the base, and ship prints the one-line marker command. Linked worktrees are
+  unaffected. Existing unmarked per-PR clones are kept until marked.
 - `visual-proof-gate`: test and story files (`*.test.*`, `*.spec.*`, `*.stories.*`,
   `__tests__/`, a `test/` dir outside routing roots), plain `.ts`/`.js`/`.json` under
   `components/ ui/ pages/ app/ views/`, and `.tsx`/`.jsx` files whose staged and HEAD content

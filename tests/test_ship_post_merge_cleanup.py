@@ -24,6 +24,9 @@ import pytest
 from test_ship import _SHIP, _fake_gh_dir, _git, _sh
 
 BASE = "private"  # the repo's base branch; there is deliberately no `main` anywhere
+# The marker a per-PR clone's creator writes; spelled out here (not imported) so renaming it in
+# ship without updating the creators' recipe fails a test.
+DISPOSABLE_MARKER = "agent-tools.disposableClone"
 
 
 def _commit(repo: Path, name: str, text: str, msg: str) -> None:
@@ -64,11 +67,12 @@ class Setup:
         _git("branch", "-q", "--set-upstream-to=origin/feat", "feat", cwd=wt)
         return wt
 
-    def clone(self, *, shared: bool, from_bare: bool = False) -> Path:
+    def clone(self, *, shared: bool, from_bare: bool = False, marked: bool | None = None) -> Path:
         """A per-PR checkout. `shared` borrows objects from the primary working checkout the way
         `git clone --shared <primary> <dir>` does for real per-PR clones (origin is then repointed
         at the server); `from_bare` borrows from the bare server repo instead (a mirror-style
-        clone, which is NOT a disposable per-PR clone)."""
+        clone, which is NOT a disposable per-PR clone). `marked` writes the positive disposable
+        marker the creator of a per-PR clone is responsible for (default: marked iff `shared`)."""
         dest = self.tmp / "pr-clone"
         source = self.origin if (from_bare or not shared) else self.primary
         flags = ["--shared"] if shared else []
@@ -77,6 +81,8 @@ class Setup:
         _git("fetch", "-q", "origin", cwd=dest)
         _identity(dest)
         _git("checkout", "-q", "-B", "feat", "origin/feat", cwd=dest)
+        if shared if marked is None else marked:
+            _git("config", "--local", DISPOSABLE_MARKER, "true", cwd=dest)
         return dest
 
     def merge_cmd(self) -> str:
@@ -187,6 +193,48 @@ def test_shared_clone_is_removed_from_inside_after_a_verified_merge(setup):
     assert _git("rev-parse", "HEAD", cwd=setup.primary).stdout.strip() == primary_head, "primary moved"
 
 
+def test_unmarked_reference_clone_is_kept_even_though_its_alternates_name_a_sibling_checkout(setup):
+    """A developer's own long-lived `git clone --reference/--shared` looks exactly like a per-PR
+    clone through objects/info/alternates: without the positive disposable marker ship must not
+    rmtree it (agent-tools#979). Clean and merged, it is only moved off the merged branch."""
+    clone = setup.clone(shared=True, marked=False)
+    assert (clone / ".git" / "objects" / "info" / "alternates").exists()
+    r = _ship(setup, clone)
+    assert r.returncode == 0, _dump(r)
+    assert clone.exists(), f"an unmarked --shared clone was deleted:\n{_dump(r)}"
+    assert _git("symbolic-ref", "--short", "HEAD", cwd=clone).stdout.strip() == BASE, _dump(r)
+    assert _branches(clone) == "", _dump(r)
+    assert DISPOSABLE_MARKER in r.stdout + r.stderr, f"ship did not say how to mark a disposable clone:\n{_dump(r)}"
+
+
+def test_marker_set_to_anything_but_true_does_not_make_a_clone_disposable(setup):
+    clone = setup.clone(shared=True, marked=False)
+    _git("config", "--local", DISPOSABLE_MARKER, "false", cwd=clone)
+    r = _ship(setup, clone)
+    assert r.returncode == 0, _dump(r)
+    assert clone.exists(), _dump(r)
+
+
+def test_marker_in_global_config_does_not_make_every_clone_disposable(setup):
+    """The marker is a per-clone fact: a machine-wide `git config --global` must not turn every
+    long-lived clone on the box into a deletable one."""
+    clone = setup.clone(shared=True, marked=False)
+    gitconfig = setup.tmp / "global-gitconfig"
+    gitconfig.write_text(f"[agent-tools]\n\tdisposableClone = true\n", encoding="utf-8")
+    r = _ship(setup, clone, GIT_CONFIG_GLOBAL=str(gitconfig))
+    assert r.returncode == 0, _dump(r)
+    assert clone.exists(), f"a global marker deleted a clone:\n{_dump(r)}"
+
+
+def test_marker_on_a_clone_with_no_alternates_is_not_enough_to_delete_it(setup):
+    """Every existing keep-guard still applies: a marked plain clone has no shared object store
+    to prove it is a per-PR copy of a sibling checkout, so it is parked, never deleted."""
+    clone = setup.clone(shared=False, marked=True)
+    r = _ship(setup, clone)
+    assert r.returncode == 0, _dump(r)
+    assert clone.exists(), _dump(r)
+
+
 def test_plain_clone_is_kept_but_moved_off_the_merged_branch(setup):
     """A plain `git clone` (no alternates) is somebody's working clone, not a disposable per-PR
     one: it is never deleted. Clean and merged, it is moved onto the fast-forwarded base and the
@@ -277,7 +325,7 @@ def test_shared_clone_holding_an_unpushed_tag_is_kept(setup):
 def test_shared_clone_of_a_bare_mirror_is_not_a_disposable_per_pr_clone(setup):
     """Alternates pointing at a bare repository is how a long-lived clone of a mirror looks: ship
     must not rmtree it. It is clean and merged, so it is only moved off the merged branch."""
-    clone = setup.clone(shared=True, from_bare=True)
+    clone = setup.clone(shared=True, from_bare=True, marked=True)
     assert (clone / ".git" / "objects" / "info" / "alternates").exists()
     r = _ship(setup, clone)
     assert r.returncode == 0, _dump(r)
