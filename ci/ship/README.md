@@ -5,6 +5,11 @@
 > script — `gh ship` is the single front door. This file documents the underlying behavior;
 > `ship.sh` is the source/template that `rig apply` provisions as `pr-ship.sh`.
 
+`ship.sh` is a short launcher; the implementation is [`ship.py`](ship.py) plus the
+[`shiplib/`](shiplib) package next to it (one module per stretch of the gate sequence, run in
+order by `ship.py`), ported from the former single bash script under the repo's Python-only rule
+(agent-tools#946). Flags, messages, knobs and exit codes are unchanged.
+
 `ship.sh <PR>` is a portable "merge this PR safely, then clean up" helper. It is **not** a
 CI workflow — it's a local/CI command you run to merge a ready PR. Before it merges, it
 runs the same preflights the CI gates in this directory enforce, so you can't merge a PR
@@ -29,9 +34,32 @@ that isn't actually ready even with a one-liner.
 | **No ticket / no acceptance** | When task-cli is on PATH, a PR with **no derivable ticket code** is refused — a PR with no ticket has no acceptance criteria, so nothing can be proven (agent-tools#639). Create a ticket (`task create`) and reference it (`Refs #N` / `Refs HYP-N`). Repos that never installed task-cli still skip. |
 | Local branch has unpushed/diverged commits, or dirty worktree | Avoids merging stale/uncommitted local state. |
 
-Then it squash-merges, deletes the remote branch, removes the local branch+worktree (from
-*inside* that worktree it first re-roots into the main checkout; a dirty tree is left in
-place), and fast-forwards your main checkout.
+Then it squash-merges and tidies up. The tidy-up is best-effort (a failure warns, it never undoes
+or masks the merge) and follows the PR, not an assumption:
+
+- **Base branch.** The base is the PR's own `baseRefName`; `SHIP_DEFAULT_BRANCH` is only the
+  fallback when `gh` cannot report it. Nothing assumes `main`.
+- **Remote head branch** is deleted (through the API on Forgejo; a fork's head is left to its owner).
+- **Local checkout + branch** are removed only after ship reads the PR back from the platform
+  (`gh pr view --json state,headRefOid`) and finds it `MERGED` with the local branch tip equal to,
+  or behind, the merged head (a squash-merge never makes the tip an ancestor of the base, so git
+  cannot answer this). A branch with a commit the merge did not take, or an unreadable platform
+  answer, keeps checkout and branch and says why. A dirty tree is never removed or forced.
+  - A **linked worktree** is removed from the main checkout; launched from inside it, ship first
+    re-roots there and tells you its cwd is gone.
+  - A **per-PR `git clone --shared` clone** (the only worktree of its own repository, borrowing its
+    objects through `objects/info/alternates` from a sibling local working checkout that still
+    exists) has no other checkout to re-root into, so ship removes the directory itself, and only
+    when, after a `git fetch --prune origin`, it holds no other local branch, stash or tag that
+    exists on no remote, no ignored file that a rebuild would not bring back (`.env*`, local notes;
+    `node_modules`, `dist`, caches and the like do not count), and no installed hook points into
+    it. A clone whose alternates name a bare repository (a mirror) is not a per-PR clone.
+  - A **plain clone** is somebody's working copy and is never deleted; if it is merged and tidy
+    it is moved onto the base branch and the merged branch is dropped.
+- **Base refresh.** The local base ref is fast-forwarded to `origin/<base>` only when it exists and
+  is safe to move: ship never switches the branch of the primary checkout, never stashes, and skips
+  a checkout that holds the base with uncommitted changes (it prints `not fast-forwarded ... skipped`).
+  A base checked out nowhere is moved with `update-ref`; a diverged one is left alone with a warning.
 
 **A worktree that backs installed agent hooks is kept** (agent-tools#905). Before removing a
 PR worktree, cleanup runs [`hook_refs.py`](hook_refs.py) over the hook wiring rig installs —
@@ -93,7 +121,7 @@ than merging unverified.
 ## Quick start
 
 ```bash
-cp ci/ship/ship.sh ~/bin/ship && chmod +x ~/bin/ship    # or wherever your PATH points
+ln -s "$PWD/ci/ship/ship.sh" ~/bin/ship        # the launcher needs ship.py + shiplib/ beside it: link it, never copy it alone
 ship 123                                                # merge PR #123 when green
 ship 123 --dry-run                                      # show what it would do
 ship 123 --screenshot ./after.png "new dialog"          # attach + post visual proof
@@ -102,14 +130,14 @@ ship 123 --screenshot ./after.png "new dialog"          # attach + post visual p
 Wire it as a `gh` alias if you like:
 
 ```bash
-gh alias set ship '!bash ~/bin/ship'    # then: gh ship 123
+gh alias set ship '!~/bin/ship'    # then: gh ship 123
 ```
 
 > **Hatch bypass needs the sibling `lib/`.** The review-quorum gate's one-time Telegram bypass
 > imports `agenttools_hatch_escalation` from `lib/` two levels above `ship.sh` in the checkout.
 > The sanctioned `gh ship` → `pr-ship.sh` delegator runs the **canonical catalog** `ci/ship/ship.sh`
 > (resolved from the repo checkout or `AGENT_TOOLS_ROOT`), so `lib/` is present and the bypass works.
-> A bare `cp ci/ship/ship.sh ~/bin/ship` copy has no sibling `lib/`, so a bypass request from it
+> A copy of `ship.sh` alone has neither `ship.py` nor a sibling `lib/` (it will not run at all); a copy of the `ci/ship/` directory has no sibling `lib/`, so a bypass request from it
 > **fails closed** (the gate still enforces; you just can't hatch-bypass) — run `ship` from the
 > checkout, or point `AGENT_TOOLS_ROOT` at it, to use the bypass.
 
@@ -130,13 +158,15 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
 
 | Env | Default | Purpose |
 | --- | ------- | ------- |
-| `SHIP_DEFAULT_BRANCH` | `main` | Base branch. |
+| `SHIP_DEFAULT_BRANCH` | `main` | Fallback base branch, used only when `gh` cannot report the PR's `baseRefName` (the PR's own base always wins). |
 | `SHIP_MERGE_METHOD` | `squash` | `squash` / `merge` / `rebase`. |
+| `SHIP_CI_STATUS_URL` | githubstatus.com components API | URL the CI-down detector reads to see whether GitHub Actions is degraded (override to point at a fake). |
+| `SHIP_TEST_CI_DOWN` | (unset) | `=1` force-triggers the CI-down local-gate path. Test-only shortcut; never set it in production. |
 | `SHIP_CI_WAIT` | `900` | Max seconds to WATCH pending CI to completion before giving up. |
 | `SHIP_CI_POLL` | `20` | Poll interval (seconds) while watching pending CI. |
 | `SHIP_CI_GRACE` | `45` | Grace window for checks to *register* on a fresh PR before concluding "no CI" (an empty rollup is briefly normal right after opening a PR). |
 | `SHIP_FLAKE_LOOKBACK_RUNS` | `5` | For the `--known-flake` gate: how many recent COMPLETED runs of the same workflow on the base branch to search for a matching failure. A match in any of them is enough. |
-| `SHIP_MAIN_CHECKOUT` | first worktree | Where to fast-forward after merge. |
+| `SHIP_MAIN_CHECKOUT` | first worktree | The primary checkout: where a worktree ship was launched from re-roots to, and whose local base ref is fast-forwarded after merge. |
 | `SHIP_UI_PATH_REGEX` | common FE paths | What makes a PR "UI-touching". **Set empty to disable the screenshot gate.** |
 | `SHIP_IMAGE_UPLOAD_CMD` | (unset) | Optional uploader for `--screenshot`: a command that takes the image (`{FILE}` token or `$1`) and prints a public URL. Without it, `--screenshot` just embeds a local-path note. |
 | `SHIP_SKIP_VERSION_BUMP` | (unset) | `=1` overrides the version-bump gate (env equivalent of `--no-version-bump-ok`). |

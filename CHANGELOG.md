@@ -26,6 +26,11 @@
 
 ### Changed
 
+- `gh ship` (`ci/ship/ship.sh`) is now Python (agent-tools#946, forced by the python-only gate on
+  the edit #974 needed). `ship.sh` is a short launcher for `ci/ship/ship.py` + the
+  `ci/ship/shiplib/` package; flags, messages, env knobs, audit lines and exit codes are those of
+  the former 4.6k-line bash script. Copying `ship.sh` alone no longer works: link it or run it
+  from the checkout.
 - `block-unlanded-removal` runs a PINNED rig and degrades on a stale one (agent-tools#961). The
   descriptor gains `"args": ["--rig", "/ABSOLUTE/PATH/TO/rig"]` (`rig apply` substitutes the
   launcher's absolute path); the hook never resolves `rig` through PATH, requires an absolute
@@ -74,6 +79,18 @@
 
 ### Fixed
 
+- `gh ship` post-merge cleanup (agent-tools#974, Refs #925, #962, #809): the base branch is the
+  PR's `baseRefName` (`SHIP_DEFAULT_BRANCH` is only the fallback), so a repo whose base is not
+  `main` no longer gets `pathspec 'main' did not match`; the local base ref is fast-forwarded
+  only when it exists and is safe (no checkout switch, no `--autostash`, a dirty checkout is
+  skipped with a notice). After reading the PR back as MERGED with the local tip not ahead of the
+  merged head, ship removes the PR's checkout and local branch even when launched from inside it,
+  including a per-PR `git clone --shared` clone (previously "no separate main checkout to re-root
+  into — leaving it in place" left the clone and branch behind); a dirty tree, a branch with
+  commits the merge did not take, a clone holding other unpushed work (branch, stash, tag, or an
+  ignored `.env`-style file a rebuild would not restore), a clone borrowing from a mirror and a
+  plain clone are kept. The remote head branch of a PR still OPEN after the merge call (merge
+  queue, auto-merge) is kept.
 - `runpod-offload` (`runpod-run`): a reaper pass over a marker whose pid is gone no longer
   prints `/proc/<pid>/cmdline: No such file or directory` (agent-tools#910).
 - `runpod-offload` (`runpod-run`): failures that billed for nothing, and staging runs

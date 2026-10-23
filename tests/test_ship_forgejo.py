@@ -10,6 +10,7 @@ reached on the Forgejo path. No real PR is ever touched.
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import base64
 import json
@@ -26,8 +27,12 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SHIP = ROOT / "ci" / "ship" / "ship.sh"
+SHIPLIB = ROOT / "ci" / "ship" / "shiplib"
 PROVIDER = ROOT / "ci" / "ship" / "forgejo_provider.py"
 PLACEHOLDER = "YOUR_TOKEN_HERE"  # obviously fake credential for the synthetic key store
+
+sys.path.insert(0, str(ROOT / "ci" / "ship"))
+from shiplib import accept_merge  # noqa: E402
 
 
 def _load_provider():
@@ -589,9 +594,7 @@ def test_unaddressed_comment_filter_reads_the_forgejo_shape(api_fake, tmp_path):
     data = fp.pr_json(_ctx_for(api_fake, tmp_path).pr(1), ["author", "comments"])
     assert data["author"] == {"login": "me"}
     assert [c["createdAt"] for c in data["comments"]] == ["2026-10-01T00:00:00Z", "2026-10-01T01:00:00Z", "2026-10-02T00:00:00Z"]
-    source = SHIP.read_text(encoding="utf-8")
-    body = source.split("_external_review_unaddressed_comments() {", 1)[1]
-    query = re.search(r"--json author,comments -q '([^']+)'", body).group(1)
+    query = accept_merge._UNADDRESSED_JQ
     run = subprocess.run(["jq", "-r", query], input=json.dumps(data), capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
     assert run.stdout.strip() == "1"  # only the second `rev` comment is unanswered
@@ -1183,36 +1186,91 @@ def test_cli_delete_head_and_prune_merged_entry_points(api_fake, tmp_path, monke
     assert _deletes(api_fake) == ["/api/v1/repos/o/r/branches/feat"]
 
 
-# --- every gh call site in ship.sh is mapped or fails closed ----------------------------------
+# --- every gh call site in ship is mapped or fails closed -------------------------------------
 
 MAPPED = {("pr", "view"), ("pr", "diff"), ("pr", "merge"), ("pr", "comment"), ("pr", "edit"),
           ("api", "graphql"), ("repo", "view"), ("run", "list"), ("run", "view")}
 # Sites the Forgejo provider deliberately does NOT map (GitHub Actions evidence): each must fail.
+# An f-string site is keyed by its text with every interpolation rendered as `$<expression>`.
 UNSUPPORTED_PROBES = {
     ("run", "list", "no-status"): ["run", "list", "--branch", "main"],
     ("run", "view", "no-json"): ["run", "view", "1"],
     ("api", "repos/{owner}/{repo}/actions/runs?head_sha=$head_sha&per_page=20"): ["api", "repos/o/r/actions/runs"],
     ("api", "repos/{owner}/{repo}/commits/$head_sha/check-runs?per_page=100"): ["api", "repos/o/r/commits/x/check-runs"],
-    ("api", "repos/{owner}/{repo}/check-runs/$id/annotations"): ["api", "repos/o/r/check-runs/1/annotations"],
+    ("api", "repos/{owner}/{repo}/check-runs/$cid/annotations"): ["api", "repos/o/r/check-runs/1/annotations"],
 }
+
+
+def _const_str(node):
+    """The literal text of a str constant / f-string (interpolations rendered `$<expr>`), else None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            part.value if isinstance(part, ast.Constant) else "$" + ast.unparse(part.value)
+            for part in node.values
+        )
+    return None
+
+
+def _list_prefix(node, func):
+    """Leading literal items of the list a `*args` splat refers to: `*name` / `*name[1:]`, where `name`
+    is assigned a list literal in the enclosing function (the way ship builds a conditional argv)."""
+    skip = 0
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+        assert isinstance(node.slice.lower, ast.Constant) and node.slice.upper is None, ast.unparse(node)
+        skip, node = node.slice.lower.value, node.value
+    if not isinstance(node, ast.Name):
+        return []
+    items = []
+    for stmt in ast.walk(func):
+        if isinstance(stmt, ast.Assign) and any(isinstance(t, ast.Name) and t.id == node.id for t in stmt.targets) \
+                and isinstance(stmt.value, ast.List):
+            for elt in stmt.value.elts:
+                if isinstance(elt, ast.Starred):
+                    break
+                items.append(_const_str(elt))
+            break
+    return items[skip:]
+
+
+def _ship_gh_calls() -> list[tuple[str, int, list]]:
+    """Every `ctx.gh(...)` call in shiplib/*.py as (file, line, leading literal argv items; None where
+    an item is not a literal). A `*splat` argument is resolved to the list literal it was built from."""
+    calls = []
+    for path in sorted(SHIPLIB.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        for func in funcs:
+            for node in ast.walk(func):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "gh"
+                        and isinstance(node.func.value, ast.Name) and node.func.value.id == "ctx"):
+                    continue
+                argv = []
+                for arg in node.args:
+                    if isinstance(arg, ast.Starred):
+                        argv += _list_prefix(arg.value, func)
+                        break
+                    argv.append(_const_str(arg))
+                calls.append((path.name, node.lineno, argv))
+    # ast.walk visits a nested function's calls once per enclosing function: de-duplicate.
+    return sorted(set((f, ln, tuple(argv)) for f, ln, argv in calls))
 
 
 def _ship_gh_callsites() -> set:
     sites = set()
-    for line in SHIP.read_text().splitlines():
-        if line.lstrip().startswith("#"):
-            continue
-        code = re.sub(r"\b(echo|printf)\b.*", "", line)
-        for m in re.finditer(r'(?:^|[\s($`])gh (pr|api|run|repo|issue|auth|release|search|workflow) +"?([^\s"]+)', code):
-            sites.add((m.group(1), m.group(2)))
+    for fname, line, argv in _ship_gh_calls():
+        assert len(argv) >= 2 and argv[0] and argv[1], (
+            f"{fname}:{line}: ctx.gh call whose command words are not literal — cannot be classified")
+        sites.add((argv[0], argv[1]))
     return sites
 
 
 def test_every_ship_gh_callsite_is_mapped_or_fails_closed(api_fake, tmp_path):
     sites = _ship_gh_callsites()
-    assert ("pr", "merge") in sites and ("api", "graphql") in sites  # the scan actually sees ship.sh
+    assert ("pr", "merge") in sites and ("api", "graphql") in sites  # the scan actually sees ship's gh calls
     unclassified = sites - MAPPED - set(UNSUPPORTED_PROBES)
-    assert not unclassified, f"new gh call site(s) in ship.sh need a Forgejo mapping or a fail-closed probe: {unclassified}"
+    assert not unclassified, f"new gh call site(s) in ship need a Forgejo mapping or a fail-closed probe: {unclassified}"
     _seed(api_fake)
     ctx = _ctx_for(api_fake, tmp_path)
     mutation = "query=mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
@@ -1227,17 +1285,13 @@ def test_every_ship_gh_callsite_is_mapped_or_fails_closed(api_fake, tmp_path):
             fp.run_gh(ctx, argv)
 
 
-def _ship_code_lines() -> str:
-    """ship.sh without comment lines, with backslash continuations joined."""
-    lines = [ln for ln in SHIP.read_text().splitlines() if not ln.lstrip().startswith("#")]
-    return re.sub(r"\\\n\s*", " ", "\n".join(lines))
-
-
 def test_every_ship_pr_view_json_field_is_mapped():
     fields = set()
-    for m in re.finditer(r"\bgh pr view [^\n]*?--json ([A-Za-z,]+)", _ship_code_lines()):
-        fields.update(f for f in m.group(1).split(",") if f)
-    assert {"headRefName", "statusCheckRollup", "reviews"} <= fields  # the scan actually sees ship.sh
+    for _fname, _line, argv in _ship_gh_calls():
+        if argv[:2] == ("pr", "view") and "--json" in argv:
+            spec = argv[argv.index("--json") + 1]
+            fields.update(f for f in re.findall(r"[A-Za-z]+", spec) if f)
+    assert {"headRefName", "statusCheckRollup", "reviews"} <= fields  # the scan actually sees ship's gh calls
     assert fields <= set(fp.FIELD_BUILDERS), sorted(fields - set(fp.FIELD_BUILDERS))
 
 

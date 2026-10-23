@@ -256,11 +256,16 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   follow-up work, not yet built;
 - the local branch has **no unpushed/diverged commits** and a **clean worktree**.
 
-Then it squash-merges, deletes the remote branch, removes the local worktree + branch (unless
-you're sitting inside that worktree), and fast-forwards the main checkout. It is
+Then it squash-merges and tidies up (best-effort, never masking the merge): it deletes the remote
+branch; reads the PR back and, only if it is MERGED and the local branch carries nothing the merge
+did not take, removes the PR's checkout (a linked worktree, re-rooting into the main checkout when
+launched from inside it, or a per-PR `git clone --shared` clone) and its local branch, never a dirty
+tree and never a plain clone; and fast-forwards the local ref of the PR's own base (`baseRefName`,
+not an assumed `main`) only when that is safe (no checkout switch, no stash). It is
 repo-agnostic: nothing about an org/tracker/path layout is hard-coded, and knobs are env-driven
 — most notably **`SHIP_MAIN_CHECKOUT`** (the primary checkout to refresh post-merge; defaults
-to the first `git worktree list` entry), plus `SHIP_DEFAULT_BRANCH`, `SHIP_MERGE_METHOD`,
+to the first `git worktree list` entry), plus `SHIP_DEFAULT_BRANCH` (the fallback base when gh cannot
+report the PR's), `SHIP_MERGE_METHOD`,
 `SHIP_UI_PATH_REGEX`, `SHIP_IMAGE_UPLOAD_CMD`. `--skip-ci` admin-merges (still runs the other
 preflights) and is **deny-by-default** — it proceeds only on a one-time live Telegram approval via
 `RIG_HATCH_REQUEST_SHIP_SKIP_CI="<justification>"`. It is NOT the billing-blocked-CI path: for that,

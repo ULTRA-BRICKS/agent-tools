@@ -2563,58 +2563,73 @@ def test_gh_ship_carve_out_does_not_vet_skip_ci(tmp_path, monkeypatch):
     assert c2 == 0 and _decision(out2) == "allow"
 
 
+_SHIPLIB = Path(__file__).resolve().parents[1] / "ci" / "ship" / "shiplib"
+
+
+def _shiplib_tree(module: str):
+    import ast
+
+    return ast.parse((_SHIPLIB / f"{module}.py").read_text(encoding="utf-8"), filename=f"shiplib/{module}.py")
+
+
+def _shiplib_function(module: str, name: str):
+    """The top-level `def name` of ci/ship/shiplib/<module>.py, as an AST node."""
+    import ast
+
+    fn = next((n for n in _shiplib_tree(module).body if isinstance(n, ast.FunctionDef) and n.name == name), None)
+    assert fn, f"{name}() function not found in shiplib/{module}.py"
+    return fn
+
+
 def test_skip_ci_hatch_still_exists_in_ship_sh():
     """Cross-check pin (Fable review): the previous test's safety argument for waving `--skip-ci`
-    through THIS gate rests entirely on `ci/ship/ship.sh` owning its OWN deny-by-default hatch for
-    it. Nothing in `orchestrator_stays_thin.py` couples to that fact — if `ship.sh`'s hatch were
+    through THIS gate rests entirely on `ci/ship` (`gh ship`) owning its OWN deny-by-default hatch
+    for it. Nothing in `orchestrator_stays_thin.py` couples to that fact — if ship's hatch were
     ever renamed, weakened, or removed, this hook would silently become an ungated inline path to
     a CI-skipping merge and every test in this file would keep passing. Pin the hatch's presence
-    here so a change to `ship.sh` that breaks the assumption fails a test, not a security review.
+    here so a change to ship that breaks the assumption fails a test, not a security review.
 
-    Pins the actual bash CONSTRUCT, not just prose (Fable review round 2: a plain substring/phrase
-    grep can pass after the real gate is deleted, as long as a stray comment survives, and can fail
-    on a harmless comment reword while the gate stays intact — the wrong signal in both directions).
-    Round 3 tightened it further: a naive `body.index("fi")` after the unset-check false-matched
-    the "fi" *inside the word* "justification" in an intervening `echo` line, proving the exact
-    failure mode the round-2 version was trying to avoid — this version extracts the FUNCTION BODY
-    (bounded by its own opening/closing braces) and locates the unset-check's `then`-block via a
-    standalone `fi` keyword (its own whitespace-only line, not a bare substring), then
-    requires a bare `exit 1` line strictly BEFORE that `fi` — an actual refusal in that specific
-    branch, not `exit 1` appearing anywhere later in the function. Also pins that `SKIP_CI=1` (the
-    `--skip-ci` flag's own state) actually calls the gate before any merge — so the coupling is to
-    the REAL call graph, not just to two constructs existing independently and unwired."""
-    ship_sh = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
-    text = ship_sh.read_text(encoding="utf-8")
+    Pins the actual CONSTRUCT, not just prose (Fable review rounds 2-3: a substring grep passes
+    after the real gate is deleted as long as a stray comment survives, and fails on a harmless
+    comment reword — the wrong signal in both directions). ship is Python now, so this reads the
+    AST of `shiplib/quorum_skipci.py::skip_ci_hatch_gate`: it requires the "hatch env var is
+    unset" check as a real `if` statement whose branch ENDS in `raise ShipExit(1)` — an actual
+    refusal in that specific branch, not a refusal appearing anywhere later in the function. Also
+    pins that `ctx.skip_ci` (the `--skip-ci` flag's own state) actually calls the gate before the
+    merge, inside that branch of `shiplib/accept_merge.py::run` — so the coupling is to the REAL
+    call graph, not just to two constructs existing independently and unwired."""
+    import ast
 
-    fn_match = re.search(r"^_skip_ci_hatch_gate\(\) \{\n(.*?)^\}", text, re.M | re.S)
-    assert fn_match, "_skip_ci_hatch_gate() function not found in ship.sh"
-    body = fn_match.group(1)
-
-    assert '${RIG_HATCH_REQUEST_SHIP_SKIP_CI+x}' in body  # the actual "is unset" bash idiom
-    unset_check = body.index('RIG_HATCH_REQUEST_SHIP_SKIP_CI+x')
-    fi_match = re.search(r"^\s*fi\s*$", body[unset_check:], re.M)
-    assert fi_match, "no standalone `fi` closing the unset-check if-block"
-    then_block = body[unset_check:unset_check + fi_match.start()]
-    assert re.search(r"^\s*exit 1\s*$", then_block, re.M), (
-        "unset-check then-block does not end in a bare `exit 1` refusal"
+    gate = _shiplib_function("quorum_skipci", "skip_ci_hatch_gate")
+    unset_checks = [
+        n for n in gate.body
+        if isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+        and len(n.test.ops) == 1 and isinstance(n.test.ops[0], ast.NotIn)
+        and isinstance(n.test.left, ast.Constant) and n.test.left.value == "RIG_HATCH_REQUEST_SHIP_SKIP_CI"
+        and ast.unparse(n.test.comparators[0]) == "ctx.env"  # the actual "is unset" idiom
+    ]
+    assert len(unset_checks) == 1, "no `RIG_HATCH_REQUEST_SHIP_SKIP_CI not in ctx.env` check in skip_ci_hatch_gate"
+    last = unset_checks[0].body[-1]
+    assert isinstance(last, ast.Raise) and ast.unparse(last.exc) == "ShipExit(1)", (
+        "unset-check branch does not end in a `raise ShipExit(1)` refusal"
     )
 
-    # The call-graph pin (Fable review round 3: the earlier version only checked that
-    # `_skip_ci_hatch_gate` appears somewhere AFTER the `if` line — it would still pass if the
-    # call sat in the `else` branch, after the whole `if`, or was never called at all). Extract the
-    # `if [ "$SKIP_CI" = "1" ]; then … fi` block by its own bounding `fi` and require the call
-    # INSIDE it, before the actual merge (`run gh pr merge`) it's meant to gate.
-    if_match = re.search(
-        r'^if \[ "\$SKIP_CI" = "1" \]; then\n(.*?)\nfi$', text, re.M | re.S
+    # The call-graph pin (Fable review round 3: the earlier version only checked that the gate is
+    # called somewhere AFTER the `if` line — it would still pass if the call sat in the `else`
+    # branch, after the whole `if`, or was never called at all). Find the `if ctx.skip_ci:` branch
+    # of the merge step and require the call INSIDE it, before the actual admin merge it gates.
+    run = _shiplib_function("accept_merge", "run")
+    skip_ci_if = next((n for n in run.body if isinstance(n, ast.If) and ast.unparse(n.test) == "ctx.skip_ci"), None)
+    assert skip_ci_if, "ctx.skip_ci branch not found in accept_merge.run in the expected shape"
+    calls = [
+        ast.unparse(stmt.value) for stmt in skip_ci_if.body
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+    ]
+    assert "skip_ci_hatch_gate(ctx)" in calls, "the skip-ci gate is not called inside the ctx.skip_ci branch"
+    assert "_merge(ctx, ['--admin'])" in calls, "the ctx.skip_ci branch does not admin-merge"
+    assert calls.index("skip_ci_hatch_gate(ctx)") < calls.index("_merge(ctx, ['--admin'])"), (
+        "the gate is not called BEFORE the admin merge"
     )
-    assert if_match, "SKIP_CI=1 if-block not found in the expected shape"
-    skip_ci_block = if_match.group(1)
-    assert "_skip_ci_hatch_gate" in skip_ci_block, (
-        "the skip-ci gate is not called inside the SKIP_CI=1 branch"
-    )
-    gate_call_idx = skip_ci_block.index("_skip_ci_hatch_gate")
-    merge_idx = skip_ci_block.index("run gh pr merge")
-    assert gate_call_idx < merge_idx, "the gate is not called BEFORE the admin merge"
 
 
 def test_ship_carve_out_not_blocked_by_a_primed_tier(tmp_path, monkeypatch):
@@ -2757,25 +2772,31 @@ def test_gh_ship_trailing_bare_tokens_are_unrestricted():
     only `argv[0]` (post-`gh`) is checked against `ship` and `argv[1]` against the digit pattern;
     everything after is genuinely unrestricted, including another bare number, not just flags
     (Fable review: the docs say "trailing flags/redirects unrestricted", which understates this).
-    Safe by defense-in-depth even so: `ci/ship/ship.sh`'s OWN arg parser treats the PR number as
-    "the lone bare arg" and refuses a SECOND one outright ("Multiple PR numbers … — pass one.",
-    ci/ship/ship.sh — grepped below), so this hook being permissive here does not sanction an
-    actual inline batch-merge; ship.sh's own parser is the second, independent gate."""
+    Safe by defense-in-depth even so: ship's OWN arg parser (`ci/ship/shiplib/setup.py`) treats the
+    PR number as "the lone bare arg" and refuses a SECOND one outright ("Multiple PR numbers … —
+    pass one.", pinned below), so this hook being permissive here does not sanction an
+    actual inline batch-merge; ship's own parser is the second, independent gate."""
     assert ost._is_gh_ship_command("gh ship 605 606") is True
     assert ost._is_gh_ship_command("gh ship 605 606 607") is True
     assert ost._is_implementation_bash("gh ship 605 606") is False
-    ship_sh_text = (
-        Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
-    ).read_text(encoding="utf-8")
-    # Pin the CONSTRUCT, not just the prose (same standard as the skip-ci cross-check above,
-    # Fable review round 3): the "Multiple PR numbers" message must sit on a line that itself
-    # `exit 1`s — an actual refusal, not merely a string that could survive after the refusal
-    # logic was removed.
-    error_line = next(
-        (line for line in ship_sh_text.splitlines() if "Multiple PR numbers" in line), None
+    # Pin the CONSTRUCT, not just the prose (same standard as the skip-ci cross-check above, Fable
+    # review round 3): the "Multiple PR numbers" message must be raised as an actual refusal
+    # (`raise ctx.refuse("Multiple PR numbers ...")`, whose default exit code is 1), not merely a
+    # string that could survive after the refusal logic was removed.
+    import ast
+
+    refusals = [
+        n for n in ast.walk(_shiplib_tree("setup"))
+        if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call) and ast.unparse(n.exc.func) == "ctx.refuse"
+        and "Multiple PR numbers" in ast.unparse(n.exc.args[0])
+    ]
+    assert len(refusals) == 1, "'Multiple PR numbers' refusal not found in shiplib/setup.py"
+    assert len(refusals[0].exc.args) == 1 and not refusals[0].exc.keywords, "the 'Multiple PR numbers' refusal passes a non-default exit code"
+    ctx_refuse = next(
+        n for cls in _shiplib_tree("ctx").body if isinstance(cls, ast.ClassDef) and cls.name == "Ctx"
+        for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "refuse"
     )
-    assert error_line is not None, "'Multiple PR numbers' refusal message not found in ship.sh"
-    assert "exit 1" in error_line, "the 'Multiple PR numbers' line does not itself exit 1"
+    assert [ast.unparse(d) for d in ctx_refuse.args.defaults] == ["1"], "ctx.refuse no longer defaults to exit 1"
 
 
 def test_gh_ship_find_mutation_text_falls_through_to_allowed():

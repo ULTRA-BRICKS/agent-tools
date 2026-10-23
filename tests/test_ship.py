@@ -29,6 +29,11 @@ from pathlib import Path
 import pytest
 
 _SHIP = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
+_SHIP_DIR = _SHIP.parent
+sys.path.insert(0, str(_SHIP_DIR))
+
+from shiplib import ci_gate, quorum_skipci, version_shot  # noqa: E402
+from shiplib.ctx import Ctx, Result  # noqa: E402
 
 # The review-quorum gate (Guard-B) defaults to ENABLED in the product. SHIP_REVIEW_QUORUM=0
 # is forbidden (agent-tools#644) and no longer disables it. Unrelated tests in this file
@@ -83,7 +88,7 @@ case "$sub" in
           # to exercise the gate's refusal/hatch paths).
           echo "${SHIP_TEST_REVIEW_COUNT:-1}"
         elif printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          printf '%s\\tOPEN\\tMERGEABLE\\t%s\\tCLEAN\\n' "${SHIP_TEST_BRANCH}" "${SHIP_TEST_CROSS_REPO:-false}"
         elif printf '%s ' "$@" | grep -q -- '--json baseRefName'; then
           # SHIP_TEST_BASEREF_QUERY_FAIL exercises the gh-failure path for the external-review
           # gate's own base-branch lookup specifically (independent of SHIP_TEST_REVIEW_QUERY_FAIL
@@ -94,6 +99,12 @@ case "$sub" in
             exit 1
           fi
           printf '%s\\n' "${SHIP_TEST_BASE_BRANCH:-main}"
+        elif printf '%s ' "$@" | grep -q -- '--json state,headRefOid'; then
+          # Post-merge readback (cleanup confirms MERGED + the merged head before it removes the
+          # PR checkout). SHIP_TEST_POST_STATE overrides the state; the head is the pushed tip of
+          # the PR branch (refs/remotes/origin/<branch>), which every checkout of the repo shares.
+          [ -z "${SHIP_TEST_READBACK_FAIL:-}" ] || { echo "fake gh: simulated read-back failure" >&2; exit 1; }
+          printf '%s\\t%s\\n' "${SHIP_TEST_POST_STATE:-MERGED}" "${SHIP_TEST_MERGED_OID:-$(git rev-parse "refs/remotes/origin/${SHIP_TEST_BRANCH}" 2>/dev/null || true)}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           # One GREEN check so the CI gate passes on the normal (non-admin) merge path — this is
           # how tests that used to pass a bare --skip-ci (a shortcut to skip CI mocking) now run
@@ -113,6 +124,9 @@ case "$sub" in
         # cleanup runs) — simulates a merge/post-merge hook writing into the tree. Used to
         # exercise ship.sh's cleanup-time clean-check in isolation from the preflight one.
         [ -n "${SHIP_TEST_MERGE_DIRTIES:-}" ] && printf 'post-merge unshipped\\n' > "${SHIP_TEST_MERGE_DIRTIES}"
+        # Optionally run a command at merge time (e.g. land a commit on the base branch the way a
+        # real squash-merge does, or add a local commit after the clean preflight).
+        [ -n "${SHIP_TEST_MERGE_CMD:-}" ] && eval "${SHIP_TEST_MERGE_CMD}"
         echo "[fake gh] merged" ;;
       *) : ;;
     esac ;;
@@ -2028,19 +2042,16 @@ def test_base_tip_version_value_is_empty_not_fatal_without_a_version_line(tmp_pa
     value in it: base_tip_version_value must print nothing and succeed. Under ship.sh's
     `set -euo pipefail` a failing pipeline there killed ship silently with exit 1."""
     main = _repo_with_files(tmp_path, {"README.md": "# x\n", "mytool/cli.py": "x = 1\n"})
-    script = "\n".join([
-        "set -euo pipefail",
-        'ROOT="$1"; PR=1; DEFAULT_BRANCH=main',
-        "gh() { echo main; }",
-        _ship_bash_functions("version_decl_ere", "version_value", "base_tip_version_value"),
-        'v=$(base_tip_version_value mytool/__init__.py); echo "missing=[$v]"',
-        'v=$(base_tip_version_value mytool/cli.py); echo "no-version=[$v]"',
-    ])
+    ctx = Ctx(str(_SHIP_DIR))
+    ctx.root = str(main)
+    ctx.pr = "1"
+    ctx.default_branch = "main"
+    ctx.gh = lambda *a, **k: Result(0, "main\n")
 
-    r = _sh("bash", "-c", script, "btv", str(main), cwd=main)
+    missing = version_shot.base_tip_version_value(ctx, "mytool/__init__.py")
+    no_version = version_shot.base_tip_version_value(ctx, "mytool/cli.py")
 
-    assert r.returncode == 0, f"rc {r.returncode}\n{r.stdout}\n{r.stderr}"
-    assert r.stdout == "missing=[]\nno-version=[]\n", r.stdout
+    assert (missing, no_version) == ("", "")
 
 
 def _pyproject_dynamic(tool_table: str) -> str:
@@ -2224,19 +2235,17 @@ def test_dynamic_version_file_resolution(tmp_path, pyproject_rel, files, expecte
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / rel).write_bytes(text.encode("utf-8"))
 
-    r = _run_dynamic_version_file(tmp_path, pyproject_rel)
+    rc, out = _run_dynamic_version_file(tmp_path, pyproject_rel)
 
-    assert r.returncode == expected_rc, f"rc {r.returncode}, stdout {r.stdout!r}\n{r.stderr}"
-    assert r.stdout == expected_out, f"{r.stdout!r} != {expected_out!r}\n{r.stderr}"
+    assert rc == expected_rc, f"rc {rc}, stdout {out!r}"
+    assert out == expected_out, f"{out!r} != {expected_out!r}"
 
 
 def _run_dynamic_version_file(root: Path, pyproject_rel: str):
-    script = "\n".join([
-        'ROOT="$2"',
-        _ship_bash_functions("version_decl_ere", "repo_file_inside_root", "dynamic_version_file"),
-        'dynamic_version_file "$1"',
-    ])
-    return _sh("bash", "-c", script, "dvf", pyproject_rel, str(root), cwd=root)
+    """(rc, text) from version_shot.dynamic_version_file for a repo rooted at `root`."""
+    ctx = Ctx(str(_SHIP_DIR))
+    ctx.root = str(root)
+    return version_shot.dynamic_version_file(ctx, pyproject_rel)
 
 
 @pytest.mark.parametrize("case", ["dotdot", "absolute", "file-symlink", "dir-symlink", "attr-package-symlink"])
@@ -2271,11 +2280,11 @@ def test_dynamic_version_file_rejects_sources_outside_the_repo(tmp_path, case):
     )
     (root / "pyproject.toml").write_text(_pyproject_dynamic(table), encoding="utf-8")
 
-    r = _run_dynamic_version_file(root, "pyproject.toml")
+    rc, out = _run_dynamic_version_file(root, "pyproject.toml")
 
     reason = "module not found" if case == "attr-package-symlink" else "not a regular file inside the repo"
-    assert r.returncode == 2, f"rc {r.returncode}, stdout {r.stdout!r}\n{r.stderr}"
-    assert r.stdout.endswith(f"({reason})"), r.stdout
+    assert rc == 2, f"rc {rc}, stdout {out!r}"
+    assert out.endswith(f"({reason})"), out
 
 
 def test_dry_run_self_clean_does_not_warn_or_remove(repo_with_pr_worktree, tmp_path):
@@ -5330,6 +5339,14 @@ def test_cidown_near_miss_of_gates_own_filenames_still_blocks(repo_with_pr_workt
     assert "leftover markers" in r.stderr, r.stderr
 
 
+_OWN_SOURCES = (
+    _SHIP,
+    _SHIP_DIR / "ship.py",
+    *sorted((_SHIP_DIR / "shiplib").glob("*.py")),
+    Path(__file__),
+)
+
+
 def test_cidown_real_ship_sh_and_test_ship_py_source_do_not_self_trigger(repo_with_pr_worktree, tmp_path):
     """Self-enforcing regression guard (review finding on this PR itself): the design this
     PR ships relies on a CONVENTION — never spell a leftover marker as one contiguous token
@@ -5346,7 +5363,7 @@ def test_cidown_real_ship_sh_and_test_ship_py_source_do_not_self_trigger(repo_wi
 
     own_source_diff = "\n".join(
         f"+{line}"
-        for path in (_SHIP, Path(__file__))
+        for path in _OWN_SOURCES
         for line in path.read_text().splitlines()
     )
 
@@ -6182,25 +6199,22 @@ def test_no_repo_flag_path_is_unchanged(repo_with_pr_worktree, tmp_path):
 
 
 # ---------------------------------------------------------------------------------------
-# Stash-pop conflict detection after main-checkout refresh (#77)
+# Main-checkout refresh never stashes: a conflicting dirty tree is skipped (#77, #962)
 #
-# ship.sh now uses `git pull --ff-only --autostash` for the main-checkout refresh.
-# --autostash is a no-op on a clean tree; when the checkout has uncommitted changes and
-# those conflict with the incoming pull, git stash pop exits non-zero and the index
-# contains UU-class unmerged files.  ship.sh must detect that and exit 1 with a clear
-# diagnostic (naming the conflicting files and the PR merge status), not silently leave
-# the main checkout broken.
+# The main-checkout refresh used to run `git pull --ff-only --autostash`: with uncommitted
+# changes that conflicted with the incoming pull the stash-pop left UU-class unmerged files and
+# another session's work hidden in a stash. ship now fast-forwards only a CLEAN checkout and
+# otherwise skips the refresh with a notice; it never stashes and never touches the tree.
 # ---------------------------------------------------------------------------------------
 
 @pytest.fixture
 def repo_with_stash_conflict(tmp_path):
-    """A repo where the main checkout will have a stash-pop conflict after the post-merge
-    pull.  Setup:
+    """A repo whose main checkout has an uncommitted edit that would conflict with what origin
+    gained after the PR branch was cut.  Setup:
       - origin/main has a file `shared.py` with content "origin\n"
       - the main checkout has an uncommitted change to the same line ("local\n")
-      - the incoming pull changes the same line to "incoming\n"
-    When `git pull --autostash` runs it stashes the local edit, fast-forwards, then tries
-    to pop — but "local" conflicts with "incoming" on the same line, producing a UU
+      - origin/main then changes the same line to "incoming\n"
+    A pull with --autostash would stash the local edit, fast-forward, and pop into a UU
     unmerged entry."""
     if not shutil.which("bash") or not shutil.which("git"):
         pytest.skip("bash/git required")
@@ -6260,13 +6274,11 @@ def repo_with_stash_conflict(tmp_path):
     return main
 
 
-def test_stash_pop_conflict_exits_nonzero_with_diagnostic(repo_with_stash_conflict, tmp_path):
-    """When git pull --autostash produces a stash-pop conflict in the main checkout, ship
-    must exit 1 with a diagnostic that:
-      - confirms the PR IS merged (so the user doesn't re-run ship and double-merge),
-      - names the conflicting files,
-      - tells the user how to resolve manually.
-    The conflict must NOT be silently swallowed."""
+def test_dirty_main_checkout_conflicting_with_the_incoming_pull_is_left_untouched(repo_with_stash_conflict, tmp_path):
+    """The main checkout holds an uncommitted edit that would conflict with what origin gained.
+    ship must never stash it (a stash-pop conflict used to leave another session's work hidden in
+    a stash and the tree conflicted, agent-tools#962): it skips the fast-forward, says so, leaves
+    the file byte-for-byte, and still exits 0 because the merge is done."""
     main = repo_with_stash_conflict
     bindir = _fake_gh_dir(tmp_path)
 
@@ -6280,31 +6292,18 @@ def test_stash_pop_conflict_exits_nonzero_with_diagnostic(repo_with_stash_confli
         cwd=main, env=env,
     )
 
-    # The merge itself succeeded — only the post-merge stash-pop conflicted.
     assert "merged #1" in r.stdout, (
         f"expected fake merge to report merged #1:\n{r.stdout}\n{r.stderr}"
     )
-    # ship must exit non-zero to signal that the main checkout needs manual attention.
-    assert r.returncode != 0, (
-        f"ship should exit non-zero on a stash-pop conflict; got 0\n{r.stdout}\n{r.stderr}"
-    )
-    # Diagnostic confirms the merge is done (so the user doesn't double-merge).
-    assert "IS merged" in r.stderr, (
-        f"diagnostic must confirm PR is merged:\n{r.stderr}"
-    )
-    # Diagnostic names the conflicting file.
-    assert "shared.py" in r.stderr, (
-        f"diagnostic must name the conflicting file(s):\n{r.stderr}"
-    )
-    # Diagnostic tells the user how to resolve.
-    assert "stash drop" in r.stderr, (
-        f"diagnostic must mention stash drop for resolution:\n{r.stderr}"
-    )
+    assert r.returncode == 0, f"the merge is done; the refresh must not fail ship\n{r.stdout}\n{r.stderr}"
+    assert "not fast-forwarded" in r.stdout + r.stderr, f"no skip notice:\n{r.stdout}\n{r.stderr}"
+    assert (main / "shared.py").read_text(encoding="utf-8") == "local\n"
+    assert _git("stash", "list", cwd=main).stdout == "", "ship must never stash"
+    assert _sh("git", "ls-files", "--unmerged", cwd=main).stdout == ""
 
 
 def test_stash_pop_no_conflict_clean_tree_passes(repo_with_pr_worktree, tmp_path):
-    """Happy path: a clean main checkout → --autostash is a no-op, pull fast-forwards,
-    ship exits 0.  Proves --autostash doesn't break the normal case."""
+    """Happy path: a clean main checkout is fast-forwarded and ship exits 0."""
     main, _wt = repo_with_pr_worktree
     bindir = _fake_gh_dir(tmp_path)
 
@@ -7529,36 +7528,18 @@ def test_review_quorum_issue_url_needs_a_known_own_repo(tmp_path):
     assert "could not derive a task code" in r.stderr, r.stderr
 
 
-def _ship_bash_functions(*names: str) -> str:
-    """The named top-level bash functions of ship.sh, verbatim, for sourcing under stubs."""
-    text = _SHIP.read_text(encoding="utf-8")
-    out = []
-    for name in names:
-        m = re.search(rf"^{re.escape(name)}\(\) \{{.*?^\}}$", text, re.MULTILINE | re.DOTALL)
-        assert m, f"{name} not found in ship.sh"
-        out.append(m.group(0))
-    return "\n".join(out)
-
-
 def _extract_ticket_with_own_repo(bodies, *, cwd: Path, origin_repo: str, live_pr_url: str | None):
-    """Run `_review_quorum_extract_ticket` on each body inside ONE shell whose checkout origin
-    slug is `origin_repo` and whose `gh pr view --json url` prints `live_pr_url` (None = the
+    """Run `review_quorum_extract_ticket` on each body under ONE Ctx whose checkout origin
+    slug is `origin_repo` and whose `gh pr view --json url` yields `live_pr_url` (None = the
     call fails). Returns the derived codes in order ("" = nothing derived)."""
-    fns = _ship_bash_functions(
-        "_review_quorum_extract_ticket", "_ship_own_repo_issue_numbers",
-        "_ship_own_repo_slugs", "_ship_normalize_repo_slug",
+    ctx = Ctx(str(_SHIP_DIR))
+    ctx.pr = "7"
+    ctx.env["GH_REPO"] = ""
+    ctx.cwd_origin_repo = origin_repo
+    ctx.gh = lambda *a, **k: (
+        Result(1) if live_pr_url is None else Result(0, live_pr_url + "\n")
     )
-    gh_stub = "gh() { return 1; }" if live_pr_url is None else f"gh() {{ printf '%s\\n' '{live_pr_url}'; }}"
-    script = "\n".join([
-        "set -euo pipefail",
-        f"PR=7; GH_REPO=''; _CWD_ORIGIN_REPO='{origin_repo}'",
-        "_SHIP_OWN_REPO_SLUGS=''; _SHIP_OWN_REPO_SLUGS_RESOLVED=0",
-        gh_stub, fns,
-        'for b in "$@"; do printf \'%s\\n\' "$(_review_quorum_extract_ticket "$b")"; done',
-    ])
-    r = _sh("bash", "-c", script, "extract", *bodies, cwd=cwd)
-    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
-    return r.stdout.split("\n")[: len(bodies)]
+    return [quorum_skipci.review_quorum_extract_ticket(ctx, b) for b in bodies]
 
 
 def test_review_quorum_issue_url_accepts_live_pr_slug_after_repo_rename(tmp_path):
@@ -8723,7 +8704,10 @@ def _ship_copy_with_helper(tmp_path: Path, *, helper_exit, helper_msg=""):
     dst = tmp_path / "toolcopy" / "ci" / "ship"
     dst.mkdir(parents=True)
     ship_copy = dst / "ship.sh"
-    ship_copy.write_text(_SHIP.read_text(encoding="utf-8"), encoding="utf-8")
+    # The launcher resolves ship.py + shiplib/ from its own directory, so copy all three.
+    shutil.copy2(_SHIP, ship_copy)
+    shutil.copy2(_SHIP_DIR / "ship.py", dst / "ship.py")
+    shutil.copytree(_SHIP_DIR / "shiplib", dst / "shiplib", ignore=shutil.ignore_patterns("__pycache__"))
     ship_copy.chmod(0o755)
     if helper_exit is not None:
         _install_fake_hatch_helper(dst, exit_code=helper_exit, message=helper_msg)
@@ -8734,6 +8718,22 @@ def _ship_copy_with_helper(tmp_path: Path, *, helper_exit, helper_msg=""):
         # neither, so a bare `cp ship.sh` still fails closed on BOTH gates.)
         _install_fake_skip_ci_helper(dst)
     return ship_copy
+
+
+def _ship_copy_with_fake_hatch(tmp_path: Path, helper: str, body: str, *, skip_ci_ok: bool = False) -> Path:
+    """A copy of the ship tree whose hatch helper `helper` (review_quorum_hatch.py,
+    skip_ci_hatch.py or external_review_hatch.py) is replaced by a fake running `body`. Ship runs
+    the helper from beside its own script, so this is the seam that stands in for a live Telegram
+    approval, or for a broken helper that exits 0 without the APPROVED sentinel."""
+    ship_copy = _ship_copy_with_helper(tmp_path, helper_exit=None)
+    (ship_copy.parent / helper).write_text(body, encoding="utf-8")
+    if skip_ci_ok:
+        _install_fake_skip_ci_helper(ship_copy.parent)
+    return ship_copy
+
+
+_HELPER_EXITS_ZERO_SILENTLY = "import sys\nsys.exit(0)\n"
+_HELPER_APPROVES = "import sys\nsys.stdout.write('APPROVED live-approved (test)\\n')\nsys.exit(0)\n"
 
 
 def _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy, *, request, audit=None,
@@ -8887,14 +8887,9 @@ def test_ship_fails_closed_when_python3_exits_zero_without_sentinel(tmp_path):
     gh = _fake_gh_quorum_dir(tmp_path)
     rv = _fake_review_dir(tmp_path)
     audit = tmp_path / "audit.jsonl"
-    # A fake python3 that exits 0 with NO sentinel (a broken/planted interpreter). Only the hatch
-    # uses python3, so shadowing it doesn't disturb the rest of the gate.
-    shim = tmp_path / "fakepy"
-    shim.mkdir()
-    (shim / "python3").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    (shim / "python3").chmod(0o755)
+    ship_copy = _ship_copy_with_fake_hatch(tmp_path, "review_quorum_hatch.py", _HELPER_EXITS_ZERO_SILENTLY, skip_ci_ok=True)
     env = dict(os.environ)
-    env["PATH"] = os.pathsep.join([str(shim), _minimal_hermetic_path(gh, rv)])
+    env["PATH"] = os.pathsep.join([_minimal_hermetic_path(gh, rv)])
     env["SHIP_TEST_BRANCH"] = "feat"
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
@@ -8906,7 +8901,7 @@ def test_ship_fails_closed_when_python3_exits_zero_without_sentinel(tmp_path):
     env["SHIP_TEST_REVIEW_ROLES"] = "1"
     env["SHIP_AUDIT_FILE"] = str(audit)
     env["RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM"] = "genuine reason but python3 is faked"
-    r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    r = _sh("bash", str(ship_copy), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
     assert r.returncode != 0, f"a fake python3 exiting 0 must fail closed\n{r.stdout}\n{r.stderr}"
     assert "NOT approved" in r.stderr, r.stderr
     assert "[fake gh] merged" not in r.stdout
@@ -9135,19 +9130,15 @@ def test_skip_ci_fails_closed_when_python3_exits_zero_without_sentinel(repo_with
     main, _wt1, _wt2 = repo_with_two_worktrees
     bindir = _fake_gh_dir(tmp_path)
     audit = tmp_path / "audit.jsonl"
-    # A fake python3 (found first on PATH) that exits 0 without emitting the APPROVED sentinel.
-    fakepy = tmp_path / "fakepy"
-    fakepy.mkdir()
-    (fakepy / "python3").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    (fakepy / "python3").chmod(0o755)
+    ship_copy = _ship_copy_with_fake_hatch(tmp_path, "skip_ci_hatch.py", _HELPER_EXITS_ZERO_SILENTLY)
     env = dict(os.environ)
-    env["PATH"] = os.pathsep.join([str(fakepy), str(bindir), env["PATH"]])
+    env["PATH"] = os.pathsep.join([str(bindir), env["PATH"]])
     env["SHIP_TEST_BRANCH"] = "feat"
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     env["SHIP_AUDIT_FILE"] = str(audit)
     env["RIG_HATCH_REQUEST_SHIP_SKIP_CI"] = "genuine reason but python3 is faked"
-    r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    r = _sh("bash", str(ship_copy), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
     assert r.returncode != 0, f"a fake python3 exiting 0 must fail closed\n{r.stdout}\n{r.stderr}"
     assert "NOT approved" in r.stderr, r.stderr
     assert "[fake gh] merged" not in r.stdout
@@ -9166,19 +9157,15 @@ def test_skip_ci_approved_hatch_reaches_admin_merge_e2e(repo_with_two_worktrees,
     the real-helper approve path + its audit line are covered in-process)."""
     main, _wt1, _wt2 = repo_with_two_worktrees
     bindir = _fake_gh_dir(tmp_path)
-    # A fake python3 (first on PATH) that emits the APPROVED verdict sentinel ship.sh gates on.
-    fakepy = tmp_path / "fakepy"
-    fakepy.mkdir()
-    (fakepy / "python3").write_text("#!/bin/sh\nprintf 'APPROVED live-approved (test)\\n'\nexit 0\n", encoding="utf-8")
-    (fakepy / "python3").chmod(0o755)
+    ship_copy = _ship_copy_with_fake_hatch(tmp_path, "skip_ci_hatch.py", _HELPER_APPROVES)
     env = dict(os.environ)
-    env["PATH"] = os.pathsep.join([str(fakepy), str(bindir), env["PATH"]])
+    env["PATH"] = os.pathsep.join([str(bindir), env["PATH"]])
     env["SHIP_TEST_BRANCH"] = "feat"
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     env["SHIP_AUDIT_FILE"] = str(tmp_path / "audit.jsonl")
     env["RIG_HATCH_REQUEST_SHIP_SKIP_CI"] = "CI billing suspended; hotfix must ship"
-    r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    r = _sh("bash", str(ship_copy), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
     assert r.returncode == 0, f"an approved skip-ci hatch must reach the admin merge\n{r.stdout}\n{r.stderr}"
     assert "APPROVED by Alex" in r.stdout, r.stdout
     assert "admin-merging" in r.stdout, r.stdout
@@ -9846,19 +9833,16 @@ def test_external_review_fails_closed_when_python3_exits_zero_without_sentinel(r
     main, _wt1, _wt2 = repo_with_two_worktrees
     bindir = _fake_gh_dir(tmp_path)
     audit = tmp_path / "audit.jsonl"
-    fakepy = tmp_path / "fakepy"
-    fakepy.mkdir()
-    (fakepy / "python3").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    (fakepy / "python3").chmod(0o755)
+    ship_copy = _ship_copy_with_fake_hatch(tmp_path, "external_review_hatch.py", _HELPER_EXITS_ZERO_SILENTLY)
     env = dict(os.environ)
-    env["PATH"] = os.pathsep.join([str(fakepy), str(bindir), env["PATH"]])
+    env["PATH"] = os.pathsep.join([str(bindir), env["PATH"]])
     env["SHIP_TEST_BRANCH"] = "feat"
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     env["SHIP_AUDIT_FILE"] = str(audit)
     env["SHIP_TEST_REVIEW_COUNT"] = "0"
     env["RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW"] = "genuine reason but python3 is faked"
-    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    r = _sh("bash", str(ship_copy), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
     assert r.returncode != 0, f"a fake python3 exiting 0 must fail closed\n{r.stdout}\n{r.stderr}"
     assert "NOT approved" in r.stderr, r.stderr
     assert "[fake gh] merged" not in r.stdout
@@ -9875,19 +9859,16 @@ def test_external_review_approved_hatch_reaches_merge_e2e(repo_with_two_worktree
     subprocess can't inject a fake tg-ctl, authority is the real home)."""
     main, _wt1, _wt2 = repo_with_two_worktrees
     bindir = _fake_gh_dir(tmp_path)
-    fakepy = tmp_path / "fakepy"
-    fakepy.mkdir()
-    (fakepy / "python3").write_text("#!/bin/sh\nprintf 'APPROVED live-approved (test)\\n'\nexit 0\n", encoding="utf-8")
-    (fakepy / "python3").chmod(0o755)
+    ship_copy = _ship_copy_with_fake_hatch(tmp_path, "external_review_hatch.py", _HELPER_APPROVES)
     env = dict(os.environ)
-    env["PATH"] = os.pathsep.join([str(fakepy), str(bindir), env["PATH"]])
+    env["PATH"] = os.pathsep.join([str(bindir), env["PATH"]])
     env["SHIP_TEST_BRANCH"] = "feat"
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     env["SHIP_AUDIT_FILE"] = str(tmp_path / "audit.jsonl")
     env["SHIP_TEST_REVIEW_COUNT"] = "0"
     env["RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW"] = "genuinely urgent, reviewer unreachable"
-    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    r = _sh("bash", str(ship_copy), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
     assert r.returncode == 0, f"an approved external-review hatch must reach the merge\n{r.stdout}\n{r.stderr}"
     assert "APPROVED by Alex" in r.stdout, r.stdout
     assert "[fake gh] merged" in r.stdout, r.stdout
@@ -10156,28 +10137,14 @@ def test_ship_resolve_mutation_failure_leaves_thread_for_gate(repo_with_two_work
     assert not log.exists(), "the failed mutation must not have logged a resolution"
 
 
-def _extract_resolve_eligible_jq() -> str:
-    text = _SHIP.read_text(encoding="utf-8")
-    m = re.search(r"RESOLVE_ELIGIBLE_JQ='(.*?)'", text, re.DOTALL)
-    assert m, "RESOLVE_ELIGIBLE_JQ not found in ship.sh"
-    return m.group(1)
-
-
-def _extract_resolve_thread_query() -> str:
-    text = _SHIP.read_text(encoding="utf-8")
-    m = re.search(r"RESOLVE_THREAD_Q='(.*?)'", text, re.DOTALL)
-    assert m, "RESOLVE_THREAD_Q not found in ship.sh"
-    return m.group(1)
-
-
 def test_resolve_thread_query_fetches_comment_bodies_for_severity_filter():
-    assert "nodes{author{login} body}" in _extract_resolve_thread_query()
+    assert "nodes{author{login} body}" in ci_gate.RESOLVE_THREAD_Q
 
 
 @pytest.mark.skipif(not shutil.which("jq"), reason="jq required for the eligibility-jq test")
 def test_resolve_eligible_jq_excludes_high_severity_bot_threads():
     """Any high-severity bot comment excludes its outdated thread; ordinary nits remain eligible."""
-    prog = _extract_resolve_eligible_jq()
+    prog = ci_gate.RESOLVE_ELIGIBLE_JQ
 
     def thread(tid, *bodies):
         nodes = [{"author": {"login": "some-app[bot]"}, "body": body} for body in bodies]
@@ -10208,7 +10175,7 @@ def test_resolve_eligible_jq_selects_only_addressed_bot_threads():
     unresolved + outdated + commented + all-bot thread is selected. A human comment (even mixed with
     a bot), a still-current (not outdated) thread, an already-resolved thread, and a comment-less
     thread are all excluded — so ship never silently closes an unaddressed or human review thread."""
-    prog = _extract_resolve_eligible_jq()
+    prog = ci_gate.RESOLVE_ELIGIBLE_JQ
 
     def thread(tid, *, resolved, outdated, logins, total=None):
         nodes = [{"author": None if lg is None else {"login": lg}, "body": "plain nit"}

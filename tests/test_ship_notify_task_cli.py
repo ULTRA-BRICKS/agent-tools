@@ -14,11 +14,16 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 _SHIP = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
+sys.path.insert(0, str(_SHIP.parent))
+
+from shiplib import accept_merge, extrev_ticket  # noqa: E402
+from shiplib.ctx import Ctx  # noqa: E402
 
 # See tests/test_ship.py's identical rationale: the review-quorum gate defaults ENABLED in the
 # product but this file never exercises it (no `review`/`jq` quorum fixture here). Isolate via
@@ -385,19 +390,16 @@ def test_notify_rejects_a_gh_prefixed_non_matching_code_as_a_ticket_shape(repo_w
     assert calls == [], calls
 
 
-def test_normalize_gh_code_only_rewrites_the_exact_gh_number_shape(tmp_path):
-    """`_ship_normalize_gh_code_for_task_cli` rewrites ONLY `GH-<digits>` (case-insensitive) into
+def test_normalize_gh_code_only_rewrites_the_exact_gh_number_shape():
+    """`ship_normalize_gh_code_for_task_cli` rewrites ONLY `GH-<digits>` (case-insensitive) into
     task-cli's `#<n>` form. Pins the `$` anchor and the digits-only tail directly, so a future
     edit that loosens either is caught here rather than by a code shape that no longer reaches
     this function."""
-    script = (
-        f'eval "$(sed -n \'/^_ship_normalize_gh_code_for_task_cli()/,/^}}/p\' {_SHIP})"\n'
-        'for c in GH-105 gh-105 GH-105A GH- GHX-105 HYP-931 "#105"; do '
-        'printf "%s=>%s\\n" "$c" "$(_ship_normalize_gh_code_for_task_cli "$c" 2>/dev/null)"; done\n'
-    )
-    r = _sh("bash", "-c", script, cwd=tmp_path, env=dict(os.environ))
-    assert r.returncode == 0, r.stderr
-    got = dict(line.split("=>", 1) for line in r.stdout.strip().splitlines())
+    ctx = Ctx(str(_SHIP.parent))
+    got = {
+        c: accept_merge.ship_normalize_gh_code_for_task_cli(ctx, c)
+        for c in ["GH-105", "gh-105", "GH-105A", "GH-", "GHX-105", "HYP-931", "#105"]
+    }
     assert got == {
         "GH-105": "#105",      # the exact shape -> rewritten
         "gh-105": "#105",      # case-insensitive
@@ -409,8 +411,8 @@ def test_normalize_gh_code_only_rewrites_the_exact_gh_number_shape(tmp_path):
     }, got
 
 
-def test_looks_like_a_ticket_id_pins_task_cli_grammar(tmp_path):
-    """`_ship_looks_like_a_ticket_id` is a hand transcription of task-cli's id routing
+def test_looks_like_a_ticket_id_pins_task_cli_grammar():
+    """`ship_looks_like_a_ticket_id` is a hand transcription of task-cli's id routing
     (`tasklib/cli.py::_route_id_to_project`: `#<n>` / bare `<n>` -> GitHub issues, `PREFIX-<n>`
     -> the Linear team named by the prefix), so it is pinned as a table here. Deliberate edges:
     a lowercase prefix is accepted (task-cli upper-cases it before routing); a digit-led prefix
@@ -421,16 +423,8 @@ def test_looks_like_a_ticket_id_pins_task_cli_grammar(tmp_path):
         "", "#", "#12a", "-931", "HYP-", "HYP-931-2", "1X-5", "rig-cli-341",
         "OC476-OPENCODE-BACKGROUND-TRUTH", "GH-105A", "SME-ROADMAP-NOTE-42", "HYP 931",
     ]
-    quoted = " ".join(f"'{c}'" for c in cases)
-    script = (
-        f'eval "$(sed -n \'/^_ship_looks_like_a_ticket_id()/,/^}}/p\' {_SHIP})"\n'
-        f"for c in {quoted}; do "
-        'if _ship_looks_like_a_ticket_id "$c"; then v=yes; else v=no; fi; '
-        'printf "%s=>%s\\n" "$c" "$v"; done\n'
-    )
-    r = _sh("bash", "-c", script, cwd=tmp_path, env=dict(os.environ))
-    assert r.returncode == 0, r.stderr
-    got = dict(line.split("=>", 1) for line in r.stdout.splitlines())
+    ctx = Ctx(str(_SHIP.parent))
+    got = {c: ("yes" if extrev_ticket.ship_looks_like_a_ticket_id(ctx, c) else "no") for c in cases}
     accepted = {"#105", "105", "007", "HYP-931", "hyp-931", "PROJ-12", "GH-105", "OC476-123", "UTF-8"}
     assert got == {c: ("yes" if c in accepted else "no") for c in cases}, got
 
