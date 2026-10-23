@@ -79,6 +79,12 @@
 
 ### Fixed
 
+- `gh ship` no longer deletes a developer's own long-lived `git clone --reference/--shared`
+  checkout after a merge (agent-tools#979). A clone is removed as a directory only when its creator
+  marked it disposable (`git config --local agent-tools.disposableClone true`, read from the
+  clone's own config only) on top of the existing alternates and keep-guards; an unmarked clone is
+  kept and moved onto the base, and ship prints the one-line marker command. Linked worktrees are
+  unaffected. Existing unmarked per-PR clones are kept until marked.
 - `gh ship` post-merge cleanup (agent-tools#974, Refs #925, #962, #809): the base branch is the
   PR's `baseRefName` (`SHIP_DEFAULT_BRANCH` is only the fallback), so a repo whose base is not
   `main` no longer gets `pathspec 'main' did not match`; the local base ref is fast-forwarded

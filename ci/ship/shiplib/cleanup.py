@@ -9,9 +9,11 @@ merge, so every step warns instead of aborting. What it does, in order:
 3. remove the checkout(s) holding the PR branch and then the local branch — only once the PR is
    confirmed MERGED, the checkout is clean, and the branch tip carries nothing the merge did not
    take. A linked worktree is removed from the main checkout (ship re-roots there when launched
-   from inside it); a standalone `git clone --shared` per-PR clone — the only worktree of its own
-   repository — is removed as a directory from its parent; a plain clone is never deleted, only
-   moved off the merged branch;
+   from inside it); a standalone per-PR clone — the only worktree of its own repository, borrowing
+   objects from a sibling checkout (`git clone --shared`) AND marked disposable by its creator
+   (`agent-tools.disposableClone=true` in its own .git/config, agent-tools#979) — is removed as a
+   directory from its parent; any other clone, however it was made, is never deleted, only moved
+   off the merged branch;
 4. fast-forward the LOCAL base ref when it exists and is safe to move: never a checkout switch,
    never a stash, never a dirty tree.
 """
@@ -164,10 +166,17 @@ REBUILDABLE_IGNORED = frozenset({
 })
 
 
-def is_disposable_clone(repo: str) -> bool:
-    """A per-PR clone made with `git clone --shared/--reference` from another LOCAL checkout: its
-    objects/info/alternates names the object store of a sibling working checkout that still
-    exists. A long-lived clone of a mirror (a bare repository) does not qualify."""
+# The positive fact "this clone was made for one PR and may be deleted with it", written into the
+# clone's OWN .git/config by whatever creates such clones (the Conloca clone recipe, agent-tools#979).
+# Read with --local so a machine-wide `git config --global` cannot mark every clone on the box.
+DISPOSABLE_CLONE_KEY = "agent-tools.disposableClone"
+
+
+def borrows_from_sibling_checkout(repo: str) -> bool:
+    """`git clone --shared/--reference` from another LOCAL working checkout: the clone's
+    objects/info/alternates names the object store of a sibling checkout that still exists. A
+    clone of a mirror (a bare repository) does not qualify. A necessary condition only — a
+    developer's own long-lived --reference clone looks exactly the same."""
     alt = os.path.join(repo, ".git", "objects", "info", "alternates")
     try:
         with open(alt, encoding="utf-8", errors="surrogateescape") as fh:
@@ -182,6 +191,11 @@ def is_disposable_clone(repo: str) -> bool:
         if os.path.basename(git_dir) == ".git" and os.path.isdir(sibling) and sibling != repo_real:
             return True
     return False
+
+
+def is_marked_disposable(ctx: Ctx, repo: str) -> bool:
+    res = ctx.git("-C", repo, "config", "--local", "--type=bool", "--get", DISPOSABLE_CLONE_KEY, stderr="devnull")
+    return res.rc == 0 and res.out.strip() == "true"
 
 
 def ignored_data(ctx: Ctx, repo: str) -> str:
@@ -355,7 +369,14 @@ def cleanup(ctx: Ctx) -> None:
 
         if sole:
             # The PR checkout is the only worktree of its repository: nothing to re-root into.
-            if is_disposable_clone(wt_real):
+            # Disposable = its creator marked it (`git config --local agent-tools.disposableClone
+            # true`) AND it is a `--shared/--reference` copy of a sibling working checkout. The
+            # marker alone is not enough (a marked clone with a private object store holds the
+            # only copy of its objects) and the alternates alone is not enough (a developer's
+            # long-lived --reference clone has them too).
+            borrows = borrows_from_sibling_checkout(wt_real)
+            marked = is_marked_disposable(ctx, wt_real)
+            if borrows and marked:
                 leftover = "" if ctx.dry_run else (other_local_work(ctx, wt) or ignored_data(ctx, wt))
                 if leftover:
                     kept_branch_reason = leftover
@@ -375,6 +396,8 @@ def cleanup(ctx: Ctx) -> None:
                     kept_branch_reason = "clone could not be removed"
                 continue
             # A plain clone is somebody's working copy: never deleted, only moved off the dead branch.
+            if borrows and not marked:
+                ctx.out(f"[ship] {wt} borrows objects from a sibling checkout but is not marked as a disposable per-PR clone — keeping the directory (ship deletes only a marked clone: git -C {shell_quote(wt_real)} config --local {DISPOSABLE_CLONE_KEY} true).")
             ctx.out(f"[ship] {wt} is a standalone clone — keeping the directory, moving it off {ctx.branch} ...")
             if not park_on_base(ctx, wt, base):
                 kept_branch_reason = f"could not move {wt} off {ctx.branch}"
