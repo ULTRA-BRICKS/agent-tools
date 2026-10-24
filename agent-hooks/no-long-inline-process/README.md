@@ -68,8 +68,9 @@ There is **no** env-var or inline escape hatch any more. The old `ALLOW_INLINE_P
 agent this gate constrains grant itself an exception — security theater, not a permission gate.
 Both were removed.
 
-The block is now **deny-by-default**. For a genuine one-off exception, ASK the human, or request
-a one-time Telegram approval with a written justification:
+The block is now **deny-by-default**. The message is a role-aware ladder (agent-tools#994): the
+background-subagent recipe first, then the coordinator relay, then — last resort for a genuine
+one-off exception — a one-time Telegram approval with a written justification:
 
 ```bash
 RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="one-shot smoke build, output needed now" \

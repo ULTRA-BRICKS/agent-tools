@@ -792,10 +792,6 @@ def test_launcher_peel_is_bounded(monkeypatch):
     assert _decision(out) == "allow"
 
 
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(pytest.main([__file__, "-q"]))
-
-
 # --- RC-9 regression (agent-tools#743) ------------------------------------------------------
 # ≥15 hatch-flood denies were a SANCTIONED subagent's synchronous pre-commit
 # `review diff --staged` tripping this guard: the omp task child had lost its identity
@@ -838,3 +834,44 @@ def test_rc9_orchestrator_review_diff_still_blocked(monkeypatch):
     stays hard-blocked — the fix relaxes nothing for the main-thread orchestrator."""
     out, _e, code = _run("review diff --staged", monkeypatch, harness="omp")
     assert code == nlip.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+# ── role-aware escalation ladder (agent-tools#994) ───────────────────────────────────────
+
+def _ladder(monkeypatch, *, session=None) -> str:
+    env = {"PI_SESSION_FILE": session} if session else None
+    out, _err, code = _run("review", monkeypatch, harness="omp", env=env)
+    assert code == nlip.BLOCK_EXIT_CODE
+    return json.loads(out)["message"]
+
+
+def test_ladder_coordinator_recipe_first_then_relay_then_hatch_last(monkeypatch):
+    message = _ladder(monkeypatch, session=_OMP_MAIN_SESSION)
+    lines = message.splitlines()
+    assert lines[0].startswith("Run this in a BACKGROUND subagent")
+    assert lines[1].startswith("1. ")
+    assert "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS" in lines[-1]
+    assert "awaiting-coordinator" not in message
+    assert "ASK the human" not in message
+
+
+def test_ladder_unknown_role_shows_both_branches(monkeypatch):
+    message = _ladder(monkeypatch)
+    assert message.splitlines()[1].startswith("1. ")
+    assert "If you were dispatched by another agent" in message
+    assert "If you are the top-level agent" in message
+    assert "ASK the human" not in message
+
+
+def test_ladder_falls_back_when_the_lib_is_missing(monkeypatch):
+    monkeypatch.setattr(nlip, "_guard_message", None)
+    message = _ladder(monkeypatch)
+    assert message.splitlines()[0].startswith("Run this in a BACKGROUND subagent")
+    assert message.splitlines()[1].startswith("1. ")
+    assert "awaiting-coordinator" in message
+    assert "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS" in message
+    assert "ASK the human" not in message
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(pytest.main([__file__, "-q"]))

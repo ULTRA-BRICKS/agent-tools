@@ -97,7 +97,8 @@ There is **no** env-var escape hatch any more. The old `ALLOW_FOREGROUND_SUBAGEN
 itself an exception — security theater, not a permission gate. It was removed. (There was never
 an inline sentinel — the Agent tool carries no shell string to hide a `# ...` in.)
 
-The block is now **deny-by-default**. For a genuine exception, ASK the human, or request a
+The block is now **deny-by-default**. The message is a role-aware ladder (agent-tools#994): the
+per-harness background recipe first, then the coordinator relay, then — last resort only — a
 one-time Telegram approval with a written justification. Because this is a **pre-agent** hook
 (it gates the Agent/Task tool, which carries no shell command string), the inline
 `VAR=… <command>` prefix form does NOT apply here — the variable must be **exported** into the

@@ -170,6 +170,72 @@ def _load_hatch_escalation():
 
 hatch_escalation = _load_hatch_escalation()
 
+# The role-aware "what to do next" builder (agent-tools#994). Loaded by repo-local path like the
+# hatch helper and OPTIONAL: any load failure falls back to the neutral wording in `_render_block`.
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations through sys.modules[cls.__module__].
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so the block emitter can name the reader's role.
+_CURRENT_EVENT: dict = {}
+
+
+def _subagent_event(event: dict) -> dict:
+    """`event` with the subagent id (top-level or `args`) surfaced where `detect_role` reads it.
+
+    This hook only fires on subagents (`_is_subagent`), which accepts the id from either place;
+    the role lookup reads `args.agent_id` only, so copy a top-level id down for the message.
+    """
+    args = event.get("args") if isinstance(event.get("args"), dict) else {}
+    aid = args.get("agent_id") or event.get("agent_id")
+    if not aid:
+        return event
+    return {**event, "args": {**args, "agent_id": aid}}
+
+
+def _render_block(what: str, self_serve: str) -> str:
+    """Subagent ladder via the shared builder; neutral subagent text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_subagent_event(_CURRENT_EVENT.get("event") or {}))
+            return _guard_message.render(_guard_message.Remedy(what=what, self_serve=self_serve), role)
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    return "\n".join(
+        [
+            what,
+            f"1. {self_serve}",
+            "2. If you genuinely cannot: message your coordinator (`write agent://<parent-id>`) with "
+            "what is missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+            "blocked/done/failed); the coordinator's `write agent://<you>` revives you. Never retry "
+            "with a hatch/env bypass and never go to the human.",
+        ]
+    )
+
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
@@ -314,14 +380,17 @@ HEARTBEAT_LOOP_EXAMPLE = (
 # `{matched}` is the long-process label the classifier found (`review`, `--watch (...)`, …).
 # The two alternatives are the SAME two subagent-no-monitor offers, so a blocked subagent is never
 # pinballed between the two gates with no legal move (agent-tools#546).
-BLOCK_MESSAGE = (
+BLOCK_WHAT = (
     "You are a SUBAGENT — run this long process ({matched}) in the FOREGROUND and BLOCK on it; "
-    "do NOT background it. Remove `run_in_background: true` (and any trailing `&` / `setsid` / "
-    "`nohup … &`) and run it inline so this tool call blocks until it finishes. Why: a shell-"
+    "do NOT background it. Why: a shell-"
     "detached job (`&`/`nohup`/a forking `setsid`) never wakes you — the harness knows nothing about it — "
     "and a `--watch` loop never exits, so ending your turn on it wedges you FOREVER with "
     "uncommitted work and no PR; a labeled long process (review/--watch/build-test suite/long "
-    "sleep) is blocked from backgrounding by ANY shape, `run_in_background: true` included. "
+    "sleep) is blocked from backgrounding by ANY shape, `run_in_background: true` included."
+)
+BLOCK_SELF_SERVE = (
+    "Remove `run_in_background: true` (and any trailing `&` / `setsid` / "
+    "`nohup … &`) and run it inline so this tool call blocks until it finishes. "
     "Use one of these instead: (1) waiting on a SINGLE ORDINARY command (NOT one of those "
     "labeled long processes) — `run_in_background: true` on the Bash tool call is fine: the "
     "harness tracks that child and auto-resumes you with its output when it exits. (2) waiting "
@@ -329,10 +398,7 @@ BLOCK_MESSAGE = (
     "block on it yourself in the FOREGROUND with a heartbeat loop: echo a line at least every "
     "~20s and keep each Bash call under ~540s, repeating the same bounded call until the wait is "
     "over, e.g.: " + HEARTBEAT_LOOP_EXAMPLE + ". Never Monitor — subagent-no-monitor blocks it "
-    "for a subagent (it never resumes you). There is NO self-service bypass. For a genuine "
-    "exception, ASK the human, or request a one-time Telegram approval by setting "
-    "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC=\"<written justification>\" "
-    "(deny-by-default; a bare 1 is rejected)."
+    "for a subagent (it never resumes you)."
 )
 
 
@@ -830,6 +896,8 @@ def main() -> int:
         emit("allow")
         return 0
 
+    _CURRENT_EVENT["event"] = event
+
     args = event.get("args") or {}
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):
@@ -852,7 +920,7 @@ def main() -> int:
         return 0
 
     cwd = str(event.get("cwd") or args.get("cwd") or os.getcwd())
-    block_message = BLOCK_MESSAGE.format(matched=matched)
+    block_message = _render_block(BLOCK_WHAT.format(matched=matched), BLOCK_SELF_SERVE)
 
     ctx = {"hook": "subagent-no-bg-longproc", "command": command}
     hatch = hatch_escalation.request_hatch_approval(

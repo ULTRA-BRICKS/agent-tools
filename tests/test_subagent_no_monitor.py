@@ -36,7 +36,7 @@ assert _spec and _spec.loader
 hook = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hook)
 
-# The sibling hook, loaded so the two remedies BLOCK_MESSAGE recommends can be run through the
+# The sibling hook, loaded so the two remedies BLOCK_SELF_SERVE recommends can be run through the
 # REAL sibling gate (not merely asserted as strings) — see
 # test_remedy_1_run_in_background_ordinary_command_passes_sibling_gate and
 # test_remedy_2_heartbeat_loop_passes_sibling_gate below.
@@ -137,7 +137,7 @@ def test_block_message_names_the_bounded_heartbeat_loop(monkeypatch):
 
 def _run_sibling(command, monkeypatch, *, run_in_background=None) -> tuple[str, int]:
     """Drive the REAL `subagent-no-bg-longproc` sibling hook with a subagent event, exactly as
-    a subagent following BLOCK_MESSAGE's printed remedy would trigger it — proves the remedy is
+    a subagent following BLOCK_SELF_SERVE's printed remedy would trigger it — proves the remedy is
     a legal move, not just a string this test file asserts appears in the message."""
     args = {"command": command, "agent_id": "sub-1"}
     if run_in_background is not None:
@@ -164,7 +164,7 @@ def test_remedy_1_run_in_background_ordinary_command_passes_sibling_gate(monkeyp
 
 
 def test_remedy_2_heartbeat_loop_passes_sibling_gate(monkeypatch):
-    """Remedy (2) — the literal foreground heartbeat-loop command from BLOCK_MESSAGE — must
+    """Remedy (2) — the literal foreground heartbeat-loop command from BLOCK_SELF_SERVE — must
     also be ALLOWED by subagent-no-bg-longproc (it is foreground, and its invoked head is
     `timeout`->`bash`, not a labeled long-process command at argv[0])."""
     remedy_2 = (
@@ -222,10 +222,12 @@ _ALLOW_REPLY_SH = (
 )
 
 
-def test_hatch_unset_blocks_and_names_env_var(monkeypatch):
+def test_block_message_hides_the_hatch_from_the_blocked_subagent(monkeypatch):
+    """agent-tools#994: the hatch is the coordinator's last resort; a subagent is told to message
+    its coordinator instead. The hatch itself still works (tests below)."""
     out, _e, code = _run(monkeypatch, agent_id="sub-1")
     assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
-    assert "RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR" in json.loads(out)["message"]
+    assert "RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR" not in json.loads(out)["message"]
 
 
 def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
@@ -279,3 +281,48 @@ def test_hatch_justification_exit1_blocks(tmp_path, monkeypatch):
     )
     assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
     assert "hatch escalation denied" in json.loads(out)["message"].lower()
+
+
+# ── role-aware escalation ladder (agent-tools#994) ───────────────────────────────────────
+
+def _ladder(monkeypatch, *, harness="omp") -> str:
+    for key in ("RIG_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE"):
+        monkeypatch.delenv(key, raising=False)
+    event: dict = {"args": {"description": "watch tests", "agent_id": "Sub"}}
+    if harness:
+        event["harness"] = harness
+    out, _err, code = _run(monkeypatch, event=event)
+    assert code == hook.BLOCK_EXIT_CODE
+    return json.loads(out)["message"]
+
+
+def test_ladder_subagent_self_serve_first_then_coordinator_never_human(monkeypatch):
+    message = _ladder(monkeypatch)
+    lines = message.splitlines()
+    assert lines[0].startswith("You are a SUBAGENT")
+    assert lines[1].startswith("1. ") and hook.HEARTBEAT_LOOP_EXAMPLE in lines[1]
+    assert "write agent://Main" in message and "awaiting-coordinator" in message
+    assert "ASK the human" not in message
+    assert "RIG_HATCH_REQUEST" not in message
+
+
+def test_ladder_subagent_detected_via_top_level_agent_id(monkeypatch):
+    for key in ("RIG_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE"):
+        monkeypatch.delenv(key, raising=False)
+    out, _err, code = _run(
+        monkeypatch, event={"args": {"description": "w"}, "agent_id": "Sub", "harness": "omp"}
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    message = json.loads(out)["message"]
+    assert "awaiting-coordinator" in message and "RIG_HATCH_REQUEST" not in message
+
+
+def test_ladder_falls_back_when_the_lib_is_missing(monkeypatch):
+    monkeypatch.setattr(hook, "_guard_message", None)
+    message = _ladder(monkeypatch)
+    lines = message.splitlines()
+    assert lines[0].startswith("You are a SUBAGENT")
+    assert lines[1].startswith("1. ") and hook.HEARTBEAT_LOOP_EXAMPLE in lines[1]
+    assert "awaiting-coordinator" in message
+    assert "ASK the human" not in message
+    assert "RIG_HATCH_REQUEST" not in message

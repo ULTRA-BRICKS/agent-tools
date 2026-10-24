@@ -151,8 +151,10 @@ There is **no** env-var or inline escape hatch any more. The old `ALLOW_SUBAGENT
 worker this gate constrains grant itself an exception — security theater, not a permission gate.
 Both were removed.
 
-The block is now **deny-by-default**. For a genuine exception, ASK the human, or request a
-one-time Telegram approval with a written justification:
+The block is now **deny-by-default** and its message is a role-aware ladder (agent-tools#994): the
+foreground/heartbeat remedy first, then "message your coordinator and `yield` `awaiting-coordinator`".
+A blocked subagent never sees the human/hatch path. The hatch below is the coordinator's last
+resort — a one-time Telegram approval with a written justification:
 
 ```bash
 RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC="self-managed watchdog, polls inline" \

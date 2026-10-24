@@ -464,5 +464,52 @@ def test_description_only_short_is_trivial(monkeypatch):
     assert _decision(out) == "allow"
 
 
+# ── role-aware escalation ladder (agent-tools#994) ───────────────────────────────────────
+
+_MAIN_SESSION = (
+    "/tmp/omp-sessions/-xp-repo/2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e.jsonl"
+)
+
+
+def _ladder(monkeypatch, *, harness="omp", session=None) -> str:
+    env = {"PI_SESSION_FILE": session} if session else None
+    monkeypatch.delenv("PI_SESSION_FILE", raising=False)
+    monkeypatch.delenv("RIG_AGENT_ID", raising=False)
+    event = {"args": {"prompt": _LONG}}
+    if harness:
+        event["harness"] = harness
+    out, _err, code = _run(event, monkeypatch, env)
+    assert code == gate.BLOCK_EXIT_CODE
+    return json.loads(out)["message"]
+
+
+def test_ladder_coordinator_recipe_first_then_relay_then_hatch_last(monkeypatch):
+    message = _ladder(monkeypatch, session=_MAIN_SESSION)
+    lines = message.splitlines()
+    assert lines[0].startswith("Dispatch this subagent in the BACKGROUND")
+    assert any("omp: dispatch with the task tool" in line for line in lines[:4])
+    assert "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE" in lines[-1]
+    assert "awaiting-coordinator" not in message
+    assert "ask the human" not in message.lower()
+
+
+def test_ladder_self_serve_precedes_every_escalation(monkeypatch):
+    message = _ladder(monkeypatch)
+    recipe = message.index("omp: dispatch with the task tool")
+    assert recipe < message.index("RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE")
+    assert "If you were dispatched by another agent" in message
+    assert "If you are the top-level agent" in message
+    assert "ask the human" not in message.lower()
+
+
+def test_ladder_falls_back_when_the_lib_is_missing(monkeypatch):
+    monkeypatch.setattr(gate, "_guard_message", None)
+    message = _ladder(monkeypatch)
+    assert message.splitlines()[0].startswith("Dispatch this subagent in the BACKGROUND")
+    assert message.index("omp: dispatch with the task tool") < message.index("awaiting-coordinator")
+    assert "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE" in message
+    assert "ask the human" not in message.lower()
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))

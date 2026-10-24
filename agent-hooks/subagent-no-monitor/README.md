@@ -56,8 +56,9 @@ suite/a long `sleep`) — an ordinary single command backgrounded this way is un
 
 ## No self-service bypass — external Telegram approval only
 
-Same deny-by-default contract as `subagent-no-bg-longproc`: no env-var self-grant. For a
-genuine exception, ASK the human, or request one-time Telegram approval:
+Same deny-by-default contract and role-aware ladder as `subagent-no-bg-longproc`: no env-var
+self-grant; the heartbeat/`run_in_background` remedy first, then the coordinator. The hatch is the
+coordinator's last resort, never shown to the blocked subagent — one-time Telegram approval:
 
 ```bash
 RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR="self-managed watchdog, will poll for the result inline"

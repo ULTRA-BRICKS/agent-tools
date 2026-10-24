@@ -278,3 +278,67 @@ def test_main_fails_open_on_unparseable_stdin(monkeypatch):
     monkeypatch.setattr(sys, "stderr", io.StringIO())
     assert hook.main() == 0
     assert json.loads(out.getvalue())["decision"] == "allow"
+
+
+# ── role-aware escalation ladder (agent-tools#994) ────────────────────────────────
+
+_MAIN_SESSION = (
+    "/tmp/omp-sessions/-xp-repo/2026-09-07T21-17-48-938Z_01a07dbc-040a-7089-9724-7f37bfdba15e.jsonl"
+)
+_OFFLOAD = "runpod-run -- bash -c 'uv run pytest tests/'"
+
+
+def _ladder(repo, monkeypatch, *, agent_id=None, harness=None, session=None):
+    for key in ("RIG_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE"):
+        monkeypatch.delenv(key, raising=False)
+    if session:
+        monkeypatch.setenv("PI_SESSION_FILE", session)
+    args = {"command": "uv run pytest tests/"}
+    if agent_id:
+        args["agent_id"] = agent_id
+    event = {"args": args, "cwd": str(repo)}
+    if harness:
+        event["harness"] = harness
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    assert hook.main() == hook.BLOCK_EXIT_CODE
+    return json.loads(out.getvalue())["message"]
+
+
+def test_ladder_subagent_self_serve_first_then_coordinator_never_human(repo, monkeypatch):
+    message = _ladder(repo, monkeypatch, agent_id="Sub", harness="omp")
+    lines = message.splitlines()
+    assert lines[0].startswith(f"Blocked ({hook.HOOK_ID})")
+    assert lines[1].startswith("1. ") and _OFFLOAD in lines[1]
+    assert "write agent://Main" in message and "awaiting-coordinator" in message
+    assert "ASK the human" not in message
+    assert "RIG_HATCH_REQUEST" not in message
+
+
+def test_ladder_coordinator_gets_relay_then_hatch_last(repo, monkeypatch):
+    message = _ladder(repo, monkeypatch, session=_MAIN_SESSION, harness="omp")
+    lines = message.splitlines()
+    assert _OFFLOAD in lines[1]
+    assert "write agent://" in lines[2] and "wait" in lines[2]
+    assert "RIG_HATCH_REQUEST_RUNPOD_OFFLOAD_GATE" in lines[-1]
+    assert "ASK the human" not in message
+    assert "awaiting-coordinator" not in message
+
+
+def test_ladder_unknown_role_shows_both_branches(repo, monkeypatch):
+    message = _ladder(repo, monkeypatch)
+    assert _OFFLOAD in message.splitlines()[1]
+    assert "If you were dispatched by another agent" in message
+    assert "If you are the top-level agent" in message
+    assert "ASK the human" not in message
+
+
+def test_ladder_falls_back_when_the_lib_is_missing(repo, monkeypatch):
+    monkeypatch.setattr(hook, "_guard_message", None)
+    message = _ladder(repo, monkeypatch)
+    assert _OFFLOAD in message.splitlines()[1]
+    assert "awaiting-coordinator" in message
+    assert "RIG_HATCH_REQUEST_RUNPOD_OFFLOAD_GATE" in message
+    assert "ASK the human" not in message

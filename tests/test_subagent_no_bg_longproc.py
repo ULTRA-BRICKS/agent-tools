@@ -353,10 +353,12 @@ _ALLOW_REPLY_SH = (
 )
 
 
-def test_hatch_unset_blocks_and_names_env_var(monkeypatch):
+def test_block_message_hides_the_hatch_from_the_blocked_subagent(monkeypatch):
+    """agent-tools#994: the hatch is the coordinator's last resort; a subagent is told to message
+    its coordinator instead. The hatch itself still works (tests below)."""
     out, _e, code = _run("review diff -C /repo &", monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
-    assert "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC" in json.loads(out)["message"]
+    assert "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC" not in json.loads(out)["message"]
 
 
 def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
@@ -518,10 +520,6 @@ def test_long_process_label_matches_sibling_for_launcher_forms(argv):
     assert hook._long_process_label(tokens) == sib._long_process_label(tokens), argv
 
 
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(pytest.main([__file__, "-q"]))
-
-
 def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     """The justification supplied as an inline command PREFIX (env var NOT exported) must reach
     tg-ctl via the new `command=` contract. Regression for the documented inline form (Codex #232)."""
@@ -574,7 +572,7 @@ def _doctrine_surfaces() -> dict[str, str]:
         "docstring": hook.__doc__ or "",
         "README.md": (_HOOK_DIR / "README.md").read_text(),
         "descriptor": descriptor["description"],
-        "block_message": hook.BLOCK_MESSAGE,
+        "block_message": hook.BLOCK_WHAT + " " + hook.BLOCK_SELF_SERVE,
     }
 
 
@@ -611,10 +609,10 @@ def test_block_message_offers_the_same_two_alternatives_as_subagent_no_monitor()
     sib = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(sib)
     assert hook.HEARTBEAT_LOOP_EXAMPLE == sib.HEARTBEAT_LOOP_EXAMPLE
-    assert hook.HEARTBEAT_LOOP_EXAMPLE in hook.BLOCK_MESSAGE
-    assert hook.HEARTBEAT_LOOP_EXAMPLE in sib.BLOCK_MESSAGE
-    assert "FOREGROUND" in hook.BLOCK_MESSAGE
-    assert "Monitor" in hook.BLOCK_MESSAGE
+    assert hook.HEARTBEAT_LOOP_EXAMPLE in hook.BLOCK_SELF_SERVE
+    assert hook.HEARTBEAT_LOOP_EXAMPLE in sib.BLOCK_SELF_SERVE
+    assert "FOREGROUND" in hook.BLOCK_SELF_SERVE
+    assert "Monitor" in hook.BLOCK_SELF_SERVE
 
 
 def test_block_output_carries_the_reconciled_message(monkeypatch):
@@ -624,3 +622,51 @@ def test_block_output_carries_the_reconciled_message(monkeypatch):
     assert hook.HEARTBEAT_LOOP_EXAMPLE in msg
     _assert_no_blanket_claim(msg, "block output")
     assert "review diff" in msg or "review" in msg
+
+
+# ── role-aware escalation ladder (agent-tools#994) ───────────────────────────────────────
+
+def _ladder(monkeypatch, *, agent_id="Sub", harness="omp") -> str:
+    for key in ("RIG_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE"):
+        monkeypatch.delenv(key, raising=False)
+    event = {"args": {"command": "review diff -C /repo &", "agent_id": agent_id}}
+    if harness:
+        event["harness"] = harness
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    assert hook.main() == hook.BLOCK_EXIT_CODE
+    return json.loads(out.getvalue())["message"]
+
+
+def test_ladder_subagent_self_serve_first_then_coordinator_never_human(monkeypatch):
+    message = _ladder(monkeypatch)
+    lines = message.splitlines()
+    assert lines[0].startswith("You are a SUBAGENT")
+    assert lines[1].startswith("1. ") and "FOREGROUND" in lines[1]
+    assert hook.HEARTBEAT_LOOP_EXAMPLE in lines[1]
+    assert "write agent://Main" in message and "awaiting-coordinator" in message
+    assert "ASK the human" not in message
+    assert "RIG_HATCH_REQUEST" not in message
+
+
+def test_ladder_subagent_without_omp_harness_still_gets_the_subagent_ladder(monkeypatch):
+    message = _ladder(monkeypatch, harness=None)
+    assert "awaiting-coordinator" in message
+    assert "ASK the human" not in message and "RIG_HATCH_REQUEST" not in message
+
+
+def test_ladder_falls_back_when_the_lib_is_missing(monkeypatch):
+    monkeypatch.setattr(hook, "_guard_message", None)
+    message = _ladder(monkeypatch)
+    lines = message.splitlines()
+    assert lines[0].startswith("You are a SUBAGENT")
+    assert lines[1].startswith("1. ") and "FOREGROUND" in lines[1]
+    assert "awaiting-coordinator" in message
+    assert "ASK the human" not in message
+    assert "RIG_HATCH_REQUEST" not in message
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(pytest.main([__file__, "-q"]))

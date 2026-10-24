@@ -163,6 +163,69 @@ def _load_hatch_escalation():
 
 hatch_escalation = _load_hatch_escalation()
 
+# The role-aware "what to do next" builder (agent-tools#994). Loaded by repo-local path like the
+# hatch helper and OPTIONAL: any load failure falls back to the neutral wording in `_render_block`.
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations through sys.modules[cls.__module__].
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so the block emitter can name the reader's role.
+_CURRENT_EVENT: dict = {}
+
+
+def _render_block(what: str, self_serve: str, relay: str = "", human: str = "") -> str:
+    """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+            return _guard_message.render(
+                _guard_message.Remedy(what=what, self_serve=self_serve, relay=relay, human=human),
+                role,
+            )
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    top = (
+        "3. If you are the top-level agent: "
+        + (relay or "supply the missing thing to a blocked subagent with `write agent://<id>`, then `wait`.")
+    )
+    if human:
+        top += f" Last resort, genuine exceptions only: {human}"
+    return "\n".join(
+        [
+            what,
+            f"1. {self_serve}",
+            "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
+            "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+            "blocked/done/failed); the coordinator's `write agent://<you>` revives you. Never "
+            "retry with RIG_HATCH_REQUEST_* and never go to the human.",
+            top,
+        ]
+    )
+
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
@@ -845,6 +908,8 @@ def main() -> int:
         emit("allow")
         return 0
 
+    _CURRENT_EVENT["event"] = event
+
     # A subagent is EXPECTED to run these in the background → always allowed.
     if _is_subagent(event):
         emit("allow")
@@ -861,14 +926,22 @@ def main() -> int:
         return 0
 
     cwd = str(event.get("cwd") or args.get("cwd") or os.getcwd())
-    block_message = (
+    what = (
         f"Run this in a BACKGROUND subagent, not the orchestrator: `{matched}` is a "
         "long-running process (review / --watch / build-or-test suite / long sleep) that "
-        f"would block the main thread. {_delegation_recipe(event.get('harness'))}. There is "
-        "NO self-service bypass. For a genuine exception, ASK the human, or "
+        "would block the main thread."
+    )
+    relay = (
+        "Dispatch it as shown above, keep working on independent steps, and `wait` for the "
+        "subagent's result instead of polling or running it inline."
+    )
+    human = (
         "request a one-time Telegram approval by setting "
-        "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS=\"<written justification>\" "
+        'RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="<written justification>" '
         "(deny-by-default; a bare 1 or a single token like pytest is rejected)."
+    )
+    block_message = _render_block(
+        what, f"{_delegation_recipe(event.get('harness'))}.", relay, human
     )
 
     ctx = {"hook": "no-long-inline-process", "command": command}
