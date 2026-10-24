@@ -91,6 +91,16 @@ categorical and has no hatch — and, when task-cli is armed, any blocked tracke
 text contains `Review uncommitted` (a wrapped `bash -c '… create …'`, a REST body title) is
 refused outright instead of being offered to the hatch.
 
+## What the block tells the reader to do (agent-tools#994)
+
+The block is a short numbered, role-aware ladder built by `lib/agenttools_guard_message` (same
+detection as `require-ticket-before-commit`): step 1 redoes the write with
+`task new --title … --acceptance … --why … --impact … --if-not-done …` (or `task change` /
+`task done`); a **subagent** that cannot is told to `write agent://<parent>` and `yield` status
+`awaiting-coordinator` (never the human, never a hatch/strict retry, and is not shown the hatch
+line); the **coordinator** relays the result to the blocked subagent and sees the hatch as the LAST
+line; an unknown role gets both branches. The builder missing → built-in neutral text.
+
 ## Escape hatch (deny-by-default)
 
 No self-service bypass. A genuine one-time exception is requested with

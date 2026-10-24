@@ -129,6 +129,41 @@ def _load_hatch_escalation():
 
 hatch_escalation = _load_hatch_escalation()
 
+# The role-aware "what to do next" builder (agent-tools#994): loaded by repo-local path like the
+# hatch helper and OPTIONAL — a load failure falls back to the neutral text in `_render_block`
+# (a crash would fail open via on_error and silently drop this block).
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations via sys.modules[cls.__module__] while executing.
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so block emitters can name the reader's role without threading it
+# through every signature. One event per hook process.
+_CURRENT_EVENT: dict = {}
+
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 HOOK_ID = "block-raw-ticket"
@@ -180,24 +215,62 @@ _INHERITED_VALUE_FLAGS = frozenset({
 })
 _MAX_DEPTH = 4
 
-_BLOCK_MSG = (
-    "[block-raw-ticket] BLOCKED: raw tracker write while task-cli is configured. "
-    "Use `task new` / `task create` / `task change` / `task done` instead of "
-    "`gh issue`, `linear issue`, `fj issue`, `tea issues`, or a raw REST/GraphQL "
-    "issue/label write (curl, wget, HTTPie, gh api, inline Python/Node). task-cli "
-    "enforces acceptance criteria, motivation, user-impact, and screenshots; a raw "
-    "tracker command skips them. Reads (`gh issue list`/`view`, `fj issue view`, a "
-    "GET on the same endpoint), `--help`, and PR commands are allowed. There is no "
-    "self-service bypass; for a genuine exception request one Telegram approval via "
-    'RIG_HATCH_REQUEST_BLOCK_RAW_TICKET="<why>" (deny-by-default).'
+# What to do next, role-aware (agent-tools#994): step 1 is always the self-service remedy, the
+# human hatch is the coordinator's LAST line, and a subagent is told to report to its coordinator
+# instead of yielding "blocked" (the 2026-10-24 require-ticket incident, same failure class).
+_BLOCK_WHAT = "[block-raw-ticket] BLOCKED: raw tracker write while task-cli is configured."
+_BLOCK_SELF_SERVE = (
+    "Redo it with task-cli instead of `gh issue`/`linear issue`/`fj issue`/`tea issues`/a raw "
+    'REST or GraphQL write: `task new --title "…" --acceptance "…" (repeatable) --why "…" '
+    '--impact "…" --if-not-done "…"` to file (a gate may refuse once: fix the flags, retry), '
+    "`task change` / `task done` to edit or close. Reads (`gh issue list`/`view`, a GET) and PR "
+    "commands stay allowed. Do not stop at this block."
+)
+_BLOCK_RELAY = (
+    "If a subagent reported this block, run the `task` command (above) yourself, send it the "
+    "result with `write agent://<id>`, then `wait` for its final report."
+)
+_BLOCK_HUMAN = (
+    'request one Telegram approval via RIG_HATCH_REQUEST_BLOCK_RAW_TICKET="<why>" (deny-by-default).'
+)
+_JUNK_WHAT = "[block-raw-ticket] BLOCKED: a 'Review uncommitted' title must not create a ticket."
+_JUNK_SELF_SERVE = (
+    "That shape never leads to a merge — run `review diff` or post a PR comment instead of "
+    "filing a GitHub/Linear/`task` ticket. Do not stop at this block."
 )
 
-_JUNK_BLOCK_MSG = (
-    "[block-raw-ticket] BLOCKED: a 'Review uncommitted' title must not create a "
-    "ticket. That shape never leads to a merge — run `review diff` or post a PR "
-    "comment instead of filing a GitHub/Linear/`task` ticket. There is no "
-    "self-service bypass."
-)
+
+def _render_block(what: str, self_serve: str, human: str = "", relay: str = "") -> str:
+    """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+            return _guard_message.render(
+                _guard_message.Remedy(what=what, self_serve=self_serve, relay=relay, human=human),
+                role,
+            )
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    top = "3. If you are the top-level agent: " + (relay or "supply the missing step to the blocked subagent.")
+    if human:
+        top += f" Last resort, genuine exceptions only: {human}"
+    return "\n".join([
+        what,
+        f"1. {self_serve}",
+        "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
+        "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+        "blocked/done/failed); the coordinator's `write agent://<you>` revives you. Never retry "
+        "with REQUIRE_TICKET_STRICT=0 or RIG_HATCH_REQUEST_* and never go to the human.",
+        top,
+    ])
+
+
+def _block_msg() -> str:
+    return _render_block(_BLOCK_WHAT, _BLOCK_SELF_SERVE, _BLOCK_HUMAN, _BLOCK_RELAY)
+
+
+def _junk_block_msg() -> str:
+    return _render_block(_JUNK_WHAT, _JUNK_SELF_SERVE)
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -1234,9 +1307,9 @@ def _block_or_hatch(command: str, cwd: str) -> int:
         return 0
     if hatch.should_stop:
         warn(f"raw tracker write hatch escalation denied: {hatch.reason}")
-        emit("block", f"hatch escalation denied: {hatch.reason}\n{_BLOCK_MSG}")
+        emit("block", f"hatch escalation denied: {hatch.reason}\n{_block_msg()}")
         return BLOCK_EXIT_CODE
-    emit("block", _BLOCK_MSG)
+    emit("block", _block_msg())
     return BLOCK_EXIT_CODE
 
 
@@ -1250,6 +1323,7 @@ def main() -> int:
 
     cwd = str(event.get("cwd") or os.getcwd())
     args = event.get("args") or {}
+    _CURRENT_EVENT["event"] = event
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):
         command = str(command)
@@ -1261,15 +1335,15 @@ def main() -> int:
             _RAW_HINT.search(command) or re.search(r"\btask\s+(?:new|create)\b", command)
         ):
             warn(f"junk-title inspection failed ({exc}) — blocking")
-            emit("block", _JUNK_BLOCK_MSG)
+            emit("block", _junk_block_msg())
             return BLOCK_EXIT_CODE
         junk = False
     if junk is None:
         warn("unparseable command looks like a Review-uncommitted ticket create — blocking")
-        emit("block", _JUNK_BLOCK_MSG)
+        emit("block", _junk_block_msg())
         return BLOCK_EXIT_CODE
     if junk:
-        emit("block", _JUNK_BLOCK_MSG)
+        emit("block", _junk_block_msg())
         return BLOCK_EXIT_CODE
 
     if not task_cli_configured(cwd):
@@ -1293,13 +1367,13 @@ def main() -> int:
         # Unparseable but plausibly a write: the hook cannot classify it, so no hatch approval
         # may cover it — hard block (fail-closed).
         warn("unparseable command looks like a raw tracker write — blocking (fail-closed)")
-        emit("block", _BLOCK_MSG)
+        emit("block", _block_msg())
         return BLOCK_EXIT_CODE
     # A parsed tracker write: blocked, hatchable unless it is the categorical junk class.
     if _JUNK_UNCOMMITTED.search(command):
         # A tracker write carrying the junk phrase in any shape (a wrapped create, a REST body
         # title) is the categorical Review-uncommitted class — never offered to the hatch.
-        emit("block", _JUNK_BLOCK_MSG)
+        emit("block", _junk_block_msg())
         return BLOCK_EXIT_CODE
     return _block_or_hatch(command, cwd)
 

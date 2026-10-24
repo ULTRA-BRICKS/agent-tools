@@ -1242,3 +1242,116 @@ def test_known_read_method_and_normalized_pr_path_allowed(tmp_path, monkeypatch,
 )
 def test_junk_phrase_outside_a_create_title_is_not_the_junk_class(command):
     assert brt.is_junk_review_ticket_create(command) is False
+
+
+# ── agent-tools#994: role-aware escalation ladder ─────────────────────────────────────────────
+# A block must say WHAT TO DO NEXT, and the ladder differs by WHO reads it: a subagent redoes the
+# write with task-cli and messages its coordinator (never the human); the coordinator relays and is
+# the only one holding the human hatch; an unidentified reader gets both branches.
+_SESSION_DIR = "2026-10-24T10-11-12-345Z_0a1b2c3d-1111-2222-3333-444455556666"
+_SUBAGENT_ENV = {
+    "RIG_AGENT_ID": "Kid",
+    "PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_SESSION_DIR}/Kid.jsonl",
+}
+_COORDINATOR_ENV = {"PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_SESSION_DIR}.jsonl"}
+_ROLE_ENV_VARS = ("RIG_AGENT_ID", "RIG_PARENT_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE")
+_HATCH_VAR = "RIG_HATCH_REQUEST_BLOCK_RAW_TICKET"
+
+
+def _task_path_once(tmp_path) -> str:
+    """`_task_on_path` mkdirs; the ladder tests call the hook several times per tmp_path."""
+    if (tmp_path / "bin" / "task").exists():
+        return f"{tmp_path / 'bin'}{os.pathsep}/usr/bin:/bin"
+    return _task_on_path(tmp_path)
+
+
+def _ladder_message(tmp_path, monkeypatch, role_env: dict[str, str], command: str = "fj issue create t --body x") -> str:
+    for name in _ROLE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv(_HATCH_VAR, raising=False)
+    out, code = _run(
+        command, monkeypatch, cwd=str(tmp_path), path=_task_path_once(tmp_path), env=role_env
+    )
+    assert code == brt.BLOCK_EXIT_CODE, out
+    return json.loads(out)["message"]
+
+
+def test_ladder_leads_with_marker_and_task_new_remedy(tmp_path, monkeypatch):
+    for env in ({}, _SUBAGENT_ENV, _COORDINATOR_ENV):
+        msg = _ladder_message(tmp_path, monkeypatch, env)
+        assert msg.startswith("[block-raw-ticket] BLOCKED")
+        step1 = msg[msg.index("1. "):msg.index("2. ")]
+        assert "task new --title" in step1
+        for flag in ("--acceptance", "--why", "--impact", "--if-not-done"):
+            assert flag in step1
+        assert "Closes" not in msg and "Fixes" not in msg
+        assert "ASK the human" not in msg
+        assert len(msg) <= 1300
+
+
+def test_ladder_subagent_messages_parent_and_has_no_human_hatch(tmp_path, monkeypatch):
+    msg = _ladder_message(tmp_path, monkeypatch, _SUBAGENT_ENV)
+    assert "`write agent://Main`" in msg
+    assert "`yield` status `awaiting-coordinator` (NOT blocked/done/failed)" in msg
+    assert "`write agent://Kid`" in msg
+    assert "never retry with REQUIRE_TICKET_STRICT=0 or RIG_HATCH_REQUEST_*" in msg
+    assert _HATCH_VAR not in msg
+
+
+def test_ladder_coordinator_relays_and_hatch_is_last_line(tmp_path, monkeypatch):
+    msg = _ladder_message(tmp_path, monkeypatch, _COORDINATOR_ENV)
+    assert "write agent://<id>" in msg
+    last = msg.rstrip().splitlines()[-1]
+    assert _HATCH_VAR in last
+    assert msg.count(_HATCH_VAR) == 1
+
+
+def test_ladder_unknown_role_has_both_branches(tmp_path, monkeypatch):
+    msg = _ladder_message(tmp_path, monkeypatch, {})
+    assert "If you were dispatched by another agent" in msg
+    assert "If you are the top-level agent" in msg
+    assert _HATCH_VAR in msg.rstrip().splitlines()[-1]
+
+
+def test_ladder_hatch_denied_path_keeps_the_ladder(tmp_path, monkeypatch):
+    _pin_fake_tg_ctl(monkeypatch, _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n"))
+    for name in _ROLE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    out, code = _run(
+        "fj issue close 5",
+        monkeypatch,
+        cwd=str(tmp_path),
+        path=_task_path_once(tmp_path),
+        env={_HATCH_VAR: _HATCH_WHY, **_SUBAGENT_ENV},
+    )
+    msg = json.loads(out)["message"]
+    assert code == brt.BLOCK_EXIT_CODE
+    assert msg.startswith("hatch escalation denied")
+    assert "task new --title" in msg and "write agent://Main" in msg
+
+
+def test_ladder_junk_block_names_review_diff_and_never_offers_the_hatch(tmp_path, monkeypatch):
+    for name in _ROLE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    for env, needle in ((_SUBAGENT_ENV, "write agent://Main"), ({}, "If you were dispatched")):
+        for name in _ROLE_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+        out, code = _run(
+            'gh issue create --title "Review uncommitted changes" --body x',
+            monkeypatch,
+            cwd=str(tmp_path),
+            path=_task_path_once(tmp_path),
+            env=env,
+        )
+        msg = json.loads(out)["message"]
+        assert code == brt.BLOCK_EXIT_CODE
+        assert "review diff" in msg and needle in msg
+        assert _HATCH_VAR not in msg
+        assert "Closes" not in msg and "Fixes" not in msg
+
+
+def test_ladder_falls_back_to_neutral_text_when_lib_is_unavailable(monkeypatch):
+    monkeypatch.setattr(brt, "_guard_message", None)
+    msg = brt._render_block("[block-raw-ticket] BLOCKED: x.", "Use `task new --title t`.", "hatch line")
+    assert msg.startswith("[block-raw-ticket] BLOCKED")
+    assert "task new --title" in msg and "dispatched by another agent" in msg

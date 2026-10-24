@@ -29,6 +29,9 @@ mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
 _HATCH_ENV = "RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT"
+# Ambient agent-identity env (the test run may itself be inside an omp subagent) selects the
+# block message's role variant; scrub it so every helper starts from the "unknown role" baseline.
+_ROLE_ENV = ("RIG_AGENT_ID", "RIG_PARENT_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE")
 
 
 def run_hook(
@@ -52,6 +55,8 @@ def run_hook(
     env.pop("REQUIRE_TICKET_SKIP", None)
     env.pop("REQUIRE_TICKET_EXEMPT_TYPES", None)
     env.pop(_HATCH_ENV, None)
+    for name in _ROLE_ENV:
+        env.pop(name, None)
     if strict is True:
         env["REQUIRE_TICKET_STRICT"] = "1"
     elif strict is False:
@@ -85,6 +90,8 @@ def _run_hook_raw(command: str, **kwargs) -> dict:
     env.pop("REQUIRE_TICKET_SKIP", None)
     env.pop("REQUIRE_TICKET_EXEMPT_TYPES", None)
     env.pop(_HATCH_ENV, None)
+    for name in _ROLE_ENV:
+        env.pop(name, None)
     if kwargs.get("env_extra"):
         env.update(kwargs["env_extra"])
     with tempfile.TemporaryDirectory() as isolated:
@@ -131,7 +138,7 @@ def _run_hook_inproc(command: str, *, env_extra: dict | None = None, tg_ctl: Pat
         "REQUIRE_TICKET_SKIP",
         "REQUIRE_TICKET_EXEMPT_TYPES",
         _HATCH_ENV,
-    } | set(env_extra or {})
+    } | set(env_extra or {}) | set(_ROLE_ENV)
     old_env = {key: os.environ.get(key) for key in env_keys}
     try:
         for key in env_keys:
@@ -1550,6 +1557,134 @@ class AbbreviatedLongFlagPrefix(unittest.TestCase):
         code, decision = run_hook("git commit --t 'Closes #9'", strict=True)
         self.assertEqual(code, mod.BLOCK_EXIT_CODE)
         self.assertEqual(decision, "block")
+
+
+_SESSION_DIR = "2026-10-24T10-11-12-345Z_0a1b2c3d-1111-2222-3333-444455556666"
+_SUBAGENT_ENV = {
+    "RIG_AGENT_ID": "Kid",
+    "PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_SESSION_DIR}/Kid.jsonl",
+}
+_COORDINATOR_ENV = {"PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_SESSION_DIR}.jsonl"}
+_BLOCKED_COMMANDS = {
+    "plain": 'git commit -m "feat: add export"',
+    "stdin": "git commit -F -",
+}
+
+
+class BlockMessageEscalationLadder(unittest.TestCase):
+    """agent-tools#994: a block must say WHAT TO DO NEXT, and the ladder differs by WHO reads it.
+
+    Incident 2026-10-24: a subagent hit this block, never ran `task new`, and yielded "blocked at
+    commit" because the text said "ASK the human" and showed `Closes #123`.
+    """
+
+    def _block(self, kind: str, env: dict | None = None) -> str:
+        out = _run_hook_raw(_BLOCKED_COMMANDS[kind], env_extra=env)
+        self.assertEqual(out["code"], mod.BLOCK_EXIT_CODE)
+        self.assertEqual(out["decision"], "block")
+        return out["message"]
+
+    def test_marker_leads_and_self_service_remedy_is_first_step(self):
+        for kind in _BLOCKED_COMMANDS:
+            for env in (None, _SUBAGENT_ENV, _COORDINATOR_ENV):
+                msg = self._block(kind, env)
+                self.assertTrue(msg.startswith(mod.BLOCK_MARKER), (kind, env, msg))
+                after_marker = msg[len(mod.BLOCK_MARKER):]
+                step1 = after_marker[after_marker.index("1. "):after_marker.index("2. ")]
+                self.assertIn("task new --title", step1)
+                for flag in ("--acceptance", "--why", "--impact", "--if-not-done"):
+                    self.assertIn(flag, step1)
+                self.assertIn("Refs #<id>", step1)
+                self.assertRegex(step1, r"(?i)do not stop")
+
+    def test_never_suggests_closing_keywords_or_asking_the_human_first(self):
+        for kind in _BLOCKED_COMMANDS:
+            for env in (None, _SUBAGENT_ENV, _COORDINATOR_ENV):
+                msg = self._block(kind, env)
+                self.assertNotIn("Closes", msg)
+                self.assertNotIn("Fixes", msg)
+                self.assertNotIn("ASK the human", msg)
+                self.assertNotIn("No self-service bypass", msg)
+
+    def test_subagent_messages_parent_and_never_sees_the_human_hatch(self):
+        for kind in _BLOCKED_COMMANDS:
+            msg = self._block(kind, _SUBAGENT_ENV)
+            self.assertIn("write agent://Main", msg)
+            self.assertIn("`yield` status `awaiting-coordinator` (NOT blocked/done/failed)", msg)
+            self.assertIn("`write agent://Kid`", msg)  # the coordinator revives the subagent by id
+            self.assertIn("never retry with REQUIRE_TICKET_STRICT=0 or RIG_HATCH_REQUEST_*", msg)
+            # the concrete hatch line is coordinator-only
+            self.assertNotIn("RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT", msg)
+            self.assertNotIn("`wait`", msg)
+
+    def test_subagent_parent_override(self):
+        msg = self._block("plain", {**_SUBAGENT_ENV, "RIG_PARENT_AGENT_ID": "Boss"})
+        self.assertIn("write agent://Boss", msg)
+
+    def test_coordinator_relays_and_hatch_is_the_last_line(self):
+        for kind in _BLOCKED_COMMANDS:
+            msg = self._block(kind, _COORDINATOR_ENV)
+            self.assertIn("write agent://<id>", msg)
+            self.assertIn("`wait` for its final report", msg)
+            last = msg.rstrip().splitlines()[-1]
+            self.assertIn("RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT", last)
+            self.assertRegex(last, r"(?i)trivial")
+            self.assertEqual(msg.count("RIG_HATCH_REQUEST"), 1)
+
+    def test_unknown_role_has_both_branches_and_hatch_last(self):
+        for kind in _BLOCKED_COMMANDS:
+            msg = self._block(kind)
+            self.assertIn("If you were dispatched by another agent", msg)
+            self.assertIn("If you are the top-level agent", msg)
+            self.assertIn("awaiting-coordinator", msg)
+            self.assertIn("RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT", msg.rstrip().splitlines()[-1])
+
+    def test_stdin_hint_still_explains_the_unreadable_message(self):
+        msg = self._block("stdin")
+        self.assertIn("-F -", msg)
+        self.assertIn("stdin", msg)
+        self.assertIn("-m", msg)
+
+    def test_messages_stay_short(self):
+        for kind in _BLOCKED_COMMANDS:
+            for env in (None, _SUBAGENT_ENV, _COORDINATOR_ENV):
+                self.assertLessEqual(len(self._block(kind, env)), 1300, (kind, env))
+
+    def test_warn_only_advisory_has_remedy_but_no_marker_or_closing_keywords(self):
+        for kind in _BLOCKED_COMMANDS:
+            out = _run_hook_raw(_BLOCKED_COMMANDS[kind], env_extra={"REQUIRE_TICKET_STRICT": "0"})
+            self.assertEqual(out["decision"], "allow")
+            self.assertNotIn(mod.BLOCK_MARKER, out["message"])
+            self.assertNotIn("Closes", out["message"])
+            self.assertNotIn("Fixes", out["message"])
+            self.assertNotIn("ASK the human", out["message"])
+        plain = _run_hook_raw(_BLOCKED_COMMANDS["plain"], env_extra={"REQUIRE_TICKET_STRICT": "0"})
+        self.assertIn("task new --title", plain["message"])
+
+    def test_hatch_denied_path_carries_the_same_ladder(self):
+        for kind in _BLOCKED_COMMANDS:
+            with tempfile.TemporaryDirectory() as tmp:
+                tg_ctl = _fake_tg_ctl(Path(tmp) / "tg-ctl", 'printf "no\n"\nexit 1\n')
+                out = _run_hook_inproc(
+                    _BLOCKED_COMMANDS[kind],
+                    env_extra={_HATCH_ENV: "one-off", **_SUBAGENT_ENV},
+                    tg_ctl=tg_ctl,
+                )
+            self.assertEqual(out["code"], mod.BLOCK_EXIT_CODE)
+            self.assertIn("hatch escalation denied", out["message"].lower())
+            self.assertIn(mod.BLOCK_MARKER, out["message"])
+            self.assertIn("task new --title", out["message"])
+            self.assertIn("write agent://Main", out["message"])
+            self.assertNotIn("Closes", out["message"])
+
+    def test_falls_back_to_neutral_message_when_lib_is_unavailable(self):
+        with mock.patch.object(mod, "_guard_message", None):
+            msg = mod._render_block(mod.BLOCK_MARKER + ".", "Run `task new --title x`.", "hatch line")
+        self.assertTrue(msg.startswith(mod.BLOCK_MARKER))
+        self.assertIn("task new --title", msg)
+        self.assertIn("dispatched by another agent", msg)
+        self.assertIn("awaiting-coordinator", msg)
+        self.assertNotIn("Closes", msg)
 
 
 if __name__ == "__main__":

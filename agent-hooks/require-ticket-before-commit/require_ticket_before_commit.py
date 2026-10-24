@@ -25,7 +25,7 @@ Exempt from the gate (no ticket expected): trivial-chore commit types
 No self-service bypass for a genuinely ticketless commit: there is NO per-commit env var /
 message trailer an agent can set on its own command to skip this gate (a self-grant is
 security theater). For a real one-off, use a `chore:`/`docs:` type if it is truly trivial,
-ASK the human, or request a ONE-TIME Telegram approval via
+or (top-level agent only) request a ONE-TIME Telegram approval via
 `RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="<justification>"` (deny-by-default; a blank or
 bare `1` is rejected — the value must be a real written justification; allowed ONLY on the
 human's tg-ctl approval). `REQUIRE_TICKET_STRICT=0` remains a repo-level opt-out back to
@@ -44,7 +44,7 @@ a hard BLOCK (exit 10). Set REQUIRE_TICKET_STRICT=0 to fall back to warn-only.
 The `-F -` (message on git's STDIN) case FAILS CLOSED WITH A HINT (agent-tools#104,
 reversing the #102 fail-open): the hook cannot read git's stdin to verify a ticket, so
 rather than let `-F -` silently dodge the gate it BLOCKS with an actionable message —
-pass the message a readable way (`-m "…Closes #N…"` or `-F <file>`), encode the ticket in
+pass the message a readable way (`-m "…Refs #N…"` or `-F <file>`), encode the ticket in
 the branch name, or request a one-time Telegram approval
 (`RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT`). The hatch is consulted BEFORE the `-F -`
 block, so an approved hatch allows a `-F -` commit; a readable `-F <file>` is checked normally.
@@ -125,6 +125,43 @@ def _load_hatch_escalation():
 
 
 hatch_escalation = _load_hatch_escalation()
+
+# The role-aware "what to do next" builder (agent-tools#994). Loaded by repo-local path exactly like
+# the hatch helper (a preloaded user/site package of the same name must not win) and OPTIONAL: a
+# hook crash would fail open via on_error=open, so any load failure just falls back to the
+# built-in neutral wording in `_render_block`.
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations through sys.modules[cls.__module__], so the module
+    # must be registered while it executes.
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is currently deciding, so the block emitters (several frames away) can name the
+# reader's role without threading the event through every signature. One event per hook process.
+_CURRENT_EVENT: dict = {}
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -1547,6 +1584,7 @@ def main() -> int:
         return _allow()
 
     args = event.get("args") or {}
+    _CURRENT_EVENT["event"] = event
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):
         command = str(command)
@@ -1579,43 +1617,87 @@ def main() -> int:
     return _allow()  # every commit segment is exempt / ticketed
 
 
-# The shared human-facing guidance — what's wrong and how to satisfy the gate. It carries NO
-# marker: the stable BLOCK_MARKER must appear ONLY on a real block, so an external check that
-# greps stdout for the marker (the task-cli Docker test) never gets a false positive on a
-# warn-mode allow. The block path prepends the marker; the warn path uses the guidance alone.
-_GUIDANCE = (
-    "Non-trivial changes should start from a ticket "
-    "(task-cli / GitHub Issue / Linear) with acceptance criteria, motivation, and "
-    "user-impact — then reference it in the commit (e.g. `Closes #123`, `Fixes #4`, "
-    "`task:ABC-12`, `ENG-456`). If this is a trivial chore, use a `chore:`/`docs:` type "
-    "(exempt). No self-service bypass: ASK the human, or request a one-time Telegram approval "
-    'via RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="<justification>" (deny-by-default; '
-    "bare 1 rejected); opt the whole gate back to warn-only with REQUIRE_TICKET_STRICT=0."
+# The human-facing guidance — what's wrong and WHAT TO DO NEXT, role-aware (agent-tools#994).
+# Incident 2026-10-24: a subagent hit this block, never ran `task new`, and yielded "blocked at
+# commit" because the old text said "ASK the human" and showed `Closes #123` (forbidden by the
+# task skill: use `Refs #N`). Step 1 is now the self-service remedy; the human hatch is the LAST
+# line and only the coordinator sees it. The stable BLOCK_MARKER appears ONLY on a real block
+# (an external check that greps stdout for it must never false-positive on a warn-mode allow),
+# so the block path puts it in `what` and the warn path uses its own marker-free `what`.
+_TASK_NEW = (
+    'Run `task new --title "…" --acceptance "…" (repeatable) --why "…" --impact "…" '
+    '--if-not-done "…"` (a gate may refuse once: fix the flags, retry)'
 )
-
+_SELF_SERVE = (
+    f"{_TASK_NEW}, then re-run this commit with `Refs #<id>` in the message. Do not stop at this "
+    "block. A truly trivial change can use a `chore:`/`docs:` type instead."
+)
 # `git commit -F -` streams the message on GIT's stdin, which a PreToolUse hook CANNOT read (the
 # hook's stdin is the JSON event, not git's). When neither the message NOR the branch yields a
 # ticket, this unreadable-message case FAILS CLOSED WITH A HINT (agent-tools#104): rather than let
 # `-F -` silently dodge the gate (the #102 fail-open), BLOCK with an actionable message. The
-# trailer/inline-env escapes are gone; the only remaining sanctioned out for a genuine ticketless
-# commit is the Telegram hatch (checked BEFORE this block, so an approved hatch allows a `-F -`).
-_STDIN_HINT = (
-    f"{BLOCK_MARKER}. The commit message is on git's stdin (`-F -`), which a PreToolUse hook "
-    "cannot read — so the ticket gate cannot verify a reference (and the branch name carried "
-    "none either) and will not let `-F -` dodge it. Put the ticket somewhere readable: pass "
-    "the message via `-m \"…Closes #123…\"` or `-F <file>` (both are checked), or encode the "
-    "ticket in the branch name (e.g. `feature/ABC-12-foo`). No self-service bypass: ASK the "
-    "human, or request a one-time Telegram approval via "
-    'RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="<justification>" (deny-by-default; bare 1 '
-    "rejected); or opt the whole gate back to warn-only with REQUIRE_TICKET_STRICT=0."
+# only remaining sanctioned out for a genuine ticketless commit is the Telegram hatch (checked
+# BEFORE this block, so an approved hatch allows a `-F -`).
+_STDIN_SELF_SERVE = (
+    f"{_TASK_NEW}, then re-run the commit with `Refs #<id>` passed where the hook can read it: "
+    '`-m "…Refs #<id>…"` or `-F <file>` (or a ticket id in the branch name, e.g. '
+    "`feature/ABC-12-foo`). Do not stop at this block."
+)
+_RELAY = (
+    "If a subagent reported this block, run `task new` (above), send it the ticket id with "
+    "`write agent://<id>` so it recommits with `Refs #<id>`, then `wait` for its final report."
+)
+_HUMAN = (
+    "request a one-time Telegram approval via "
+    'RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="<justification>" (deny-by-default).'
+)
+_BLOCK_WHAT = f"{BLOCK_MARKER}."
+_STDIN_BLOCK_WHAT = (
+    f"{BLOCK_MARKER}. The commit message is on git's stdin (`-F -`), which this hook cannot read."
+)
+# Warn-only advisories (REQUIRE_TICKET_STRICT=0). They deliberately say "No ticket reference
+# found", not "BLOCKED", so the marker stays unambiguous proof of a real block.
+_ADVISORY_WHAT = "No ticket reference found — committing anyway (warn-only)."
+_STDIN_ADVISORY_WHAT = (
+    "commit message is on git's stdin (`-F -`) — unreadable, so the ticket gate cannot verify a "
+    "reference; committing anyway (warn-only)."
 )
 
-# Warn-only opt-out advisory for a `-F -` commit (REQUIRE_TICKET_STRICT=0). Never leaks the marker.
-_STDIN_ADVISORY = (
-    "commit message is on git's stdin (`-F -`) — unreadable, so the ticket gate cannot "
-    "verify a reference; committing anyway (warn-only). Prefer `-m`/`-F <file>` so the gate "
-    "can check the ticket."
-)
+
+def _render_block(what: str, self_serve: str, human: str = "") -> str:
+    """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+            return _guard_message.render(
+                _guard_message.Remedy(what=what, self_serve=self_serve, relay=_RELAY, human=human),
+                role,
+            )
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    lines = [
+        what,
+        f"1. {self_serve}",
+        "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
+        "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+        "blocked/done/failed); the coordinator's `write agent://<you>` revives you. Never retry "
+        "with REQUIRE_TICKET_STRICT=0 or RIG_HATCH_REQUEST_* and never go to the human.",
+    ]
+    top = f"3. If you are the top-level agent: {_RELAY[0].lower()}{_RELAY[1:]}"
+    lines.append(f"{top} Last resort, genuine trivial-ticketless cases only: {human}" if human else top)
+    return "\n".join(lines)
+
+
+def _block_message(stdin: bool) -> str:
+    if stdin:
+        return _render_block(_STDIN_BLOCK_WHAT, _STDIN_SELF_SERVE, _HUMAN)
+    return _render_block(_BLOCK_WHAT, _SELF_SERVE, _HUMAN)
+
+
+def _advisory_message(stdin: bool) -> str:
+    if stdin:
+        return _render_block(_STDIN_ADVISORY_WHAT, _STDIN_SELF_SERVE)
+    return _render_block(_ADVISORY_WHAT, _SELF_SERVE)
 
 
 def _evaluate_commit_segment(
@@ -1682,7 +1764,7 @@ def _consult_hatch(command: str, cwd: str | None, stdin: bool) -> int | None:
         emit("allow", note)
         return 0
     warn(f"require-ticket gate hatch escalation denied: {hatch.reason}")
-    base = _STDIN_HINT if stdin else f"{BLOCK_MARKER}. {_GUIDANCE}"
+    base = _block_message(stdin)
     emit("block", f"hatch escalation denied: {hatch.reason}\n{base}")
     return BLOCK_EXIT_CODE
 
@@ -1690,21 +1772,12 @@ def _consult_hatch(command: str, cwd: str | None, stdin: bool) -> int | None:
 def _emit_gate(stdin: bool) -> int:
     """Emit the block (STRICT) or warn-only allow (REQUIRE_TICKET_STRICT=0) for a ticketless
     commit, choosing the `-F -` stdin wording when the message is on git's unreadable stdin."""
-    if stdin:
-        if STRICT:
-            warn(_STDIN_HINT)
-            emit("block", _STDIN_HINT)
-            return BLOCK_EXIT_CODE
-        warn(_STDIN_ADVISORY)
-        emit("allow", _STDIN_ADVISORY)
-        return 0
     if STRICT:
         # Marker LEADS the block message so an external assertion can grep one fixed string.
-        emit("block", f"{BLOCK_MARKER}. {_GUIDANCE}")
+        message = _block_message(stdin)
+        emit("block", message)
         return BLOCK_EXIT_CODE
-    # Warn-only opt-out: the advisory deliberately says "no ticket reference found", not "BLOCKED",
-    # so the marker is unambiguous proof of a real block.
-    advisory = f"No ticket reference found — committing anyway (warn-only). {_GUIDANCE}"
+    advisory = _advisory_message(stdin)
     warn(advisory)
     emit("allow", advisory)
     return 0

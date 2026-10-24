@@ -4,6 +4,16 @@
 
 ### Added
 
+- `lib/agenttools_guard_message` + role-aware block messages (agent-tools#994): a blocking guard now
+  says WHAT TO DO NEXT as a short ordered ladder that depends on the reader. `require-ticket-before-commit`
+  (plain block, `-F -` stdin block, hatch-denied path, warn-only advisory) and `block-raw-ticket`
+  lead with the self-service remedy (`task new --title … --acceptance … --why … --impact …
+  --if-not-done …`, then recommit with `Refs #<id>`; the old `Closes #123`/`Fixes #4` examples and
+  "ASK the human" are gone). A subagent is told to `write agent://<parent>` and `yield`
+  `awaiting-coordinator` (it cannot block-wait, and must never retry `REQUIRE_TICKET_STRICT=0` /
+  `RIG_HATCH_REQUEST_*`); the coordinator relays the missing thing and holds the Telegram hatch as
+  the LAST line; an unknown role gets both branches. Fixes the 2026-10-24 incident where a subagent
+  yielded "blocked at commit" instead of running `task new`.
 - `python-only`: exact-path Allow entries for the four Guardian browser-injected DOM adapters
   (`lib/agenttools_chatgpt/{dom,live_dom,monitor_dom,conversation_root}.js`, run by Chromium in
   the ChatGPT page; agent-tools#969, Refs #891). No glob: other JS in that package still blocks.

@@ -13,6 +13,27 @@ The block message always leads with the stable marker `[require-ticket] BLOCKED:
 ticket reference` (exit code `10`), so an external check (e.g. a task-cli Docker test)
 can assert on one fixed string.
 
+## What the block tells the reader to do (agent-tools#994)
+
+A block says WHAT TO DO NEXT as a short numbered ladder, and the ladder depends on who reads it
+(`lib/agenttools_guard_message`; role from the bridge-trusted `args.agent_id` and the launcher env
+`RIG_AGENT_ID` / `RIG_PARENT_AGENT_ID` / `RIG_DETACHED_AGENT` / `PI_SESSION_FILE`, never from
+model-controlled tool args). Step 1 is always the self-service remedy: run
+`task new --title … --acceptance … --why … --impact … --if-not-done …` (a gate may refuse once:
+fix the flags, retry), then re-run the commit with `Refs #<id>` (never `Closes`/`Fixes`, per the
+`task` skill), and do not stop.
+
+- **Subagent:** if it genuinely cannot, `write agent://<parent>` (omp: `Main` for a depth-1 child,
+  `Parent` for `Parent.Child`) with what is missing and what it tried, then `yield` status
+  `awaiting-coordinator` (not blocked/done/failed) — a subagent cannot block-wait; the
+  coordinator's `write agent://<you>` revives it. Never retry with `REQUIRE_TICKET_STRICT=0` /
+  `RIG_HATCH_REQUEST_*`, never go to the human. Subagents are not shown the hatch line.
+- **Coordinator:** run `task new` itself and relay the id to the blocked subagent with
+  `write agent://<id>` then `wait`; the Telegram hatch is the LAST line, for genuine
+  trivial-ticketless commits only.
+- **Unknown role:** both branches spelled out. The builder is missing/unloadable → a built-in
+  neutral two-branch message with the same marker.
+
 ## Ticket-detection heuristic
 
 Detection is intentionally **broad**: a missed reference at worst nags (the default is
@@ -54,7 +75,7 @@ the branch name either** now **blocks** (exit 10, the stable marker) with an act
 Because the branch name is still readable, a `-F -` commit on a ticket-encoded branch
 (`feature/ABC-12-foo`) **passes** — same as the editor-commit path (a `git commit` with no `-m`/`-F`
 is likewise unreadable pre-commit and is checked against the branch only). To satisfy the gate, put
-the ticket somewhere readable: pass the message via `-m "…Closes #123…"` or `-F <file>` (both read
+the ticket somewhere readable: pass the message via `-m "…Refs #123…"` or `-F <file>` (both read
 and checked), or encode it in the branch name. The **Telegram hatch is consulted BEFORE the `-F -`
 block**, so an approved `RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT` allows a genuinely
 ticketless `-F -` commit. `-F <file>` is read and checked normally; only the `-` (stdin) form
@@ -101,8 +122,8 @@ These commits skip the gate by default:
 
 There is **no** per-commit env var or message trailer an agent can set on its own command to
 skip this gate (a self-grant is security theater). For a genuinely ticketless one-off: use a
-`chore:`/`docs:` type if it is truly trivial, **ASK the human**, or request a **one-time
-Telegram approval**:
+`chore:`/`docs:` type if it is truly trivial, or (top-level agent only) request a **one-time
+Telegram approval**; a subagent routes through its coordinator instead (see above):
 
 ```bash
 RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="one-off backfill, no ticket warranted" git commit -m "feat: x"
@@ -192,7 +213,7 @@ echo '{"args":{"command":"git commit -m \"feat: add export\""}}' | ./require_tic
 # → {"hook_api":"agents-hooks/v1","decision":"block","message":"[require-ticket] BLOCKED: ..."}  exit=10
 
 # ticket present → clean allow
-echo '{"args":{"command":"git commit -m \"feat: add export (Closes #123)\""}}' | ./require_ticket_before_commit.py; echo " exit=$?"
+echo '{"args":{"command":"git commit -m \"feat: add export (Refs #123)\""}}' | ./require_ticket_before_commit.py; echo " exit=$?"
 # → {"hook_api":"agents-hooks/v1","decision":"allow"}  exit=0
 
 # removed self-service escapes no longer bypass — these now BLOCK (exit 10)
