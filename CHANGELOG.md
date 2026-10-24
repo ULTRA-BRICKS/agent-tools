@@ -88,6 +88,12 @@
 
 ### Fixed
 
+- `gh ship` cleanup (agent-tools#995): worktrees on the PR head commit under another branch name
+  or detached are removed like the named one; a seeded `task.yaml` identical to the base's no longer
+  makes the tree dirty (a differing one or any other change still does, and is never forced); cleanup
+  ends with `rig worktree gc --yes` for what ship cannot attribute to the PR. The `--known-flake`
+  local gate now says up front that it runs the whole local suite on this machine and how to scope
+  it (`SHIP_LOCAL_TEST_CMD` / `.ship-config`); documented in the ship README.
 - `gh ship` no longer deletes a developer's own long-lived `git clone --reference/--shared`
   checkout after a merge (agent-tools#979). A clone is removed as a directory only when its creator
   marked it disposable (`git config --local agent-tools.disposableClone true`, read from the

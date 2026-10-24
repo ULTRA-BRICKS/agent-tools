@@ -26,6 +26,7 @@ import shutil
 from dataclasses import dataclass, field
 
 from shiplib.ctx import Ctx, Result
+from shiplib.wt_state import wt_status
 
 
 # ---- agent-hook wiring that may still point into a worktree (agent-tools#905) -----------------
@@ -109,16 +110,18 @@ def read_back_merge(ctx: Ctx) -> tuple[str, str]:
     return state, oid
 
 
-def unmerged_reason(ctx: Ctx, repo: str, state: str, head_oid: str) -> str:
+def unmerged_reason(ctx: Ctx, repo: str, state: str, head_oid: str, ref: str = "") -> str:
     """Why the local branch may NOT be discarded ("" = it carries nothing the merge did not take).
 
     A squash-merge never makes the branch tip an ancestor of the base, so ask the platform:
-    the PR must be MERGED and the local tip must be the merged head (or lie behind it)."""
+    the PR must be MERGED and the local tip must be the merged head (or lie behind it).
+    `ref` names what to judge (default: the PR branch; `HEAD` for a checkout found by commit)."""
+    ref = ref or f"refs/heads/{ctx.branch}"
     if state != "MERGED":
         return f"the platform does not report PR #{ctx.pr} as MERGED (state: {state or 'unreadable'})"
     if not head_oid:
         return f"the platform did not report the merged head of PR #{ctx.pr}"
-    tip = ctx.git("-C", repo, "rev-parse", "--verify", "-q", f"refs/heads/{ctx.branch}", stderr="devnull")
+    tip = ctx.git("-C", repo, "rev-parse", "--verify", "-q", ref, stderr="devnull")
     if tip.rc != 0:
         return ""
     tip_oid = tip.out.strip()
@@ -126,7 +129,7 @@ def unmerged_reason(ctx: Ctx, repo: str, state: str, head_oid: str) -> str:
         return ""
     if ctx.git("-C", repo, "merge-base", "--is-ancestor", tip_oid, head_oid, stderr="devnull").rc == 0:
         return ""
-    return f"local {ctx.branch} ({tip_oid[:12]}) has commits that are not part of the merged head {head_oid[:12]}"
+    return f"local {ref.removeprefix('refs/heads/')} ({tip_oid[:12]}) has commits that are not part of the merged head {head_oid[:12]}"
 
 
 def other_local_work(ctx: Ctx, repo: str) -> str:
@@ -331,10 +334,10 @@ class CheckoutOutcome:
     kept_branch_reason: str = ""
 
 
-def plan_checkout(ctx: Ctx, wt: str, state: str, head_oid: str) -> CheckoutPlan:
+def plan_checkout(ctx: Ctx, wt: str, state: str, head_oid: str, base: str) -> CheckoutPlan:
     """Decide how to handle `wt`. Inspects git state; mutates nothing and prints nothing."""
     wt_real = os.path.realpath(wt) if os.path.isdir(wt) else wt
-    st = ctx.git("-C", wt, "status", "--porcelain", stderr="devnull")
+    st = wt_status(ctx, wt, base)
     is_clean = st.rc == 0 and not st.out.strip()
 
     scan = ship_hook_refs(ctx, wt)
@@ -353,7 +356,9 @@ def plan_checkout(ctx: Ctx, wt: str, state: str, head_oid: str) -> CheckoutPlan:
             notices=[("err", f"[ship] WARNING: PR worktree {wt_real} has uncommitted/unverifiable changes — leaving it in place (refusing to --force-remove unshipped work).")],
         )
 
-    reason = "" if (ctx.dry_run or not is_clean) else unmerged_reason(ctx, wt, state, head_oid)
+    # A checkout found by commit (another branch name / detached) is judged by its own HEAD.
+    ref = "HEAD" if wt in ctx.wt_aliases else ""
+    reason = "" if (ctx.dry_run or not is_clean) else unmerged_reason(ctx, wt, state, head_oid, ref)
     if reason:
         return CheckoutPlan(**common, action="keep", kept_branch_reason=reason,
                             notices=[("err", f"[ship] keeping {wt}: {reason}.")])
@@ -434,7 +439,7 @@ def execute_checkout_plan(ctx: Ctx, plan: CheckoutPlan, base: str) -> CheckoutOu
             return outcome
     ctx.out(f"[ship] removing worktree {wt} ...")
     head = ctx.git("-C", wt, "symbolic-ref", "--quiet", "--short", "HEAD", stderr="devnull").out.strip()
-    if plan.is_clean and head == ctx.branch:
+    if plan.is_clean and head:  # every checkout here holds the PR head: under the PR branch or another name
         ctx.run(["git", "-C", wt, "checkout", "--detach", "--quiet"], check=False)
     if remove_worktree(ctx, wt, plan.is_clean):
         if plan.reroot_target and not ctx.dry_run:
@@ -478,23 +483,31 @@ def cleanup(ctx: Ctx) -> None:
 
     self_removed = ""
     kept_branch_reason = ""
+    sweep_ok = True
     wts = [] if fork else list(ctx.wts)
     for wt in wts:
         if not wt:
             continue
         # Plan and execute ONE checkout at a time: removing the first one changes what the next
         # looks like (`sole` in plan_checkout), so the plans cannot all be made up front.
-        plan = plan_checkout(ctx, wt, state, head_oid)
+        plan = plan_checkout(ctx, wt, state, head_oid, base)
         outcome = execute_checkout_plan(ctx, plan, base)
+        # A tree ship kept on purpose (hooks run from it, we are inside it) must not be swept by rig either.
+        if plan.action == "keep_hook_backed" or (plan.action == "keep" and plan.inside):
+            sweep_ok = False
         self_removed = outcome.self_removed or self_removed
-        kept_branch_reason = outcome.kept_branch_reason or kept_branch_reason
+        if wt not in ctx.wt_aliases:  # a kept alias says nothing about the PR branch itself
+            kept_branch_reason = outcome.kept_branch_reason or kept_branch_reason
 
     repo = ctx.main_checkout if os.path.isdir(ctx.main_checkout) else ""
     if repo:
         if not fork:
             delete_local_branch(ctx, repo, state, head_oid, kept_branch_reason)
+            delete_alias_branches(ctx, repo, state, head_oid)
         ctx.run(["git", "-C", repo, "worktree", "prune"], check=False)
         refresh_base(ctx, base, repo)
+        if state == "MERGED" and not fork and sweep_ok:  # a queued PR or a fork's head says nothing about local trees
+            sweep_landed_worktrees(ctx, repo)
 
     if self_removed:
         ctx.err(f"[ship] NOTE: removed the worktree you launched from — your shell's cwd is now gone. cd into {self_removed} before your next command.")
@@ -510,6 +523,43 @@ def delete_local_branch(ctx: Ctx, repo: str, state: str, head_oid: str, kept_rea
         return
     if ctx.run(["git", "-C", repo, "branch", "-D", ctx.branch], check=False) != 0:
         ctx.err(f"[ship] WARNING: could not delete local branch {ctx.branch} (still checked out somewhere?) — delete it manually.")
+
+
+def delete_alias_branches(ctx: Ctx, repo: str, state: str, head_oid: str) -> None:
+    """Drop the other-named local branches whose checkout was just removed — same rule as the PR
+    branch: only when the merge took everything on them, and never while still checked out."""
+    for branch in sorted({b for b in ctx.wt_aliases.values() if b}):
+        ref = f"refs/heads/{branch}"
+        if ctx.git("-C", repo, "show-ref", "--verify", "--quiet", ref).rc != 0:
+            continue
+        reason = "" if ctx.dry_run else unmerged_reason(ctx, repo, state, head_oid, ref)
+        if reason:
+            ctx.err(f"[ship] keeping local branch {branch}: {reason}.")
+        elif ctx.run(["git", "-C", repo, "branch", "-D", branch], check=False, stderr="devnull") != 0:
+            ctx.err(f"[ship] keeping local branch {branch}: still checked out or protected — delete it manually if wanted.")
+
+
+def sweep_landed_worktrees(ctx: Ctx, repo: str) -> None:
+    """Hand whatever ship cannot attribute to this PR (renamed branches with extra commits, review
+    copies, other merged PRs' leftovers) to rig's repo-agnostic sweeper, after the base refresh so it
+    judges against the fresh origin/<base>. rig removes only clean trees whose commits all landed
+    there or sit on a remote branch that stays; ship never forces anything itself here."""
+    if not ctx.which("rig"):
+        return
+    # rig's sweeper does not yet check installed hook wiring (rig-cli#695): a landed, clean tree that
+    # hooks still run code from would be deleted and the hooks would break machine-wide. Run ship's own
+    # scan on every other worktree and skip the sweep while any is referenced or unreadable.
+    for other in worktree_paths(ctx, repo)[1:]:
+        other_real = os.path.realpath(other)
+        if ctx.orig_pwd == other_real or ctx.orig_pwd.startswith(other_real + "/"):
+            ctx.err(f"[ship] skipping rig worktree gc: ship was launched from {other}, which the sweep could remove.")
+            return
+        scan = ship_hook_refs(ctx, other)
+        if scan.rc != 0:
+            ctx.err(f"[ship] skipping rig worktree gc: installed hooks reference {other} (or the hook scan was incomplete, exit {scan.rc}) and rig's sweeper does not check that yet (rig-cli#695).")
+            return
+    if ctx.run(["rig", "worktree", "gc", "--repo", repo, "--yes"], check=False) != 0:
+        ctx.err(f"[ship] WARNING: rig worktree gc failed — run it by hand: rig worktree gc --repo {shell_quote(repo)} --yes")
 
 
 def run(ctx: Ctx) -> None:

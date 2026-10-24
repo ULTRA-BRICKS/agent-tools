@@ -319,6 +319,11 @@ def forge(tmp_path):
     poison = bindir / "gh"
     poison.write_text(f"#!/bin/sh\necho REAL-GH-CALLED \"$@\" >> {tmp_path}/gh.log\nexit 97\n")
     poison.chmod(0o755)
+    # Post-merge cleanup runs `rig worktree gc` when rig is on PATH; the workstation's real one would
+    # reach for the (poisoned) gh against this scratch repo.
+    rig = bindir / "rig"
+    rig.write_text("#!/bin/sh\nexit 0\n")
+    rig.chmod(0o755)
     yield {"fake": fake, "main": main, "head": head, "tmp": tmp_path, "keys": keys, "bindir": bindir}
     fake.close()
 

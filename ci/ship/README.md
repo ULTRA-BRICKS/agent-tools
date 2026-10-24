@@ -69,6 +69,26 @@ or masks the merge) and follows the PR, not an assumption:
     remove it. Linked worktrees (what `rig worktree create` makes) are not clones and need no marker.
   - A **plain or unmarked clone** is somebody's working copy and is never deleted; if it is merged and tidy
     it is moved onto the base branch and the merged branch is dropped.
+  - **Checkouts of the PR under another name.** A detached HEAD on the PR head commit
+    (`gh pr view --json headRefOid`), or a differently named local branch on it whose upstream is
+    `origin/<pr-branch>`, is treated like the named checkout: same hook/merged-head checks, removed,
+    and its extra local branch dropped when the merge took all of it. A branch that merely sits on
+    that commit without tracking the PR branch is not matched (a stacked PR started with
+    `git worktree add -b next origin/<pr-branch>` tracks it by git's default, so keep stacked work
+    on `--no-track` branches or commit once before shipping the base PR). The primary checkout, locked
+    trees and checkouts of the base branch are never matched; a tree with commits beyond the PR head
+    is not the PR's. Found by commit rather than by name, a tree with uncommitted changes is left
+    alone with a notice — it does not block the ship (the named PR checkout still does).
+  - **Seeded `task.yaml`.** Tooling seeds a `task.yaml` into every worktree; on a base that does not
+    track it yet that is an untracked `?? task.yaml`. A copy byte-identical to `origin/<base>:task.yaml`
+    is not counted as unshipped work (preflight does not refuse, cleanup does not keep the tree) — the
+    case of a PR branch forked before the base began tracking the file. A
+    differing `task.yaml`, or any other change, still counts — such a tree is never removed or forced.
+  - **`rig worktree gc`.** After the base refresh, once the PR is confirmed merged, ship kept no tree on
+    purpose (hooks pointing into it, launched from it) and its own hook scan finds no other worktree
+    that installed hooks reference (rig's sweeper does not check that yet, rig-cli#695), ship runs `rig worktree gc --repo <primary> --yes`
+    (when `rig` is on PATH; only printed under `--dry-run`): the repo-agnostic, verdict-gated sweeper removes
+    whatever else is landed and clean (review copies, other merged PRs' leftovers). A failure only warns.
 - **Base refresh.** The local base ref is fast-forwarded to `origin/<base>` only when it exists and
   is safe to move: ship never switches the branch of the primary checkout, never stashes, and skips
   a checkout that holds the base with uncommitted changes (it prints `not fast-forwarded ... skipped`).
@@ -145,6 +165,11 @@ Wire it as a `gh` alias if you like:
 ```bash
 gh alias set ship '!~/bin/ship'    # then: gh ship 123
 ```
+
+> **Start ship from a shell whose PATH has `~/.local/bin`** (where `review`, `task`, `tg-ctl`, `rig`, `dev`
+> live): the gates that find those tools by PATH skip silently or fail without it. Non-interactive agent
+> shells read only `~/.zshenv` (zsh) / `$BASH_ENV` (bash), so put the PATH line there, not just in
+> `.zshrc`/`.profile`.
 
 > **Hatch bypass needs the sibling `lib/`.** The review-quorum gate's one-time Telegram bypass
 > imports `agenttools_hatch_escalation` from `lib/` two levels above `ship.sh` in the checkout.
@@ -284,7 +309,10 @@ stays enabled). Role coverage is the predicate; `distinct_models_passed` is tele
   claim against the base branch's own recent CI history before doing anything with it (see the
   table row above); an unverifiable assertion is refused, same as not passing the flag. On
   success, runs the local fallback gate and merges only if it's green too. Logged to
-  `SHIP_AUDIT_FILE`.
+  `SHIP_AUDIT_FILE`. **That gate runs the repo's whole local test suite on THIS machine** (ship says so before it
+  starts), so it needs the project's test dependencies installed here; on a workstation without them,
+  point the gate at a runnable command first (`SHIP_LOCAL_TEST_CMD=<cmd>`, or a committed
+  `.ship-config`) or run the suite on a pod.
 - `--subject <text>` / `--body <text>` / `--author-email <email>` — the merge commit's subject,
   body and author email, passed verbatim to `gh pr merge`. Without them a GitHub squash takes the
   repository's default message, which can join every commit message of the PR — use them when

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from test_ship import _SHIP, _fake_gh_dir, _git, _sh
+from test_ship import _SHIP, _fake_gh_dir, _git, _sh, _write_descriptor, hook_home  # noqa: F401 (fixture)
 
 BASE = "private"  # the repo's base branch; there is deliberately no `main` anywhere
 # The marker a per-PR clone's creator writes; spelled out here (not imported) so renaming it in
@@ -410,3 +410,152 @@ def test_fork_pr_keeps_local_state_but_still_refreshes_the_base(setup):
     assert wt.exists(), _dump(r)
     assert "feat" in _branches(setup.primary) or "feat" in _git("branch", "--list", cwd=wt).stdout, _dump(r)
     assert _git("rev-parse", BASE, cwd=setup.primary).stdout.strip() == setup.origin_tip(), _dump(r)
+
+
+# --- checkouts of the PR that do not carry its branch name; seeded task.yaml; rig gc ---------------
+def _alias_worktree(setup: Setup, *, branch: str | None, name: str = "wt-alias") -> Path:
+    """A linked worktree on the PR head commit under another local branch name (or detached)."""
+    wt = setup.tmp / name
+    if branch is None:
+        _git("worktree", "add", "-q", "--detach", str(wt), "origin/feat", cwd=setup.primary)
+    else:
+        _git("worktree", "add", "-q", "-b", branch, str(wt), "origin/feat", cwd=setup.primary)
+    _identity(wt)
+    return wt
+
+
+def _base_tracks_task_yaml(setup: Setup, text: str = "tracker: x\n") -> None:
+    """The base branch gained a tracked task.yaml AFTER the PR branch forked, so a PR worktree
+    seeded with the same file sees it as an untracked `?? task.yaml`."""
+    _commit(setup.primary, "task.yaml", text, "track task.yaml")
+    _git("push", "-q", "origin", BASE, cwd=setup.primary)
+
+
+def test_worktree_on_another_branch_name_is_removed_with_its_branch(setup):
+    wt = _alias_worktree(setup, branch="renamed-local")
+    r = _ship(setup, setup.primary)
+    assert r.returncode == 0, _dump(r)
+    assert not wt.exists(), f"worktree on the PR head under another name left behind:\n{_dump(r)}"
+    assert _git("branch", "--list", "renamed-local", cwd=setup.primary).stdout == "", _dump(r)
+    assert not setup.origin_has_branch("feat")
+
+
+def test_detached_worktree_on_the_pr_head_commit_is_removed(setup):
+    wt = _alias_worktree(setup, branch=None)
+    r = _ship(setup, setup.primary)
+    assert r.returncode == 0, _dump(r)
+    assert not wt.exists(), f"detached worktree on the PR head left behind:\n{_dump(r)}"
+
+
+def test_detached_worktree_with_extra_commits_is_not_the_prs_and_is_left_alone(setup):
+    wt = _alias_worktree(setup, branch=None)
+    _commit(wt, "mine.txt", "unshipped\n", "local only")
+    r = _ship(setup, setup.primary)
+    assert r.returncode == 0, _dump(r)
+    assert wt.exists() and (wt / "mine.txt").exists(), f"a tree that is not at the PR head was touched:\n{_dump(r)}"
+
+
+def test_dirty_alias_worktree_does_not_block_the_ship_and_is_never_forced(setup):
+    wt = _alias_worktree(setup, branch="renamed-local")
+    (wt / "feat.txt").write_text("edited, not committed\n", encoding="utf-8")
+    r = _ship(setup, setup.primary)
+    assert r.returncode == 0, _dump(r)
+    assert "leaving" in r.stderr and "alone" in r.stderr, _dump(r)
+    assert (wt / "feat.txt").read_text() == "edited, not committed\n"
+    assert _git("branch", "--list", "renamed-local", cwd=setup.primary).stdout != "", "its branch must stay"
+    assert not setup.origin_has_branch("feat")
+
+
+def test_branch_that_merely_sits_on_the_pr_head_is_not_the_prs_checkout(setup):
+    """The next stacked PR just started from the PR's commit: no upstream on the PR branch, so it
+    is somebody else's work and ship must neither remove the tree nor delete the branch."""
+    wt = setup.tmp / "wt-stacked"
+    _git("worktree", "add", "-q", "--no-track", "-b", "part2", str(wt), "origin/feat", cwd=setup.primary)
+    r = _ship(setup, setup.primary)
+    assert r.returncode == 0, _dump(r)
+    assert wt.exists(), f"a stacked branch's tree was removed:\n{_dump(r)}"
+    assert _git("branch", "--list", "part2", cwd=setup.primary).stdout != ""
+
+
+def test_seeded_task_yaml_identical_to_the_base_copy_does_not_make_the_tree_dirty(setup):
+    _base_tracks_task_yaml(setup)
+    wt = setup.worktree()
+    (wt / "task.yaml").write_text("tracker: x\n", encoding="utf-8")
+    assert _git("status", "--porcelain", cwd=wt).stdout == "?? task.yaml\n"
+    r = _ship(setup, wt)
+    assert r.returncode == 0, _dump(r)
+    assert "uncommitted" not in r.stderr, _dump(r)
+    assert not wt.exists(), f"tree dirty only from the seeded task.yaml was kept:\n{_dump(r)}"
+    assert _branches(setup.primary) == "", _dump(r)
+
+
+def test_task_yaml_that_differs_from_the_base_copy_still_counts_as_unshipped_work(setup):
+    _base_tracks_task_yaml(setup)
+    wt = setup.worktree()
+    (wt / "task.yaml").write_text("tracker: something-i-edited\n", encoding="utf-8")
+    r = _ship(setup, wt)
+    assert r.returncode == 1, _dump(r)
+    assert (wt / "task.yaml").read_text() == "tracker: something-i-edited\n"
+
+
+def test_task_yaml_next_to_a_real_change_is_never_forced_away_at_cleanup(setup):
+    """Clean (task.yaml only) at preflight, then real work lands in the tree while the merge runs:
+    the cleanup-time status check must keep the tree, task.yaml or not."""
+    _base_tracks_task_yaml(setup)
+    wt = setup.worktree()
+    (wt / "task.yaml").write_text("tracker: x\n", encoding="utf-8")
+    r = _ship(setup, setup.primary, SHIP_TEST_MERGE_DIRTIES=str(wt / "late-work.txt"))
+    assert r.returncode == 0, _dump(r)
+    assert (wt / "late-work.txt").exists(), f"a tree with real changes was removed:\n{_dump(r)}"
+
+
+def test_cleanup_hands_the_rest_to_rig_worktree_gc_on_the_primary_checkout(setup):
+    log = setup.tmp / "rig.log"
+    setup.worktree()
+    r = _ship(setup, setup.primary, SHIP_TEST_RIG_LOG=str(log))
+    assert r.returncode == 0, _dump(r)
+    assert log.read_text().splitlines() == [f"worktree gc --repo {setup.primary} --yes"], _dump(r)
+
+
+def test_failing_rig_worktree_gc_only_warns(setup):
+    setup.worktree()
+    r = _ship(setup, setup.primary, SHIP_TEST_RIG_RC="2")
+    assert r.returncode == 0, _dump(r)
+    assert "rig worktree gc failed" in r.stderr, _dump(r)
+    assert "merged + cleaned up" in r.stdout
+
+
+def test_dry_run_does_not_invoke_rig_worktree_gc(setup):
+    log = setup.tmp / "rig.log"
+    setup.worktree()
+    bindir = _fake_gh_dir(setup.tmp)
+    env = {**os.environ, "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}", "SHIP_TEST_BRANCH": "feat",
+           "SHIP_TEST_BASE_BRANCH": BASE, "SHIP_TEST_RIG_LOG": str(log)}
+    r = _sh("bash", str(_SHIP), "1", "--dry-run", "--no-screenshot-ok", "test", cwd=setup.primary, env=env)
+    assert r.returncode == 0, _dump(r)
+    assert not log.exists(), "dry-run must only print the rig command"
+    assert "[dry-run] rig worktree gc" in r.stdout, _dump(r)
+
+
+def test_rig_worktree_gc_is_skipped_when_the_pr_is_not_confirmed_merged(setup):
+    log = setup.tmp / "rig.log"
+    setup.worktree()
+    r = _ship(setup, setup.primary, SHIP_TEST_RIG_LOG=str(log), SHIP_TEST_POST_STATE="OPEN")
+    assert r.returncode == 0, _dump(r)
+    assert not log.exists(), "a queued PR must not trigger a sweep of other worktrees"
+
+
+def test_rig_worktree_gc_is_skipped_while_installed_hooks_run_code_from_another_worktree(setup, hook_home):
+    """rig's sweeper does not check hook wiring (rig-cli#695): an unrelated landed tree that a hook
+    descriptor points into must survive, so ship does not call the sweeper at all."""
+    log = setup.tmp / "rig.log"
+    other = setup.tmp / "wt-hooked"
+    _git("worktree", "add", "-q", "--detach", str(other), BASE, cwd=setup.primary)
+    _write_descriptor(hook_home / ".omp" / "agent" / "hooks", other / "README.md")
+    wt = setup.worktree()
+    r = _ship(setup, setup.primary, SHIP_TEST_RIG_LOG=str(log))
+    assert r.returncode == 0, _dump(r)
+    assert not wt.exists(), _dump(r)
+    assert other.exists()
+    assert not log.exists(), f"rig worktree gc ran although a hook points into {other}:\n{_dump(r)}"
+    assert "skipping rig worktree gc" in r.stderr and "rig-cli#695" in r.stderr, _dump(r)

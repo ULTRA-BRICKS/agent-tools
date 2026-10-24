@@ -135,7 +135,8 @@ class Ctx:
         self.ship_cfg_acceptance_gate = ""
         self.ship_cfg_external_review = ""
         # ci_gate.py / cleanup.py
-        self.wts: list[str] = []  # worktrees checking out the PR branch
+        self.wts: list[str] = []  # worktrees checking out the PR branch, then the aliases below
+        self.wt_aliases: dict[str, str] = {}  # worktree path -> local branch ("" = detached) of checkouts on the PR head commit under another name
         self.ship_hook_refs_src = ""  # hook_refs.py source, read before the PR worktree can vanish
         # extrev_ticket.py
         self.extrev_enabled = True

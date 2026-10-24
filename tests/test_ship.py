@@ -107,6 +107,10 @@ case "$sub" in
           # the PR branch (refs/remotes/origin/<branch>), which every checkout of the repo shares.
           [ -z "${SHIP_TEST_READBACK_FAIL:-}" ] || { echo "fake gh: simulated read-back failure" >&2; exit 1; }
           printf '%s\\t%s\\n' "${SHIP_TEST_POST_STATE:-MERGED}" "${SHIP_TEST_MERGED_OID:-$(git rev-parse "refs/remotes/origin/${SHIP_TEST_BRANCH}" 2>/dev/null || true)}"
+        elif printf '%s ' "$@" | grep -q -- '--json headRefOid'; then
+          # The PR head commit before the merge (worktrees sitting on it under another name or
+          # detached belong to the PR). SHIP_TEST_HEAD_OID overrides; else the pushed branch tip.
+          printf '%s\n' "${SHIP_TEST_HEAD_OID:-$(git rev-parse "refs/remotes/origin/${SHIP_TEST_BRANCH}" 2>/dev/null || true)}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           # One GREEN check so the CI gate passes on the normal (non-admin) merge path — this is
           # how tests that used to pass a bare --skip-ci (a shortcut to skip CI mocking) now run
@@ -222,6 +226,15 @@ def _fake_gh_dir(tmp_path: Path) -> Path:
     gh = bindir / "gh"
     gh.write_text(_FAKE_GH, encoding="utf-8")
     gh.chmod(0o755)
+    # A fake `rig` so no test ever runs the workstation's real `rig worktree gc` against a scratch
+    # repo; it records its argv in $SHIP_TEST_RIG_LOG and exits $SHIP_TEST_RIG_RC (default 0).
+    rig = bindir / "rig"
+    rig.write_text(
+        '#!/usr/bin/env bash\n[ -z "${SHIP_TEST_RIG_LOG:-}" ] || printf \'%s\\n\' "$*" >> "$SHIP_TEST_RIG_LOG"\n'
+        'exit "${SHIP_TEST_RIG_RC:-0}"\n',
+        encoding="utf-8",
+    )
+    rig.chmod(0o755)
     return bindir
 
 
@@ -5518,6 +5531,7 @@ def test_known_flake_confirmed_runs_local_gate_and_merges(repo_with_pr_worktree,
     )
     assert "CONFIRMED against main's recent CI history" in r.stderr, r.stderr
     assert "known-flake gate PASSED" in r.stderr, r.stderr
+    assert "runs the repo's WHOLE local test suite on this machine" in r.stderr, r.stderr
     assert "merged #1" in r.stdout, r.stdout
     lines = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines() if line.strip()]
     known_flake_lines = [line for line in lines if line.get("gate") == "known-flake"]

@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from shiplib.ctx import ShipExit, sum_first_fields
 from shiplib.ci_fallback import ci_appears_structurally_down, empty_rollup_is_ci_outage, known_flake_audit_log, known_flake_confirmed, run_local_ci_gate
 from shiplib.setup import abort_if_core_bare
+from shiplib.cleanup import resolve_base_branch
+from shiplib.wt_state import head_alias_checkouts, list_checkouts, pr_head_oid, wt_status
 
 RESOLVE_THREAD_Q = 'query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated comments(first:100){totalCount nodes{author{login} body}}}}}}}'
 
@@ -298,6 +300,7 @@ def green_ci_gate(ctx) -> None:
         flakes = " ".join(ctx.known_flakes)
         if flake_ok:
             ctx.err(f"[ship] known-flake gate PASSED — every failing check is a confirmed pre-existing flake on {kf_base}, not something this PR introduced. Running local fallback gates instead of blocking on CI.")
+            ctx.err("[ship] known-flake: the local fallback gate runs the repo's WHOLE local test suite on this machine, so it needs the project's test dependencies installed here; scope or replace it with SHIP_LOCAL_TEST_CMD=<cmd> or a committed .ship-config (SHIP_LOCAL_TEST_CMD= / SHIP_LOCAL_TEST_DIR=), or run the suite on a pod.")
             # The `confirmed` audit line waits for the real merge (kf_audit_pending, logged in accept_merge).
             if run_local_ci_gate(ctx, f"a confirmed pre-existing flake on {kf_base}, not a CI outage"):
                 ctx.kf_audit_pending = flakes
@@ -386,27 +389,28 @@ def review_dwell_gate(ctx) -> None:
 
 
 def local_branch_sanity(ctx) -> None:
-    """Collect every worktree holding the PR branch (ctx.wts); refuse dirty trees / unpushed commits."""
+    """Collect every worktree holding the PR branch (ctx.wts) plus every one sitting on the PR head
+    commit under another name (ctx.wt_aliases: another local branch, or a detached HEAD); refuse
+    dirty trees / unpushed commits."""
 
     cwd = ctx.root or None
-    r = ctx.git("worktree", "list", "--porcelain", cwd=cwd, stderr="devnull")
-    wts: list[str] = []
-    w = ""
-    for line in r.out.split("\n"):
-        if line.startswith("worktree "):
-            w = line[9:]
-        if line == f"branch refs/heads/{ctx.branch}" and w:
-            wts.append(w)
-    ctx.wts = wts  # read again by cleanup
-    for wt in wts:
+    checkouts = list_checkouts(ctx, cwd)
+    wts = [c.path for c in checkouts if c.branch == ctx.branch]
+    base = resolve_base_branch(ctx)
+    ctx.wt_aliases = {c.path: c.branch for c in head_alias_checkouts(ctx, checkouts, pr_head_oid(ctx), base)}
+    for wt in [*wts, *ctx.wt_aliases]:
         # A worktree-scoped core.bare makes `status` exit 128 with its fatal swallowed below (reads "clean").
         abort_if_core_bare(ctx, wt, "PR worktree")
-        st = ctx.git("-C", wt, "status", "--short", stderr="devnull")
-        if st.out.rstrip("\n") != "":
+        st = wt_status(ctx, wt, base)
+        if st.out.rstrip("\n") != "" and wt in ctx.wt_aliases:
+            # Found by commit, not by the PR branch name: its edits are not this ship's to refuse over.
+            ctx.err(f"[ship] leaving {wt} alone: it sits on the PR head under another name and has uncommitted changes.")
+            del ctx.wt_aliases[wt]
+        elif st.out.rstrip("\n") != "":
             ctx.err(f"Refusing: worktree {wt} has uncommitted changes. Commit or discard first.")
-            again = ctx.git("-C", wt, "status", "--short")
-            ctx.err(again.out, end="")
+            ctx.err(st.out.rstrip("\n") + "\n", end="")
             raise ShipExit(1)
+    ctx.wts = [*wts, *ctx.wt_aliases]  # read again by cleanup
     ctx.git("fetch", "-q", "origin", ctx.branch, cwd=cwd, stdout="inherit", stderr="devnull")
     branch = ctx.branch
     if (
