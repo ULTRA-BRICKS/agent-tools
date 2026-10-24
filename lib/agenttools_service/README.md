@@ -18,8 +18,10 @@ This is the SAME machinery the roadmap wants shared by **tg-ctl autostart** and 
 | Subcommand | What it does |
 | --- | --- |
 | `run` | Run in the **foreground** (this shell), blocking. For `disable`d / ad-hoc use. No pidfile (this shell *is* the service). |
-| `start` | Start in the **background** (detached daemon); writes a pidfile; returns immediately. |
-| `status` | Is it running? Reports `{running, pid, port, url, enabled}`. |
+| `start` | Start in the **background**; returns immediately. With an enabled systemd unit it starts the **unit** (one owner); otherwise a detached daemon with a pidfile. Exit 3 if already running. |
+| `restart` | Stop then start, whichever owner runs it (`systemctl --user restart` for the unit). |
+| `status` | Is it running? Reports `{running, pid, port, url, enabled}`; with a systemd unit the real `ActiveState`/`MainPID`. |
+| `logs` | Last lines of the service logfile (`-n N`, `-f` to follow). Exit 3 when there is no log yet. |
 | `stop` | Stop the background instance; remove the pidfile. Idempotent. |
 | `enable` | Install OS autostart (launchd / systemd `--user` / a no-systemd fallback) **AND** start it now. Idempotent. |
 | `disable` | Remove OS autostart **AND** stop. Idempotent. |
@@ -36,10 +38,13 @@ never fight over the port:
 
 - On **launchd / systemd**, installing the unit *also launches the process now* (launchd
   `RunAtLoad`, `systemctl --user enable --now`). So `enable` installs the unit and lets the
-  **OS** run it — it does **not** also spawn a pidfile-tracked daemon. `status` then reports
-  `running` with `pid=None` and `state="autostart"` (the OS is the supervisor; there is no
-  pidfile to read a pid from). `disable` removes the unit, which stops that OS-owned process,
-  and *also* stops any manager-spawned (`start`) instance.
+  **OS** run it — it does **not** also spawn a pidfile-tracked daemon. `status` reports
+  `running` with `state="autostart"` and the unit's `MainPID` (read from
+  `systemctl --user show`; a stopped / failed / crash-looping unit reads `stopped` / `failed` /
+  `restarting`, exit 3). `start`, `restart` and `stop` act on the unit too (a leftover pidfile
+  daemon is stopped first because it holds the port), so `restart` with autostart on never
+  leaves a second daemon. `stop` keeps autostart installed; `disable` removes the unit and
+  *also* stops any manager-spawned (`start`) instance.
 - On the **no-autostart fallback** OS, there is no OS to run anything, so `enable` falls back
   to a background `start` (pidfile-tracked) and `status().enabled` stays `False`.
 - If the OS control command **fails** (`launchctl`/`systemctl` missing or sandbox-blocked),
@@ -126,21 +131,17 @@ installed. **Windows caveat:** `start`'s detach (`start_new_session`) is POSIX-o
 Windows the spawned process is not fully detached from the launching shell. Windows is best-
 effort; the supported autostart targets are macOS and Linux.
 
-When autostart owns the process (launchd/systemd) and no manager-spawned pidfile instance is
-also running, `status` reports `running=True`, `state="autostart"`, `pid=None` — there is no
-pidfile because the OS, not the manager, spawned it. (If a pidfile instance is *also* running,
-`state` mirrors the daemon state and `pid` is set.) To stop an autostart-owned service, use
-`disable` (which uninstalls the unit and stops it), not `stop` (which only targets a manager-
-spawned pidfile instance).
+When autostart owns the process and systemd cannot answer (no user bus), `status` falls back to
+`running=True`, `state="autostart"`, `pid=None` inferred from "the unit is installed", and
+`start`/`stop` use the pidfile path. To stop an autostart-owned service in that state, use
+`disable`.
 
 **Honest limitations of the OS-managed path** (deliberately out of scope rather than
 half-done):
 
-- `status().running` for an enabled service is inferred from "the unit is installed", not from
-  probing the live launchd/systemd process. A service that crashed in a way the OS won't
-  auto-restart (a clean `exit 0`, or a `SIGKILL`) can still read `running=True`. For
-  authoritative OS-managed liveness use the OS's own tools (`launchctl list`,
-  `systemctl --user is-active`).
+- When systemd cannot be queried (no user bus, sandbox), `status().running` for an enabled
+  service is inferred from "the unit is installed"; launchd is never queried at all (use
+  `launchctl list`).
 - Re-running `enable` is **file-idempotent** (no duplicate units) but reloads the unit
   (`launchctl unload`+`load` / `systemctl enable --now`), which **restarts** the running
   daemon. Don't re-run `enable` "just to be sure" on a live service if a restart is costly.
@@ -149,9 +150,21 @@ half-done):
   For a reliable LaunchAgent, pass an **absolute** `argv[0]` (e.g. `shutil.which("review")` or
   `sys.executable`) in the `Service`. The plist renderer is pure and does not resolve PATH.
 
+**Readiness, boot, doctor.** `Service(health_check=callable, ready_timeout=10)` makes the CLI
+actions (`run_action`/`dispatch`) wait after `start`/`restart`/`enable` for the callable to
+return true and exit `4` with the log path (and whether the port is held by another process)
+when it never does; `ServiceManager` methods return immediately, library callers use
+`manager.wait_ready()`. `enable` on Linux also
+checks `loginctl` linger and turns it on when off (a unit only starts at **boot**, without a
+login, with linger); if that fails it warns on stderr. The unit has no
+`network-online.target` ordering: that is a system target the user manager does not have.
+`service_checks(manager)` returns `ServiceCheck(name, level, detail, fix)` rows (command exists,
+autostart installed, `systemd-analyze --user verify` findings about this unit, unit state,
+linger) for a consumer's own `doctor` to append.
+
 **CLI output conventions** (`run_action` / `dispatch`): success lines go to **stdout**, failure
 and warning lines (`already running`, autostart `FAILED`, "won't survive reboot", a still-
-occupied port) go to **stderr**. Exit codes are `0` (ok), `3` (nothing running), `4` (autostart
+occupied port, a refused or never-healthy `start`/`restart`/`enable`) go to **stderr**. Exit codes are `0` (ok), `3` (nothing running), `4` (autostart
 enable/disable failed, OR `stop`/`disable` acted but something is still listening on the
 service's port afterward — see "Port liveness" below) — except `run`, which returns the **raw**
 exit code of the foreground child (so it may itself be 3/4); the 3/4 contract applies only to

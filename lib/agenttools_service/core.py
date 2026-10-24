@@ -72,6 +72,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Protocol, Sequence
@@ -143,6 +144,20 @@ class Service:
         defaults to ``$HOME``. The state dir (pid + autostart unit) is
         ``$XDG_STATE_HOME/<tool>`` (fallback ``~/.local/state/<tool>``); the cache dir
         (logs) is ``$XDG_CACHE_HOME/<tool>`` (fallback ``~/.cache/<tool>``).
+    health_check
+        Optional zero-arg probe returning ``True`` once the server answers (e.g. an HTTP
+        ``/health`` GET). When set, ``run_action``/``dispatch`` wait after
+        ``start``/``restart``/``enable`` up to ``ready_timeout`` seconds for it and fail with
+        exit 4 plus the log path, because a live pid does not mean the port is serving (a
+        server that exits at boot, or a port held by another process, would otherwise read as
+        a successful start). The ``ServiceManager`` methods themselves return immediately;
+        library callers call ``manager.wait_ready()`` (``None`` = healthy, else why not).
+    ready_timeout
+        Seconds ``health_check`` may take to turn true. Default 10.
+    cli
+        How a user invokes this service's lifecycle verbs (``"hsw-editor --port 9000"``), used in
+        hints and doctor fixes (``<cli> enable``). Default: ``"<tool> <name>"`` when ``tool`` is
+        set, else ``name``.
     """
 
     name: str
@@ -152,6 +167,9 @@ class Service:
     tool: Optional[str] = None
     description: str = ""
     home: Optional[Path] = None
+    health_check: Optional[Callable[[], bool]] = None
+    ready_timeout: float = 10.0
+    cli: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.name or not _is_slug(self.name):
@@ -204,8 +222,12 @@ class Service:
                 raise ValueError(f"argv token must not contain control characters: {token!r}")
         if _has_control_char(self.description):
             raise ValueError("description must not contain control characters (e.g. newlines)")
+        if self.cli is not None and (not self.cli.strip() or _has_control_char(self.cli)):
+            raise ValueError("cli must be a non-blank string without control characters")
         if self.port is not None and not (0 < int(self.port) < 65536):
             raise ValueError(f"port must be in 1..65535 or None, got {self.port!r}")
+        if not 0 < self.ready_timeout < float("inf"):  # also rejects NaN
+            raise ValueError(f"ready_timeout must be a finite number of seconds > 0, got {self.ready_timeout!r}")
         # Reject a blank/control-char host AND any host carrying whitespace: a value like
         # "  127.0.0.1  " or "my host" would otherwise render into `url` as
         # "http://  127.0.0.1  :7878" — a silently broken URL. The host lands verbatim in the
@@ -459,6 +481,60 @@ def _default_port_prober(host: str, port: int) -> PortProbe:
     return PortProbe(occupied=False, pid=None)
 
 
+@dataclass(frozen=True)
+class UnitState:
+    """``systemctl --user show`` answer for a service unit.
+
+    ``active_state`` is ``None`` when systemd could not answer (no user bus, ``systemctl``
+    missing or sandboxed): callers then fall back to the pidfile/installed-unit inference.
+    """
+
+    active_state: Optional[str]
+    main_pid: Optional[int] = None
+    error: str = ""
+
+    @property
+    def answered(self) -> bool:
+        return self.active_state is not None
+
+    @property
+    def up(self) -> bool:
+        """Something of the unit exists (also while it starts, auto-restarts or stops): ``stop`` acts."""
+        return self.active_state in ("active", "activating", "reloading", "deactivating")
+
+    @property
+    def serving(self) -> bool:
+        """A process is running. A crash loop waiting in ``auto-restart`` is ``activating`` with no MainPID."""
+        return self.active_state in ("active", "reloading") or (
+            self.active_state == "activating" and self.main_pid is not None
+        )
+
+
+class ServiceControlError(RuntimeError):
+    """The OS refused a lifecycle command (``systemctl --user start|stop|restart`` failed)."""
+
+
+def _default_capture(cmd: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+    """Run a control/query command capturing stdout+stderr. Never raises.
+
+    Same exit-code convention as :func:`_default_runner`: missing binary ``127``, any other
+    ``OSError`` or a timeout ``126``.
+    """
+    try:
+        return subprocess.run(  # noqa: S603
+            list(cmd), check=False, capture_output=True, text=True, timeout=30
+        )
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(list(cmd), 127, "", "command not found")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(list(cmd), 126, "", str(exc))
+
+
+def _no_answer(cmd: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+    """Query seam used when a test injected its own ``runner``: never ask the real systemd."""
+    return subprocess.CompletedProcess(list(cmd), 127, "", "no state query (injected runner)")
+
+
 # ---------------------------------------------------------------------------------------
 # Autostart backends
 # ---------------------------------------------------------------------------------------
@@ -570,11 +646,9 @@ def render_systemd_unit(service: Service) -> str:
     return (
         "[Unit]\n"
         f"Description={desc}\n"
-        # `network-online.target` (+ Wants) is the correct "wait for the network" ordering for
-        # a --user service; bare `network.target` is a system-level target that gives a user
-        # unit no real ordering guarantee, so a login-started service could race the network.
-        "Wants=network-online.target\n"
-        "After=network-online.target\n"
+        # No `Wants=/After=network-online.target`: that is a SYSTEM target and the user manager
+        # does not know it (`systemctl --user status network-online.target` -> not found), so
+        # the lines ordered nothing. A service that needs the network at boot must retry.
         "\n"
         "[Service]\n"
         "Type=simple\n"
@@ -724,10 +798,16 @@ class SystemdUserBackend:
     # `enable --now` starts the unit now and at every login — systemd OWNS the process when
     # enabled, so the manager must not also pidfile-spawn it (see ServiceManager.enable).
     manages_process: bool = True
+    # Runs a query/control command and captures its output (state, linger, verify, start/stop
+    # with a stderr message). When a test injects its own `runner`, this defaults to a stub
+    # that cannot answer, so no test ever asks the real systemd about a real unit.
+    capture: Optional[Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]] = None
 
     def __post_init__(self) -> None:
         if self.runner is None:
             self.runner = _default_runner
+        if self.capture is None:
+            self.capture = _default_capture if self.runner is _default_runner else _no_answer
 
     def _unit_dir(self) -> Path:
         base = os.environ.get("XDG_CONFIG_HOME")
@@ -772,6 +852,53 @@ class SystemdUserBackend:
 
     def is_installed(self, service: Service) -> bool:
         return self.unit_path(service).exists()
+
+    def unit_name(self, service: Service) -> str:
+        return f"{service.systemd_unit_name}.service"
+
+    def unit_state(self, service: Service) -> UnitState:
+        """The unit's real ``ActiveState``/``MainPID`` (``answered`` is False if systemd is unreachable)."""
+        proc = self.capture(
+            ["systemctl", "--user", "show", "--property=ActiveState,MainPID", self.unit_name(service)]
+        )
+        if proc.returncode != 0:
+            return UnitState(None, None, proc.stderr.strip() or f"systemctl exited {proc.returncode}")
+        props = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+        pid = props.get("MainPID", "")
+        return UnitState(
+            props.get("ActiveState", "unknown"),
+            int(pid) if pid.isdigit() and int(pid) > 0 else None,
+        )
+
+    def control(self, service: Service, verb: str) -> "subprocess.CompletedProcess[str]":
+        """``systemctl --user <verb> <unit>`` (start / stop / restart) with captured stderr."""
+        return self.capture(["systemctl", "--user", verb, self.unit_name(service)])
+
+    def linger(self) -> Optional[bool]:
+        """Whether ``loginctl`` linger is on for this user (user manager runs without a login,
+        i.e. the unit starts at boot). ``None`` when loginctl cannot answer."""
+        proc = self.capture(["loginctl", "show-user", str(os.getuid()), "--property=Linger"])
+        if proc.returncode != 0:
+            return None
+        value = proc.stdout.strip().partition("=")[2]
+        return {"yes": True, "no": False}.get(value)
+
+    def ensure_linger(self) -> Optional[bool]:
+        """Turn linger on when it is off (``loginctl enable-linger``); return the resulting state."""
+        state = self.linger()
+        if state is False:
+            self.runner(["loginctl", "enable-linger"])
+            state = self.linger()
+        return state
+
+    def verify(self, service: Service) -> Optional[list[str]]:
+        """``systemd-analyze --user verify`` findings about THIS unit (other units' noise is
+        dropped); ``None`` when systemd-analyze is unavailable."""
+        path = self.unit_path(service)
+        proc = self.capture(["systemd-analyze", "--user", "verify", str(path)])
+        if proc.returncode in (126, 127):
+            return None
+        return [line for line in (proc.stdout + "\n" + proc.stderr).splitlines() if path.name in line]
 
 
 @dataclass
@@ -931,6 +1058,8 @@ class ServiceManager:
     _last_enable_ok: bool = field(default=True, init=False, repr=False)
     # Same-process record of whether the most recent disable's uninstall fully succeeded.
     _last_disable_ok: bool = field(default=True, init=False, repr=False)
+    # Same-process record of the linger state `enable` left behind (None: unknown / no systemd).
+    _linger: Optional[bool] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._backend = self.autostart or select_autostart_backend(
@@ -995,15 +1124,78 @@ class ServiceManager:
         """
         return int(self.foreground_runner(list(self.service.argv)))  # type: ignore[misc]
 
-    def start(self) -> ServiceStatus:
-        """Start the service as a BACKGROUND detached daemon; return immediately.
+    def owned_unit_state(self) -> Optional[UnitState]:
+        """The unit's real state when an installed systemd unit owns this service, else ``None``.
 
-        Writes the pidfile (via the Supervisor) and returns a :class:`ServiceStatus`. Raises
-        ``agenttools_daemon.AlreadyRunningError`` if a live instance is already recorded.
+        ``None`` also when systemd cannot answer (no user bus): the pidfile path then applies.
         """
+        backend = self._backend
+        query = getattr(backend, "unit_state", None)
+        if query is None or not backend.manages_process or not backend.is_installed(self.service):
+            return None
+        state = query(self.service)
+        return state if state.answered else None
+
+    def _control(self, verb: str) -> None:
+        proc = self._backend.control(self.service, verb)  # type: ignore[attr-defined]
+        if proc.returncode != 0:
+            unit = self._backend.unit_name(self.service)  # type: ignore[attr-defined]
+            raise ServiceControlError(
+                f"systemctl --user {verb} {unit} failed: {proc.stderr.strip() or proc.returncode}"
+            )
+
+    def start(self) -> ServiceStatus:
+        """Start the service in the background; return immediately.
+
+        With an installed systemd unit the UNIT is started (one owner: a leftover pidfile
+        daemon holds the port, so it is stopped first). Otherwise a detached pidfile daemon is
+        spawned. Raises ``agenttools_daemon.AlreadyRunningError`` if an instance is already up,
+        :class:`ServiceControlError` if systemctl refuses.
+        """
+        unit = self.owned_unit_state()
+        if unit is not None:
+            self._supervisor().stop()  # a leftover pidfile daemon holds the port the unit needs
+            if unit.serving:
+                raise AlreadyRunningError(unit.main_pid or 0)
+            self._control("start")
+            return self.status()
         sup = self._supervisor()
         sup.start()
         return self.status()
+
+    def restart(self) -> ServiceStatus:
+        """Stop then start, whichever owner runs the service (the unit: ``systemctl restart``)."""
+        unit = self.owned_unit_state()
+        if unit is not None:
+            self._supervisor().stop()
+            self._control("restart")
+            return self.status()
+        self.stop()
+        return self.start()
+
+    def wait_ready(self) -> Optional[str]:
+        """Wait for ``service.health_check``; ``None`` when it passes (or none is set), else why not."""
+        check = self.service.health_check
+        if check is None:
+            return None
+        deadline = time.monotonic() + self.service.ready_timeout
+        while True:
+            try:
+                if check():
+                    return None
+            except (OSError, ValueError):
+                pass  # a refused connection / garbled reply is just "not ready yet"
+            if time.monotonic() >= deadline:
+                break
+            self.sleeper(0.25)  # type: ignore[misc]
+        probe = self.probe_port()
+        if probe is not None and probe.occupied:
+            pid = f" (pid {probe.pid})" if probe.pid is not None else ""
+            return (
+                f"port {self.service.port} is in use{pid} but the health check did not pass "
+                f"— another process may hold it"
+            )
+        return "the server is not listening — it exited or is still starting"
 
     def status(self) -> ServiceStatus:
         """Report {running, pid, port, url, enabled} from the pidfile + a liveness probe.
@@ -1035,14 +1227,29 @@ class ServiceManager:
         sup = self._supervisor()
         st: DaemonStatus = sup.status()
         enabled = self._backend.is_installed(self.service)
-        # An OS-managed (enabled) service is "running" even though no pidfile names it — the OS
-        # is the supervisor. Surface that so `status` after `enable` doesn't read "stopped".
-        running = st.running or (enabled and self._backend.manages_process)
-        state = (
-            "autostart" if (enabled and self._backend.manages_process and not st.running)
-            else st.state
-        )
+        unit = self.owned_unit_state()
         pid = st.pid
+        if unit is not None:
+            # systemd answered: its ActiveState/MainPID are the truth, not "the unit file exists".
+            if st.running:  # a leftover pidfile daemon
+                running, state = True, st.state
+            elif unit.serving:
+                running = True
+                state = "autostart" if unit.active_state != "activating" else "starting"
+                pid = unit.main_pid
+            else:
+                running = False
+                state = "restarting" if unit.up else (unit.active_state or "stopped")
+                if state == "inactive":
+                    state = "stopped"
+        else:
+            # An OS-managed (enabled) service is "running" even though no pidfile names it — the
+            # OS is the supervisor. Surface that so `status` after `enable` doesn't read "stopped".
+            running = st.running or (enabled and self._backend.manages_process)
+            state = (
+                "autostart" if (enabled and self._backend.manages_process and not st.running)
+                else st.state
+            )
         if not running:
             probe = self.probe_port()
             if probe is not None and probe.occupied:
@@ -1059,13 +1266,19 @@ class ServiceManager:
         )
 
     def stop(self) -> bool:
-        """Stop the background instance and remove the pidfile. Idempotent.
+        """Stop the running instance and remove the pidfile. Idempotent.
 
-        Returns ``True`` if a live process was signalled, ``False`` if nothing was running.
-        Stops only the MANAGER-spawned instance; an OS-autostart-owned process is stopped by
-        ``disable`` (via the backend's ``uninstall``), not here.
+        Stops the pidfile daemon and, when an installed systemd unit owns the service, the
+        unit too (autostart stays installed: it comes back at the next login/boot or
+        ``start``). Returns ``True`` if something live was signalled. On a backend whose
+        state cannot be queried an OS-owned process is left to ``disable``.
         """
-        return self._supervisor().stop()
+        unit = self.owned_unit_state()
+        released = self._supervisor().stop()
+        if unit is not None and unit.up:
+            self._control("stop")
+            return True
+        return released
 
     def probe_port(self) -> Optional[PortProbe]:
         """Check whether something is listening on this service's port right now.
@@ -1105,6 +1318,12 @@ class ServiceManager:
         """
         return self._last_disable_ok
 
+    @property
+    def linger(self) -> Optional[bool]:
+        """Linger state `enable` left behind: ``False`` means the unit will NOT start at boot
+        (only at login). ``None``: unknown or not a systemd backend."""
+        return self._linger
+
     def enable(self) -> ServiceStatus:
         """Install OS autostart AND start the service now. Idempotent.
 
@@ -1128,6 +1347,8 @@ class ServiceManager:
         # distinguish "unit on disk" from "OS actually accepted it" (a failed launchctl/
         # systemctl leaves the file but does not make autostart live).
         self._last_enable_ok = installed_ok or not self._backend.manages_process
+        ensure = getattr(self._backend, "ensure_linger", None)
+        self._linger = ensure() if (ensure is not None and installed_ok) else None
         if not self._backend.manages_process:
             # No OS supervisor — the manager owns the process. Start if not already up.
             if not self._supervisor().status().running:
@@ -1205,7 +1426,7 @@ def _default_foreground_runner(argv: Argv) -> int:
 # ---------------------------------------------------------------------------------------
 
 # The lifecycle subcommands, in the order a CLI should present them.
-SUBCOMMANDS = ("run", "start", "stop", "status", "enable", "disable")
+SUBCOMMANDS = ("run", "start", "stop", "restart", "status", "enable", "disable", "logs")
 
 
 def add_service_subcommands(
@@ -1215,7 +1436,7 @@ def add_service_subcommands(
     service_name: str,
     help_text: Optional[Mapping[str, str]] = None,
 ) -> None:
-    """Wire ``run|start|stop|status|enable|disable`` for one service into an argparse tree.
+    """Wire ``run|start|stop|restart|status|enable|disable|logs`` for one service into an argparse tree.
 
     ``subparsers`` is the result of ``parser.add_subparsers(...)`` for the SERVICE level
     (e.g. ``review dashboard <here>``). Each lifecycle subcommand gets a parser whose
@@ -1238,6 +1459,9 @@ def add_service_subcommands(
             help=override or _SUBCOMMAND_HELP[name].format(service=service_name),
         )
         sub.set_defaults(_service_action=name, _service_manager_factory=manager_factory)
+        if name == "logs":
+            sub.add_argument("-n", "--lines", type=int, default=50, help="last N lines (default 50)")
+            sub.add_argument("-f", "--follow", action="store_true", help="keep printing new lines")
 
 
 def dispatch(args, *, on_no_subcommand: Callable[[], int]) -> int:
@@ -1252,6 +1476,8 @@ def dispatch(args, *, on_no_subcommand: Callable[[], int]) -> int:
         return int(on_no_subcommand())
     factory = getattr(args, "_service_manager_factory")
     manager = factory()
+    if action == "logs":
+        return run_logs(manager, lines=getattr(args, "lines", 50), follow=getattr(args, "follow", False))
     return run_action(manager, action)
 
 
@@ -1260,16 +1486,27 @@ def run_action(manager: ServiceManager, action: str) -> int:
 
     Exit codes: ``0`` on success; ``3`` when ``status``/``stop`` find nothing running (so a
     script can branch on "was it up?"); ``4`` when ``enable``/``disable`` could not set up /
-    tear down OS autostart (the launchctl/systemctl command failed), OR when ``stop``/
-    ``disable`` acted on (or found nothing of) the MANAGER-spawned instance but something
-    else is still listening on the service's port afterward — an unmanaged/foreign process
-    (e.g. an ad-hoc ``run``) this manager does not own and did not stop; see
-    :meth:`ServiceManager.probe_port`. NOTE: ``run`` returns the RAW exit code of the
-    foreground child, which may itself be ``3``/``4`` — the 3/4 contract above applies only to
-    the manager-driven actions, not to ``run``'s passthrough. Success lines go to stdout;
-    failure lines go to stderr (Unix convention). Kept tiny + side-effecting so a consumer can
-    call it directly or let :func:`dispatch` call it.
+    tear down OS autostart (the launchctl/systemctl command failed), when systemctl refused
+    ``start``/``stop``/``restart``, when a ``start``/``restart``/``enable`` of a service with
+    a ``health_check`` never became healthy, OR when ``stop``/``disable`` acted on (or found
+    nothing of) the MANAGER-spawned instance but something else is still listening on the
+    service's port afterward — an unmanaged/foreign process (e.g. an ad-hoc ``run``) this
+    manager does not own and did not stop; see :meth:`ServiceManager.probe_port`. NOTE:
+    ``run`` returns the RAW exit code of the foreground child, which may itself be ``3``/``4``
+    — the 3/4 contract above applies only to the manager-driven actions, not to ``run``'s
+    passthrough. Success lines go to stdout; failure lines go to stderr (Unix convention).
+    Kept tiny + side-effecting so a consumer can call it directly or let :func:`dispatch`
+    call it.
     """
+    try:
+        return _run_action(manager, action)
+    except ServiceControlError as exc:
+        _eprint(f"{manager.service.name}: {exc}")
+        return 4
+
+
+def _run_action(manager: ServiceManager, action: str) -> int:
+    """The action table behind :func:`run_action` (which maps a refused systemctl to exit 4)."""
     svc = manager.service
     if action == "run":
         try:
@@ -1281,16 +1518,26 @@ def run_action(manager: ServiceManager, action: str) -> int:
             # (the shell convention), so a script can branch on it.
             _eprint(f"{svc.name}: command not found: {svc.argv[0]!r}")
             return 127
-    if action == "start":
-        try:
-            st = manager.start()
-        except AlreadyRunningError as exc:
-            # Clean CLI message instead of a raw traceback for the common "already up" case.
-            _eprint(f"{svc.name}: already running (pid {exc.pid})")
-            return 3
-        _print(f"{svc.name}: started{_pid_suffix(st)}{_url_suffix(st)}")
-        _hint_enable(manager)
+    if action in ("start", "restart"):
+        if action == "restart":
+            st = manager.restart()
+        else:
+            try:
+                st = manager.start()
+            except AlreadyRunningError as exc:
+                # Clean CLI message instead of a raw traceback for the common "already up" case.
+                _eprint(f"{svc.name}: already running (pid {exc.pid})")
+                return 3
+        not_ready = manager.wait_ready()
+        if not_ready is not None:
+            return _report_not_ready(manager, not_ready)
+        verb = "restarted" if action == "restart" else "started"
+        _print(f"{svc.name}: {verb}{_pid_suffix(st)}{_url_suffix(st)}")
+        if action == "start":
+            _hint_enable(manager)
         return 0
+    if action == "logs":
+        return run_logs(manager)
     if action == "status":
         st = manager.status()
         if st.running:
@@ -1303,6 +1550,8 @@ def run_action(manager: ServiceManager, action: str) -> int:
                 else " [autostart on]" if st.enabled
                 else ""
             )
+            if st.state == "starting":
+                qualifier += " [starting]"
             _print(f"{svc.name}: running{_pid_suffix(st)}{_url_suffix(st)}{qualifier}")
             return 0
         _print(f"{svc.name}: {st.state}")
@@ -1316,8 +1565,16 @@ def run_action(manager: ServiceManager, action: str) -> int:
         # accepted it — distinct from `st.enabled` (file on disk), which stays true even after a
         # failed launchctl/systemctl. Don't claim "enabled" when the OS rejected it.
         if manager.autostart_active():
+            not_ready = manager.wait_ready()
+            if not_ready is not None:
+                return _report_not_ready(manager, not_ready)
             _print(f"{svc.name}: autostart enabled ({where}), "
                    f"running{_pid_suffix(st)}{_url_suffix(st)}")
+            if manager.linger is False:
+                _eprint(
+                    f"{svc.name}: user linger is off and could not be enabled — the service "
+                    f"starts at login, NOT at boot; run 'loginctl enable-linger $USER'"
+                )
             return 0
         if st.enabled:
             # file written but the OS command failed; we fell back to a manager-spawned start.
@@ -1359,7 +1616,7 @@ def _run_action_stop(manager: ServiceManager) -> int:
         if foreign:
             _eprint(f"{svc.name}: stopped the managed instance, but {foreign}")
             return 4
-        _print(f"{svc.name}: stopped")
+        _print(f"{svc.name}: stopped{_autostart_stays(manager)}")
         return 0
     # No pidfile-tracked instance. But if OS autostart owns the process (enabled on a
     # launchd/systemd backend), a bare "was not running" is misleading — the service is
@@ -1367,7 +1624,7 @@ def _run_action_stop(manager: ServiceManager) -> int:
     # (that's `disable`'s job). Warn on stderr so a script reading stdout/exit-3 isn't
     # fooled into thinking nothing is up. Deliberately does NOT probe the port here (see the
     # docstring above) — an occupied port in this exact state is expected, not a finding.
-    if manager.backend.manages_process and manager.status().enabled:
+    if manager.backend.manages_process and manager.status().enabled and manager.owned_unit_state() is None:
         _eprint(
             f"{svc.name}: no background instance to stop, but OS autostart "
             f"({manager.backend.kind}) is enabled — run 'disable' to stop the "
@@ -1472,6 +1729,106 @@ def _foreign_listener_fragment(manager: ServiceManager) -> Optional[str]:
     )
 
 
+def _autostart_stays(manager: ServiceManager) -> str:
+    """Suffix for ``stop``: an enabled unit stays installed and returns at login/boot."""
+    if manager.backend.manages_process and manager.backend.is_installed(manager.service):
+        return f" (autostart stays enabled; '{_cli_name(manager.service)} disable' removes it)"
+    return ""
+
+
+def _cli_name(svc: Service) -> str:
+    return svc.cli or (f"{svc.tool_name} {svc.name}" if svc.tool else svc.name)
+
+
+def _report_not_ready(manager: ServiceManager, why: str) -> int:
+    svc = manager.service
+    _eprint(
+        f"{svc.name}: did not come up within {svc.ready_timeout:g}s: {why}\n"
+        f"  log: {svc.logfile}"
+    )
+    return 4
+
+
+def run_logs(manager: ServiceManager, *, lines: int = 50, follow: bool = False) -> int:
+    """Print the last ``lines`` of the service logfile; ``follow`` keeps printing new lines.
+
+    Exit ``3`` when there is no logfile yet. Reads the file the unit/daemon appends to, so
+    it works for both owners.
+    """
+    svc = manager.service
+    log = svc.logfile
+    if not log.exists():
+        _eprint(f"{svc.name}: no log yet at {log}")
+        return 3
+    with log.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in deque(handle, maxlen=max(lines, 0)):
+            sys.stdout.write(line)
+        sys.stdout.flush()
+        while follow:
+            line = handle.readline()
+            if line:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            else:
+                time.sleep(0.25)
+    return 0
+
+
+@dataclass(frozen=True)
+class ServiceCheck:
+    """One doctor finding about the service's lifecycle wiring (``level``: ok / warn / fail)."""
+
+    name: str
+    level: str
+    detail: str
+    fix: str = ""
+
+
+def service_checks(manager: ServiceManager) -> list[ServiceCheck]:
+    """Generic lifecycle checks a consumer's ``doctor`` can append to its own.
+
+    The command to run exists; autostart is installed; the unit file passes
+    ``systemd-analyze --user verify``; the unit's real state (a ``failed`` unit is a fail);
+    linger is on so the unit starts at boot, not only after a login.
+    """
+    svc = manager.service
+    backend = manager.backend
+    cli = _cli_name(svc)
+    checks: list[ServiceCheck] = []
+    exe = svc.argv[0]
+    if shutil.which(exe) or (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+        checks.append(ServiceCheck("service command", "ok", exe))
+    else:
+        checks.append(ServiceCheck("service command", "fail", f"{exe} is not an executable", f"fix the {svc.name} install"))
+    if backend.kind == "none":
+        checks.append(ServiceCheck("autostart", "warn", "unavailable on this OS: the service will not survive a reboot", f"{cli} start"))
+        return checks
+    if not backend.is_installed(svc):
+        checks.append(ServiceCheck("autostart", "warn", "not enabled", f"{cli} enable"))
+        return checks
+    checks.append(ServiceCheck("autostart", "ok", f"{backend.kind} unit {backend.unit_path(svc)}"))
+    verify = getattr(backend, "verify", None)
+    if verify is not None:
+        problems = verify(svc)
+        if problems:
+            checks.append(ServiceCheck("unit file", "fail", "; ".join(problems), f"{cli} enable  (rewrites the unit)"))
+        elif problems is not None:
+            checks.append(ServiceCheck("unit file", "ok", "systemd-analyze verify: clean"))
+    state = manager.owned_unit_state()
+    if state is not None:
+        level = "fail" if state.active_state == "failed" else "ok"
+        checks.append(ServiceCheck("unit state", level, state.active_state or "unknown",
+                                   f"{cli} logs; {cli} restart" if level == "fail" else ""))
+    linger = getattr(backend, "linger", None)
+    if linger is not None:
+        enabled = linger()
+        if enabled is False:
+            checks.append(ServiceCheck("linger", "warn", "off: the unit starts at login, not at boot", "loginctl enable-linger $USER"))
+        elif enabled:
+            checks.append(ServiceCheck("linger", "ok", "on: the unit starts at boot"))
+    return checks
+
+
 def _url_suffix(st: ServiceStatus) -> str:
     return f" — {st.url}" if st.url else ""
 
@@ -1490,7 +1847,7 @@ def _hint_enable(manager: ServiceManager) -> None:
     """
     svc = manager.service
     if not manager.backend.is_installed(svc) and manager.backend.kind != "none":
-        cmd = f"{svc.tool_name} {svc.name}" if svc.tool else svc.name
+        cmd = _cli_name(svc)
         _print(f"  hint: run '{cmd} enable' to start it at login")
 
 
@@ -1505,11 +1862,13 @@ def _eprint(msg: str) -> None:
 
 _SUBCOMMAND_HELP = {
     "run": "run {service} in the foreground (this shell), blocking",
-    "start": "start {service} in the background (detached daemon)",
-    "stop": "stop the background {service} instance",
+    "start": "start {service} in the background (the autostart unit when enabled, else a detached daemon)",
+    "stop": "stop {service} (autostart, if enabled, stays installed)",
+    "restart": "stop then start {service}",
     "status": "show whether {service} is running (pid/port/url)",
     "enable": "install OS autostart for {service} AND start it now",
     "disable": "remove OS autostart for {service} AND stop it",
+    "logs": "print the last lines of the {service} log (-n N, -f to follow)",
 }
 
 
@@ -1529,6 +1888,11 @@ __all__ = [
     "add_service_subcommands",
     "dispatch",
     "run_action",
+    "run_logs",
+    "service_checks",
+    "ServiceCheck",
+    "ServiceControlError",
+    "UnitState",
     "SUBCOMMANDS",
     "MACOS",
     "LINUX",

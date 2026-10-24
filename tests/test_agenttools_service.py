@@ -709,9 +709,9 @@ def test_subcommands_order_and_help_present(home):
     mgr = make_manager(home, spawner=spawner)
     parser = _build_parser(mgr)
     help_text = parser.format_help()
-    for name in ("run", "start", "stop", "status", "enable", "disable"):
+    for name in ("run", "start", "stop", "restart", "status", "enable", "disable", "logs"):
         assert name in help_text
-    assert ats.SUBCOMMANDS == ("run", "start", "stop", "status", "enable", "disable")
+    assert ats.SUBCOMMANDS == ("run", "start", "stop", "restart", "status", "enable", "disable", "logs")
 
 
 @pytest.mark.parametrize(
@@ -1290,7 +1290,7 @@ def test_add_service_subcommands_help_text_overrides(home):
     assert "boot the dashboard daemon" in full
     # ...and an un-overridden subcommand keeps its built-in help (both appear in the parent's
     # subcommand listing).
-    assert "stop the background dashboard instance" in full
+    assert "stop then start dashboard" in full
 
 
 def test_run_action_run_handles_missing_binary(home, capsys):
@@ -1792,3 +1792,294 @@ def test_stop_action_on_healthy_os_autostart_service_does_not_probe_the_port(hom
     assert "was not running" not in captured.out
     assert "autostart" in captured.err and "disable" in captured.err
     assert "still listening" not in captured.err
+
+
+# --- systemd unit owns the process (agent-tools#1005) ------------------------------------
+
+
+class FakeSystemd:
+    """Stands in for systemctl/loginctl/systemd-analyze: the backend's ``capture`` seam.
+
+    ``active`` is the unit's ActiveState; start/restart make it ``active``, stop ``inactive``.
+    ``fail`` makes the named systemctl verb exit 1; ``unreachable`` makes every systemctl call
+    fail like a missing user bus.
+    """
+
+    def __init__(self, active="active", pid=4242, linger="yes", fail=(), unreachable=False,
+                 analyze_output="", linger_stuck=False):
+        self.linger_stuck = linger_stuck
+        self.active = active
+        self.pid = pid
+        self.linger = linger
+        self.fail = set(fail)
+        self.unreachable = unreachable
+        self.analyze_output = analyze_output
+        self.calls: list[list[str]] = []
+
+    def verbs(self, verb):
+        return [c for c in self.calls if c[0] == "systemctl" and c[2] == verb]
+
+    def __call__(self, cmd):
+        import subprocess
+
+        self.calls.append(list(cmd))
+        done = lambda rc=0, out="", err="": subprocess.CompletedProcess(list(cmd), rc, out, err)  # noqa: E731
+        if cmd[0] == "loginctl":
+            if cmd[1] == "enable-linger":
+                if self.linger_stuck:
+                    return done(1, "", "denied")
+                self.linger = "yes"
+                return done()
+            return done(0, f"Linger={self.linger}\n")
+        if cmd[0] == "systemd-analyze":
+            return done(0, "", self.analyze_output)
+        verb = cmd[2]
+        if self.unreachable:
+            return done(1, "", "Failed to connect to bus")
+        if verb == "show":
+            return done(0, f"ActiveState={self.active}\nMainPID={self.pid if self.active == 'active' else 0}\n")
+        if verb in self.fail:
+            return done(1, "", "boom")
+        if verb in ("start", "restart", "enable"):
+            self.active = "active"
+        elif verb in ("stop", "disable"):
+            self.active = "inactive"
+        return done()
+
+
+def make_unit_manager(home, systemd, *, installed=True, spawner=None, **svc_kwargs):
+    svc = make_service(home, **svc_kwargs)
+    spawner = spawner or SpawnerSpy()
+    backend = SystemdUserBackend(
+        home=home, runner=lambda cmd: systemd(cmd).returncode, capture=systemd
+    )
+    if installed:
+        backend.unit_path(svc).parent.mkdir(parents=True, exist_ok=True)
+        backend.unit_path(svc).write_text(render_systemd_unit(svc), encoding="utf-8")
+    mgr = ServiceManager(
+        svc, platform=LINUX, autostart=backend, spawner=spawner, alive=lambda pid: False,
+        sleeper=lambda seconds: None,
+    )
+    return mgr, spawner
+
+
+def test_unit_has_no_dead_network_online_ordering(home):
+    text = render_systemd_unit(make_service(home))
+    assert "network-online" not in text
+    assert "WantedBy=default.target" in text
+
+
+def test_start_with_enabled_unit_starts_the_unit_not_a_second_daemon(home, capsys):
+    systemd = FakeSystemd(active="inactive")
+    mgr, spawner = make_unit_manager(home, systemd)
+    assert run_action(mgr, "start") == 0
+    assert len(systemd.verbs("start")) == 1
+    assert spawner.calls == []  # the duplicate-daemon bug: no pidfile spawn next to the unit
+    assert "started (pid 4242)" in capsys.readouterr().out
+
+
+def test_start_when_unit_already_serving_reports_running(home, capsys):
+    systemd = FakeSystemd(active="active")
+    mgr, spawner = make_unit_manager(home, systemd)
+    assert run_action(mgr, "start") == 3
+    assert "already running (pid 4242)" in capsys.readouterr().err
+    assert systemd.verbs("start") == [] and spawner.calls == []
+
+
+def test_restart_with_enabled_unit_restarts_the_unit_only(home, capsys):
+    systemd = FakeSystemd(active="active")
+    mgr, spawner = make_unit_manager(home, systemd)
+    assert run_action(mgr, "restart") == 0
+    assert len(systemd.verbs("restart")) == 1
+    assert spawner.calls == []
+    assert "restarted (pid 4242)" in capsys.readouterr().out
+
+
+def test_restart_without_unit_stops_then_starts_the_pidfile_daemon(home):
+    spawner = SpawnerSpy()
+    mgr = make_manager(home, spawner=spawner, alive=lambda pid: False)
+    assert run_action(mgr, "restart") == 0
+    assert len(spawner.calls) == 1
+
+
+def test_start_releases_a_leftover_pidfile_daemon_even_when_the_unit_is_serving(home, capsys):
+    systemd = FakeSystemd(active="active")
+    mgr, _ = make_unit_manager(home, systemd)
+    stopped = []
+    real = mgr._supervisor
+
+    def spy():
+        sup = real()
+        original = sup.stop
+        sup.stop = lambda: stopped.append(True) or original()
+        return sup
+
+    mgr._supervisor = spy
+    assert run_action(mgr, "start") == 3
+    assert stopped == [True]
+    assert "already running" in capsys.readouterr().err
+
+def test_stop_with_enabled_unit_stops_the_unit_and_keeps_autostart(home, capsys):
+    systemd = FakeSystemd(active="active")
+    mgr, _ = make_unit_manager(home, systemd)
+    assert run_action(mgr, "stop") == 0
+    assert len(systemd.verbs("stop")) == 1
+    out = capsys.readouterr().out
+    assert "stopped" in out and "autostart stays enabled" in out
+    assert mgr.backend.is_installed(mgr.service)
+
+
+def test_stop_inactive_unit_is_not_running_exit_3(home, capsys):
+    systemd = FakeSystemd(active="inactive")
+    mgr, _ = make_unit_manager(home, systemd)
+    assert run_action(mgr, "stop") == 3
+    assert systemd.verbs("stop") == []
+    assert "was not running" in capsys.readouterr().out
+
+
+def test_status_reads_the_units_real_state(home, capsys):
+    systemd = FakeSystemd(active="active", pid=777)
+    mgr, _ = make_unit_manager(home, systemd)
+    assert run_action(mgr, "status") == 0
+    assert "running (pid 777)" in capsys.readouterr().out
+    systemd.active = "inactive"
+    assert run_action(mgr, "status") == 3  # an installed but stopped unit used to read running
+    assert "stopped" in capsys.readouterr().out
+    systemd.active = "failed"
+    assert run_action(mgr, "status") == 3
+    assert "failed" in capsys.readouterr().out
+    systemd.active = "activating"
+    systemd.pid = 0
+    assert run_action(mgr, "status") == 3
+    assert "restarting" in capsys.readouterr().out
+
+
+def test_systemctl_refusing_a_verb_is_exit_4_with_its_message(home, capsys):
+    systemd = FakeSystemd(active="inactive", fail={"start"})
+    mgr, spawner = make_unit_manager(home, systemd)
+    assert run_action(mgr, "start") == 4
+    assert "systemctl --user start agenttools-review-dashboard.service failed: boom" in capsys.readouterr().err
+    assert spawner.calls == []
+
+
+def test_unreachable_systemd_falls_back_to_the_pidfile_path(home):
+    systemd = FakeSystemd(unreachable=True)
+    mgr, spawner = make_unit_manager(home, systemd)
+    assert run_action(mgr, "start") == 0
+    assert len(spawner.calls) == 1
+
+
+def test_injected_runner_never_queries_the_real_systemd(home):
+    backend = SystemdUserBackend(home=home, runner=RunnerSpy())
+    unit = backend.unit_state(make_service(home))
+    assert not unit.answered
+
+
+def test_start_waits_for_health_check_and_fails_with_log_path(home, capsys):
+    systemd = FakeSystemd(active="inactive")
+    mgr, _ = make_unit_manager(home, systemd, health_check=lambda: False, ready_timeout=0.05)
+    assert run_action(mgr, "start") == 4
+    err = capsys.readouterr().err
+    assert "did not come up" in err and str(mgr.service.logfile) in err
+
+
+def test_start_passes_once_health_check_answers(home, capsys):
+    answers = iter([False, False, True])
+    systemd = FakeSystemd(active="inactive")
+    mgr, _ = make_unit_manager(home, systemd, health_check=lambda: next(answers), ready_timeout=5)
+    assert run_action(mgr, "start") == 0
+    assert "started" in capsys.readouterr().out
+
+
+def test_health_check_connection_errors_count_as_not_ready(home):
+    def refuse():
+        raise ConnectionRefusedError
+
+    mgr, _ = make_unit_manager(home, FakeSystemd(), health_check=refuse, ready_timeout=0.05)
+    assert mgr.wait_ready() is not None
+
+
+def test_health_check_failure_names_a_port_holder(home):
+    mgr, _ = make_unit_manager(home, FakeSystemd(), health_check=lambda: False, ready_timeout=0.05)
+    mgr.port_probe = lambda host, port: PortProbe(occupied=True, pid=99)
+    why = mgr.wait_ready()
+    assert "port 7878 is in use (pid 99)" in why
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("inf"), float("nan")])
+def test_ready_timeout_must_be_finite_and_positive(home, bad):
+    with pytest.raises(ValueError):
+        make_service(home, ready_timeout=bad)
+
+
+def test_enable_turns_linger_on_when_it_is_off(home, capsys):
+    systemd = FakeSystemd(active="inactive", linger="no")
+    mgr, _ = make_unit_manager(home, systemd, installed=False)
+    assert run_action(mgr, "enable") == 0
+    assert ["loginctl", "enable-linger"] in systemd.calls
+    assert mgr.linger is True
+    assert "linger" not in capsys.readouterr().err
+
+
+def test_enable_warns_when_linger_cannot_be_turned_on(home, capsys):
+    systemd = FakeSystemd(active="inactive", linger="no", linger_stuck=True)
+    mgr, _ = make_unit_manager(home, systemd, installed=False)
+    assert run_action(mgr, "enable") == 0
+    assert mgr.linger is False
+    assert "NOT at boot" in capsys.readouterr().err
+
+
+def test_logs_prints_the_tail_and_exit_3_without_a_log(home, capsys):
+    mgr = make_manager(home)
+    assert run_action(mgr, "logs") == 3
+    assert "no log yet" in capsys.readouterr().err
+    mgr.service.logfile.parent.mkdir(parents=True, exist_ok=True)
+    mgr.service.logfile.write_text("".join(f"line {i}\n" for i in range(10)))
+    assert ats.run_logs(mgr, lines=3) == 0
+    assert capsys.readouterr().out == "line 7\nline 8\nline 9\n"
+
+
+def test_dispatch_routes_restart_and_logs_with_flags(home, capsys):
+    systemd = FakeSystemd(active="active")
+    mgr, _ = make_unit_manager(home, systemd)
+    mgr.service.logfile.parent.mkdir(parents=True, exist_ok=True)
+    mgr.service.logfile.write_text("a\nb\nc\n")
+    parser = _build_parser(mgr)
+    assert dispatch(parser.parse_args(["restart"]), on_no_subcommand=lambda: 0) == 0
+    assert len(systemd.verbs("restart")) == 1
+    capsys.readouterr()
+    assert dispatch(parser.parse_args(["logs", "-n", "2"]), on_no_subcommand=lambda: 0) == 0
+    assert capsys.readouterr().out == "b\nc\n"
+
+
+def test_service_checks_report_unit_linger_and_verify(home):
+    systemd = FakeSystemd(active="failed", linger="no",
+                          analyze_output="agenttools-review-dashboard.service:3: Unknown key 'Bogus'")
+    mgr, _ = make_unit_manager(home, systemd, argv=["/bin/sh", "-c", "true"])
+    checks = {c.name: c for c in ats.service_checks(mgr)}
+    assert checks["service command"].level == "ok"
+    assert checks["unit file"].level == "fail" and "Bogus" in checks["unit file"].detail
+    assert checks["unit state"].level == "fail"
+    assert checks["linger"].level == "warn"
+
+
+def test_service_checks_clean_unit_is_all_ok_and_not_enabled_warns(home):
+    systemd = FakeSystemd(active="active", linger="yes")
+    mgr, _ = make_unit_manager(home, systemd, argv=["/bin/sh", "-c", "true"])
+    assert {c.level for c in ats.service_checks(mgr)} == {"ok"}
+    mgr, _ = make_unit_manager(home, systemd, installed=False, name="other", argv=["/bin/sh", "-c", "true"])
+    assert [c.level for c in ats.service_checks(mgr)][-1] == "warn"
+
+
+def test_cli_names_the_command_in_the_enable_hint(home, capsys):
+    svc = make_service(home, cli="review --port 7878")
+    mgr = ServiceManager(svc, platform=LINUX, autostart=SystemdUserBackend(home=home, runner=RunnerSpy()),
+                         spawner=SpawnerSpy(), alive=lambda pid: False)
+    assert run_action(mgr, "start") == 0
+    assert "run 'review --port 7878 enable'" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("bad", ["", "  ", "a\nb"])
+def test_cli_rejects_blank_or_multiline(home, bad):
+    with pytest.raises(ValueError):
+        make_service(home, cli=bad)

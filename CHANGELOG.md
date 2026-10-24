@@ -4,6 +4,17 @@
 
 ### Added
 
+- `agenttools_service` 0.3.0 (agent-tools#1005): the systemd user unit and the lifecycle verbs
+  now agree. With an enabled unit `start`/`restart`/`stop`/`status` act on the unit (exactly one
+  daemon; a leftover pidfile daemon is stopped first) and `status` reports the unit's real
+  `ActiveState`/`MainPID` instead of "the unit file exists". New `restart` and `logs` (`-n`,
+  `-f`) verbs; `Service(health_check=, ready_timeout=)` makes `start`/`restart`/`enable` wait for
+  the server and exit 4 with the log path when it never answers; `enable` checks `loginctl`
+  linger and turns it on (warns on stderr when it cannot); `service_checks(manager)` gives
+  consumers' `doctor` generic unit/linger/`systemd-analyze verify` rows. The rendered unit drops
+  `Wants/After=network-online.target`, which the user manager does not have. Behaviour change:
+  `stop` with an enabled, systemd-answering unit now stops the unit (autostart stays installed)
+  instead of exiting 3 with "run disable".
 - `python-only`: exact-path Allow entries for the four Guardian browser-injected DOM adapters
   (`lib/agenttools_chatgpt/{dom,live_dom,monitor_dom,conversation_root}.js`, run by Chromium in
   the ChatGPT page; agent-tools#969, Refs #891). No glob: other JS in that package still blocks.

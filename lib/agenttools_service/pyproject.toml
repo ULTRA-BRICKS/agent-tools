@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agenttools-service"
-version = "0.2.0"
+version = "0.3.0"
 description = "Shared service-manager for the agent-tools ecosystem — one run/start/stop/status/enable/disable lifecycle (incl. launchd/systemd autostart) for every long-running server (stdlib-only + agenttools-daemon)."
 readme = "README.md"
 # 3.9 to match the lowest floor in the ecosystem (review-cli is >=3.9; rig-cli >=3.10),

@@ -6,9 +6,12 @@ hand-rolling them (slightly differently, and one always forgetting the systemd f
 accidentally launching on the bare command), this package gives you one shared manager:
 
     run      — foreground/blocking (this shell), for ``disable``d / ad-hoc use.
-    start    — background detached daemon; writes a pidfile, returns immediately.
-    status   — {running, pid, port, url, enabled}.
-    stop     — stop the background instance.
+    start    — background: the autostart unit when enabled, else a detached pidfile daemon;
+               with ``Service.health_check`` it returns once the server answers.
+    restart  — stop then start (one owner either way).
+    status   — {running, pid, port, url, enabled}; the unit's real state when enabled.
+    stop     — stop the running instance (autostart stays installed).
+    logs     — last lines of the service log (-n N, -f).
     enable   — install OS autostart (launchd / systemd --user / a no-systemd fallback)
                AND start it now.
     disable  — remove OS autostart AND stop.
@@ -67,12 +70,17 @@ from .core import (
     Service,
     ServiceManager,
     ServiceStatus,
+    ServiceCheck,
+    ServiceControlError,
+    UnitState,
     SystemdUserBackend,
     add_service_subcommands,
+    service_checks,
     current_platform,
     dispatch,
     render_launchd_plist,
     render_systemd_unit,
+    run_logs,
     run_action,
     select_autostart_backend,
 )
@@ -93,9 +101,14 @@ __all__ = [
     "add_service_subcommands",
     "dispatch",
     "run_action",
+    "run_logs",
+    "service_checks",
+    "ServiceCheck",
+    "ServiceControlError",
+    "UnitState",
     "SUBCOMMANDS",
     "MACOS",
     "LINUX",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
