@@ -800,8 +800,8 @@ _RELAY = (
     "`write agent://<id>`) and touch the marker, then `wait` for its final report."
 )
 _HUMAN = (
-    "no self-service skip (`REVIEW_SKIP` / `[skip-review: …]` are gone); genuine one-time "
-    'exception only, single Telegram approval: RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT="<why>" '
+    "single Telegram approval (`REVIEW_SKIP` / `[skip-review: …]` are gone): "
+    'RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT="<why>" '
     "(deny-by-default; a bare `1` is rejected)."
 )
 

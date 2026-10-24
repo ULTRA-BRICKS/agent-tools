@@ -8,12 +8,22 @@
   says WHAT TO DO NEXT as a short ordered ladder that depends on the reader. `require-ticket-before-commit`
   (plain block, `-F -` stdin block, hatch-denied path, warn-only advisory) and `block-raw-ticket`
   lead with the self-service remedy (`task new --title … --acceptance … --why … --impact …
-  --if-not-done …`, then recommit with `Refs #<id>`; the old `Closes #123`/`Fixes #4` examples and
+--if-not-done …`, then recommit with `Refs #<id>`; the old `Closes #123`/`Fixes #4` examples and
   "ASK the human" are gone). A subagent is told to `write agent://<parent>` and `yield`
   `awaiting-coordinator` (it cannot block-wait, and must never retry `REQUIRE_TICKET_STRICT=0` /
   `RIG_HATCH_REQUEST_*`); the coordinator relays the missing thing and holds the Telegram hatch as
   the LAST line; an unknown role gets both branches. Fixes the 2026-10-24 incident where a subagent
   yielded "blocked at commit" instead of running `task new`.
+- The same role-aware ladder (agent-tools#994) now ends the block messages of 18 more guards whose
+  remedy is self-service: `skills-read-gate`, `visual-proof-gate`, `require-review-before-commit`,
+  `block-raw-worktree-add`, `pin-primary-worktree`, `worktree-only-writes`, `block-devserver-primary`,
+  `no-shell-file-edit`, `runpod-offload-gate`, `pkill-guard`, `subagent-no-bg-longproc`,
+  `subagent-no-monitor`, `background-subagent-gate`, `no-long-inline-process`,
+  `orchestrator-stays-thin`, `block-raw-pr-merge`, `block-reset-hard` and `package-store-guard`
+  (the last three keep a human-only path for the coordinator). The remedy comes first, the hatch /
+  "ask the human" text is demoted to the coordinator's last line, and a subagent is sent to its
+  coordinator instead. Block markers, exit codes and hatch logic are unchanged. The two guards that
+  fire only on subagents no longer tell a subagent to ask the human.
 - `python-only`: exact-path Allow entries for the four Guardian browser-injected DOM adapters
   (`lib/agenttools_chatgpt/{dom,live_dom,monitor_dom,conversation_root}.js`, run by Chromium in
   the ChatGPT page; agent-tools#969, Refs #891). No glob: other JS in that package still blocks.
@@ -51,7 +61,7 @@
   A rig older than 0.64.0 (no `worktree guard`) denies STRICT with an "upgrade rig" message and
   allows LOOSE with a stderr warning, so a stale rig no longer wedges every heredoc commit. New
   STRICT shapes for rig-cli#740: `git branch` with `-f/-M/-C/-m/-c` (or `--f…/--m…/--c…`), `git
-  checkout -B`, `git switch -C/--force-create`, and `rm` with a recursive flag as a command word.
+checkout -B`, `git switch -C/--force-create`, and `rm` with a recursive flag as a command word.
   Other #961 items (aliases, xargs, rescue hint) are unchanged.
 - `block-unlanded-removal` deny text names the route that works for a PR closed as superseded
   (agent-tools#963): push the commits to a branch that is not being deleted
@@ -121,9 +131,9 @@
   `ci/ship/hook_refs.py` scans every harness's descriptors, bridge commands, extension links
   and `~/.config/agent-tools/env`; a referenced (or unscannable) tree is kept and ship prints
   the references plus the fix (`rig apply commit --only agent_hooks`, re-check, `rig worktree
-  remove`).
+remove`).
 - `agent-hooks/heavy-op-memory-gate`: a run of one or two test files (`bun test ./tests/x.test.ts
-  -t foo`, `pytest a.py b.py::T`, `go test ./pkg/foo_test.go`, also through `uv run`/`python -m`/
+-t foo`, `pytest a.py b.py::T`, `go test ./pkg/foo_test.go`, also through `uv run`/`python -m`/
   `poetry run`) is gated on the emergency signals only — `MemAvailable` floor, PSI, wired
   share, jetsam level — not on the memory budget, the swap check or the live-runner ceiling
   (agent-tools#911: one test file was blocked for "7 heavy runner(s) already live"). A bare
@@ -248,7 +258,7 @@
   `python -m` / `poetry run` / `coverage run -m`) with no path, a directory, or more than two
   files; `scripts/check.sh`; mypy with anything but exactly one file; `bun test`/`vitest`/`jest`
   with no file or a directory; `npm|pnpm|yarn|bun test`; `cargo test` without `--test`; `go test
-  ./...`; `docker build`/`docker compose up` — and names the `runpod-run -- bash -c '<command>'`
+./...`; `docker build`/`docker compose up` — and names the `runpod-run -- bash -c '<command>'`
   equivalent. One test file stays allowed. Argv-aware (the sibling hooks' tokenizer; `cd x &&`,
   wrappers, inline env and launchers peeled). Hatch: `RIG_HATCH_REQUEST_RUNPOD_OFFLOAD_GATE`.
   Added after the 2026-10-10/11 thrash incidents on the shared Linux workstation, where the
@@ -315,7 +325,7 @@
 
 - `agent-hooks/package-store-guard` (pre-bash, every harness): blocks wiping a shared package
   store (`bun pm cache rm`, deleting/moving `~/.bun/install/cache` or an ancestor, `uv cache
-  clean`, `uv cache prune --all`/`--ci`, deleting `~/.cache/uv`), creating a symlink named
+clean`, `uv cache prune --all`/`--ci`, deleting `~/.cache/uv`), creating a symlink named
   `node_modules`, and `npm install`/`npm ci`/`pnpm install`/`yarn` where the nearest lockfile is
   `bun.lock`/`bun.lockb`. Each block names the replacement (`bun install --frozen-lockfile`,
   `rig worktree gc`). It also blocks installing or starting the banned container VM runtimes
@@ -355,12 +365,12 @@
 
 - `agent-hooks/orchestrator-stays-thin`: the block/warn message is five structured lines —
   `TRIGGER` (the exact rule that fired, quoting the offending segment(s): `chain of 4 segments;
-  unrecognized heads: …`, `implementation-shaped segment: …`, `heredoc …`, `code write to …`),
+unrecognized heads: …`, `implementation-shaped segment: …`, `heredoc …`, `code write to …`),
   `WHY` (one sentence), `DO THIS` (the firing harness's delegation recipe plus what is allowed
   inline), `EXCEPTION` (the deny-by-default Telegram hatch) — replacing a single ~900-char
   paragraph that never named the rule, so the supervisor session guessed and reworded a pure
   orchestration command (agent-tools#861). Logic: `omp-steer` (any args), `tg-ctl
-  status|inbox|audit-delivery|ask|omp-live status|send` and read-only `rig`
+status|inbox|audit-delivery|ask|omp-live status|send` and read-only `rig`
   (`status`, `doctor` without `--yes`/`--fix`/`--optional`, `sysmon status|sample|incidents`,
   `--version`) are sanctioned orchestration via shlex predicates built like
   `_is_tg_command`, deny-by-default tables for the mutating subcommands; `tr`/`read`/`printf`/
@@ -490,7 +500,7 @@
   (agent-tools#824). It used to send `--no-verify-identity`, so every repository's iterations for
   a task code counted: sme-archiving-gc's `#464` passed with consistency and security roles that
   came from rig-cli and review-cli records stored as `464`. Ship now asks `review task <code>
-  --check -C <repo root> --verify-repo-only` (review-cli#589), which compares the repository
+--check -C <repo root> --verify-repo-only` (review-cli#589), which compares the repository
   alone. The primary checkout's own unrelated diff no longer matters, and reviews recorded before
   a repository moved hosts still count. Ship names the iterations it dropped as another
   repository's (repo and timestamp, the first 50 plus the full count). Three setup errors refuse
@@ -543,7 +553,6 @@
   (macOS) warned "unused label" and stripped nothing, so an env-prefixed local scan such as
   `GITLEAKS_CONFIG=x gitleaks git --staged` read as "no local secret scan" (agent-tools#810).
 
-
 - `cc-hook-bridge`: one hard wall-clock budget (1100s) for all agent-hooks run on a single
   Claude Code tool call. Two hatch approval waits (960s each) in one pre-bash call used to
   exceed Claude Code's outer 1200s hook timeout, and a killed command hook fails OPEN. Each
@@ -586,7 +595,7 @@
     `Bun.write`/`fs.writeFile*` fallbacks) closes it.
   - `_EVAL_OPEN_WRITE`'s permissive `,[^)]*` mode/tail (round 2) could also swallow a NESTED
     call expression sitting in that tail position — `open("foo.example",
-    open("src/secret.py","w").write("API_KEY=..."))` let the tail consume up to the inner
+open("src/secret.py","w").write("API_KEY=..."))` let the tail consume up to the inner
     `open(...)` call's own closing paren, so the match's `.write(` anchor landed on the nested
     call instead, attributing the real secret to the outer call's allowlist-friendly decoy path
     `foo.example` and never scanning it under its real path (or path-lessly) at all — a genuine
@@ -601,7 +610,7 @@
   - `_EVAL_KWARG_VALUE` (what `_EVAL_OTHER_KWARG` recognizes as another keyword argument's value
     sitting before `data=`) only matched a quoted literal, a bare identifier, or a number — a
     CALL EXPRESSION there (`write_text(encoding=locale.getpreferredencoding(),
-    data="API_KEY=...")`) matched none of its alternatives, so the whole call went entirely
+data="API_KEY=...")`) matched none of its alternatives, so the whole call went entirely
     unrecognized (content silently dropped), contradicting round 3's "`data=` recognized
     regardless of position" fix. A new alternative recognizes a call expression with up to one
     level of nested parens.
@@ -619,7 +628,7 @@
     full 8-digit escape as one unit.
   - Round 5's `_EVAL_OPEN_MODE_TAIL` guard only rejected a tail beginning with the SHAPE
     `identifier(` — a decoy like `open("foo.example", [open][0]("src/secret.py","w").write(
-    "API_KEY=..."))` (subscript-then-call, `[open][0](...)`) begins with `[`, not an identifier
+"API_KEY=..."))` (subscript-then-call, `[open][0](...)`) begins with `[`, not an identifier
     character, so it wasn't rejected and the secret was misattributed to the allowlist-friendly
     decoy path `foo.example` again — the identical bypass class as round 5's own finding, via a
     different call shape. The guard is widened to reject any `(` or `[` in the tail.

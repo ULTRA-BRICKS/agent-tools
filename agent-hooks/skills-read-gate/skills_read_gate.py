@@ -731,7 +731,7 @@ _RELAY = (
     "`write agent://<id>`, then `wait` for its final report."
 )
 _HUMAN = (
-    "genuine one-off only, one-time Telegram approval: "
+    "one-time Telegram approval: "
     'RIG_HATCH_REQUEST_SKILLS_READ_GATE="<justification>" (deny-by-default; bare 1 rejected).'
 )
 

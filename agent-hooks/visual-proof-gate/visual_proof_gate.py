@@ -1236,7 +1236,7 @@ _RELAY = (
     "for its final report."
 )
 _HUMAN = (
-    "no self-service bypass; genuine exception only, one-time Telegram approval: "
+    "one-time Telegram approval (there is no self-service bypass): "
     'RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="<justification>" (deny-by-default; bare 1 rejected).'
 )
 
