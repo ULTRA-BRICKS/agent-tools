@@ -62,7 +62,7 @@ const SHUTDOWN_KILL_GRACE_MS = 1000;
 const MAX_STDOUT_BYTES = 1 << 20;
 const MAX_STDERR_LINE_BYTES = 64 << 10;
 
-type BridgeEvent = "tool_call" | "tool_result";
+type BridgeEvent = "tool_call" | "tool_result" | "session_stop";
 type DispatcherChild = ReturnType<typeof spawn>;
 
 // Every dispatcher child still running, shared across reloads of this module. omp leaving
@@ -287,6 +287,26 @@ function sessionManagerString(ctx: SessionManagerHost | null | undefined, getter
   }
 }
 
+// The visible text of an omp assistant message (a string, or content blocks — thinking and
+// tool-call blocks are not text the user saw), joined by newlines.
+function assistantText(message: unknown): string {
+  const content = typeof message === "object" && message !== null && "content" in message ? message.content : undefined;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content as unknown[]) {
+    if (typeof block === "object" && block !== null && "type" in block && block.type === "text" && "text" in block && typeof block.text === "string") {
+      parts.push(block.text);
+    }
+  }
+  return parts.join("\n");
+}
+
+// omp's own `session_stop` event (the only slice of it this bridge reads).
+interface SessionStopEvent {
+  signal?: { aborted?: boolean };
+}
+
 async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<BridgeResult | undefined> {
   let outcome: DispatcherOutcome;
   try {
@@ -298,13 +318,19 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
     // sessionFile values must not outrank the harness's own session state — session-scoped
     // hook state keys on these (agent-tools#743 RC-2), so a spoofed value would rotate
     // marker keys per call (warn forever, never block).
+    // `session_stop` is omp's own lifecycle event (never model-controlled): it names the session as
+    // `session_id`/`session_file` rather than through a tool ctx, so those are the LAST fallback for
+    // that event only. A tool_call/tool_result event never consults them.
+    const stopEvent = eventName === "session_stop" ? event : undefined;
     const sessionId = firstNonBlank(
       sessionManagerString(ctx, "getSessionId"),
       ctxString(ctx, event, "sessionId", "getSessionId"),
+      stopEvent?.session_id,
     );
     const sessionFile = firstNonBlank(
       sessionManagerString(ctx, "getSessionFile"),
       ctxString(ctx, event, "sessionFile", "getSessionFile"),
+      stopEvent?.session_file,
     );
     // File-independent nested signal (see the block comment on `latchRootSessionId` above):
     // narrows dispatch.py's fallback ONLY when the file-shape check above found nothing
@@ -327,6 +353,15 @@ async function runBridge(eventName: BridgeEvent, event: any, ctx: any): Promise<
       sessionId,
       sessionFile,
       isMainSession,
+      // session_stop only: the closing message and loop counters a completion-aware stop hook
+      // judges against. The full `messages` history is deliberately NOT forwarded.
+      ...(stopEvent
+        ? {
+            lastAssistantMessage: assistantText(stopEvent.last_assistant_message),
+            turnId: stopEvent.turn_id,
+            stopHookActive: stopEvent.stop_hook_active === true,
+          }
+        : {}),
     });
     outcome = await spawnDispatcher(eventName, payload, event?.toolCallId, {
       sessionFile,
@@ -583,5 +618,22 @@ export default function (pi: any): void {
       logToDebugFile(`omp-hook-bridge: unexpected post-call bridge error (ignored): ${error?.message}`);
     }
     return undefined;
+  });
+
+  // The MAIN session's stop hook (omp >= 18.8; never fires for subagents, which end through the
+  // `yield` tool_call above — agent-tools#1003). Awaited by omp before the session settles;
+  // `{decision: "block", reason}` makes omp continue the session with `reason`. Fails OPEN like
+  // every other handler here: a bridge failure must never trap a session unable to finish.
+  pi.on("session_stop", async (event: SessionStopEvent, ctx: unknown) => {
+    try {
+      // An interrupted session (Ctrl-C) is leaving on purpose; never hold it with a hook.
+      if (event?.signal?.aborted) return undefined;
+      const result = await runBridge("session_stop", event, ctx);
+      return result?.block ? { decision: "block", reason: result.reason } : undefined;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logToDebugFile(`omp-hook-bridge: unexpected session_stop bridge error, allowing stop: ${message}`);
+      return undefined;
+    }
   });
 }

@@ -43,7 +43,10 @@ HOOK_API = "agents-hooks/v1"
 # `.../<session-id>/<ChildName>.jsonl` (agent-tools#743).
 HARNESS = "omp"
 
-_KNOWN_EVENTS = frozenset({"tool_call", "tool_result"})
+# `session_stop` (omp >= 18.8, omp://extensions.md): the MAIN session's own stop hook, awaited
+# before the session settles. Subagents never fire it — they end through the `yield` tool_call
+# (agent-tools#640) — so together the two cover every way an omp agent can end (agent-tools#1003).
+_KNOWN_EVENTS = frozenset({"tool_call", "tool_result", "session_stop"})
 # `eval` (agent-tools#614): an omp eval cell can write a file directly via
 # `Path(...).write_text(...)` (Python) or `Bun.write(...)` (JS) inside its `code` string,
 # bypassing every path-based pre-write hook (worktree-only-writes, block-secrets-write) the
@@ -195,6 +198,8 @@ _HASHLINE_PUT_WITH_BODY = re.compile(r"^PUT\b.*:\s*$")
 def point_for_event(event_name: str, tool_name: str | None) -> str | None:
     """Map an omp extension event/tool pair to a logical v1 point."""
     tool = (tool_name or "").lower()
+    if event_name == "session_stop":
+        return "stop"
     if event_name == "tool_call":
         if tool in _PRE_BASH_TOOLS:
             return "pre-bash"
@@ -239,6 +244,16 @@ def _stop_session_id(omp_event: dict, detached_id: str | None = None) -> str:
     return _trusted_session_id(omp_event, detached_id) or _cwd(omp_event)
 
 
+def _is_session_stop(omp_event: dict) -> bool:
+    return str(omp_event.get("event") or "") == "session_stop"
+
+
+def _trusted_text(omp_event: dict, key: str) -> str:
+    """A string field the EXTENSION put on the payload (never `input`, which a model controls)."""
+    val = omp_event.get(key)
+    return val if isinstance(val, str) else ""
+
+
 def to_v1_event(omp_event: dict, *, point: str) -> dict:
     """Translate the omp extension payload into agents-hooks/v1."""
     tool = _tool_name(omp_event)
@@ -281,6 +296,26 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
         sid = _stop_session_id(omp_event, detached_id)
         args["session_id"] = sid
         event_id = sid
+        # What a completion-aware stop hook needs to judge the session from facts instead of
+        # the agent's say-so. All of it is read from the extension's own payload keys, never
+        # from `input` (model-controlled): the transcript to scan for todo/job/subagent state
+        # and, for the main session's `session_stop`, the closing message and loop counters.
+        # `args.session_id` above prefers the AGENT NAME for a nested helper (stable across yield
+        # retries, but not unique across parents); `harness_session_id` is omp's own per-session id,
+        # the one a ledger key (`omp:<id>`) and a transcript's header agree on.
+        for forged in ("transcript_path", "last_assistant_message", "turn_id", "stop_hook_active", "harness_session_id"):
+            args.pop(forged, None)
+        transcript = _trusted_text(omp_event, "sessionFile")
+        if transcript:
+            args["transcript_path"] = transcript
+        own_session_id = _trusted_text(omp_event, "sessionId")
+        if own_session_id:
+            args["harness_session_id"] = own_session_id
+        if _is_session_stop(omp_event):
+            tool = "session_stop"
+            args["last_assistant_message"] = _trusted_text(omp_event, "lastAssistantMessage")
+            args["turn_id"] = omp_event.get("turnId") if isinstance(omp_event.get("turnId"), int) else None
+            args["stop_hook_active"] = omp_event.get("stopHookActive") is True
     else:
         # Every OTHER point (pre-write/pre-bash/post-write/pre-agent): restore the same
         # trusted value if one resolves, so `orchestrator-stays-thin`'s marker key is stable

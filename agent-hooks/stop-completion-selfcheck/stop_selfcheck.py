@@ -249,7 +249,15 @@ def _disabled() -> bool:
         return False
 
 
-def _log_firing(sid: str, decision: str, *, prompt_variant: str | None, hook_ms: float) -> None:
+def _harness(event: dict) -> str | None:
+    """The bridge-stamped harness tag (omp/claude-code/codex...), or None when absent."""
+    tag = event.get("harness")
+    return tag if isinstance(tag, str) and tag else None
+
+
+def _log_firing(
+    sid: str, decision: str, *, prompt_variant: str | None, hook_ms: float, harness: str | None = None
+) -> None:
     """Append one JSONL row per invocation — data only, nothing here changes the decision.
 
     Best-effort and silent on failure: a logging problem must never affect whether the
@@ -261,6 +269,7 @@ def _log_firing(sid: str, decision: str, *, prompt_variant: str | None, hook_ms:
         "ts": time.time(),
         "session": sid,
         "decision": decision,
+        "harness": harness,
         "prompt_variant": prompt_variant,
         "hook_ms": round(hook_ms, 2),
     }
@@ -498,7 +507,7 @@ def main() -> int:
         # every single one, since the very next stop again found no marker. Leaving the
         # marker in place caps re-blocking at once per TTL, at the cost of a genuinely new
         # task started before the TTL expires not getting an immediate fresh prompt.
-        _log_firing(sid, "allow", prompt_variant=None, hook_ms=_elapsed_ms(start))
+        _log_firing(sid, "allow", prompt_variant=None, hook_ms=_elapsed_ms(start), harness=_harness(event))
         emit("allow")
         return 0
 
@@ -520,7 +529,7 @@ def main() -> int:
         emit("allow")
         return 0
 
-    _log_firing(sid, "block", prompt_variant=variant, hook_ms=_elapsed_ms(start))
+    _log_firing(sid, "block", prompt_variant=variant, hook_ms=_elapsed_ms(start), harness=_harness(event))
     emit("block", prompt)
     # Sweep AFTER emitting the block: this is opportunistic cleanup, not part of the
     # decision — it must not be able to affect whether the block fires (structurally, not

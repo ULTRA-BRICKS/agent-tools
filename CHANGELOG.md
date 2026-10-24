@@ -88,6 +88,14 @@
 
 ### Fixed
 
+- `omp-hook-bridge` (agent-tools#1003): the omp MAIN session now runs `stop` hooks. Only a subagent's
+  `yield` mapped to `stop`, so an interactive/orchestrator omp session — which ends a turn with plain
+  text — never ran `stop-completion-selfcheck` (or any Stop hook): 0 of ~5,400 recorded yields were
+  from a top-level session. The extension registers omp 18.8's `session_stop` event, maps it to the
+  v1 `stop` point and returns `{decision: "block", reason}`; stop events carry `args.transcript_path`,
+  `args.harness_session_id`, `args.last_assistant_message`, `args.turn_id`, `args.stop_hook_active`;
+  `firings.jsonl` rows record the `harness`. An interrupted session is never held; every failure
+  fails open.
 - `gh ship` cleanup (agent-tools#995): worktrees on the PR head commit under another branch name
   or detached are removed like the named one; a seeded `task.yaml` identical to the base's no longer
   makes the tree dirty (a differing one or any other change still does, and is never forced); cleanup

@@ -85,7 +85,9 @@ remember to do this" into "the model is reliably prompted".
 ## Usefulness logging (agent-tools#529)
 
 Every invocation that reaches a block/allow decision appends one line to `firings.jsonl`:
-`{ts, session, decision, prompt_variant, hook_ms}` — the two early-exit paths (a malformed
+`{ts, session, decision, harness, prompt_variant, hook_ms}` — `harness` is the bridge-stamped
+source (`omp`, `claude-code`, `codex`, null for a bare event; added with agent-tools#1003 so a
+harness whose Stop never fires shows up as a missing value instead of silence) — the two early-exit paths (a malformed
 stdin event, and a marker-write failure) skip logging along with the decision itself, since
 neither represents a real block/allow outcome worth counting. This hook only ever *writes*
 that log — it never reads it back, so a logging failure can't change a decision (same

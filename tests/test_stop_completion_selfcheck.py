@@ -471,6 +471,18 @@ def test_firings_log_records_block_then_allow(monkeypatch, tmp_path):
         assert isinstance(row["hook_ms"], (int, float))
 
 
+def test_firings_log_records_the_harness_the_stop_came_from(monkeypatch, tmp_path):
+    """agent-tools#1003: the omp main session silently had no Stop hook for weeks because a
+    firing row did not say which harness produced it; the harness is now part of the row."""
+    log_path = tmp_path / "firings.jsonl"
+    monkeypatch.setattr(selfcheck, "FIRINGS_LOG", log_path)
+    _run({"event_id": "sess-omp", "harness": "omp"}, monkeypatch)
+    _run({"event_id": "sess-unknown"}, monkeypatch)
+    rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert rows[0]["harness"] == "omp"
+    assert rows[1]["harness"] is None
+
+
 def test_firings_log_write_failure_does_not_break_the_hook(monkeypatch, tmp_path):
     """Logging is best-effort: an unwritable log path must not change the decision.
 
