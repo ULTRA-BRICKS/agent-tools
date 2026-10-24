@@ -144,6 +144,83 @@ hatch_escalation = _load_hatch_escalation()
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
+# Role-aware "what to do next" builder (agent-tools#994): loaded by repo-local path like the hatch
+# helper and OPTIONAL — a load failure falls back to the neutral text in `_render_block` (a crash
+# would fail open via on_error and silently drop this block).
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations via sys.modules[cls.__module__] while executing.
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so block emitters can name the reader's role without threading it
+# through every signature. One event per hook process.
+_CURRENT_EVENT: dict = {}
+
+_BLOCK_SELF_SERVE = (
+    "Use the Edit tool (or Write to replace the whole file) instead of the shell edit. The "
+    "hyperide rule is 'edits only via Edit/Write; no sed/perl/awk for editing files' — a shell "
+    "in-place edit (`sed -i`/`perl -i`/`gawk -i inplace`) or a `> file` redirect onto a tracked "
+    "source file leaves no reviewable diff, skips the formatter, and desyncs file-state "
+    "tracking. Read-only sed/awk/grep pipelines and writes to /tmp or new files are fine."
+)
+_BLOCK_RELAY = (
+    "If a subagent reported this block, tell it to use its Edit/Write tools with "
+    "`write agent://<id>`, then `wait` for its report."
+)
+_BLOCK_HUMAN = (
+    "a genuine exception only — request a one-time Telegram approval by setting "
+    'RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT="<written justification>" '
+    "(deny-by-default; a bare 1 is rejected)."
+)
+
+
+def _render_block(what: str, self_serve: str, human: str = "", relay: str = "") -> str:
+    """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+            return _guard_message.render(
+                _guard_message.Remedy(what=what, self_serve=self_serve, relay=relay, human=human),
+                role,
+            )
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    top = "3. If you are the top-level agent: " + (relay or "supply the missing step to the blocked subagent.")
+    if human:
+        top += f" Last resort, genuine exceptions only: {human}"
+    return "\n".join([
+        what,
+        f"1. {self_serve}",
+        "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
+        "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+        "blocked/done/failed); the coordinator's `write agent://<you>` revives you. Never retry "
+        "with RIG_HATCH_REQUEST_* and never go to the human.",
+        top,
+    ])
+
 # Per-`git ls-files` call bound, so a single slow/hanging git can't run away. Mirrors
 # visual-proof-gate's inner-git timeout (#14). NOTE: this caps each call, not their SUM — a glob
 # operand matching many existing-but-untracked source files runs one `git ls-files` per match (the
@@ -910,6 +987,7 @@ def main() -> int:
         return 0
 
     args = event.get("args") or {}
+    _CURRENT_EVENT["event"] = event
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):
         command = str(command)
@@ -928,17 +1006,12 @@ def main() -> int:
         emit("allow")
         return 0
 
-    block_message = (
-        f"Edit files with the Edit/Write tools, not the shell: {matched}. The hyperide rule "
-        "is 'edits only via Edit/Write; no sed/perl/awk for editing files' — a shell in-place "
-        "edit (`sed -i`/`perl -i`/`gawk -i inplace`) or a `> file` redirect onto a tracked "
-        "source file leaves no reviewable diff, skips the formatter, and desyncs file-state "
-        "tracking. Use the Edit tool (or Write to replace the whole file). Read-only "
-        "sed/awk/grep pipelines and writes to /tmp or new files are fine. There is NO "
-        "self-service bypass. For a genuine exception, ASK the human, or request a one-time "
-        "Telegram approval by setting "
-        "RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT=\"<written justification>\" "
-        "(deny-by-default; a bare 1 is rejected)."
+    block_message = _render_block(
+        f"Edit files with the Edit/Write tools, not the shell: {matched}. There is NO "
+        "self-service bypass.",
+        _BLOCK_SELF_SERVE,
+        _BLOCK_HUMAN,
+        _BLOCK_RELAY,
     )
 
     ctx = {"hook": "no-shell-file-edit", "command": command}

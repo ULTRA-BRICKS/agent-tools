@@ -164,24 +164,98 @@ _GIT_TIMEOUT_S = 3.0
 # external kill can ever fire.
 _MAIN_LOOP_BUDGET_S = 10.0
 
-MESSAGE = (
+# Role-aware "what to do next" builder (agent-tools#994): loaded by repo-local path like the hatch
+# helper and OPTIONAL — a load failure falls back to the neutral text in `_render_block` (a crash
+# would fail open via on_error and silently drop this block).
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations via sys.modules[cls.__module__] while executing.
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so block emitters can name the reader's role without threading it
+# through every signature. One event per hook process.
+_CURRENT_EVENT: dict = {}
+
+_BLOCK_WHAT = (
     "BLOCKED — this is the repo's PRIMARY worktree; switching it to '{target}' risks colliding "
     "with other concurrent agents/sessions that share this checkout (this exact collision "
     "already happened once — Alex tg#6462/tg#6477). The primary worktree is for merge / pull / "
-    "read-only only; checkout/switch there is blocked outside the default branch ({default}).\n"
+    "read-only only; checkout/switch there is blocked outside the default branch ({default}). "
+    "There is NO automatic bypass: never self-grant via an environment variable "
+    "(RIG_ALLOW_MAIN_EDIT no longer opens this hook)."
+)
+_BLOCK_SELF_SERVE = (
     "Do the work in a separate worktree instead:\n"
     "    git worktree add ../wt-<feature> -b {target} origin/{default}\n"
-    "    cd ../wt-<feature>   # then git checkout/switch there\n"
-    "There is NO automatic bypass and NO self-service escape hatch for THIS checkout guard. Do "
-    "NOT try to self-grant via any environment variable — RIG_ALLOW_MAIN_EDIT no longer opens "
-    "this hook (an agent setting its own bypass is security theater; removed per Alex tg#6554). "
-    "If you have a genuine reason for an exception, ASK the human directly (your usual channel "
-    "to Alex), or request a one-time Telegram approval by setting "
-    'RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE="<written justification>" (deny-by-default; a '
-    "bare 1 is rejected) — asking is fine, self-granting is not. A repo owner can also wire a "
-    "real external-approval path via agent_hooks.approval_cmd in rig.yaml; unconfigured means "
-    "denied."
+    "    cd ../wt-<feature>   # then git checkout/switch there"
 )
+_BLOCK_RELAY = (
+    "If a subagent reported this block, tell it to work in its own worktree "
+    "(`git worktree add ../wt-<feature>`) with `write agent://<id>`, then `wait` for its report."
+)
+_BLOCK_HUMAN = (
+    "a genuine exception only — request a one-time Telegram approval by setting "
+    'RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE="<written justification>" (deny-by-default; a '
+    "bare 1 is rejected), or a repo owner can wire agent_hooks.approval_cmd in rig.yaml; "
+    "unconfigured means denied."
+)
+
+
+def _render_block(what: str, self_serve: str, human: str = "", relay: str = "") -> str:
+    """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+            return _guard_message.render(
+                _guard_message.Remedy(what=what, self_serve=self_serve, relay=relay, human=human),
+                role,
+            )
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    top = "3. If you are the top-level agent: " + (relay or "supply the missing step to the blocked subagent.")
+    if human:
+        top += f" Last resort, genuine exceptions only: {human}"
+    return "\n".join([
+        what,
+        f"1. {self_serve}",
+        "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
+        "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+        "blocked/done/failed); the coordinator's `write agent://<you>` revives you. Never retry "
+        "with RIG_HATCH_REQUEST_* and never go to the human.",
+        top,
+    ])
+
+
+def _block_message(target: str, default: str) -> str:
+    return _render_block(
+        _BLOCK_WHAT.format(target=target, default=default),
+        _BLOCK_SELF_SERVE.format(target=target, default=default),
+        _BLOCK_HUMAN,
+        _BLOCK_RELAY,
+    )
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -715,7 +789,7 @@ def _evaluate_checkout_segment(
         warn(f"primary-worktree checkout hatch escalation denied: {hatch.reason}")
         return "block", (
             f"hatch escalation denied: {hatch.reason}\n"
-            f"{MESSAGE.format(target=target, default=default)}"
+            f"{_block_message(target, default)}"
         )
 
     # Reserve the FULL approval-cmd ceiling before starting this call, not just check whether
@@ -737,7 +811,7 @@ def _evaluate_checkout_segment(
 
     approved, detail = _request_approval(eff_cwd, context)
     if not approved:
-        return "block", MESSAGE.format(target=target, default=default)
+        return "block", _block_message(target, default)
 
     warn(f"primary-worktree checkout approved via approval_cmd ({detail})")
     return "approved", f"{subcommand} {target} approved via external approval_cmd ({detail})"
@@ -752,6 +826,7 @@ def main() -> int:
         return 0
 
     cwd = str(event.get("cwd") or os.getcwd())
+    _CURRENT_EVENT["event"] = event
     args = event.get("args") if isinstance(event.get("args"), dict) else {}
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str) or not command.strip():

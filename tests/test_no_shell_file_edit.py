@@ -539,10 +539,6 @@ def test_hatch_justification_exit1_blocks(repo, tmp_path, monkeypatch):
     assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(pytest.main([__file__, "-q"]))
-
-
 def test_hatch_inline_command_justification_allows(repo, tmp_path, monkeypatch):
     """The justification supplied as an inline command PREFIX (env var NOT exported) must reach
     tg-ctl via the new `command=` contract. Regression for the documented inline form (Codex #232)."""
@@ -559,3 +555,7 @@ def test_hatch_inline_command_justification_allows(repo, tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert "vetted bulk codemod, reviewed" in question.read_text()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(pytest.main([__file__, "-q"]))

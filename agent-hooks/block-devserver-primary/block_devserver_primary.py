@@ -146,18 +146,96 @@ CONFIG_KEY = "worktree_only"  # SYNC: same knob as worktree-only-writes / pin-pr
 _FALLBACK_DEFAULT_BRANCH = "main"
 _GIT_TIMEOUT_S = 3.0
 
-MESSAGE = (
+# Role-aware "what to do next" builder (agent-tools#994): loaded by repo-local path like the hatch
+# helper and OPTIONAL — a load failure falls back to the neutral text in `_render_block` (a crash
+# would fail open via on_error and silently drop this block).
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations via sys.modules[cls.__module__] while executing.
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so block emitters can name the reader's role without threading it
+# through every signature. One event per hook process.
+_CURRENT_EVENT: dict = {}
+
+_BLOCK_WHAT = (
     "You are on the default branch ({branch}) of an enrolled repo — starting a dev server / "
     "build watcher here is blocked by the worktree-only workflow. A dev server's own writes "
     "(HMR output, a preview/codegen generator, etc.) can silently corrupt tracked files in the "
     "SHARED checkout with no Edit/Write tool call to catch — that already happened once here. "
+    "There is NO self-service env-var bypass."
+)
+_BLOCK_SELF_SERVE = (
     "Run it from a separate worktree instead, e.g.:\n"
     "    git worktree add ../wt-<feature> -b <feature> origin/{branch}\n"
-    "    cd ../wt-<feature> && {command}\n"
-    "There is NO self-service env-var bypass. For a genuine one-off need, request a one-time "
-    'Telegram approval via RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY="<justification>" '
+    "    cd ../wt-<feature> && {command}"
+)
+_BLOCK_RELAY = (
+    "If a subagent reported this block, tell it to run the server from its own worktree "
+    "(`git worktree add ../wt-<feature>`) with `write agent://<id>`, then `wait` for its report."
+)
+_BLOCK_HUMAN = (
+    "a genuine one-off need only — request a one-time Telegram approval via "
+    'RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY="<justification>" '
     "(deny-by-default; a bare 1 is rejected)."
 )
+
+
+def _render_block(what: str, self_serve: str, human: str = "", relay: str = "") -> str:
+    """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+            return _guard_message.render(
+                _guard_message.Remedy(what=what, self_serve=self_serve, relay=relay, human=human),
+                role,
+            )
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    top = "3. If you are the top-level agent: " + (relay or "supply the missing step to the blocked subagent.")
+    if human:
+        top += f" Last resort, genuine exceptions only: {human}"
+    return "\n".join([
+        what,
+        f"1. {self_serve}",
+        "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
+        "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+        "blocked/done/failed); the coordinator's `write agent://<you>` revives you. Never retry "
+        "with RIG_HATCH_REQUEST_* and never go to the human.",
+        top,
+    ])
+
+
+def _block_message(branch: str, label: str) -> str:
+    return _render_block(
+        _BLOCK_WHAT.format(branch=branch),
+        _BLOCK_SELF_SERVE.format(branch=branch, command=label),
+        _BLOCK_HUMAN,
+        _BLOCK_RELAY,
+    )
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -926,7 +1004,7 @@ def _decide_block(cwd: str, branch: str, label: str, full_command: str) -> int:
     makes the ENTIRE original command string (not just the first launch) part of what the human
     is asked to approve.
     """
-    message = MESSAGE.format(branch=branch, command=label)
+    message = _block_message(branch, label)
     hatch = hatch_escalation.request_hatch_approval(
         HOOK_ID,
         {"hook": HOOK_ID, "branch": branch, "launch": label, "command": full_command},
@@ -1041,6 +1119,7 @@ def main() -> int:
         return 0
 
     cwd = str(event.get("cwd") or os.getcwd())
+    _CURRENT_EVENT["event"] = event
     raw_args = event.get("args")
     args = raw_args if isinstance(raw_args, dict) else {}
     command = args.get("command") or args.get("cmd") or event.get("command") or ""

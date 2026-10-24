@@ -577,29 +577,102 @@ _GUIDANCE = {
     ),
 }
 
-MESSAGE = (
+# Role-aware "what to do next" builder (agent-tools#994): loaded by repo-local path like the hatch
+# helper and OPTIONAL — a load failure falls back to the neutral text in `_render_block` (a crash
+# would fail open via on_error and silently drop this block).
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations via sys.modules[cls.__module__] while executing.
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so block emitters can name the reader's role without threading it
+# through every signature. One event per hook process.
+_CURRENT_EVENT: dict = {}
+
+_BLOCK_WHAT = (
     "BLOCKED — raw `git worktree {kind}` outside `{worktrees_dir}/` is not the sanctioned door "
     "(agent-tools#608 / rig-cli AGENTS.md: a real incident — GH-329 — left ~70 leftover "
     "worktrees scattered across five different ad-hoc locations, none tracked, tens of GB of "
-    "duplicated node_modules/.venv). `{repo_worktrees}` is the ONLY sanctioned location.\n"
+    "duplicated node_modules/.venv). `{repo_worktrees}` is the ONLY sanctioned location."
+)
+_BLOCK_SELF_SERVE = (
     "Use the rig door instead:\n"
     "{guidance}"
     "or, if `{target}` is a worktree that predates this convention, `rig worktree gc` to "
-    "reconcile it.\n"
-    "There is NO self-service bypass. If you have a genuine one-off reason (migrating an "
-    "existing worktree, a documented non-agent use case), ASK the human — request a single "
-    'Telegram approval via RIG_HATCH_REQUEST_BLOCK_RAW_WORKTREE_ADD="<why>" (deny-by-default; a '
-    "bare `1` is rejected)."
+    "reconcile it."
+)
+_BLOCK_RELAY = (
+    "If a subagent reported this block, run the `rig worktree create <name>` step for it (or "
+    "tell it the worktree path with `write agent://<id>`), then `wait` for its final report."
+)
+_BLOCK_HUMAN = (
+    "a genuine one-off reason (migrating an existing worktree, a documented non-agent use case) "
+    "only — request a single Telegram approval via "
+    'RIG_HATCH_REQUEST_BLOCK_RAW_WORKTREE_ADD="<why>" (deny-by-default; a bare `1` is rejected).'
 )
 
 
+def _render_block(what: str, self_serve: str, human: str = "", relay: str = "") -> str:
+    """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+            return _guard_message.render(
+                _guard_message.Remedy(what=what, self_serve=self_serve, relay=relay, human=human),
+                role,
+            )
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    top = "3. If you are the top-level agent: " + (relay or "supply the missing step to the blocked subagent.")
+    if human:
+        top += f" Last resort, genuine exceptions only: {human}"
+    return "\n".join([
+        what,
+        f"1. {self_serve}",
+        "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
+        "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+        "blocked/done/failed); the coordinator's `write agent://<you>` revives you. Never retry "
+        "with RIG_HATCH_REQUEST_* and never go to the human.",
+        top,
+    ])
+
+
 def _block_message(kind: str, root: Path, target_display: str) -> str:
-    return MESSAGE.format(
-        kind=kind,
-        worktrees_dir=_WORKTREES_DIR_NAME,
-        repo_worktrees=str(root / _WORKTREES_DIR_NAME),
-        guidance=_GUIDANCE[kind],
-        target=target_display,
+    fields = {
+        "kind": kind,
+        "worktrees_dir": _WORKTREES_DIR_NAME,
+        "repo_worktrees": str(root / _WORKTREES_DIR_NAME),
+        "guidance": _GUIDANCE[kind],
+        "target": target_display,
+    }
+    return _render_block(
+        _BLOCK_WHAT.format(**fields),
+        _BLOCK_SELF_SERVE.format(**fields),
+        _BLOCK_HUMAN,
+        _BLOCK_RELAY,
     )
 
 
@@ -734,6 +807,7 @@ def main() -> int:
         return 0
 
     cwd = str(event.get("cwd") or os.getcwd())
+    _CURRENT_EVENT["event"] = event
     args = event.get("args") if isinstance(event.get("args"), dict) else {}
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str) or not command.strip():

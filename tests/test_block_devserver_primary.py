@@ -38,7 +38,15 @@ assert _spec and _spec.loader
 bdp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bdp)
 
-_ENV_KEYS = ("RIG_WORKTREE_ONLY", "RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY")
+_ENV_KEYS = (
+    "RIG_WORKTREE_ONLY",
+    "RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY",
+    # Role detection env (agent-tools#994): a test run inside an agent must not inherit its role.
+    "RIG_AGENT_ID",
+    "RIG_PARENT_AGENT_ID",
+    "RIG_DETACHED_AGENT",
+    "PI_SESSION_FILE",
+)
 
 
 def test_hook_file_is_executable_and_runs_standalone(tmp_path):
@@ -963,6 +971,61 @@ def test_classify_devserver_segment(segment, expected_matched):
     toks = bdp._strip_leading_assignments(bdp.shlex.split(segment))
     result = bdp._classify_devserver_segment(toks)
     assert (result is not None) == expected_matched
+
+
+# ── agent-tools#994: role-aware escalation ladder ───────────────────────────────────────────
+_SESSION_DIR = "2026-10-24T10-11-12-345Z_0a1b2c3d-1111-2222-3333-444455556666"
+_SUBAGENT_ENV = {
+    "RIG_AGENT_ID": "Kid",
+    "PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_SESSION_DIR}/Kid.jsonl",
+}
+_COORDINATOR_ENV = {"PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_SESSION_DIR}.jsonl"}
+_HATCH_VAR = "RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY"
+
+
+def _ladder_message(tmp_path, monkeypatch, role_env: dict) -> str:
+    repo = tmp_path / "repo" if (tmp_path / "repo").exists() else _make_repo(tmp_path, branch="main")
+    out, code = _run(repo, monkeypatch, "npm run dev", {"RIG_WORKTREE_ONLY": "1", **role_env})
+    assert code == bdp.BLOCK_EXIT_CODE, out
+    return json.loads(out)["message"]
+
+
+def test_ladder_leads_with_marker_and_separate_worktree_remedy(tmp_path, monkeypatch):
+    for env in ({}, _SUBAGENT_ENV, _COORDINATOR_ENV):
+        msg = _ladder_message(tmp_path, monkeypatch, env)
+        assert msg.startswith("You are on the default branch (main) of an enrolled repo")
+        step1 = msg[msg.index("\n1. "):msg.index("\n2. ")]
+        assert "git worktree add ../wt-<feature>" in step1 and "npm run dev" in step1
+        assert "ASK the human" not in msg and "Closes" not in msg and "Fixes" not in msg
+
+
+def test_ladder_subagent_messages_parent_and_has_no_human_hatch(tmp_path, monkeypatch):
+    msg = _ladder_message(tmp_path, monkeypatch, _SUBAGENT_ENV)
+    assert "`write agent://Main`" in msg
+    assert "`yield` status `awaiting-coordinator` (NOT blocked/done/failed)" in msg
+    assert "`write agent://Kid`" in msg
+    assert _HATCH_VAR not in msg and "Telegram" not in msg
+
+
+def test_ladder_coordinator_relays_and_hatch_is_last_line(tmp_path, monkeypatch):
+    msg = _ladder_message(tmp_path, monkeypatch, _COORDINATOR_ENV)
+    assert "write agent://<id>" in msg
+    last = msg.rstrip().splitlines()[-1]
+    assert _HATCH_VAR in last and msg.count(_HATCH_VAR) == 1
+
+
+def test_ladder_unknown_role_has_both_branches(tmp_path, monkeypatch):
+    msg = _ladder_message(tmp_path, monkeypatch, {})
+    assert "If you were dispatched by another agent" in msg
+    assert "If you are the top-level agent" in msg
+    assert _HATCH_VAR in msg.rstrip().splitlines()[-1]
+
+
+def test_ladder_falls_back_to_neutral_text_when_lib_is_unavailable(monkeypatch):
+    monkeypatch.setattr(bdp, "_guard_message", None)
+    msg = bdp._render_block("You are on main.", "Run it from `git worktree add ../wt-<feature>`.", "hatch line")
+    assert msg.startswith("You are on main.") and "git worktree add" in msg
+    assert "dispatched by another agent" in msg
 
 
 if __name__ == "__main__":  # pragma: no cover
