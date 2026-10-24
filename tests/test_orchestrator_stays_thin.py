@@ -4178,9 +4178,9 @@ def test_four_segment_unknown_chain_message_names_rule_and_heads(tmp_path, monke
     for banned in ("CTO", "NO self-service", "route around", "not a bug"):
         assert banned not in msg
     assert len(lines) == 5
-    # ~630 chars of fixed text + the harness recipe (omp's is the shortest, ~85); the old
-    # paragraph was ~900 before any recipe and named no rule at all.
-    assert len(msg) <= 720
+    # ~630 chars of fixed text + the harness recipe (omp's is the shortest, ~85) + the unknown-role
+    # EXCEPTION ladder (both branches, agent-tools#994; a known role gets one branch, far shorter).
+    assert len(msg) <= 1250
 
 
 def test_trigger_stays_one_line_with_embedded_newlines(tmp_path, monkeypatch):
@@ -4552,3 +4552,68 @@ def test_rig_doctor_argparse_prefix_abbreviations_are_not_granted(command):
 def test_awk_file_backed_program_shapes_are_not_granted(command):
     assert ost._is_read_only_awk(command) is False, command
     assert ost._implementation_reason(f"{command} | tr a b | sort") is not None, command
+
+
+# ── agent-tools#994: role-aware EXCEPTION line ────────────────────────────────────────────────
+# The pinned five-line shape stays (verdict, TRIGGER, WHY, DO THIS, EXCEPTION): DO THIS leads with
+# the delegate step, and the EXCEPTION line follows the role ladder — the coordinator relays and
+# holds the Telegram hatch LAST; an unidentified reader gets both branches; a subagent (normally
+# exempt, so only reachable by a direct call) is sent to its coordinator, never to the human.
+_LADDER_SESSION_DIR = "2026-10-24T10-11-12-345Z_0a1b2c3d-1111-2222-3333-444455556666"
+_LADDER_COORD_ENV = {"PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_LADDER_SESSION_DIR}.jsonl"}
+_LADDER_HATCH = 'RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN="<justification>"'
+
+
+def _ladder_lines(tmp_path, monkeypatch, env: dict) -> list[str]:
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "omp",
+             "args": {"command": "mkdir a; touch b; cp b c; mv c d"}}
+    _run(event, monkeypatch, tmp_path / "m", env)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", env)
+    assert c == ost.BLOCK_EXIT_CODE
+    return json.loads(out)["message"].split("\n")
+
+
+def test_ladder_coordinator_exception_relays_then_hatch_last(tmp_path, monkeypatch):
+    lines = _ladder_lines(tmp_path, monkeypatch, _LADDER_COORD_ENV)
+    assert len(lines) == 5
+    assert lines[0] == "orchestrator-stays-thin BLOCKED."
+    assert lines[3].startswith("DO THIS: delegate — omp: the task tool")
+    exc = lines[4]
+    assert exc.startswith("EXCEPTION: deny-by-default")
+    assert "write agent://<id>" in exc
+    assert exc.index("write agent://<id>") < exc.index(_LADDER_HATCH)
+    assert exc.count("RIG_HATCH_REQUEST_") == 1
+    assert "ask the human" not in "\n".join(lines).lower()
+    assert "Closes" not in "\n".join(lines) and "Fixes" not in "\n".join(lines)
+
+
+def test_ladder_unknown_role_exception_has_both_branches(tmp_path, monkeypatch):
+    lines = _ladder_lines(tmp_path, monkeypatch, {})
+    assert len(lines) == 5
+    exc = lines[4]
+    assert exc.startswith("EXCEPTION: deny-by-default")
+    assert "If you were dispatched by another agent" in exc
+    assert "If you are the top-level agent" in exc
+    assert _LADDER_HATCH in exc
+    assert exc.index("If you were dispatched") < exc.index("If you are the top-level agent") < exc.index(_LADDER_HATCH)
+    assert "ask the human" not in exc.lower()
+
+
+def test_ladder_subagent_exception_goes_to_coordinator_never_human(monkeypatch):
+    monkeypatch.setenv("RIG_AGENT_ID", "Kid")
+    monkeypatch.setenv("PI_SESSION_FILE", f"/home/u/.omp/sessions/proj/{_LADDER_SESSION_DIR}/Kid.jsonl")
+    monkeypatch.setitem(ost._CURRENT_EVENT, "event", {"point": "pre-bash", "args": {}})
+    msg = ost._message_for("omp", "pre-bash", "chain of 4 segments", blocked=True)
+    lines = msg.split("\n")
+    assert len(lines) == 5 and lines[1] == "TRIGGER: chain of 4 segments."
+    assert "write agent://Main" in lines[4]
+    assert "awaiting-coordinator" in lines[4]
+    assert "RIG_HATCH_REQUEST_" not in msg.replace("RIG_HATCH_REQUEST_*", "")
+    assert "ask the human" not in msg.lower()
+
+
+def test_ladder_falls_back_to_unknown_wording_when_lib_is_unavailable(monkeypatch):
+    monkeypatch.setattr(ost, "_guard_message", None)
+    lines = ost._message_for("omp", "pre-bash", "chain of 4 segments", blocked=True).split("\n")
+    assert len(lines) == 5 and lines[0] == "orchestrator-stays-thin BLOCKED."
+    assert "If you were dispatched by another agent" in lines[4] and _LADDER_HATCH in lines[4]

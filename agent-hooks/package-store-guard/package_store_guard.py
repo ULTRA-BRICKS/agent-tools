@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import fnmatch
 import functools
+import importlib.util
 import json
 import os
 import re
@@ -55,10 +56,47 @@ import secrets
 import shlex
 import subprocess
 import sys
+from pathlib import Path
 import time
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
+
+# The role-aware "what to do next" builder (agent-tools#994): loaded by repo-local path and
+# OPTIONAL — a load failure falls back to the neutral text in `_render_block` (a crash would fail
+# open via on_error and silently drop this block).
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations through sys.modules[cls.__module__], so the module
+    # must be registered while it executes.
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so the block emitters can name the reader's role without threading
+# it through every signature. One event per hook process.
+_CURRENT_EVENT: dict = {}
 HOOK_ID = "package-store-guard"
 
 # ── shell grammar ─────────────────────────────────────────────────────────────
@@ -199,15 +237,22 @@ _UV_RUN_VALUE_FLAGS = frozenset({
     "--index-url", "--extra-index-url", "-i", "--constraints", "-c", "--overrides", "--cache-dir",
 })
 
-_STORE_MSG = (
+_STORE_WHAT = (
     "[package-store-guard] BLOCKED: this would wipe a shared package store ({what}). "
     "The bun global store (~/.bun/install/cache, including links/) is what every worktree's "
     "node_modules symlinks into, and uv venvs are cloned from ~/.cache/uv — wiping either breaks "
-    "or re-bloats every install on the machine. Never clean package-manager caches or stores to "
-    "free disk. To reclaim space instead: remove stale worktrees (`rig worktree gc --yes`, "
-    "`rig worktree remove <name>`), or delete ONE worktree's node_modules and re-run "
-    "`bun install --frozen-lockfile` there. No self-service bypass — ask the human."
+    "or re-bloats every install on the machine."
 )
+_STORE_SELF_SERVE = (
+    "Never clean package-manager caches or stores to free disk. To reclaim space instead: remove "
+    "stale worktrees (`rig worktree gc --yes`, `rig worktree remove <name>`), or delete ONE "
+    "worktree's node_modules and re-run `bun install --frozen-lockfile` there."
+)
+_STORE_RELAY = (
+    "If a subagent reported this block, hand it the reclaim steps above via `write agent://<id>`; "
+    "only a genuine store wipe needs the human."
+)
+_STORE_HUMAN = "a real store wipe is the human's decision alone — ask the human; there is no self-service bypass."
 _SYMLINK_MSG = (
     "[package-store-guard] BLOCKED: do not symlink node_modules to another checkout. `bun install` "
     "in a worktree whose node_modules is a symlink writes THROUGH it and corrupts the other "
@@ -216,13 +261,61 @@ _SYMLINK_MSG = (
     "creates symlinks into the shared store — a few MB, seconds — unless the repo's own "
     "bunfig.toml asks for a local layout. `rig worktree create` already does this for bun repos."
 )
-_VM_MSG = (
+_VM_WHAT = (
     "[package-store-guard] BLOCKED: {what} — colima/lima-style container VMs are banned on this "
-    "machine (their disk images kept filling the Mac's disk, and agents kept reinstalling them). "
+    "machine (their disk images kept filling the Mac's disk, and agents kept reinstalling them)."
+)
+_VM_SELF_SERVE = (
     "For docker compose use Apple `container` / `mocker`; for the sme-archiving-gc tests use the "
     "native fake-gcs-server backend. Do not install or start another VM runtime (colima, lima, "
-    "podman, OrbStack, Docker Desktop) — ask the human if nothing else works."
+    "podman, OrbStack, Docker Desktop)."
 )
+_VM_RELAY = (
+    "If a subagent reported this block, point it at the alternatives above via "
+    "`write agent://<id>`; if none fit, that is a question for the human."
+)
+_VM_HUMAN = "if nothing else works, ask the human — there is no self-service bypass."
+_NO_BYPASS = (
+    "As a subagent never wipe a store or start a VM runtime yourself and never go to the human — "
+    "your coordinator decides."
+)
+
+
+def _render_block(what: str, self_serve: str, human: str = "", relay: str = "") -> str:
+    """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+            return _guard_message.render(
+                _guard_message.Remedy(
+                    what=what, self_serve=self_serve, relay=relay, human=human, no_bypass=_NO_BYPASS
+                ),
+                role,
+            )
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    top = "3. If you are the top-level agent: " + (relay or "supply the missing step to the blocked subagent.")
+    if human:
+        top += f" Last resort, genuine exceptions only: {human}"
+    return "\n".join([
+        what,
+        f"1. {self_serve}",
+        "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
+        "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+        "blocked/done/failed); the coordinator's `write agent://<you>` revives you. "
+        + _NO_BYPASS,
+        top,
+    ])
+
+
+def _store_msg(what: str) -> str:
+    return _render_block(_STORE_WHAT.format(what=what), _STORE_SELF_SERVE, _STORE_HUMAN, _STORE_RELAY)
+
+
+def _vm_msg(what: str) -> str:
+    return _render_block(_VM_WHAT.format(what=what), _VM_SELF_SERVE, _VM_HUMAN, _VM_RELAY)
+
+
 _HOOK_MANAGER_MSG = (
     "[package-store-guard] BLOCKED: `{tool}` would write its hook shims into core.hooksPath = {path}, "
     "which is OUTSIDE this repo — rig's global hooks dir — and replace the global pre-commit "
@@ -819,7 +912,7 @@ def _check_bun(argv: list[str]) -> str | None:
     words = [t for t in argv[1:] if not t.startswith("-")]  # a valued flag (`--cwd /x`) may sit in front
     for i in range(len(words) - 2):
         if words[i] == "pm" and words[i + 1] == "cache" and words[i + 2] in _BUN_CACHE_VERBS:
-            return _STORE_MSG.format(what=f"`bun pm cache {words[i + 2]}`")
+            return _store_msg(f"`bun pm cache {words[i + 2]}`")
     return None
 
 
@@ -836,19 +929,19 @@ def _check_uv(argv: list[str]) -> str | None:
         i += 1
     if len(words) >= 2 and words[0] == "cache":
         if words[1] == "clean":
-            return _STORE_MSG.format(what="`uv cache clean`")
+            return _store_msg("`uv cache clean`")
         if words[1] == "prune" and _UV_PRUNE_WIPE_FLAGS.intersection(argv):
-            return _STORE_MSG.format(what="`uv cache prune --all/--ci`")
+            return _store_msg("`uv cache prune --all/--ci`")
     return None
 
 
 def _check_remove(head: str, operands: list[str], rest: list[str], ctx: _Ctx, cwd: str) -> str | None:
     if _store_substitution(" ".join(rest)):
-        return _STORE_MSG.format(what=f"`{head}` of the store path")
+        return _store_msg(f"`{head}` of the store path")
     for target in operands:
         label = _protected_hit(target, cwd, ctx.vars)
         if label:
-            return _STORE_MSG.format(what=f"`{head} {target}` removes {label}")
+            return _store_msg(f"`{head} {target}` removes {label}")
     return None
 
 
@@ -974,7 +1067,7 @@ def _check_find(argv: list[str], ctx: _Ctx, cwd: str, depth: int = 0) -> str | N
     for path in paths:
         label = _protected_hit(path, cwd, ctx.vars, allow_ancestor=True)
         if label:
-            return _STORE_MSG.format(what=f"`find {path} ... -delete/-exec rm` reaches {label}")
+            return _store_msg(f"`find {path} ... -delete/-exec rm` reaches {label}")
     return None
 
 
@@ -1106,34 +1199,34 @@ def _check_vm_runtime(argv: list[str]) -> str | None:
     flags = [t for t in argv[1:] if t.startswith("-")]
     if head in _VM_START_VERBS:
         verb = _vm_verb(head, argv[1:])
-        return _VM_MSG.format(what=f"`{head} {verb}`") if verb in _VM_START_VERBS[head] else None
+        return _vm_msg(f"`{head} {verb}`") if verb in _VM_START_VERBS[head] else None
     if head == "podman" and "machine" in words:
         # `podman [global flags] machine init|start` creates/boots podman's VM; stop/rm/list stay allowed
         after = words[words.index("machine") + 1 :]
         if after and after[0] in {"init", "start"}:
-            return _VM_MSG.format(what=f"`podman machine {after[0]}`")
+            return _vm_msg(f"`podman machine {after[0]}`")
         return None
     if head == "brew" and words and words[0] in _BREW_INSTALL_VERBS:
         for pkg in words[1:]:
             name = _vm_package(pkg)
             if name or ("--cask" in flags and pkg.rsplit("/", 1)[-1] == "docker"):
-                return _VM_MSG.format(what=f"`brew {words[0]} {pkg}`")
+                return _vm_msg(f"`brew {words[0]} {pkg}`")
         return None
     if head == "nix" and words and (words[0] in _NIX_RUNNERS or words[:2] == ["profile", "install"]):
         for ref in words[1:]:
             if _vm_package(ref):
-                return _VM_MSG.format(what=f"`nix {words[0]} {ref}`")
+                return _vm_msg(f"`nix {words[0]} {ref}`")
         return None
     if head == "open":
         # `open -a Docker` / `open -a OrbStack` launch the VM app itself
         for i, tok in enumerate(argv[1:-1], start=1):
             if tok in {"-a", "-b"} and _basename(argv[i + 1]).lower().removesuffix(".app") in _VM_APPS:
-                return _VM_MSG.format(what=f"`open {tok} {argv[i + 1]}`")
+                return _vm_msg(f"`open {tok} {argv[i + 1]}`")
         return None
     if head in {"nix-env", "nix-shell"} and any(f.startswith(("-i", "-p", "--install", "--packages")) for f in flags):
         for ref in words:
             if _vm_package(ref):
-                return _VM_MSG.format(what=f"`{head} … {ref}`")
+                return _vm_msg(f"`{head} … {ref}`")
     return None
 
 
@@ -1500,7 +1593,7 @@ def _check_argv(argv: list[str], ctx: _Ctx, cwd: str, via_xargs: bool, depth: in
         return inspect_command(script, cwd, depth + 1, ctx.vars) if depth < _MAX_DEPTH else None
     head = _cmd(argv[0])
     if via_xargs and ctx.store_seen and head in _REMOVERS:
-        return _STORE_MSG.format(what=f"`… | xargs {head}` over paths in {ctx.store_seen}")
+        return _store_msg(f"`… | xargs {head}` over paths in {ctx.store_seen}")
     if head in {"bun", "bunx"}:
         return _check_bun(argv)
     if head == "uv":
@@ -1591,6 +1684,7 @@ def main() -> int:
     try:
         event = json.load(sys.stdin)
         args = event.get("args") if isinstance(event, dict) else None
+        _CURRENT_EVENT["event"] = event
         args = args if isinstance(args, dict) else {}
         command = args.get("command") or args.get("cmd") or (event.get("command") if isinstance(event, dict) else "") or ""
         cwd = str((event.get("cwd") if isinstance(event, dict) else None) or args.get("cwd") or os.getcwd())

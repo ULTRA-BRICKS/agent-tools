@@ -94,8 +94,9 @@ inline sentinel any more. An agent could set either on its own command, so those
 guarded agent grant itself the exact bypass this hook exists to stop. The block is now
 **deny-by-default**.
 
-Use `gh ship <PR>` (the green-CI-gated, screenshot-checked path). For a genuine one-time
-exception, **ask Alex** — or request a single approval by setting
+Use `gh ship <PR>` (the green-CI-gated, screenshot-checked path). A blocked subagent messages its
+coordinator (`write agent://<parent>`, then `yield` `awaiting-coordinator`); as a last resort, for
+a genuine one-time exception, the coordinator requests a single approval by setting
 `RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="<written justification>"`:
 
 ```bash
@@ -105,7 +106,7 @@ RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="ship gate down, manual verify done" \
 
 The inline `VAR=… <command>` form works here because this is a **pre-bash** hook: it parses the
 leading `RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE=…` assignment out of the command string the event
-carries (a pre-bash hook runs in its own process *before* the shell evaluates that prefix, so the
+carries (a pre-bash hook runs in its own process _before_ the shell evaluates that prefix, so the
 value never lands in the hook's `os.environ` — only in the command text). Exporting the same var
 into the harness environment works too and takes precedence. (For Edit/Write-gated hooks there is
 no command string, so the var **must** be exported into the hook process env — see those hooks'

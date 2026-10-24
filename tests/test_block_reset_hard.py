@@ -746,3 +746,69 @@ def test_empty_command_allows(monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ── agent-tools#994: role-aware escalation ladder ─────────────────────────────────────────────
+# Destructive consent stays human, but the block leads with the scoped reversible alternatives,
+# keeps subagents off the human (they message their coordinator), and only the coordinator sees
+# the Telegram hatch (last line).
+_SESSION_DIR = "2026-10-24T10-11-12-345Z_0a1b2c3d-1111-2222-3333-444455556666"
+_SUBAGENT_ENV = {
+    "RIG_AGENT_ID": "Kid",
+    "PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_SESSION_DIR}/Kid.jsonl",
+}
+_COORDINATOR_ENV = {"PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_SESSION_DIR}.jsonl"}
+_ROLE_ENV_VARS = ("RIG_AGENT_ID", "RIG_PARENT_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE")
+_HATCH_VAR = "RIG_HATCH_REQUEST_BLOCK_RESET_HARD"
+
+
+def _ladder_message(monkeypatch, tmp_path, role_env: dict, command: str = "git reset --hard") -> str:
+    for name in _ROLE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    out, _err, code = _run(command, monkeypatch, env=role_env, cwd=_rig_dir(tmp_path))
+    assert code == hook.BLOCK_EXIT_CODE
+    return json.loads(out)["message"]
+
+
+def test_ladder_leads_with_scoped_alternatives(monkeypatch, tmp_path):
+    for i, env in enumerate(({}, _SUBAGENT_ENV, _COORDINATOR_ENV)):
+        (tmp_path / str(i)).mkdir()
+        msg = _ladder_message(monkeypatch, tmp_path / str(i), env)
+        assert msg.startswith("Refusing a `git reset --hard`")
+        step1 = msg[msg.index("1. "):msg.index("2. ")]
+        assert "git checkout -- <file>" in step1 and "git restore" in step1 and "git clean -n" in step1
+        assert "ASK the human" not in msg
+        assert "Closes" not in msg and "Fixes" not in msg
+        assert "trivial-ticketless" not in msg
+
+
+def test_ladder_clean_force_names_its_own_kind(monkeypatch, tmp_path):
+    msg = _ladder_message(monkeypatch, tmp_path, _SUBAGENT_ENV, "git clean -fd")
+    assert msg.startswith("Refusing a `git clean -f...`")
+
+
+def test_ladder_subagent_goes_to_coordinator_not_human(monkeypatch, tmp_path):
+    msg = _ladder_message(monkeypatch, tmp_path, _SUBAGENT_ENV)
+    assert "`write agent://Main`" in msg
+    assert "`yield` status `awaiting-coordinator` (NOT blocked/done/failed)" in msg
+    assert _HATCH_VAR not in msg
+
+
+def test_ladder_coordinator_hatch_is_last_line_and_only_once(monkeypatch, tmp_path):
+    msg = _ladder_message(monkeypatch, tmp_path, _COORDINATOR_ENV)
+    assert _HATCH_VAR in msg.rstrip().splitlines()[-1]
+    assert msg.count(_HATCH_VAR) == 1
+
+
+def test_ladder_unknown_role_has_both_branches(monkeypatch, tmp_path):
+    msg = _ladder_message(monkeypatch, tmp_path, {})
+    assert "If you were dispatched by another agent" in msg
+    assert "If you are the top-level agent" in msg
+    assert _HATCH_VAR in msg.rstrip().splitlines()[-1]
+
+
+def test_ladder_falls_back_to_neutral_text_when_lib_is_unavailable(monkeypatch):
+    monkeypatch.setattr(hook, "_guard_message", None)
+    msg = hook._render_block("Refusing a `git reset --hard`.", "Use `git restore <file>`.", "hatch line")
+    assert msg.startswith("Refusing a `git reset --hard`")
+    assert "git restore <file>" in msg and "dispatched by another agent" in msg

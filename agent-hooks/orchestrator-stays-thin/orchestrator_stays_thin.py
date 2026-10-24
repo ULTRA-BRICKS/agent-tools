@@ -107,7 +107,7 @@ RIG_ORCHESTRATOR_ONLY=0. Default ON means an un-enrolled repo keeps the current 
 behavior (no regression). Mirrors the opt-IN worktree-only-writes guard's per-repo knob.
 
 External approval (deny-by-default): there is NO self-service bypass. For a genuine exception,
-ASK the human, or request a one-time Telegram approval by setting
+a coordinator relays to the subagent first and requests a one-time Telegram approval by setting
 `RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN="<written justification>"` — when the tiered guard
 would BLOCK (a REPEAT offense), the hook asks via a trusted `tg-ctl` and allows ONLY on an
 explicit approval tap. A blank value or a bare `1`/`true` is rejected (deny), no Telegram call
@@ -202,6 +202,42 @@ def _load_hatch_escalation():
 
 
 hatch_escalation = _load_hatch_escalation()
+
+# The role-aware "what to do next" builder (agent-tools#994): loaded by repo-local path like the
+# hatch helper and OPTIONAL — a load failure falls back to the unknown-role EXCEPTION wording in
+# `_exception_ladder` (a crash would fail open via on_error and silently drop this block).
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations through sys.modules[cls.__module__], so the module
+    # must be registered while it executes.
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so `_message_for` can name the reader's role without threading it
+# through every signature. One event per hook process.
+_CURRENT_EVENT: dict = {}
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -712,10 +748,55 @@ _INLINE_SAFE = (
 )
 
 
+_HATCH_LAST_RESORT = (
+    'RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN="<justification>" <command> for a one-time '
+    "Telegram approval (a bare 1 is rejected)"
+)
+_COORDINATOR_RELAY = (
+    "if a subagent should do this, supply what it lacks with `write agent://<id>` and `wait`"
+)
+_PAUSE_NO_BYPASS = "never retry with RIG_HATCH_REQUEST_* and never go to the human"
+
+
+def _reader_role():
+    """The role of whoever reads this message (None if the builder is missing or unusable)."""
+    if _guard_message is None:
+        return None
+    try:
+        return _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+    except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+        return None
+
+
+def _pause_clause(parent_id: str) -> str:
+    target = f"`write agent://{parent_id or '<parent-id>'}`"
+    return (
+        f"{target} with what is missing + what you tried, then `yield` status "
+        "`awaiting-coordinator` (NOT blocked/done/failed); the coordinator's "
+        f"`write agent://<you>` revives you — {_PAUSE_NO_BYPASS}"
+    )
+
+
+def _exception_ladder(role) -> str:
+    """The role-specific tail of the one-line EXCEPTION (coordinator: relay, hatch LAST; subagent:
+    its coordinator, never the human; unknown/no builder: both branches)."""
+    kind = getattr(role, "kind", "unknown")
+    if kind == "coordinator":
+        return f"{_COORDINATOR_RELAY}; last resort for a genuine exception: {_HATCH_LAST_RESORT}."
+    if kind == "subagent":
+        return f"subagents are exempt from this guard; if you still see it, {_pause_clause(getattr(role, 'parent_id', ''))}."
+    return (
+        f"If you were dispatched by another agent: {_pause_clause('')}. "
+        f"If you are the top-level agent: {_COORDINATOR_RELAY}; last resort for a genuine "
+        f"exception: {_HATCH_LAST_RESORT}."
+    )
+
+
 def _message_for(harness, point: str, trigger: str, blocked: bool, hatch_denied: str | None = None) -> str:
     """The five-line WARN/BLOCK message (README: verdict, TRIGGER, WHY, DO THIS, EXCEPTION). A
     denied/unavailable hatch (``hatch_denied`` = its reason) is reported INSIDE the EXCEPTION
-    line, never as a sixth line — the first `TRIGGER:` line is what agents parse."""
+    line, never as a sixth line — the first `TRIGGER:` line is what agents parse. DO THIS leads
+    with the delegate step; the EXCEPTION line follows the role ladder (agent-tools#994)."""
     verdict = "BLOCKED" if blocked else f"WARN — a repeat within {TTL_S // 60} min BLOCKS"
     alternative = _INLINE_SAFE if point == "pre-bash" else (
         "Docs paths (*.md/*.mdx/*.txt/*.rst, docs/) are always allowed."
@@ -727,9 +808,7 @@ def _message_for(harness, point: str, trigger: str, blocked: bool, hatch_denied:
         f"TRIGGER: {trigger}.\n"
         "WHY: orchestrator session — plan, dispatch, verify; implementation runs in a subagent.\n"
         f"DO THIS: delegate — {_delegation_recipe(harness)}. {alternative}\n"
-        f"EXCEPTION: {denied}deny-by-default, no self-service bypass — ask the human, or "
-        "RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN=\"<justification>\" <command> for a one-time "
-        "Telegram approval (a bare 1 is rejected)."
+        f"EXCEPTION: {denied}deny-by-default, no self-service bypass — {_exception_ladder(_reader_role())}"
     )
 
 
@@ -2723,6 +2802,7 @@ def main() -> int:
         emit("allow")
         return 0
 
+    _CURRENT_EVENT["event"] = event
     # Subagents do the actual work → always allowed.
     if _is_subagent(event):
         emit("allow")

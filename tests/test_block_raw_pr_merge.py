@@ -2156,3 +2156,76 @@ def test_api_bool_and_value_short_chars_stay_disjoint_and_in_sync():
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ── agent-tools#994: role-aware escalation ladder ─────────────────────────────────────────────
+# The block must say what to do next: step 1 is the self-service `gh ship <PR>`; a subagent then
+# messages its coordinator (never the human); only the coordinator sees the Telegram hatch, last.
+_SESSION_DIR = "2026-10-24T10-11-12-345Z_0a1b2c3d-1111-2222-3333-444455556666"
+_SUBAGENT_ENV = {
+    "RIG_AGENT_ID": "Kid",
+    "PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_SESSION_DIR}/Kid.jsonl",
+}
+_COORDINATOR_ENV = {"PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_SESSION_DIR}.jsonl"}
+_ROLE_ENV_VARS = ("RIG_AGENT_ID", "RIG_PARENT_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE")
+
+
+def _ladder_message(monkeypatch, role_env: dict) -> str:
+    for name in _ROLE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    out, _err, code = _run("gh pr merge 123 --admin", monkeypatch, env=role_env)
+    assert code == hook.BLOCK_EXIT_CODE
+    return json.loads(out)["message"]
+
+
+def test_ladder_leads_with_marker_and_gh_ship(monkeypatch):
+    for env in ({}, _SUBAGENT_ENV, _COORDINATOR_ENV):
+        msg = _ladder_message(monkeypatch, env)
+        assert msg.startswith("Refusing a raw `gh pr merge`")
+        step1 = msg[msg.index("1. "):msg.index("2. ")]
+        assert "gh ship <PR>" in step1
+        assert "ASK" not in msg and "ask Alex" not in msg
+        assert "Closes" not in msg and "Fixes" not in msg
+        assert "trivial-ticketless" not in msg
+
+
+def test_ladder_subagent_messages_parent_and_has_no_human_hatch(monkeypatch):
+    msg = _ladder_message(monkeypatch, _SUBAGENT_ENV)
+    assert "`write agent://Main`" in msg
+    assert "`yield` status `awaiting-coordinator` (NOT blocked/done/failed)" in msg
+    assert _HATCH_ENV not in msg
+
+
+def test_ladder_coordinator_hatch_is_last_line_and_only_once(monkeypatch):
+    msg = _ladder_message(monkeypatch, _COORDINATOR_ENV)
+    assert "write agent://<id>" in msg
+    assert _HATCH_ENV in msg.rstrip().splitlines()[-1]
+    assert msg.count(_HATCH_ENV) == 1
+
+
+def test_ladder_unknown_role_has_both_branches(monkeypatch):
+    msg = _ladder_message(monkeypatch, {})
+    assert "If you were dispatched by another agent" in msg
+    assert "If you are the top-level agent" in msg
+    assert _HATCH_ENV in msg.rstrip().splitlines()[-1]
+
+
+def test_ladder_hatch_denied_keeps_marker_and_ladder(tmp_path, monkeypatch):
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    for name in _ROLE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    out, _err, code = _run(
+        "gh pr merge 5", monkeypatch, env={_HATCH_ENV: "Genuine one-off.", **_SUBAGENT_ENV}
+    )
+    msg = json.loads(out)["message"]
+    assert code == hook.BLOCK_EXIT_CODE
+    assert msg.startswith("hatch escalation denied")
+    assert "Refusing a raw `gh pr merge`" in msg and "gh ship <PR>" in msg and "write agent://Main" in msg
+
+
+def test_ladder_falls_back_to_neutral_text_when_lib_is_unavailable(monkeypatch):
+    monkeypatch.setattr(hook, "_guard_message", None)
+    msg = hook._render_block("Refusing a raw `gh pr merge`.", "Use `gh ship <PR>`.", "hatch line")
+    assert msg.startswith("Refusing a raw `gh pr merge`")
+    assert "gh ship <PR>" in msg and "dispatched by another agent" in msg

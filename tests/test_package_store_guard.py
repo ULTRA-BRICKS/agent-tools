@@ -1025,3 +1025,66 @@ def test_a_dotfiles_repo_at_home_does_not_make_the_global_hooks_dir_local(home, 
     _blocked("lefthook install", monkeypatch, home)
     subprocess.run(["git", "config", "core.hooksPath", ".husky/_"], cwd=home, check=True)
     _allowed("npx husky install", monkeypatch, home)
+
+
+# ── agent-tools#994: role-aware escalation ladder ─────────────────────────────────────────────
+# `_STORE_MSG` / `_VM_MSG` used to end "ask the human". A subagent must self-serve the safe
+# alternative (step 1), then message its coordinator; only the coordinator is routed to the human.
+_SESSION_DIR = "2026-10-24T10-11-12-345Z_0a1b2c3d-1111-2222-3333-444455556666"
+_SUBAGENT_ENV = {
+    "RIG_AGENT_ID": "Kid",
+    "PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_SESSION_DIR}/Kid.jsonl",
+}
+_COORDINATOR_ENV = {"PI_SESSION_FILE": f"/home/u/.omp/sessions/proj/{_SESSION_DIR}.jsonl"}
+_ROLE_ENV_VARS = ("RIG_AGENT_ID", "RIG_PARENT_AGENT_ID", "RIG_DETACHED_AGENT", "PI_SESSION_FILE")
+_LADDER_CASES = [
+    ("bun pm cache rm", "[package-store-guard] BLOCKED: this would wipe a shared package store", "rig worktree gc --yes"),
+    ("colima start", "[package-store-guard] BLOCKED:", "mocker"),
+]
+
+
+def _ladder(command: str, monkeypatch, home, bun_repo, role_env: dict) -> str:
+    for name in _ROLE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    for k, v in role_env.items():
+        monkeypatch.setenv(k, v)
+    return _blocked(command, monkeypatch, bun_repo)
+
+
+@pytest.mark.parametrize(("command", "marker", "remedy"), _LADDER_CASES)
+def test_ladder_leads_with_remedy_and_keeps_marker(command, marker, remedy, monkeypatch, home, bun_repo):
+    for env in ({}, _SUBAGENT_ENV, _COORDINATOR_ENV):
+        msg = _ladder(command, monkeypatch, home, bun_repo, env)
+        assert msg.startswith(marker)
+        assert remedy in msg[msg.index("1. "):msg.index("2. ")]
+        assert "ask the human" not in msg.lower().split("\n1. ")[0]
+        assert "Closes" not in msg and "Fixes" not in msg
+        assert "trivial-ticketless" not in msg
+
+
+@pytest.mark.parametrize(("command", "marker", "remedy"), _LADDER_CASES)
+def test_ladder_subagent_messages_coordinator_never_human(command, marker, remedy, monkeypatch, home, bun_repo):
+    msg = _ladder(command, monkeypatch, home, bun_repo, _SUBAGENT_ENV)
+    assert "`write agent://Main`" in msg
+    assert "`yield` status `awaiting-coordinator` (NOT blocked/done/failed)" in msg
+    assert "ask the human" not in msg.lower()
+
+
+@pytest.mark.parametrize(("command", "marker", "remedy"), _LADDER_CASES)
+def test_ladder_coordinator_routes_to_the_human_last(command, marker, remedy, monkeypatch, home, bun_repo):
+    msg = _ladder(command, monkeypatch, home, bun_repo, _COORDINATOR_ENV)
+    assert "human" in msg.rstrip().splitlines()[-1].lower()
+
+
+@pytest.mark.parametrize(("command", "marker", "remedy"), _LADDER_CASES)
+def test_ladder_unknown_role_has_both_branches(command, marker, remedy, monkeypatch, home, bun_repo):
+    msg = _ladder(command, monkeypatch, home, bun_repo, {})
+    assert "If you were dispatched by another agent" in msg
+    assert "If you are the top-level agent" in msg
+
+
+def test_ladder_falls_back_to_neutral_text_when_lib_is_unavailable(monkeypatch):
+    monkeypatch.setattr(psg, "_guard_message", None)
+    msg = psg._render_block("[package-store-guard] BLOCKED: x.", "Do the safe thing.", "human line")
+    assert msg.startswith("[package-store-guard] BLOCKED")
+    assert "Do the safe thing." in msg and "dispatched by another agent" in msg

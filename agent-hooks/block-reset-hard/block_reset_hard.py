@@ -51,7 +51,8 @@ The block is now DENY-BY-DEFAULT. A repo owner may wire `agent_hooks.approval_cm
 command) in the committed, code-reviewed rig.yaml; when a reset --hard / clean -f is about to
 be blocked this hook runs that command (with RIG_APPROVAL_* context in the child's env) and
 allows ONLY on exit 0. Nothing configured = denied; a nonzero/error/timeout verdict = denied.
-An agent with a genuine reason should ASK the human, not self-grant.
+A subagent with a genuine reason messages its coordinator; only the coordinator asks the human
+(after trying the scoped alternatives) — nobody self-grants.
 
 Known limitations — there is no longer a self-service hatch (removed — Alex tg#6554), so the
 parser is the only line; the bar for what's fixed above vs. documented below remains: would a
@@ -170,6 +171,42 @@ def _load_hatch_escalation():
 
 
 hatch_escalation = _load_hatch_escalation()
+
+# The role-aware "what to do next" builder (agent-tools#994): loaded by repo-local path like the
+# hatch helper and OPTIONAL — this hook is on_error=closed, so a load failure must still produce a
+# block, via the neutral text in `_render_block`.
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations through sys.modules[cls.__module__], so the module
+    # must be registered while it executes.
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so the block emitter can name the reader's role without threading
+# it through every signature. One event per hook process.
+_CURRENT_EVENT: dict = {}
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -881,25 +918,68 @@ def _request_approval(cwd: str, context: dict[str, str]) -> tuple[bool, str | No
     return True, detail
 
 
+_BLOCK_SELF_SERVE = (
+    "Use a scoped, reversible alternative instead — `git checkout -- <file>` / `git restore "
+    "<file>` for tracked files, `git clean -n` to preview untracked files first, then remove only "
+    "the named files."
+)
+_BLOCK_RELAY = (
+    "If a subagent reported this block, hand it the scoped alternative above via "
+    "`write agent://<id>` (or do it inline), then `wait` for its final report."
+)
+_LAST_RESORT = "Last resort, only if the wipe is genuinely required (destructive consent is the human's alone): "
+_NO_BYPASS = (
+    "As a subagent never self-grant (no RIG_HATCH_REQUEST_*, no env/comment bypass) and never go "
+    "to the human — destructive consent goes through your coordinator."
+)
+_BLOCK_HUMAN = (
+    "ask the human, "
+    'or request a one-time Telegram approval via RIG_HATCH_REQUEST_BLOCK_RESET_HARD="<written '
+    'justification>" (deny-by-default; a bare 1 is rejected). A repo owner can also wire '
+    "agent_hooks.approval_cmd in rig.yaml; unconfigured means denied."
+)
+
+
+def _render_block(what: str, self_serve: str, human: str = "", relay: str = "") -> str:
+    """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+            return _guard_message.render(
+                _guard_message.Remedy(
+                    what=what, self_serve=self_serve, relay=relay, human=human,
+                    last_resort=_LAST_RESORT, no_bypass=_NO_BYPASS,
+                ),
+                role,
+            )
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    top = "3. If you are the top-level agent: " + (relay or "supply the missing step to the blocked subagent.")
+    if human:
+        top += f" {_LAST_RESORT}{human}"
+    return "\n".join([
+        what,
+        f"1. {self_serve}",
+        "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
+        "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+        "blocked/done/failed); the coordinator's `write agent://<you>` revives you. "
+        + _NO_BYPASS,
+        top,
+    ])
+
+
 def _block_message(kind: str) -> str:
     """The refusal text for an unapproved dangerous segment of `kind` ("reset --hard" or
     "clean -f..."). Factored out of `main()` so `_gate_dangerous_segments` — which may need to
     emit this once per dangerous segment in a chained command — doesn't duplicate the literal.
     """
-    return (
-        f"Refusing a `git {kind}`: it irreversibly wipes uncommitted/untracked work with no "
-        "undo. Use a scoped, reversible alternative instead — `git checkout -- <file>` / "
-        "`git restore <file>` for tracked files, `git clean -n` to preview untracked files "
-        "first.\nThere is NO automatic bypass and NO self-service escape hatch. Do NOT try to "
-        "self-grant via ALLOW_GIT_RESET_HARD or a `# no-reset-guard:` comment — both were "
-        "removed (an agent setting its own bypass is security theater; removed per Alex "
-        "tg#6554). If you genuinely need this, ASK the human directly (your usual channel to "
-        "Alex), or request a one-time Telegram approval by setting "
-        'RIG_HATCH_REQUEST_BLOCK_RESET_HARD="<written justification>" (deny-by-default; a '
-        "bare 1 is rejected) — asking is fine, self-granting is not. A repo owner can also "
-        "wire a real external-approval path via agent_hooks.approval_cmd in rig.yaml; "
-        "unconfigured means denied."
+    what = (
+        f"Refusing a `git {kind}`: it irreversibly wipes uncommitted/untracked work with no undo. "
+        "There is NO automatic bypass and NO self-service escape hatch: ALLOW_GIT_RESET_HARD and "
+        "a `# no-reset-guard:` comment were removed (an agent setting its own bypass is security "
+        "theater; removed per Alex tg#6554)."
     )
+    return _render_block(what, _BLOCK_SELF_SERVE, _BLOCK_HUMAN, _BLOCK_RELAY)
 
 
 def _gate_dangerous_segments(
@@ -974,6 +1054,7 @@ def main() -> int:
         return BLOCK_EXIT_CODE
 
     cwd = str(event.get("cwd") or os.getcwd())
+    _CURRENT_EVENT["event"] = event
     args = event.get("args") or {}
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):

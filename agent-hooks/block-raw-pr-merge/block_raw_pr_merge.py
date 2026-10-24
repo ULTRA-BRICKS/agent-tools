@@ -52,8 +52,9 @@ External approval (replaces the OLD self-service escape hatch): there is NO
 `ALLOW_RAW_PR_MERGE`(+`_REASON`) env and NO `# no-ship-guard: <reason>` inline sentinel any
 more — an agent could set either on its own command, so those merely let the guarded agent
 grant itself the bypass this hook exists to stop. The block is now DENY-BY-DEFAULT. Use
-`gh ship <PR>` (the green-CI-gated, screenshot-checked path). For a genuine one-time exception,
-ASK Alex, or request a single approval by setting
+`gh ship <PR>` (the green-CI-gated, screenshot-checked path); a blocked subagent messages its
+coordinator, which alone may, as a last resort for a genuine one-time exception, request a single
+approval by setting
 `RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="<written justification>"`, which routes one Telegram
 approval request to Alex (deny-by-default; a bare `1`/`true` is rejected). Only an approved
 `tg-ctl ask` (exit 0) allows the raw merge; anything else denies.
@@ -142,6 +143,42 @@ def _load_hatch_escalation():
 
 
 hatch_escalation = _load_hatch_escalation()
+
+# The role-aware "what to do next" builder (agent-tools#994): loaded by repo-local path like the
+# hatch helper and OPTIONAL — a load failure falls back to the neutral text in `_render_block`
+# (a crash would fail open via on_error and silently drop this block).
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations through sys.modules[cls.__module__], so the module
+    # must be registered while it executes.
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so `_block` can name the reader's role without threading it through
+# every signature. One event per hook process.
+_CURRENT_EVENT: dict = {}
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -1586,16 +1623,59 @@ def _command_contains_gh_pr_merge(command: str, strict: bool = False) -> bool | 
     return sub  # False, or None (a merge-like substitution body that could not be parsed)
 
 
+_BLOCK_WHAT = (
+    "Refusing a raw `gh pr merge` (incl. --admin): it bypasses the ship gates (green CI + "
+    "required screenshots)."
+)
+_BLOCK_SELF_SERVE = (
+    "Use `gh ship <PR>` instead — it merges only once CI is green and the mandatory screenshots "
+    "are present. There is no self-service override (`ALLOW_RAW_PR_MERGE` / `# no-ship-guard:` are gone)."
+)
+_BLOCK_RELAY = (
+    "If a subagent reported this block, run `gh ship <PR>` yourself (or tell it to via "
+    "`write agent://<id>`), then `wait` for its final report."
+)
+_BLOCK_HUMAN = (
+    'request a single Telegram approval via RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="<why>" '
+    "(deny-by-default; a bare `1` is rejected)."
+)
+_LAST_RESORT = "Last resort, genuine one-time exception only: "
+_NO_BYPASS = (
+    "As a subagent never retry with RIG_HATCH_REQUEST_* or another bypass and never go to the "
+    "human."
+)
+
+
+def _render_block(what: str, self_serve: str, human: str = "", relay: str = "") -> str:
+    """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+            return _guard_message.render(
+                _guard_message.Remedy(
+                    what=what, self_serve=self_serve, relay=relay, human=human,
+                    last_resort=_LAST_RESORT, no_bypass=_NO_BYPASS,
+                ),
+                role,
+            )
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    top = "3. If you are the top-level agent: " + (relay or "supply the missing step to the blocked subagent.")
+    if human:
+        top += f" {_LAST_RESORT}{human}"
+    return "\n".join([
+        what,
+        f"1. {self_serve}",
+        "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
+        "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+        "blocked/done/failed); the coordinator's `write agent://<you>` revives you. "
+        + _NO_BYPASS,
+        top,
+    ])
+
+
 def _block(prefix: str | None = None) -> int:
-    body = (
-        "Refusing a raw `gh pr merge` (incl. --admin): it bypasses the ship gates "
-        "(green CI + required screenshots). Use `gh ship <PR>` instead — it merges only "
-        "once CI is green and the mandatory screenshots are present. There is NO self-service "
-        "override any more (`ALLOW_RAW_PR_MERGE` / `# no-ship-guard:` are gone). For a genuine "
-        "one-time exception, ASK Alex, or request a single approval via "
-        'RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="<why>" — that routes a Telegram approval request '
-        "to Alex (deny-by-default; a bare `1` is rejected)."
-    )
+    body = _render_block(_BLOCK_WHAT, _BLOCK_SELF_SERVE, _BLOCK_HUMAN, _BLOCK_RELAY)
     emit("block", f"{prefix}\n{body}" if prefix else body)
     return BLOCK_EXIT_CODE
 
@@ -1609,6 +1689,7 @@ def main() -> int:
         return BLOCK_EXIT_CODE
 
     args = event.get("args") or {}
+    _CURRENT_EVENT["event"] = event
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):
         command = str(command)
