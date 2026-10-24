@@ -57,6 +57,7 @@ class Remedy:
     last_resort: str = ""  # label before `human`; "" -> generic "Last resort, genuine exceptions only: "
     coordinator_note: str = ""  # appended to step 1 for the coordinator ONLY (e.g. the exempt-type remark)
     subagent_note: str = ""  # appended to step 1 for subagent/unknown readers (e.g. "do not reword ...")
+    coordinator_ask: str = ""  # what a paused subagent should ask its coordinator for, verbatim
     no_bypass: str = ""  # subagent/unknown no-bypass sentence; "" -> generic (hook names its own env vars)
 
 
@@ -163,10 +164,15 @@ def _pause_clause(role: Role) -> str:
     )
 
 
-def _subagent_step(role: Role, no_bypass: str) -> str:
+def _ask_clause(ask: str) -> str:
+    # A vague pause makes a cheap-model coordinator ask the human; name the exact request instead.
+    return f" Tell the coordinator exactly what you need: {ask.strip()}" if ask.strip() else ""
+
+
+def _subagent_step(role: Role, no_bypass: str, ask: str = "") -> str:
     return (
         "If you genuinely cannot (tool missing, backend error, wrong repo): "
-        f"{_pause_clause(role)} {no_bypass}"
+        f"{_pause_clause(role)}{_ask_clause(ask)} {no_bypass}"
     )
 
 
@@ -187,7 +193,7 @@ def render(remedy: Remedy, role: Role) -> str:
     no_bypass = remedy.no_bypass.strip() or _NO_BYPASS
     last_resort = remedy.last_resort or _LAST_RESORT
     if role.kind == "subagent":
-        steps.append(_subagent_step(role, no_bypass))
+        steps.append(_subagent_step(role, no_bypass, remedy.coordinator_ask))
     elif role.kind == "coordinator":
         steps.append(remedy.relay.strip() or _GENERIC_RELAY)
         if remedy.human:
@@ -197,7 +203,7 @@ def render(remedy: Remedy, role: Role) -> str:
             "If you were dispatched by another agent: "
             "`write agent://<parent-id>` with what is missing + what you tried, then `yield` "
             f"status `{_PAUSE_STATUS}` (NOT blocked/done/failed); the coordinator's "
-            f"`write agent://<you>` revives you. {no_bypass}"
+            f"`write agent://<you>` revives you.{_ask_clause(remedy.coordinator_ask)} {no_bypass}"
         )
         relay = remedy.relay.strip() or _GENERIC_RELAY
         top = f"If you are the top-level agent: {relay[0].lower()}{relay[1:]}"

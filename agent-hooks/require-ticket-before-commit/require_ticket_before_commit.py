@@ -1626,16 +1626,23 @@ def main() -> int:
 # so the block path puts it in `what` and the warn path uses its own marker-free `what`.
 _TASK_NEW = (
     'Run `task new --title "…" --acceptance "…" (repeatable) --why "…" --impact "…" '
-    '--if-not-done "…"` (a gate may refuse once: fix the flags, retry)'
+    '--if-not-done "…"` (if refused, fix flags, retry)'
 )
 _SELF_SERVE = (
-    f"{_TASK_NEW}, then re-run this commit with `Refs #<id>` in the message. Do not stop at this "
-    "block."
+    f"{_TASK_NEW}, then re-run this commit with `Refs #<id>` in the message. Do not stop here."
 )
 # The exempt-type remark is for the coordinator only; a dispatched agent reads it as a loophole
 # (baseline trials: 7/10 subagents reworded their mandated message into `chore:` to dodge the gate).
 _COORDINATOR_NOTE = "A truly trivial change can use a `chore:`/`docs:` type instead."
-_SUBAGENT_NOTE = "Do not reword a mandated commit message (e.g. into chore:/docs:) to dodge the gate."
+# A trailer paragraph keeps a mandated subject intact: baseline trial A#3 never ran `task new`
+# because adding a ticket reference seemed to violate an exact-message constraint.
+_SUBAGENT_NOTE = (
+    "Do not reword a mandated commit message (e.g. into chore:/docs:) to dodge the gate; a "
+    'trailer keeps the subject: `git commit -m "<mandated subject>" -m "Refs #<id>"`.'
+)
+_COORDINATOR_ASK = (
+    "run `task new …` for this change and send me the ticket id; I recommit with `Refs #<id>`."
+)
 # `git commit -F -` streams the message on GIT's stdin, which a PreToolUse hook CANNOT read (the
 # hook's stdin is the JSON event, not git's). When neither the message NOR the branch yields a
 # ticket, this unreadable-message case FAILS CLOSED WITH A HINT (agent-tools#104): rather than let
@@ -1643,12 +1650,12 @@ _SUBAGENT_NOTE = "Do not reword a mandated commit message (e.g. into chore:/docs
 # only remaining sanctioned out for a genuine ticketless commit is the Telegram hatch (checked
 # BEFORE this block, so an approved hatch allows a `-F -`).
 _STDIN_SELF_SERVE = (
-    f"{_TASK_NEW}, then re-run the commit with `Refs #<id>` passed where the hook can read it: "
-    '`-m "…Refs #<id>…"` or `-F <file>` (or a ticket id in the branch name, e.g. '
-    "`feature/ABC-12-foo`). Do not stop at this block."
+    f"{_TASK_NEW}, then re-run the commit with `Refs #<id>` where the hook can read it: "
+    '`-m "…Refs #<id>…"`, `-F <file>` or a ticket id in the branch name (`feature/ABC-12-foo`). '
+    "Do not stop here."
 )
 _RELAY = (
-    "If a subagent reported this block, run `task new` (above), send it the ticket id with "
+    "If a subagent reported this block, run `task new` (above), send it the id with "
     "`write agent://<id>` so it recommits with `Refs #<id>`, then `wait` for its final report."
 )
 _LAST_RESORT = "Last resort, genuine trivial-ticketless cases only: "
@@ -1683,6 +1690,7 @@ def _render_block(what: str, self_serve: str, human: str = "") -> str:
                     what=what, self_serve=self_serve, relay=_RELAY, human=human,
                     last_resort=_LAST_RESORT, no_bypass=_NO_BYPASS,
                     coordinator_note=_COORDINATOR_NOTE, subagent_note=_SUBAGENT_NOTE,
+                    coordinator_ask=_COORDINATOR_ASK,
                 ),
                 role,
             )

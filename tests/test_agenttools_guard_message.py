@@ -229,3 +229,11 @@ def test_last_resort_and_no_bypass_overrides():
     assert "LR: H." in render(remedy, _UNKNOWN)
     assert "NB." in render(remedy, _SUB) and "NB." in render(remedy, _UNKNOWN)
     assert "NB." not in render(remedy, _COORD)
+
+
+def test_coordinator_ask_is_named_in_subagent_and_unknown_step_only():
+    remedy = Remedy(what="W.", self_serve="S.", human="H.", coordinator_ask="DO-THIS-THING.")
+    for role in (_SUB, _UNKNOWN):
+        assert "Tell the coordinator exactly what you need: DO-THIS-THING." in render(remedy, role)
+    assert "DO-THIS-THING" not in render(remedy, _COORD)
+    assert "Tell the coordinator" not in render(Remedy(what="W.", self_serve="S."), _SUB)

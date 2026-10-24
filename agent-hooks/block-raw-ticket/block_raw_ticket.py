@@ -245,6 +245,9 @@ _NO_BYPASS = (
 )
 
 
+_COORDINATOR_ASK = "run the needed `task` command for me and send me the result."
+
+
 def _render_block(what: str, self_serve: str, human: str = "", relay: str = "") -> str:
     """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
     if _guard_message is not None:
@@ -253,7 +256,7 @@ def _render_block(what: str, self_serve: str, human: str = "", relay: str = "") 
             return _guard_message.render(
                 _guard_message.Remedy(
                     what=what, self_serve=self_serve, relay=relay, human=human,
-                    no_bypass=_NO_BYPASS,
+                    no_bypass=_NO_BYPASS, coordinator_ask=_COORDINATOR_ASK,
                 ),
                 role,
             )

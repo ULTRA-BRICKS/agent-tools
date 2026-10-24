@@ -1617,6 +1617,16 @@ class BlockMessageEscalationLadder(unittest.TestCase):
             self.assertNotIn("RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT", msg)
             self.assertNotIn("`wait`", msg)
 
+    def test_subagent_is_told_the_trailer_keeps_the_mandated_subject_and_what_to_ask(self):
+        for kind in _BLOCKED_COMMANDS:
+            for env in (_SUBAGENT_ENV, None):
+                msg = self._block(kind, env)
+                self.assertIn('git commit -m "<mandated subject>" -m "Refs #<id>"', msg)
+                self.assertIn("Tell the coordinator exactly what you need: run `task new", msg)
+                self.assertIn("send me the ticket id", msg)
+        self.assertNotIn("Tell the coordinator", self._block("plain", _COORDINATOR_ENV))
+        self.assertLessEqual(len(self._block("plain", _SUBAGENT_ENV)), 1100)
+
     def test_subagent_parent_override(self):
         msg = self._block("plain", {**_SUBAGENT_ENV, "RIG_PARENT_AGENT_ID": "Boss"})
         self.assertIn("write agent://Boss", msg)
@@ -1648,7 +1658,7 @@ class BlockMessageEscalationLadder(unittest.TestCase):
     def test_messages_stay_short(self):
         for kind in _BLOCKED_COMMANDS:
             for env in (None, _SUBAGENT_ENV, _COORDINATOR_ENV):
-                self.assertLessEqual(len(self._block(kind, env)), 1300, (kind, env))
+                self.assertLessEqual(len(self._block(kind, env)), 1500, (kind, env))
 
     def test_warn_only_advisory_has_remedy_but_no_marker_or_closing_keywords(self):
         for kind in _BLOCKED_COMMANDS:
