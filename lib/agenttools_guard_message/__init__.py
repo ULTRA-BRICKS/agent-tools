@@ -55,6 +55,8 @@ class Remedy:
     relay: str = ""  # coordinator: how to supply the missing thing to a blocked subagent ("" -> generic)
     human: str = ""  # coordinator/unknown last line (hatch env var text); "" = no human escalation line
     last_resort: str = ""  # label before `human`; "" -> generic "Last resort, genuine exceptions only: "
+    coordinator_note: str = ""  # appended to step 1 for the coordinator ONLY (e.g. the exempt-type remark)
+    subagent_note: str = ""  # appended to step 1 for subagent/unknown readers (e.g. "do not reword ...")
     no_bypass: str = ""  # subagent/unknown no-bypass sentence; "" -> generic (hook names its own env vars)
 
 
@@ -177,7 +179,11 @@ _LAST_RESORT = "Last resort, genuine exceptions only: "
 
 def render(remedy: Remedy, role: Role) -> str:
     """Short, numbered, role-specific escalation ladder. `remedy.what` leads, verbatim."""
-    steps: list[str] = [remedy.self_serve.strip()]
+    # The coordinator may be told about a legitimate exemption; a dispatched agent must NOT be:
+    # 7/10 baseline subagents rewrote a mandated commit message into `chore:` to dodge the gate.
+    note = remedy.coordinator_note if role.kind == "coordinator" else remedy.subagent_note
+    first = f"{remedy.self_serve.strip()} {note.strip()}".strip()
+    steps: list[str] = [first]
     no_bypass = remedy.no_bypass.strip() or _NO_BYPASS
     last_resort = remedy.last_resort or _LAST_RESORT
     if role.kind == "subagent":

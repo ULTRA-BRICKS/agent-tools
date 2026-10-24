@@ -1630,8 +1630,12 @@ _TASK_NEW = (
 )
 _SELF_SERVE = (
     f"{_TASK_NEW}, then re-run this commit with `Refs #<id>` in the message. Do not stop at this "
-    "block. A truly trivial change can use a `chore:`/`docs:` type instead."
+    "block."
 )
+# The exempt-type remark is for the coordinator only; a dispatched agent reads it as a loophole
+# (baseline trials: 7/10 subagents reworded their mandated message into `chore:` to dodge the gate).
+_COORDINATOR_NOTE = "A truly trivial change can use a `chore:`/`docs:` type instead."
+_SUBAGENT_NOTE = "Do not reword a mandated commit message (e.g. into chore:/docs:) to dodge the gate."
 # `git commit -F -` streams the message on GIT's stdin, which a PreToolUse hook CANNOT read (the
 # hook's stdin is the JSON event, not git's). When neither the message NOR the branch yields a
 # ticket, this unreadable-message case FAILS CLOSED WITH A HINT (agent-tools#104): rather than let
@@ -1678,6 +1682,7 @@ def _render_block(what: str, self_serve: str, human: str = "") -> str:
                 _guard_message.Remedy(
                     what=what, self_serve=self_serve, relay=_RELAY, human=human,
                     last_resort=_LAST_RESORT, no_bypass=_NO_BYPASS,
+                    coordinator_note=_COORDINATOR_NOTE, subagent_note=_SUBAGENT_NOTE,
                 ),
                 role,
             )
