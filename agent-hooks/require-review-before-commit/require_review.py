@@ -23,8 +23,8 @@ could set either on its own commit, so that "gate" was security theater. The blo
 DENY-BY-DEFAULT. A one-time exception is requested by setting
 `RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT="<written justification>"`, which routes a
 single approval request to the human via Telegram (deny-by-default; a bare `1`/`true` is
-rejected — it needs a real justification). An agent with a genuine reason should ASK the
-human, not self-grant.
+rejected — it needs a real justification). A subagent with a genuine reason messages its
+coordinator (never self-grants).
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command, the repo cwd in event.cwd
@@ -114,6 +114,40 @@ def _load_hatch_escalation():
 
 
 hatch_escalation = _load_hatch_escalation()
+
+# Role-aware "what to do next" builder (agent-tools#994). Loaded by repo-local path like the hatch
+# helper and OPTIONAL: any load failure falls back to neutral wording in `_render_block`, so a
+# wording helper can never turn into a hook crash (on_error=open).
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations through sys.modules[cls.__module__].
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so the message builder can name the reader's role.
+_CURRENT_EVENT: dict = {}
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -761,21 +795,51 @@ def _marker_is_fresh() -> bool | None:
     return stat.S_ISREG(st.st_mode) and (time.time() - st.st_mtime) <= FRESH_WINDOW_S
 
 
+_RELAY = (
+    "If a subagent reported this block, run the review for it (or tell it to, via "
+    "`write agent://<id>`) and touch the marker, then `wait` for its final report."
+)
+_HUMAN = (
+    "no self-service skip (`REVIEW_SKIP` / `[skip-review: …]` are gone); genuine one-time "
+    'exception only, single Telegram approval: RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT="<why>" '
+    "(deny-by-default; a bare `1` is rejected)."
+)
+
+
+def _render_block(what: str, self_serve: str, relay: str, human: str) -> str:
+    """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+            return _guard_message.render(
+                _guard_message.Remedy(what=what, self_serve=self_serve, relay=relay, human=human),
+                role,
+            )
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    return "\n".join([
+        what,
+        f"1. {self_serve}",
+        "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
+        "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+        "blocked/done/failed); the coordinator's `write agent://<you>` revives you. Never retry "
+        "with RIG_HATCH_REQUEST_* and never go to the human.",
+        f"3. If you are the top-level agent: {relay[0].lower()}{relay[1:]} Last resort: {human}",
+    ])
+
+
 def _block(prefix: str | None = None) -> int:
     marker = marker_path()
-    body = (
-        "No recent AI code review found for this change. Run a review on the "
-        "uncommitted diff (e.g. `review` / `codex exec review --uncommitted`) and "
-        f"address its findings before committing. (Set/touch {marker} on a successful "
-        "review, or set REVIEW_MARKER. A PURE-docs commit auto-allows — but only the simple "
-        "form: `git commit -a`/`-am`, a trailing pathspec, or a preceding `git add` of other "
-        "files FORFEITS that fast-path (the commit may include un-reviewed non-docs changes), "
-        "so a docs-only diff can still land here — stage just the docs and `git commit` them "
-        "alone.) There is NO self-service skip any more (`REVIEW_SKIP` / `[skip-review: …]` are "
-        "gone). For a genuine one-time exception, ASK the human, or request a single approval "
-        'via RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT="<why>" — that routes a Telegram '
-        "approval request to Alex (deny-by-default; a bare `1` is rejected)."
+    what = "No recent AI code review found for this change."
+    self_serve = (
+        "Run a review on the uncommitted diff (`review` / `codex exec review --uncommitted`), "
+        f"address its findings, then `touch {marker}` (or set REVIEW_MARKER) and recommit. A "
+        "PURE-docs commit auto-allows — but only the simple form: `git commit -a`/`-am`, a "
+        "trailing pathspec, or a preceding `git add` of other files FORFEITS that fast-path (the "
+        "commit may include un-reviewed non-docs changes), so a docs-only diff can still land "
+        "here — stage just the docs and `git commit` them alone."
     )
+    body = _render_block(what, self_serve, _RELAY, _HUMAN)
     emit("block", f"{prefix}\n{body}" if prefix else body)
     return BLOCK_EXIT_CODE
 
@@ -838,6 +902,7 @@ def main() -> int:
         warn(f"could not parse event: {exc} — allowing (fail-open)")
         return _allow()
 
+    _CURRENT_EVENT["event"] = event
     args = event.get("args") or {}
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):

@@ -132,6 +132,7 @@ _REMEDY = Remedy(
     what="[x] BLOCKED: no ticket.",
     self_serve="Run `task new --title T --acceptance A --why W --impact I --if-not-done N`, then recommit with `Refs #<id>`.",
     human='Genuine trivial ticketless commit only: RIG_HATCH_REQUEST_X="<why>".',
+    no_bypass="As a subagent never retry with REQUIRE_TICKET_STRICT=0 or RIG_HATCH_REQUEST_* (coordinator only) and never go to the human.",
 )
 _SUB = Role(kind="subagent", agent_id="Kid", parent_id="Boss", harness="omp")
 _COORD = Role(kind="coordinator", agent_id="Main", harness="omp")
@@ -209,3 +210,22 @@ def test_render_is_short_and_has_no_closing_keywords(role):
     assert len(text) <= 1000
     assert "Closes" not in text and "Fixes" not in text
     assert "ASK the human" not in text
+
+
+def test_defaults_are_generic_not_ticket_specific():
+    remedy = Remedy(what="W.", self_serve="S.", human="H.")
+    for role in (_SUB, _COORD, _UNKNOWN):
+        text = render(remedy, role)
+        assert "REQUIRE_TICKET" not in text and "RIG_HATCH_REQUEST" not in text
+        assert "ticketless" not in text
+    assert "Last resort, genuine exceptions only: H." in render(remedy, _COORD)
+    assert "never use a hatch/env bypass and never go to the human" in render(remedy, _SUB)
+    assert "never use a hatch/env bypass and never go to the human" in render(remedy, _UNKNOWN)
+
+
+def test_last_resort_and_no_bypass_overrides():
+    remedy = Remedy(what="W.", self_serve="S.", human="H.", last_resort="LR: ", no_bypass="NB.")
+    assert render(remedy, _COORD).rstrip().endswith("LR: H.")
+    assert "LR: H." in render(remedy, _UNKNOWN)
+    assert "NB." in render(remedy, _SUB) and "NB." in render(remedy, _UNKNOWN)
+    assert "NB." not in render(remedy, _COORD)

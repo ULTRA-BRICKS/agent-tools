@@ -1176,3 +1176,46 @@ def test_hatch_justification_exit1_blocks_citing_denied(tmp_path, monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ── Role-aware block ladder (agent-tools#994) ──────────────────────────────────────────
+
+def _ladder_msg(tmp_path, monkeypatch, *, agent_id=None, lib=True) -> str:
+    for var in ("PI_SESSION_FILE", "RIG_AGENT_ID", "RIG_DETACHED_AGENT", "RIG_PARENT_AGENT_ID"):
+        monkeypatch.delenv(var, raising=False)
+    if not lib:
+        monkeypatch.setattr(rr, "_guard_message", None)
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
+    env = {"RIG_AGENT_ID": agent_id} if agent_id else None
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=tmp_path / "m", env=env)
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+    return json.loads(out)["message"]
+
+
+def test_ladder_subagent_self_serve_first_then_pause(tmp_path, monkeypatch):
+    msg = _ladder_msg(tmp_path, monkeypatch, agent_id="Main.Worker")
+    assert msg.index("1. ") < msg.index("2. ")
+    assert all(m in msg.splitlines()[1] for m in ['codex exec review --uncommitted', 'touch'])
+    assert "awaiting-coordinator" in msg and "write agent://Main" in msg
+    assert "ASK the human" not in msg and "RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT" not in msg
+
+
+def test_ladder_coordinator_hatch_is_last_line(tmp_path, monkeypatch):
+    msg = _ladder_msg(tmp_path, monkeypatch, agent_id="Main")
+    lines = msg.splitlines()
+    assert lines[1].startswith("1. ") and all(m in lines[1] for m in ['codex exec review --uncommitted', 'touch'])
+    assert lines[-1].startswith("3.") and "RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT" in lines[-1]
+    assert "ASK the human" not in msg
+
+
+def test_ladder_unknown_role_shows_both_branches(tmp_path, monkeypatch):
+    msg = _ladder_msg(tmp_path, monkeypatch)
+    assert "If you were dispatched by another agent" in msg
+    assert "If you are the top-level agent" in msg
+    assert "ASK the human" not in msg
+
+
+def test_ladder_falls_back_when_lib_missing(tmp_path, monkeypatch):
+    msg = _ladder_msg(tmp_path, monkeypatch, lib=False)
+    assert "1. " in msg and all(m in msg.splitlines()[1] for m in ['codex exec review --uncommitted', 'touch'])
+    assert "awaiting-coordinator" in msg and "ASK the human" not in msg

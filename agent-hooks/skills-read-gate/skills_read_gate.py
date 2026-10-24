@@ -39,7 +39,7 @@ command to skip this gate — a self-grant is security theater. (Previously an
 `ALLOW_SKIP_SKILLS=1` override was routinely forced onto EVERY subagent commit to dodge the
 orchestration/visual defaults; that dominant false-block is now handled structurally — those
 two defaults are dropped for a dispatched subagent, see above — so no blanket override is
-needed.) For a genuine one-off, ASK the human, or request a ONE-TIME Telegram approval via
+needed.) For a genuine one-off (coordinator only; subagents message their coordinator), request a ONE-TIME Telegram approval via
 `RIG_HATCH_REQUEST_SKILLS_READ_GATE="<justification>"` (deny-by-default; a blank or bare `1` is
 rejected — the value must be a real written justification). The request routes to the human
 over Telegram (tg-ctl) and allows ONLY on their approval.
@@ -128,6 +128,40 @@ def _load_hatch_escalation():
 
 
 hatch_escalation = _load_hatch_escalation()
+
+# Role-aware "what to do next" builder (agent-tools#994). Loaded by repo-local path like the hatch
+# helper and OPTIONAL: any load failure falls back to neutral wording in `_render_block`, so a
+# wording helper can never turn into a hook crash (on_error=open).
+_GUARD_MESSAGE_MODULE = "agenttools_guard_message"
+
+
+def _load_guard_message():
+    init = Path(__file__).resolve().parents[2] / "lib" / _GUARD_MESSAGE_MODULE / "__init__.py"
+    if not init.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_GUARD_MESSAGE_MODULE, init)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_GUARD_MESSAGE_MODULE)
+    # dataclasses resolves string annotations through sys.modules[cls.__module__].
+    sys.modules[_GUARD_MESSAGE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(_GUARD_MESSAGE_MODULE, None)
+        else:
+            sys.modules[_GUARD_MESSAGE_MODULE] = previous
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return None
+    return module
+
+
+_guard_message = _load_guard_message()
+# The event main() is deciding, so the message builder can name the reader's role.
+_CURRENT_EVENT: dict = {}
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -683,15 +717,45 @@ def _block_message(missing: list[str]) -> str:
     redefined MANDATORY_SKILLS without those defaults likewise won't see a stale example."""
     head = (
         f"Mandatory/relevant skills not invoked before this work: {', '.join(missing)}. "
-        "Invoke them (Skill tool) first — they encode the rules this action must follow."
+        "They encode the rules this action must follow."
     )
     examples = [_SKILL_EXAMPLE[s] for s in missing if s in _SKILL_EXAMPLE]
     example = f" (e.g. {', '.join(examples)}.)" if examples else ""
-    override = (
-        " No self-service bypass. ASK the human, or request a one-time Telegram approval via "
-        'RIG_HATCH_REQUEST_SKILLS_READ_GATE="<justification>" (deny-by-default; bare 1 rejected).'
-    )
-    return head + example + override
+    what = head + example
+    return _render_block(what, _SELF_SERVE, _RELAY, _HUMAN)
+
+
+_SELF_SERVE = "Invoke the missing skills above (Skill tool / `read skill://<name>`), then retry."
+_RELAY = (
+    "If a subagent reported this block, invoke the skills yourself or tell it to with "
+    "`write agent://<id>`, then `wait` for its final report."
+)
+_HUMAN = (
+    "genuine one-off only, one-time Telegram approval: "
+    'RIG_HATCH_REQUEST_SKILLS_READ_GATE="<justification>" (deny-by-default; bare 1 rejected).'
+)
+
+
+def _render_block(what: str, self_serve: str, relay: str, human: str) -> str:
+    """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
+    if _guard_message is not None:
+        try:
+            role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
+            return _guard_message.render(
+                _guard_message.Remedy(what=what, self_serve=self_serve, relay=relay, human=human),
+                role,
+            )
+        except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
+            pass
+    return "\n".join([
+        what,
+        f"1. {self_serve}",
+        "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
+        "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
+        "blocked/done/failed); the coordinator's `write agent://<you>` revives you. Never retry "
+        "with RIG_HATCH_REQUEST_* and never go to the human.",
+        f"3. If you are the top-level agent: {relay[0].lower()}{relay[1:]} Last resort: {human}",
+    ])
 
 
 def main() -> int:
@@ -721,6 +785,7 @@ def main() -> int:
         emit("allow")  # every demanded skill has a fresh marker → satisfied
         return 0
 
+    _CURRENT_EVENT["event"] = event
     message = _block_message(missing)
     cwd = str(event.get("cwd") or os.getcwd())
 

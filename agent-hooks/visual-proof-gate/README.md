@@ -86,7 +86,7 @@ exempt subagents (unlike the orchestration gates 1–3).
 
 There is **no** env var or inline sentinel an agent can set on its own command to skip this
 gate (a self-grant is security theater). If you have a genuine reason to commit UI work with
-no fresh screenshot marker, **ASK the human**, or request a **one-time Telegram approval**:
+no fresh screenshot marker, the block message leads with the self-service proof (`dev shot ... --out ...` or `--write-marker`) and a role-aware ladder (a subagent messages its coordinator and yields `awaiting-coordinator`); only a coordinator requests a **one-time Telegram approval**:
 
 ```bash
 RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="deleting a dead component, nothing to render" git commit -m x

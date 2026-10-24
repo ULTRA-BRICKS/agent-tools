@@ -1647,6 +1647,11 @@ _RELAY = (
     "If a subagent reported this block, run `task new` (above), send it the ticket id with "
     "`write agent://<id>` so it recommits with `Refs #<id>`, then `wait` for its final report."
 )
+_LAST_RESORT = "Last resort, genuine trivial-ticketless cases only: "
+_NO_BYPASS = (
+    "As a subagent never retry with REQUIRE_TICKET_STRICT=0 or RIG_HATCH_REQUEST_* "
+    "(coordinator only) and never go to the human."
+)
 _HUMAN = (
     "request a one-time Telegram approval via "
     'RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="<justification>" (deny-by-default).'
@@ -1670,7 +1675,10 @@ def _render_block(what: str, self_serve: str, human: str = "") -> str:
         try:
             role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
             return _guard_message.render(
-                _guard_message.Remedy(what=what, self_serve=self_serve, relay=_RELAY, human=human),
+                _guard_message.Remedy(
+                    what=what, self_serve=self_serve, relay=_RELAY, human=human,
+                    last_resort=_LAST_RESORT, no_bypass=_NO_BYPASS,
+                ),
                 role,
             )
         except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash

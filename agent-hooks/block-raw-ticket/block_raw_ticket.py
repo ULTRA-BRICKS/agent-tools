@@ -240,13 +240,21 @@ _JUNK_SELF_SERVE = (
 )
 
 
+_NO_BYPASS = (
+    "As a subagent never retry with RIG_HATCH_REQUEST_* (coordinator only) and never go to the human."
+)
+
+
 def _render_block(what: str, self_serve: str, human: str = "", relay: str = "") -> str:
     """Role-aware ladder via the shared builder; neutral two-branch text if the lib is unusable."""
     if _guard_message is not None:
         try:
             role = _guard_message.detect_role(_CURRENT_EVENT.get("event") or {})
             return _guard_message.render(
-                _guard_message.Remedy(what=what, self_serve=self_serve, relay=relay, human=human),
+                _guard_message.Remedy(
+                    what=what, self_serve=self_serve, relay=relay, human=human,
+                    no_bypass=_NO_BYPASS,
+                ),
                 role,
             )
         except Exception:  # noqa: BLE001 - a wording helper must never turn a block into a crash
@@ -260,7 +268,7 @@ def _render_block(what: str, self_serve: str, human: str = "", relay: str = "") 
         "2. If you were dispatched by another agent: `write agent://<parent-id>` with what is "
         "missing + what you tried, then `yield` status `awaiting-coordinator` (NOT "
         "blocked/done/failed); the coordinator's `write agent://<you>` revives you. Never retry "
-        "with REQUIRE_TICKET_STRICT=0 or RIG_HATCH_REQUEST_* and never go to the human.",
+        "with RIG_HATCH_REQUEST_* and never go to the human.",
         top,
     ])
 

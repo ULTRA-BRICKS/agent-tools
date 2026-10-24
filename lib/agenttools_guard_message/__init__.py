@@ -54,6 +54,8 @@ class Remedy:
     self_serve: str  # step 1: concrete copy-pasteable commands, role independent
     relay: str = ""  # coordinator: how to supply the missing thing to a blocked subagent ("" -> generic)
     human: str = ""  # coordinator/unknown last line (hatch env var text); "" = no human escalation line
+    last_resort: str = ""  # label before `human`; "" -> generic "Last resort, genuine exceptions only: "
+    no_bypass: str = ""  # subagent/unknown no-bypass sentence; "" -> generic (hook names its own env vars)
 
 
 def _str(value: object) -> str:
@@ -134,10 +136,7 @@ def _detect_role(event: Mapping, env: Mapping[str, str]) -> Role:
 # coordinator, then `yield` with status `awaiting-coordinator`; the coordinator's
 # `write agent://<you>` revives the subagent with its context (live trial, agent-tools#994).
 _PAUSE_STATUS = "awaiting-coordinator"
-_NO_BYPASS = (
-    "As a subagent never retry with REQUIRE_TICKET_STRICT=0 or RIG_HATCH_REQUEST_* "
-    "(coordinator only) and never go to the human."
-)
+_NO_BYPASS = "As a subagent never use a hatch/env bypass and never go to the human."
 
 
 def _is_omp_channel(role: Role) -> bool:
@@ -162,10 +161,10 @@ def _pause_clause(role: Role) -> str:
     )
 
 
-def _subagent_step(role: Role) -> str:
+def _subagent_step(role: Role, no_bypass: str) -> str:
     return (
         "If you genuinely cannot (tool missing, backend error, wrong repo): "
-        f"{_pause_clause(role)} {_NO_BYPASS}"
+        f"{_pause_clause(role)} {no_bypass}"
     )
 
 
@@ -173,30 +172,31 @@ _GENERIC_RELAY = (
     "If a subagent reported this block, supply the missing thing with `write agent://<id>` so "
     "it continues (or do the step inline), then `wait` for its final report."
 )
-_LAST_RESORT = "Last resort, genuine trivial-ticketless cases only: "
+_LAST_RESORT = "Last resort, genuine exceptions only: "
 
 
 def render(remedy: Remedy, role: Role) -> str:
     """Short, numbered, role-specific escalation ladder. `remedy.what` leads, verbatim."""
     steps: list[str] = [remedy.self_serve.strip()]
+    no_bypass = remedy.no_bypass.strip() or _NO_BYPASS
+    last_resort = remedy.last_resort or _LAST_RESORT
     if role.kind == "subagent":
-        steps.append(_subagent_step(role))
+        steps.append(_subagent_step(role, no_bypass))
     elif role.kind == "coordinator":
         steps.append(remedy.relay.strip() or _GENERIC_RELAY)
         if remedy.human:
-            steps.append(_LAST_RESORT + remedy.human.strip())
+            steps.append(last_resort + remedy.human.strip())
     else:
         steps.append(
             "If you were dispatched by another agent: "
             "`write agent://<parent-id>` with what is missing + what you tried, then `yield` "
             f"status `{_PAUSE_STATUS}` (NOT blocked/done/failed); the coordinator's "
-            "`write agent://<you>` revives you. Never retry with REQUIRE_TICKET_STRICT=0 or "
-            "RIG_HATCH_REQUEST_* and never go to the human."
+            f"`write agent://<you>` revives you. {no_bypass}"
         )
         relay = remedy.relay.strip() or _GENERIC_RELAY
         top = f"If you are the top-level agent: {relay[0].lower()}{relay[1:]}"
         if remedy.human:
-            top += f" {_LAST_RESORT}{remedy.human.strip()}"
+            top += f" {last_resort}{remedy.human.strip()}"
         steps.append(top)
     numbered = "\n".join(f"{i}. {text}" for i, text in enumerate(steps, start=1))
     return f"{remedy.what.strip()}\n{numbered}"

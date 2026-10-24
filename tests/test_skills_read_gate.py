@@ -760,3 +760,49 @@ def test_unparseable_command_does_not_classify_as_build_or_test():
     """An unbalanced quote fails OPEN for the build/test half — this gate is process
     discipline (on_error=open), so a parse failure must never invent a work action."""
     assert not srg._is_work_action("rg -n 'unterminated vitest")
+
+
+# ── Role-aware block ladder (agent-tools#994) ──────────────────────────────────────────
+
+def _block_text(monkeypatch, tmp_path, *, agent_id=None, env=None) -> str:
+    for var in ("PI_SESSION_FILE", "RIG_AGENT_ID", "RIG_DETACHED_AGENT", "RIG_PARENT_AGENT_ID"):
+        monkeypatch.delenv(var, raising=False)
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    # a project skill is demanded of subagents too (only the two defaults are dropped for them)
+    kw = dict(invoked=invoked, tier=tier, agent_id=agent_id, env=env, mandatory="project-skill")
+    _run("git commit -m x", monkeypatch, **kw)
+    out, _e, c = _run("git commit -m x", monkeypatch, **kw)
+    assert c == srg.BLOCK_EXIT_CODE
+    return json.loads(out)["message"]
+
+
+def test_block_ladder_subagent_leads_with_skill_remedy_and_pauses(tmp_path, monkeypatch):
+    msg = _block_text(monkeypatch, tmp_path, agent_id="Main.Worker")
+    assert msg.startswith("Mandatory/relevant skills not invoked")
+    assert msg.index("1. Invoke") < msg.index("2.")
+    assert "awaiting-coordinator" in msg and "write agent://Main" in msg
+    assert "ASK the human" not in msg and "RIG_HATCH_REQUEST_SKILLS_READ_GATE" not in msg
+
+
+def test_block_ladder_coordinator_demotes_hatch_to_last_line(tmp_path, monkeypatch):
+    msg = _block_text(monkeypatch, tmp_path, agent_id="Main")
+    lines = msg.splitlines()
+    assert lines[1].startswith("1. Invoke")
+    assert lines[-1].startswith("3.") and "RIG_HATCH_REQUEST_SKILLS_READ_GATE" in lines[-1]
+    assert "ASK the human" not in msg
+
+
+def test_block_ladder_unknown_role_shows_both_branches(tmp_path, monkeypatch):
+    msg = _block_text(monkeypatch, tmp_path)
+    assert "If you were dispatched by another agent" in msg
+    assert "If you are the top-level agent" in msg
+    assert msg.index("1. Invoke") < msg.index("dispatched")
+    assert "ASK the human" not in msg
+
+
+def test_block_ladder_falls_back_when_lib_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(srg, "_guard_message", None)
+    msg = _block_text(monkeypatch, tmp_path)
+    assert msg.startswith("Mandatory/relevant skills not invoked")
+    assert "1. Invoke" in msg and "awaiting-coordinator" in msg
+    assert "ASK the human" not in msg

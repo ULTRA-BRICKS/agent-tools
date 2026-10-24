@@ -96,8 +96,8 @@ There is **no** env var or inline sentinel an agent can set on its own command t
 gate (a self-grant is security theater). The dominant reason one used to be forced —
 `ALLOW_SKIP_SKILLS=1` on every subagent commit to dodge the orchestration/visual defaults — is
 now handled **structurally** (those two defaults are dropped for a dispatched subagent, see
-above), so no blanket override is needed. For a genuine one-off, **ASK the human**, or request
-a **one-time Telegram approval**:
+above), so no blanket override is needed. Every block message now leads with the self-service remedy (invoke the skills) and a role-aware ladder (a subagent messages its coordinator and yields `awaiting-coordinator`); only a coordinator, for a genuine one-off, requests a
+**one-time Telegram approval**:
 
 ```bash
 RIG_HATCH_REQUEST_SKILLS_READ_GATE="docs-only commit, the mandatory skills are N/A here" npm test

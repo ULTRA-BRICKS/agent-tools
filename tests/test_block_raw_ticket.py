@@ -1294,7 +1294,7 @@ def test_ladder_subagent_messages_parent_and_has_no_human_hatch(tmp_path, monkey
     assert "`write agent://Main`" in msg
     assert "`yield` status `awaiting-coordinator` (NOT blocked/done/failed)" in msg
     assert "`write agent://Kid`" in msg
-    assert "never retry with REQUIRE_TICKET_STRICT=0 or RIG_HATCH_REQUEST_*" in msg
+    assert "never retry with RIG_HATCH_REQUEST_* (coordinator only)" in msg
     assert _HATCH_VAR not in msg
 
 

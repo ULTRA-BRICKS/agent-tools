@@ -36,7 +36,7 @@ There is **no** `REVIEW_SKIP=1` inline-env bypass and **no** `[skip-review: <rea
 commit-message trailer any more. An agent could set either on its own commit, so those
 "gates" were security theater — they are removed and the block is now **deny-by-default**.
 
-For a genuine one-time exception, **ask the human** — or request a single approval by setting
+For a genuine one-time exception, message your coordinator (a subagent never goes to the human; the block message gives the ladder) — or, as the coordinator, request a single approval by setting
 `RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT="<written justification>"`. That routes one
 Telegram approval request to Alex (deny-by-default): the env var must carry a real
 justification — unset means the hook never contacts Telegram, and a blank or bare
