@@ -4,6 +4,18 @@
 
 ### Added
 
+- Worktree-only guard is ON BY DEFAULT and now covers commits (agent-tools#1012, Refs #1012):
+  `worktree-only-writes`, `pin-primary-worktree` and `block-devserver-primary` enforce in every
+  repo that has a `rig.yaml` unless it sets `agent_hooks.worktree_only: false` (or the session
+  sets `RIG_WORKTREE_ONLY=0`); a directory with no `rig.yaml` is still never blocked.
+  `pin-primary-worktree` additionally DENIES `git commit` (incl. `--amend`), `cherry-pick`,
+  `merge` (except `--ff-only`), `rebase`, `revert` and `am` on the default branch of the PRIMARY
+  checkout, follows `cd <dir> &&` / `git -C`, and all three block messages now give the exact
+  `rig worktree create <feature> --from origin/<default> -C <root>` command instead of raw
+  `git worktree add`. Closes the 2026-10-24 gap where garage-band (no `worktree_only` key) took
+  four agent commits straight onto local main. A repo that legitimately works on main must opt out with
+  `agent_hooks.worktree_only: false` in its `rig.yaml`.
+
 - `agenttools_service` 0.3.0 (agent-tools#1005): the systemd user unit and the lifecycle verbs
   now agree. With an enabled unit `start`/`restart`/`stop`/`status` act on the unit (exactly one
   daemon; a leftover pidfile daemon is stopped first) and `status` reports the unit's real
@@ -580,7 +592,6 @@
   prefixes with one portable substitution instead of a GNU-only `sed ':a; …; ta'` loop. BSD sed
   (macOS) warned "unused label" and stripped nothing, so an env-prefixed local scan such as
   `GITLEAKS_CONFIG=x gitleaks git --staged` read as "no local secret scan" (agent-tools#810).
-
 
 - `cc-hook-bridge`: one hard wall-clock budget (1100s) for all agent-hooks run on a single
   Claude Code tool call. Two hatch approval waits (960s each) in one pre-bash call used to

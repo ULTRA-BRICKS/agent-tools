@@ -12,13 +12,15 @@ redirected to a worktree BEFORE it writes, not after it tries to push. (Alex tg#
 Read-only tools and `git merge` / `git pull` are unaffected — they are not Edit/Write tool
 calls, so this pre-write point never sees them.
 
-PER-REPO, opt-in (this must NOT break a repo that legitimately works on main — e.g. 3d-cli):
-the guard enforces ONLY where the repo opts in. Opt-in signal, first match wins:
+ON BY DEFAULT in every rig-provisioned repo (one with a rig.yaml). Alex's rule: every agent edits
+and commits only in its OWN worktree, never in the primary checkout — a guard that needs a per-repo
+opt-in is a guard that was never switched on (2026-10-24: garage-band had no `worktree_only` key,
+so agents committed straight onto its main). Resolution order, first match wins:
   1. env  RIG_WORKTREE_ONLY=1 (force on) / =0 (force off)   — session/CI override + tests.
-  2. the repo's committed rig.yaml → `agent_hooks.worktree_only: true`  (rig-provisioned).
-  3. default OFF — a repo with no signal is never blocked.
-So hyperide + the agent-ecosystem repos set `worktree_only: true` in their rig.yaml; 3d-cli
-leaves it absent and is exempt automatically.
+  2. the repo's committed rig.yaml → `agent_hooks.worktree_only: false` OPTS OUT (a repo that
+     legitimately works on main); `true` is the explicit spelling of the default.
+  3. a rig.yaml with no such key → ON. No rig.yaml up the tree (a scratch `git init` dir, /tmp) →
+     OFF: an un-enrolled directory is never blocked.
 
 External approval (replaces the OLD self-service escape hatch): there is NO env-var bypass for
 this guard any more — an agent could set `RIG_ALLOW_MAIN_EDIT=1` on itself, so that merely
@@ -145,12 +147,14 @@ _HARNESS_URI_RE = re.compile(r"([a-z]+)://(.*)", re.DOTALL)
 _MAX_UNQUOTE_ROUNDS = 3
 
 MESSAGE = (
-    "You are on the default branch ({branch}) — the worktree-only workflow forbids authoring "
-    "files here. main is for merge / pull / read-only operations only. Do the work in a "
-    "separate worktree on a feature branch first, e.g.:\n"
-    "    git worktree add ../wt-<feature> -b <feature> origin/{branch}\n"
-    "    cd ../wt-<feature>   # then Edit/Write there\n"
-    "(worktree-only workflow, rig-provisioned; Alex tg#5742.) There is NO self-service env-var "
+    "You are on the default branch ({branch}) of the PRIMARY checkout {root} — the worktree-only "
+    "workflow forbids authoring files here, so this write was NOT made. main is for merge / "
+    "pull / read-only operations only; every agent works in its OWN worktree on its own branch.\n"
+    "Create one and write there instead:\n"
+    "    rig worktree create <feature> --from origin/{branch} -C {root}\n"
+    "    cd {root}/.worktrees/<feature>   # then Edit/Write there\n"
+    "(Use rig worktree create, not raw `git worktree add` — rig provisions deps and "
+    "block-raw-worktree-add rejects the raw form.) There is NO self-service env-var "
     "bypass. For a genuine one-off main edit, request a one-time Telegram approval via "
     'RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES="<justification>" (deny-by-default; bare 1 rejected).'
 )
@@ -280,7 +284,8 @@ def _agent_hooks_bool(rig_yaml_text: str, key: str, default: bool) -> bool:
 
 
 def worktree_only_enabled(cwd: str) -> bool:
-    """Whether worktree-only enforcement is ON for this repo. env override > rig.yaml > OFF."""
+    """Whether worktree-only enforcement is ON for this repo. env override > rig.yaml > ON
+    (a rig.yaml is present) / OFF (no rig.yaml: not enrolled)."""
     env = os.environ.get("RIG_WORKTREE_ONLY")
     if env is not None:
         return env.strip() == "1"
@@ -292,7 +297,7 @@ def worktree_only_enabled(cwd: str) -> bool:
     except OSError as exc:
         warn(f"could not read {root / 'rig.yaml'}: {exc}")
         return False
-    return _agent_hooks_bool(text, CONFIG_KEY, default=False)
+    return _agent_hooks_bool(text, CONFIG_KEY, default=True)
 
 
 def _decide_block(cwd: str, branch: str) -> int:
@@ -303,7 +308,8 @@ def _decide_block(cwd: str, branch: str) -> int:
     A pre-write hook has NO shell command string (the event is an Edit/Write), so the
     justification is read purely from the process environment (`RIG_HATCH_REQUEST_…`); `command`
     is not passed."""
-    message = MESSAGE.format(branch=branch)
+    root = _git(cwd, "rev-parse", "--show-toplevel") or cwd
+    message = MESSAGE.format(branch=branch, root=root)
     hatch = hatch_escalation.request_hatch_approval(
         HOOK_ID, {"hook": HOOK_ID, "branch": branch}, cwd=cwd,
     )

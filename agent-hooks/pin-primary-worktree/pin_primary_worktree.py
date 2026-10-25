@@ -21,12 +21,22 @@ This hook closes that gap directly: it inspects `git checkout` / `git switch` in
 BLOCKS one that would move the PRIMARY worktree (never a `git worktree add`-created linked
 worktree — see `is_primary_worktree`) onto anything other than the repo's default branch.
 Checking OUT of a feature branch back to default, `git worktree add` (a different worktree
-entirely), `git merge`/`git pull`/`git fetch`, and any checkout inside a LINKED worktree are
-all unaffected. Complements (does not replace) `worktree-only-writes`.
+entirely), `git pull`/`git fetch`/`git merge --ff-only`, and any checkout inside a LINKED
+worktree are all unaffected. Complements (does not replace) `worktree-only-writes`.
 
-PER-REPO, opt-in — reuses the SAME `agent_hooks.worktree_only` knob as `worktree-only-writes`
-(one feature, one flag; see that hook's docstring for the resolution order: env
-RIG_WORKTREE_ONLY > rig.yaml agent_hooks.worktree_only > default OFF).
+ON BY DEFAULT — reuses the SAME `agent_hooks.worktree_only` knob as `worktree-only-writes` (one
+feature, one flag; see that hook's docstring for the resolution order: env RIG_WORKTREE_ONLY >
+rig.yaml agent_hooks.worktree_only (false opts out) > ON when a rig.yaml exists, OFF without one).
+
+Second job (2026-10-24 incident): the same PRIMARY-checkout rule applies to history-writing
+commands. `git commit` / `cherry-pick` / `merge` / `rebase` / `revert` / `am` while the primary
+checkout sits on the DEFAULT branch is DENIED with a message that gives the exact
+`rig worktree create` command. Two omp subagents had run plain `git commit` in
+garage-band/projects/wall-plugs (the primary checkout, on main): four commits landed on local
+main because nothing here looked at commit. Non-committing forms stay allowed: `merge
+--ff-only` (the pull-like sync), `--abort` / `--quit`, `commit --dry-run`, `--help`. A
+`cd <dir> &&` earlier in the chain is followed, so `cd .worktrees/x && git commit` is judged
+against the linked worktree, not the shell's starting directory.
 
 External approval (replaces the OLD self-service escape hatch): there is NO env-var / inline
 bypass for THIS checkout guard any more — an agent could set `RIG_ALLOW_MAIN_EDIT=1` on its own
@@ -163,15 +173,10 @@ _GIT_TIMEOUT_S = 3.0
 # gate-worthy segments to safely clear in time is denied by THIS hook, deliberately, before the
 # external kill can ever fire.
 _MAIN_LOOP_BUDGET_S = 10.0
+# Live Telegram hatch asks made so far in THIS hook invocation (see `_gate_primary`).
+_HATCH_ASKS = 0
 
-MESSAGE = (
-    "BLOCKED — this is the repo's PRIMARY worktree; switching it to '{target}' risks colliding "
-    "with other concurrent agents/sessions that share this checkout (this exact collision "
-    "already happened once — Alex tg#6462/tg#6477). The primary worktree is for merge / pull / "
-    "read-only only; checkout/switch there is blocked outside the default branch ({default}).\n"
-    "Do the work in a separate worktree instead:\n"
-    "    git worktree add ../wt-<feature> -b {target} origin/{default}\n"
-    "    cd ../wt-<feature>   # then git checkout/switch there\n"
+_ESCAPE_TEXT = (
     "There is NO automatic bypass and NO self-service escape hatch for THIS checkout guard. Do "
     "NOT try to self-grant via any environment variable — RIG_ALLOW_MAIN_EDIT no longer opens "
     "this hook (an agent setting its own bypass is security theater; removed per Alex tg#6554). "
@@ -181,6 +186,34 @@ MESSAGE = (
     "bare 1 is rejected) — asking is fine, self-granting is not. A repo owner can also wire a "
     "real external-approval path via agent_hooks.approval_cmd in rig.yaml; unconfigured means "
     "denied."
+)
+
+MESSAGE = (
+    "BLOCKED — {root} is the repo's PRIMARY worktree; switching it to '{target}' risks colliding "
+    "with other concurrent agents/sessions that share this checkout (this exact collision "
+    "already happened once — Alex tg#6462/tg#6477). The primary checkout is for merge / pull / "
+    "read-only only; checkout/switch there is blocked outside the default branch ({default}). "
+    "Nothing was run.\n"
+    "Do the work in your own worktree instead:\n"
+    "    rig worktree create <feature> --from origin/{default} -C {root}\n"
+    "    cd {root}/.worktrees/<feature>   # then git checkout/switch there\n"
+    "(rig worktree create, not raw `git worktree add`: rig provisions deps and "
+    "block-raw-worktree-add rejects the raw form.)\n" + _ESCAPE_TEXT
+)
+
+HISTORY_MESSAGE = (
+    "BLOCKED — `git {verb}` on the default branch ({default}) of the PRIMARY worktree {root}. "
+    "Nothing was run. Every agent commits only in its OWN worktree on its OWN branch; the "
+    "primary checkout's {default} is for `git pull --ff-only` / `git merge --ff-only` / "
+    "read-only work. (2026-10-24: four commits landed on garage-band's local main this way and "
+    "had to be moved off by hand.)\n"
+    "Create a worktree and do this there:\n"
+    "    rig worktree create <feature> --from origin/{default} -C {root}\n"
+    "    cd {root}/.worktrees/<feature>   # then git {verb}, push the branch, open a PR\n"
+    "(rig worktree create, not raw `git worktree add`: rig provisions deps and "
+    "block-raw-worktree-add rejects the raw form. Uncommitted edits already sitting here: do "
+    "NOT `git stash` — save `git -C {root} diff --binary HEAD > ~/.cache/<repo>-recovery/<name>.patch` "
+    "and apply it inside the new worktree.)\n" + _ESCAPE_TEXT
 )
 
 
@@ -292,7 +325,8 @@ def _agent_hooks_bool(rig_yaml_text: str, key: str, default: bool) -> bool:
 
 
 def worktree_only_enabled(cwd: str) -> bool:
-    """Whether worktree-only enforcement is ON for this repo. env override > rig.yaml > OFF."""
+    """Whether worktree-only enforcement is ON for this repo. env override > rig.yaml > ON
+    (a rig.yaml is present) / OFF (no rig.yaml: not enrolled)."""
     env = os.environ.get("RIG_WORKTREE_ONLY")
     if env is not None:
         return env.strip() == "1"
@@ -304,7 +338,7 @@ def worktree_only_enabled(cwd: str) -> bool:
     except OSError as exc:
         warn(f"could not read {root / 'rig.yaml'}: {exc}")
         return False
-    return _agent_hooks_bool(text, CONFIG_KEY, default=False)
+    return _agent_hooks_bool(text, CONFIG_KEY, default=True)
 
 
 # ── external-approval extension point (SYNC: the functions below — _agent_hooks_raw,
@@ -505,15 +539,27 @@ def is_primary_worktree(cwd: str) -> bool | None:
     return gd == cd
 
 
-# ── bash chain parsing (SYNC: chain-split copied from
-# orchestrator-stays-thin/orchestrator_stays_thin.py._split_chain — same quote-aware algorithm) ─
+# ── bash chain parsing (SYNC: the quote-aware split is orchestrator-stays-thin/
+# orchestrator_stays_thin.py._split_chain, EXCEPT this copy also returns each segment's preceding
+# operator so `_CwdTracker` can tell which `cd`s are certain to run) ─
 
-def _split_chain(command: str) -> list[str]:
-    """Split on shell operators (&&, ||, ;, |, newline, a bare control &) that lie OUTSIDE quotes."""
-    segs: list[str] = []
+def _split_chain(command: str) -> list[tuple[str | None, str]]:
+    """Split on shell operators (&&, ||, ;, |, newline, a bare control &) that lie OUTSIDE quotes.
+
+    Returns ``(preceding_operator, segment)`` pairs (operator None for the first segment) so
+    callers can tell which segments are certain to run (see `_CwdTracker`)."""
+    segs: list[tuple[str | None, str]] = []
     buf: list[str] = []
+    pending: str | None = None
     quote: str | None = None
     i, n = 0, len(command)
+
+    def flush(next_op: str) -> None:
+        nonlocal buf, pending
+        segs.append((pending, "".join(buf)))
+        buf = []
+        pending = next_op
+
     while i < n:
         c = command[i]
         prev = command[i - 1] if i > 0 else ""
@@ -528,22 +574,29 @@ def _split_chain(command: str) -> list[str]:
             buf.append(c)
             i += 1
         elif command[i:i + 2] in ("&&", "||"):
-            segs.append("".join(buf))
-            buf = []
+            flush(command[i:i + 2])
             i += 2
         elif c == "&" and prev not in ("&", ">") and nxt not in ("&", ">"):
-            segs.append("".join(buf))
-            buf = []
+            flush("&")
             i += 1
         elif c in (";", "|", "\n"):
-            segs.append("".join(buf))
-            buf = []
+            flush(c)
             i += 1
         else:
             buf.append(c)
             i += 1
-    segs.append("".join(buf))
-    return [s for s in segs if s.strip()]
+    segs.append((pending, "".join(buf)))
+    kept: list[tuple[str | None, str]] = []
+    carried: str | None = None
+    for op, s in segs:
+        if not s.strip():
+            # `make &\ngit commit`: the `&` must survive the empty segment the newline creates.
+            if op not in (None, "\n") and carried is None:
+                carried = op
+            continue
+        kept.append((carried if op in (None, "\n") and carried else op, s))
+        carried = None
+    return kept
 
 
 # ── git checkout/switch classification ───────────────────────────────────────────────────────
@@ -577,7 +630,8 @@ def _classify_git_segment(
     principle).
     """
     try:
-        toks = shlex.split(segment)
+        # `(git commit`, `{ git commit`, `then git commit`, `time git commit` are still git
+        toks = shlex.split(_COMMAND_PREFIX_RE.sub("", segment, count=1), comments=True)
     except ValueError:
         return None
     i = 0
@@ -596,7 +650,13 @@ def _classify_git_segment(
             i += 1
     if i >= len(toks):
         return None
-    return toks[i], toks[i + 1:], cwd_override
+    # `(git commit --abort)`: a compound's closer is glued to the last token.
+    rest = toks[i + 1:]
+    if rest:
+        rest[-1] = rest[-1].rstrip(");}")
+        if not rest[-1]:
+            rest.pop()
+    return toks[i].rstrip(");}"), rest, cwd_override
 
 
 def _switch_target(subcommand: str, toks: list[str]) -> str | None:
@@ -632,6 +692,316 @@ def _resolve_effective_cwd(base_cwd: str, cwd_override: str | None) -> str:
     if not p.is_absolute():
         p = Path(base_cwd or ".") / p
     return str(p)
+
+
+def _gate_primary(
+    eff_cwd: str, context: dict[str, str], command: str, deadline: float, what: str, message: str
+) -> tuple[str, str]:
+    """The deny-by-default tail shared by every primary-checkout violation: Telegram hatch first,
+    then the rig.yaml ``approval_cmd`` under the chained-command ``deadline``. Returns
+    ``("approved", note)`` or ``("block", message)``. ``what`` names the gated action in notes."""
+    # RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE (live Telegram ask) is checked first and is not
+    # bounded by _MAIN_LOOP_BUDGET_S/_APPROVAL_TIMEOUT_CEILING_S — a human approval round-trip
+    # legitimately runs up to tg-ctl's 900s cap, which is why this hook's manifest timeout_ms was
+    # raised to 960000. It only "stops" (should_stop=True) when an actual hatch request was made;
+    # an unset env var falls through to the approval_cmd budget below.
+    global _HATCH_ASKS
+    if _HATCH_ASKS:
+        # A live Telegram ask is not bounded by the chained-command budget, so a second one in the
+        # same invocation could run the hook past its manifest timeout (on_error is "open").
+        return "block", (
+            f"BLOCKED — a second gated segment ('{what}') in one chained command after a "
+            "Telegram hatch ask: split this into separate Bash calls so each is approved "
+            "individually."
+        )
+    hatch = hatch_escalation.request_hatch_approval(
+        "pin-primary-worktree", context, cwd=eff_cwd, command=command
+    )
+    if hatch.should_stop:
+        _HATCH_ASKS += 1
+        if hatch.approved:
+            warn(f"primary-checkout {what} approved via hatch escalation ({hatch.reason})")
+            return "approved", f"{what} approved via hatch escalation ({hatch.reason})"
+        warn(f"primary-checkout {what} hatch escalation denied: {hatch.reason}")
+        return "block", f"hatch escalation denied: {hatch.reason}\n{message}"
+
+    # Reserve the FULL approval-cmd ceiling before starting this call, not just check whether
+    # the deadline has already passed: a call that's allowed to START just before `deadline`
+    # can still RUN for up to `_APPROVAL_TIMEOUT_CEILING_S` more, which alone could push the
+    # aggregate past the manifest timeout. Only start this approval call if it can finish (at
+    # its absolute worst case) before `deadline`.
+    if time.monotonic() + _APPROVAL_TIMEOUT_CEILING_S >= deadline:
+        warn(
+            f"denying '{what}' — chained-command approval budget "
+            f"({_MAIN_LOOP_BUDGET_S:.1f}s) would be exhausted before this segment's "
+            "approval_cmd could safely finish"
+        )
+        return "block", (
+            f"BLOCKED — too many chained segments needed approval to check safely within this "
+            f"hook's time budget (denying '{what}' rather than risk an external-timeout "
+            "fail-open). Split this into separate Bash calls so each is approved individually."
+        )
+
+    approved, detail = _request_approval(eff_cwd, context)
+    if not approved:
+        return "block", message
+    warn(f"primary-checkout {what} approved via approval_cmd ({detail})")
+    return "approved", f"{what} approved via external approval_cmd ({detail})"
+
+
+# History-writing git commands that must not run on the default branch of the primary checkout.
+_HISTORY_VERBS = frozenset({"commit", "cherry-pick", "merge", "rebase", "revert", "am"})
+
+
+# Options that consume the NEXT token as their value, per verb — that value must not be read as a
+# flag (`git commit -m --dry-run` commits with the message "--dry-run").
+_VALUE_OPTS: dict[str, frozenset[str]] = {
+    "commit": frozenset({
+        "-m", "--message", "-F", "--file", "-C", "--reuse-message", "-c", "--reedit-message",
+        "--author", "--date", "-t", "--template", "--fixup", "--squash", "--cleanup",
+        "--pathspec-from-file",
+    }),
+    "merge": frozenset({
+        "-m", "--message", "-F", "--file", "-s", "--strategy", "-X", "--strategy-option",
+        "--into-name",
+    }),
+    "rebase": frozenset({
+        "-s", "--strategy", "-X", "--strategy-option", "-x", "--exec", "--onto", "-C",
+    }),
+    "cherry-pick": frozenset({"-m", "--mainline", "-s", "--strategy", "-X", "--strategy-option"}),
+    "revert": frozenset({"-m", "--mainline", "-s", "--strategy", "-X", "--strategy-option"}),
+    "am": frozenset({
+        "-p", "-C", "--directory", "--exclude", "--include", "--whitespace", "--patch-format",
+    }),
+}
+
+
+def _writes_history(subcommand: str, toks: list[str]) -> bool:
+    """Whether this git invocation would add/rewrite commits (or stage a merge) on HEAD's branch.
+
+    Not history-writing: ``--help``/``-h``, ``--abort``/``--quit`` (they only clean up),
+    ``commit --dry-run``, and ``merge --ff-only`` (the pull-like fast-forward sync of main).
+    The value token of a value-taking option (``-m <msg>``, or a short bundle ending in one such
+    as ``-am <msg>``) is skipped, never read as a flag."""
+    if subcommand not in _HISTORY_VERBS:
+        return False
+    value_opts = _VALUE_OPTS.get(subcommand, frozenset())
+    flags: set[str] = set()
+    ordered: list[str] = []
+    skip_next = False
+    for t in toks:
+        if skip_next:
+            skip_next = False
+            continue
+        if t == "--":
+            break
+        if t.startswith("-"):
+            flags.add(t)
+            ordered.append(t)
+            bundle = not t.startswith("--") and len(t) > 2
+            skip_next = t in value_opts or (bundle and f"-{t[-1]}" in value_opts)
+    if flags & {"-h", "--help", "--abort", "--quit"}:
+        return False
+
+    def last_of(*options: str) -> str | None:
+        """git parses boolean options left to right and the LAST one wins."""
+        return next((t for t in reversed(ordered) if t in options), None)
+
+    if subcommand == "commit":
+        return last_of("--dry-run", "--no-dry-run") != "--dry-run"
+    if subcommand == "merge":
+        return last_of("--ff", "--no-ff", "--ff-only") != "--ff-only"
+    return True
+
+
+def _current_branch(cwd: str) -> str | None:
+    """Checked-out branch name, or None when detached / not a repo / git failed (→ fail open)."""
+    return _git(cwd, "symbolic-ref", "--short", "-q", "HEAD") or None
+
+
+def _evaluate_history_segment(
+    segment: str, base_cwd: str, command: str, deadline: float, head_may_move: bool = False
+) -> tuple[str, str] | None:
+    """Evaluate ONE chained-command segment for a commit/cherry-pick/merge/rebase/revert/am on
+    the default branch of the PRIMARY checkout. Same return contract as
+    `_evaluate_checkout_segment`: None (not gated / fail-open), ("block", msg), ("approved", note).
+    A linked worktree (even one on main), a feature branch, a detached HEAD, a non-enrolled repo
+    and any git failure are all allowed."""
+    classified = _classify_git_segment(segment)
+    if classified is None:
+        return None
+    subcommand, rest, cwd_override = classified
+    if not _writes_history(subcommand, rest):
+        return None
+    eff_cwd = _resolve_effective_cwd(base_cwd, cwd_override)
+    if not worktree_only_enabled(eff_cwd):
+        return None
+    if is_primary_worktree(eff_cwd) is not True:
+        return None
+    branch = _current_branch(eff_cwd)
+    default = default_branch(eff_cwd)
+    if branch is None or branch != default:
+        if not head_may_move:
+            return None
+        branch = default  # `git checkout main && git commit`: HEAD is on default by then
+    root = _git(eff_cwd, "rev-parse", "--show-toplevel") or eff_cwd
+    context = {"hook": "pin-primary-worktree", "kind": subcommand, "target": branch, "command": command}
+    return _gate_primary(
+        eff_cwd, context, command, deadline, f"git {subcommand} on {branch}",
+        HISTORY_MESSAGE.format(verb=subcommand, default=default, root=root),
+    )
+
+
+def _cd_step(cwd: str, segment: str) -> tuple[str, str] | None:
+    """For a ``cd`` / ``pushd`` / ``popd`` segment: ``(kind, new_cwd)`` where kind is ``"ok"``
+    (a literal target that exists: the shell certainly lands in new_cwd if the segment runs) or
+    ``"unknown"`` (``cd -`` / ``popd`` / bare ``pushd`` / ``pushd +N`` / a target using ``$`` or
+    a backtick or ``~-``/``~+`` / a target that does not resolve here — ``CDPATH`` or a failed
+    ``cd`` both leave the real directory not knowable). None for any other segment."""
+    try:
+        toks = shlex.split(segment, comments=True)
+    except ValueError:
+        return None
+    if not toks or toks[0] not in ("cd", "pushd", "popd"):
+        return None
+    args = [
+        t for t in toks[1:]
+        if t != "--" and not (t.startswith("-") and t != "-") and not re.match(r"^\d*[<>&]", t)
+    ]
+    if toks[0] == "popd" or (toks[0] == "pushd" and not args) or args == ["-"]:
+        return "unknown", cwd
+    if len(args) > 1:
+        return "unknown", cwd  # bash: `cd a b` fails with "too many arguments", cwd unchanged
+    raw = args[0] if args else "~"
+    if "$" in raw or "`" in raw or raw.startswith(("~-", "~+", "+")):
+        return "unknown", cwd
+    target = Path(os.path.expanduser(raw))
+    if not target.is_absolute():
+        target = Path(cwd or ".") / target
+    return ("ok", str(target)) if target.is_dir() else ("unknown", cwd)
+
+
+def _distinct_checkouts(candidates: set[str], collapse: bool = True) -> list[str]:
+    """The candidate cwds, one per git toplevel — two candidates in the same checkout give the
+    same verdict, and each gated one would cost its own approval round-trip. ``collapse=False``
+    keeps them all (a relative ``git -C <dir>`` resolves differently from each candidate)."""
+    if len(candidates) < 2 or not collapse:
+        return sorted(candidates)
+    by_root: dict[str, str] = {}
+    for c in sorted(candidates):
+        by_root.setdefault(_git(c, "rev-parse", "--show-toplevel") or c, c)
+    return sorted(by_root.values())
+
+
+# A segment that opens/closes a compound command or defines a function: `(`, `{`, `if`/`then`/
+# `fi`, `for`/`do`/`done`, `while`, `case`, `name()`. Nesting is not tracked by `_split_chain`, so
+# a `cd` inside one could be skipped or confined to a subshell.
+_COMPOUND_SEGMENT_RE = re.compile(
+    r"^\s*(?:[({}]|\)|(?:if|then|else|elif|fi|for|while|until|do|done|case|esac|select|function)\b"
+    r"|\w+\s*\(\s*\))"
+)
+
+
+# A line that starts with a cd — in a heredoc body it is data, but `_split_chain` sees a command.
+_HEREDOC_CD_LINE_RE = re.compile(r"\n\s*(?:cd|pushd|popd)(?=\s|$)")
+
+
+def _cd_may_not_narrow(command: str) -> bool:
+    """True when a `cd` cannot be trusted to change the shell's directory for what follows: the
+    command backgrounds something (`&`), contains a heredoc, or a compound command / function
+    definition."""
+    if "<<" in command and _HEREDOC_CD_LINE_RE.search(command):
+        return True  # a heredoc body is split into fake segments, `cd` lines included
+    return any(op == "&" or _COMPOUND_SEGMENT_RE.match(seg) for op, seg in _split_chain(command))
+
+
+
+# Words that may precede a command inside a compound / wrapper: `(cd x`, `{ cd x`, `then cd x`,
+# `builtin cd x`, `eval cd x`, `FOO=1 cd x`. Shared by cd tracking and git classification.
+_COMMAND_PREFIX = (
+    r"(?:[({!]\s*|(?:then|do|else|elif|if|while|until|time|command|builtin|eval|exec)\s+"
+    r"|\w+=(?:\"[^\"]*\"|'[^']*'|[^\s\"'])*\s+)*"
+)
+_COMMAND_PREFIX_RE = re.compile(r"^\s*" + _COMMAND_PREFIX)
+_EMBEDDED_CD_RE = re.compile(r"^\s*" + _COMMAND_PREFIX + r"(cd|pushd|popd)(?=\s|$)")
+
+
+def _embedded_cd_step(cwd: str, segment: str) -> tuple[str, str] | None:
+    """`_cd_step` for a ``cd`` that is not the segment's first word but opens a compound or sits
+    behind a wrapper (``{ cd x``, ``(cd x``, ``then cd x``, ``builtin cd x``, ``X=1 cd x``)."""
+    m = _EMBEDDED_CD_RE.match(segment)
+    if m is None:
+        return None
+    return _cd_step(cwd, segment[m.start(1):].rstrip(") };"))
+
+
+class _CwdTracker:
+    """The set of directories the shell MIGHT be in at each chain segment (``candidates``).
+
+    Within an and-or list (`a && b && c`) a later segment runs only if every earlier one
+    succeeded, so a `cd` there narrows the set for the rest of the list; when the list ends
+    (`;`, newline, `||`) the cd may not have run, so ``enter`` re-adds the pre-list set. A `cd` at
+    a list start narrows for good. A `cd` whose outcome decides a `||` branch, in a pipeline, in a
+    compound (`{ cd x`, `(cd x`, `then cd x`), or in a command that contains ANY `&` (which
+    backgrounds a whole and-or list, not just the adjacent segment) or any multi-line / nested
+    compound (`_cd_may_not_narrow`) never narrows; `cd -` /
+    `popd` widen to every directory seen so far. Every git segment is judged in EVERY possible
+    directory, so a skipped `cd` can never launder a primary-checkout commit into a linked
+    worktree."""
+
+    def __init__(self, cwd: str, no_narrow: bool) -> None:
+        self.candidates: set[str] = {cwd}
+        self._seen: set[str] = {cwd}
+        self._no_narrow = no_narrow
+        self._prev_ok = True  # previous segment certainly ran and certainly succeeded
+        self._pre_list: set[str] | None = None  # set before a cd that is conditional in its list
+
+    def enter(self, op: str | None) -> None:
+        """Call before judging a segment preceded by ``op``: a list boundary re-adds the set the
+        shell may still be in if the list's conditional `cd` never ran."""
+        if op in (None, ";", "\n", "||", "&") and self._pre_list is not None:
+            self.candidates |= self._pre_list
+            self._pre_list = None
+
+    def advance(self, op: str | None, next_op: str | None, segment: str) -> None:
+        """Account for ``segment`` (preceded by ``op``, followed by ``next_op``)."""
+        cands = sorted(self.candidates)
+        steps = [_cd_step(c, segment) for c in cands]
+        embedded = False
+        if any(step is None for step in steps):
+            steps = [_embedded_cd_step(c, segment) for c in cands]
+            embedded = True
+        if any(step is None for step in steps):
+            self._prev_ok = False
+            return
+        if op == "|" or next_op == "|":
+            self._prev_ok = False  # pipeline member: runs in a subshell
+            return
+        starts_list = op in (None, ";", "\n")
+        narrow = (
+            (starts_list or op == "&&")
+            and next_op != "||"
+            and not embedded
+            and not self._no_narrow
+        )
+        conditional = narrow and not starts_list and not self._prev_ok
+        moved: set[str] = set()
+        certain = True
+        for kind, new in (s for s in steps if s is not None):
+            if kind == "unknown":
+                moved |= self._seen
+                certain = False
+            else:
+                moved.add(new)
+                certain = certain and kind == "ok"
+        if narrow:
+            if conditional:
+                self._pre_list = (self._pre_list or set()) | self.candidates
+            self.candidates = moved
+        else:
+            self.candidates = self.candidates | moved
+        self._seen |= self.candidates
+        self._prev_ok = narrow and not conditional and certain
 
 
 def _evaluate_checkout_segment(
@@ -690,60 +1060,17 @@ def _evaluate_checkout_segment(
     if not is_primary_worktree(eff_cwd):
         return None  # None (undetermined) or False (a linked worktree) → fail open / allowed
 
-    # Reserve the FULL approval-cmd ceiling before starting this call, not just check whether
-    # the deadline has already passed: a call that's allowed to START just before `deadline`
-    # can still RUN for up to `_APPROVAL_TIMEOUT_CEILING_S` more, which alone could push the
-    # aggregate past the manifest timeout. Only start this approval call if it can finish (at
-    # its absolute worst case) before `deadline`.
     context = {"hook": "pin-primary-worktree", "kind": subcommand, "target": target, "command": command}
-
-    # RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE (live Telegram ask) is checked first and is not
-    # bounded by _MAIN_LOOP_BUDGET_S/_APPROVAL_TIMEOUT_CEILING_S — a human approval round-trip
-    # legitimately runs up to tg-ctl's 900s cap, which is why this hook's manifest timeout_ms was
-    # raised to 960000. It only "stops" (should_stop=True) when an actual hatch request was made;
-    # an unset env var falls through to the approval_cmd budget below.
-    hatch = hatch_escalation.request_hatch_approval(
-        "pin-primary-worktree", context, cwd=eff_cwd, command=command
+    root = _git(eff_cwd, "rev-parse", "--show-toplevel") or eff_cwd
+    return _gate_primary(
+        eff_cwd, context, command, deadline, f"{subcommand} {target}",
+        MESSAGE.format(target=target, default=default, root=root),
     )
-    if hatch.should_stop:
-        if hatch.approved:
-            warn(f"primary-worktree checkout approved via hatch escalation ({hatch.reason})")
-            return (
-                "approved",
-                f"{subcommand} {target} approved via hatch escalation ({hatch.reason})",
-            )
-        warn(f"primary-worktree checkout hatch escalation denied: {hatch.reason}")
-        return "block", (
-            f"hatch escalation denied: {hatch.reason}\n"
-            f"{MESSAGE.format(target=target, default=default)}"
-        )
-
-    # Reserve the FULL approval-cmd ceiling before starting this call, not just check whether
-    # the deadline has already passed: a call that's allowed to START just before `deadline`
-    # can still RUN for up to `_APPROVAL_TIMEOUT_CEILING_S` more, which alone could push the
-    # aggregate past the manifest timeout. Only start this approval call if it can finish (at
-    # its absolute worst case) before `deadline`.
-    if time.monotonic() + _APPROVAL_TIMEOUT_CEILING_S >= deadline:
-        warn(
-            f"denying '{target}' — chained-command approval budget "
-            f"({_MAIN_LOOP_BUDGET_S:.1f}s) would be exhausted before this segment's "
-            "approval_cmd could safely finish"
-        )
-        return "block", (
-            f"BLOCKED — too many chained segments needed approval to check safely within this "
-            f"hook's time budget (denying '{target}' rather than risk an external-timeout "
-            "fail-open). Split this into separate Bash calls so each is approved individually."
-        )
-
-    approved, detail = _request_approval(eff_cwd, context)
-    if not approved:
-        return "block", MESSAGE.format(target=target, default=default)
-
-    warn(f"primary-worktree checkout approved via approval_cmd ({detail})")
-    return "approved", f"{subcommand} {target} approved via external approval_cmd ({detail})"
 
 
 def main() -> int:
+    global _HATCH_ASKS
+    _HATCH_ASKS = 0
     try:
         event = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError) as exc:
@@ -765,15 +1092,37 @@ def main() -> int:
     # time spent across every segment's approval_cmd call (see _MAIN_LOOP_BUDGET_S).
     approved_notes: list[str] = []
     deadline = time.monotonic() + _MAIN_LOOP_BUDGET_S
-    for segment in _split_chain(command):
-        result = _evaluate_checkout_segment(segment, cwd, command, deadline)
-        if result is None:
-            continue
-        verdict, message = result
-        if verdict == "block":
-            emit("block", message)
-            return BLOCK_EXIT_CODE
-        approved_notes.append(message)
+    tracker = _CwdTracker(cwd, no_narrow=_cd_may_not_narrow(command))
+    segments = _split_chain(command)
+    head_may_move = False  # an earlier checkout/switch in this chain may have put HEAD on default
+    for idx, (op, segment) in enumerate(segments):
+        next_op = segments[idx + 1][0] if idx + 1 < len(segments) else None
+        tracker.enter(op)
+        for cand_cwd in _distinct_checkouts(tracker.candidates, collapse=" -C" not in segment):
+            for result in (
+                _evaluate_checkout_segment(segment, cand_cwd, command, deadline),
+                _evaluate_history_segment(segment, cand_cwd, command, deadline, head_may_move),
+            ):
+                if result is None:
+                    continue
+                verdict, message = result
+                if verdict == "block":
+                    emit("block", message)
+                    return BLOCK_EXIT_CODE
+                approved_notes.append(message)
+        classified = _classify_git_segment(segment)
+        if classified is not None and classified[0] in ("checkout", "switch"):
+            target = _switch_target(classified[0], classified[1])
+            if target is not None and (
+                target == "-"  # `checkout -` / `@{-1}`: the previous branch, possibly default
+                or target.startswith("@{")
+                or any(
+                    target == default_branch(_resolve_effective_cwd(c, classified[2]))
+                    for c in tracker.candidates
+                )
+            ):
+                head_may_move = True
+        tracker.advance(op, next_op, segment)
 
     emit("allow", "; ".join(approved_notes) if approved_notes else None)
     return 0

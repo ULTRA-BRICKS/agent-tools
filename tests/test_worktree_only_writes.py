@@ -579,5 +579,42 @@ def test_agent_hooks_bool_parse(text, expected):
     assert wow._agent_hooks_bool(text, "worktree_only", default=False) is expected
 
 
+# ── ON BY DEFAULT where a rig.yaml exists (2026-10-24: garage-band had no key → unguarded) ───
+
+def test_rig_yaml_without_key_is_enforced_by_default(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path, branch="main")
+    (repo / "rig.yaml").write_text("version: 1\nagent_hooks:\n  enabled: true\n  all: true\n")
+    out, code = _run(repo, monkeypatch)
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_block_message_names_rig_worktree_create_with_exact_command(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path, branch="main")
+    (repo / "rig.yaml").write_text("version: 1\n")
+    out, _ = _run(repo, monkeypatch)
+    msg = json.loads(out)["message"]
+    assert f"rig worktree create <feature> --from origin/main -C {repo}" in msg
+    assert f"cd {repo}/.worktrees/<feature>" in msg
+
+
+def test_write_into_dot_worktrees_linked_tree_allows(tmp_path, monkeypatch):
+    """A file under <primary>/.worktrees/<name> belongs to that linked worktree's branch."""
+    repo = _make_repo(tmp_path, branch="main")
+    (repo / "rig.yaml").write_text("version: 1\n")
+    wt = repo / ".worktrees" / "feat-x"
+    _git(repo, "worktree", "add", str(wt), "-b", "feat/x")
+    out, code = _run(repo, monkeypatch, target=wt / "a.txt")
+    assert code == 0 and _decision(out) == "allow"
+    out, code = _run(repo, monkeypatch, target=repo / "a.txt")
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_env_zero_opts_out_of_default(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path, branch="main")
+    (repo / "rig.yaml").write_text("version: 1\n")
+    out, code = _run(repo, monkeypatch, {"RIG_WORKTREE_ONLY": "0"})
+    assert code == 0 and _decision(out) == "allow"
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))

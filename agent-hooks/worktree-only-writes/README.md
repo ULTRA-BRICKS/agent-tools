@@ -55,19 +55,22 @@ checkout, so they are **allowed** even on an enrolled default branch:
 A `master`-only repo is judged against `master`. Each step is repo-local, so enforcement never
 swings with the developer's global git config.
 
-## Per-repo opt-in (this must NOT break repos that work on main)
+## ON BY DEFAULT where a rig.yaml exists
 
-Enforcement is **opt-in**, first match wins:
+Alex's rule: every agent edits only in its own worktree. A guard that needs a per-repo opt-in
+was never switched on in garage-band (2026-10-24: no `worktree_only` key, agents committed
+straight onto main), so enforcement is now the default. First match wins:
 
 1. `RIG_WORKTREE_ONLY=1` (force on) / `=0` (force off) — session/CI override, and how the
    tests drive it.
-2. the repo's committed `rig.yaml` → `agent_hooks.worktree_only: true` — the rig-provisioned
-   signal.
-3. **default OFF** — a repo with no signal is never blocked.
+2. the repo's committed `rig.yaml` → `agent_hooks.worktree_only: false` opts OUT (a repo that
+   legitimately works on main); `true` is the explicit spelling of the default.
+3. a `rig.yaml` without the key → **ON**. No `rig.yaml` up the tree (a scratch `git init`
+   dir, `/tmp`) → off: an un-enrolled directory is never blocked.
 
-So `hyperide` and the agent-ecosystem repos set `worktree_only: true` in their `rig.yaml`;
-`3d-cli` (which legitimately works directly on main) leaves it absent and is exempt
-automatically. See rig-cli `docs/config-schema.md` for the knob.
+The block message names the exact command: `rig worktree create <feature> --from origin/<default> -C <repo root>`.
+A target under `<repo>/.worktrees/<name>` resolves to that linked worktree's own branch, so
+writes there are allowed. The `git commit` side of the same rule lives in `pin-primary-worktree`.
 
 ## No self-service bypass — external approval only (the rare, deliberate main edit)
 

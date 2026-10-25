@@ -965,5 +965,19 @@ def test_classify_devserver_segment(segment, expected_matched):
     assert (result is not None) == expected_matched
 
 
+def test_rig_yaml_without_key_is_enforced_by_default(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path, branch="main")
+    (repo / "rig.yaml").write_text("version: 1\nagent_hooks:\n  all: true\n")
+    out, code = _run(repo, monkeypatch, "npm run dev")
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_rig_yaml_worktree_only_false_opts_out(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path, branch="main")
+    (repo / "rig.yaml").write_text("agent_hooks:\n  worktree_only: false\n")
+    out, code = _run(repo, monkeypatch, "npm run dev")
+    assert code == 0 and _decision(out) == "allow"
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))

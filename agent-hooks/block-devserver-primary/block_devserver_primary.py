@@ -46,9 +46,9 @@ built-in worktree-isolation Bash guard, which is git-command-focused) recognizes
 close, with a narrow, low-false-positive signature (a fixed handful of well-known
 package-manager scripts and CLI binaries) rather than a general "any Bash mutation" detector.
 
-PER-REPO, opt-in: reuses the EXACT SAME `agent_hooks.worktree_only` knob as `worktree-only-writes`
-and `pin-primary-worktree` (env `RIG_WORKTREE_ONLY` > rig.yaml `agent_hooks.worktree_only` >
-default OFF) — one feature, one flag, three enforcement points.
+ON BY DEFAULT: reuses the EXACT SAME `agent_hooks.worktree_only` knob as `worktree-only-writes`
+and `pin-primary-worktree` (env `RIG_WORKTREE_ONLY` > rig.yaml `agent_hooks.worktree_only`, false
+opts out > ON when a rig.yaml exists, OFF without one) — one feature, one flag, three enforcement points.
 
 External approval: same deny-by-default hatch pattern as the sibling hooks. No self-service
 env-var bypass. `RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY="<justification>"` asks the human via
@@ -152,8 +152,8 @@ MESSAGE = (
     "(HMR output, a preview/codegen generator, etc.) can silently corrupt tracked files in the "
     "SHARED checkout with no Edit/Write tool call to catch — that already happened once here. "
     "Run it from a separate worktree instead, e.g.:\n"
-    "    git worktree add ../wt-<feature> -b <feature> origin/{branch}\n"
-    "    cd ../wt-<feature> && {command}\n"
+    "    rig worktree create <feature> --from origin/{branch} -C {root}\n"
+    "    cd {root}/.worktrees/<feature> && {command}\n"
     "There is NO self-service env-var bypass. For a genuine one-off need, request a one-time "
     'Telegram approval via RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY="<justification>" '
     "(deny-by-default; a bare 1 is rejected)."
@@ -267,7 +267,7 @@ def worktree_only_enabled(cwd: str) -> bool:
     except OSError as exc:
         warn(f"could not read {root / 'rig.yaml'}: {exc}")
         return False
-    return _agent_hooks_bool(text, CONFIG_KEY, default=False)
+    return _agent_hooks_bool(text, CONFIG_KEY, default=True)
 
 
 # ── bash chain + `cd` tracking ────────────────────────────────────────────────────────────────
@@ -926,7 +926,8 @@ def _decide_block(cwd: str, branch: str, label: str, full_command: str) -> int:
     makes the ENTIRE original command string (not just the first launch) part of what the human
     is asked to approve.
     """
-    message = MESSAGE.format(branch=branch, command=label)
+    root = _git(cwd, "rev-parse", "--show-toplevel") or cwd
+    message = MESSAGE.format(branch=branch, command=label, root=root)
     hatch = hatch_escalation.request_hatch_approval(
         HOOK_ID,
         {"hook": HOOK_ID, "branch": branch, "launch": label, "command": full_command},

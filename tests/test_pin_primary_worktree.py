@@ -466,6 +466,23 @@ def test_hatch_escalation_exit0_allows_and_logs_source(tmp_path, monkeypatch):
     assert "hatch escalation" in json.loads(out)["message"].lower()
 
 
+def test_second_gated_segment_after_a_hatch_ask_is_denied_not_asked(tmp_path, monkeypatch):
+    """A live Telegram ask is unbudgeted; two in one chain could outlive the hook timeout
+    (on_error=open), so only the first is asked and the rest are denied."""
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"echo x >> {marker}\n" + _ALLOW_REPLY_SH)
+    monkeypatch.setattr(ppw.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _make_repo(tmp_path)
+    out, code = _run(
+        repo,
+        "git commit -m a && git commit --amend --no-edit",
+        monkeypatch,
+        {"RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE": "Need to inspect the primary checkout."},
+    )
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert marker.read_text().count("x") == 1
+
+
 def test_hatch_escalation_denial_wins_over_approval_cmd(tmp_path, monkeypatch):
     tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
     monkeypatch.setattr(ppw.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
@@ -557,6 +574,486 @@ def test_leading_unrelated_env_assignment_still_denies(tmp_path, monkeypatch):
     repo = _make_repo(tmp_path)
     out, code = _run(repo, "GIT_TRACE=1 git checkout feat/x", monkeypatch)
     assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+# ── git commit & friends on the default branch of the PRIMARY checkout (2026-10-24 incident) ─
+# Two omp subagents ran plain `git commit` in garage-band's primary checkout on main; four
+# commits landed on local main because no hook looked at commit. These tests fail without the
+# history guard in pin_primary_worktree.py.
+
+def _msg(out: str) -> str:
+    return json.loads(out)["message"]
+
+
+def test_commit_on_primary_default_branch_denies_with_rig_worktree_command(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, 'git commit -m "x"', monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+    msg = _msg(out)
+    assert f"rig worktree create <feature> --from origin/main -C {repo}" in msg
+    assert "git worktree add" not in msg.replace("not raw `git worktree add`", "")
+    assert "git commit" in msg and "Nothing was run" in msg
+
+
+@pytest.mark.parametrize("command", [
+    'git commit -m x',
+    'git commit --amend --no-edit',
+    'git commit -a -m x',
+    'git cherry-pick feat/x',
+    'git merge feat/x',
+    'git merge --no-ff feat/x',
+    'git rebase feat/x',
+    'git revert HEAD',
+    'git am some.patch',
+    'git add -A && git commit -m x',
+    'GIT_AUTHOR_NAME=a git commit -m x',
+    '/usr/bin/git commit -m x',
+])
+def test_history_commands_on_primary_default_branch_deny(tmp_path, monkeypatch, command):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, command, monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_commit_from_subdirectory_of_primary_denies(tmp_path, monkeypatch):
+    """The real incident ran from <repo>/projects/wall-plugs, not the repo root."""
+    repo = _make_repo(tmp_path)
+    sub = repo / "projects" / "wall-plugs"
+    sub.mkdir(parents=True)
+    out, code = _run(sub, 'git commit -m x', monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_git_dash_c_commit_from_elsewhere_denies(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    out, code = _run(elsewhere, f'git -C {repo} commit -m x', monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    'git merge --ff-only origin/main',
+    'git merge --abort',
+    'git rebase --abort',
+    'git cherry-pick --abort',
+    'git commit --dry-run',
+    'git commit --help',
+    'git pull --ff-only',
+    'git status',
+    'git log --oneline',
+    'git add -A',
+    'git push origin HEAD',
+])
+def test_non_history_writing_commands_on_primary_allow(tmp_path, monkeypatch, command):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, command, monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_commit_in_linked_worktree_allows(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(wt, 'git commit -m x', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_cd_into_linked_worktree_then_commit_allows(tmp_path, monkeypatch):
+    """`cd <worktree> && git commit` — the recommended flow — is judged against the worktree,
+    not the shell's starting (primary, main) directory."""
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(repo, f'cd {wt} && git add -A && git commit -m x', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_cd_into_primary_then_commit_denies(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(wt, f'cd {repo} && git commit -m x', monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("chain", [
+    'false && cd {wt}; git commit -m x',
+    'false || cd {wt}; git commit -m x',
+    'cd {wt}; cd -; git commit -m x',
+    'cd {wt} && cd - && git commit -m x',
+    'pushd {wt} && popd && git commit -m x',
+    'cd {wt} | cat; git commit -m x',
+    'cd {wt} & git commit -m x',
+    'false && cd {wt}; git checkout feat/x',
+])
+def test_cd_that_may_not_run_does_not_launder_primary_commit(tmp_path, monkeypatch, chain):
+    """A `cd` into a linked worktree that is skipped / undone / run in a subshell leaves the
+    commit in the primary checkout on main — it must still be denied."""
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(repo, chain.format(wt=wt), monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("chain", [
+    'cd {wt}; git commit -m x',
+    'cd -P {wt} && git commit -m x',
+    'cd {wt} && cd . && git commit -m x',
+])
+def test_certain_cd_into_worktree_then_commit_allows(tmp_path, monkeypatch, chain):
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(repo, chain.format(wt=wt), monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    'git commit -m --dry-run',
+    'git commit -m --help',
+    'git commit -F --abort',
+    'git merge -m --ff-only feat/x',
+])
+def test_option_value_that_looks_like_a_flag_is_not_a_flag(tmp_path, monkeypatch, command):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, command, monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("chain", [
+    'cd {wt} && cd "$OLDPWD" && git commit -m x',
+    'cd {wt} && cd ~- && git commit -m x',
+    'cd {wt} && cd /nonexistent-dir && git commit -m x',
+])
+def test_non_literal_or_missing_cd_target_is_unknown_not_a_noop(tmp_path, monkeypatch, chain):
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(repo, chain.format(wt=wt), monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("chain", [
+    'sleep 1 & cd {repo} && git commit -m x',
+    '{{ cd {repo}; git commit -m x; }}',
+    '(cd {repo} && git commit -m x)',
+    'if true; then cd {repo}; fi; git commit -m x',
+    'builtin cd {repo} && git commit -m x',
+])
+def test_cd_forms_the_tracker_cannot_narrow_still_judge_the_primary(tmp_path, monkeypatch, chain):
+    """Started in a linked worktree: a `cd` to the primary hidden in a compound, behind `builtin`
+    or after a `&` must leave the primary among the candidates, so the commit is denied."""
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(wt, chain.format(repo=repo), monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_backgrounded_and_or_list_with_cd_still_judges_the_primary(tmp_path, monkeypatch):
+    """`cd wt && make & git commit`: the `&` backgrounds the whole and-or list, the commit runs
+    in the primary."""
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(repo, f'cd {wt} && make & git commit -m x', monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_cd_word_inside_a_commit_message_is_not_a_cd(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(repo, f'cd {wt} && git commit -m "cd fix"', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_cd_after_a_non_cd_in_an_and_chain_narrows_for_the_rest_of_the_chain(tmp_path, monkeypatch):
+    """`git status && cd wt && git commit` — the recommended flow — passes: the commit runs only
+    if the cd ran."""
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(repo, f'git status && cd {wt} && git commit -m x', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("chain", [
+    'git status && cd {wt} && git commit -m x; git commit -m y',
+    'cd {wt} || git commit -m x',
+    'cd {wt} extra; git commit -m x',
+])
+def test_cd_that_may_not_have_taken_effect_judges_the_primary_too(tmp_path, monkeypatch, chain):
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(repo, chain.format(wt=wt), monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("chain", ['X=1 cd {repo}; git commit -m x', 'eval cd {repo}; git commit -m x'])
+def test_wrapped_cd_into_the_primary_is_followed(tmp_path, monkeypatch, chain):
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(wt, chain.format(repo=repo), monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    '(git commit -m x)',
+    '{{ git commit -m x; }}',
+    'if true; then git commit -m x; fi',
+    'time git commit -m x',
+    'command git commit -m x',
+])
+def test_git_inside_a_compound_or_wrapper_is_still_judged(tmp_path, monkeypatch, command):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, command, monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    'git merge --ff-only --no-ff feat/x',
+    'git merge --ff-only --ff feat/x',
+    'git commit --dry-run --no-dry-run -m x',
+])
+def test_later_flag_cancelling_a_no_history_flag_wins(tmp_path, monkeypatch, command):
+    """git parses boolean options left to right; the LAST one wins."""
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, command, monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_ff_only_after_no_ff_is_still_a_fast_forward_sync(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, 'git merge --no-ff --ff-only origin/main', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("chain", [
+    '(set -e; cd {wt} && make); git commit -m y',
+    'if false; then\ncd {wt}\nfi\ngit commit -m y',
+    'f() {{\ncd {wt}\n}}\ngit commit -m y',
+    '(\ncd {wt}\nmake\n)\ngit commit -m y',
+])
+def test_cd_inside_a_multiline_compound_never_narrows(tmp_path, monkeypatch, chain):
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(repo, chain.format(wt=wt), monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("chain", [
+    'cd {wt} && make &\ngit commit -m x',
+    'false &&\ncd {wt}\ngit commit -m x',
+    'true ||\ncd {wt}\ngit commit -m x',
+])
+def test_operator_before_a_newline_is_not_lost(tmp_path, monkeypatch, chain):
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    out, code = _run(repo, chain.format(wt=wt), monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_heredoc_body_cd_line_never_narrows(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    command = f"cat > run.sh <<'EOF'\ncd {wt}\nEOF\ngit add run.sh && git commit -m add"
+    out, code = _run(repo, command, monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_cd_then_commit_with_heredoc_message_from_primary_allows(tmp_path, monkeypatch):
+    """The everyday flow: the heredoc is the commit message (inside `$(...)` in quotes)."""
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    command = f"cd {wt} && git commit -m \"$(cat <<'EOF'\nfix: thing\nEOF\n)\""
+    out, code = _run(repo, command, monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    '(git merge --abort)',
+    '(git commit --dry-run)',
+    '(git merge --ff-only origin/main)',
+    '(git checkout main)',
+])
+def test_glued_closer_on_the_last_token_does_not_cause_a_false_block(tmp_path, monkeypatch, command):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, command, monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    'git checkout main && git commit -m x',
+    'git switch main && git merge feat/x',
+])
+def test_history_verb_after_a_switch_to_default_in_the_same_chain_is_denied(
+    tmp_path, monkeypatch, command
+):
+    """Primary parked on feat/x: the checkout to main is allowed, the commit then lands on main."""
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "feat/x")
+    out, code = _run(repo, command, monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_two_conditional_cds_in_one_list_keep_every_intermediate_dir(tmp_path, monkeypatch):
+    """Started in a linked worktree: if `make` fails the shell stays in the primary."""
+    repo = _make_repo(tmp_path)
+    wt = tmp_path / "wt"
+    _add_linked_worktree(repo, wt, "feat/x")
+    sub = wt / "sub"
+    sub.mkdir()
+    out, code = _run(
+        wt, f'git status && cd {repo} && make && cd {sub}; git commit -m wip', monkeypatch
+    )
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    'git checkout -- a.txt && git commit -m x',
+    'git checkout --detach && git commit -m x',
+    'git checkout feat/y && git commit -m x',
+])
+def test_switch_that_does_not_land_on_default_leaves_a_feature_primary_alone(
+    tmp_path, monkeypatch, command
+):
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "feat/x")
+    out, code = _run(repo, command, monkeypatch)
+    # `checkout feat/y` is the checkout guard's business (a primary parked on a feature); the
+    # history guard must not add a second, wrong denial for the commit that follows.
+    assert _decision(out) == ("block" if "feat/y" in command else "allow")
+
+
+@pytest.mark.parametrize("command, expected", [
+    ("git merge feat/x  # not --ff-only", "block"),
+    ("git commit -m wip  # --dry-run first?", "block"),
+    ("git merge --ff-only origin/main  # sync", "allow"),
+])
+def test_shell_comment_words_are_not_flags(tmp_path, monkeypatch, command, expected):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, command, monkeypatch)
+    assert _decision(out) == expected
+
+
+def test_checkout_dash_back_to_default_then_commit_is_denied(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "feat/x")  # previous branch is main
+    out, code = _run(repo, 'git checkout - && git commit -m x', monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_relative_git_dash_c_is_judged_from_every_candidate(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    (repo / "sub").mkdir()
+    out, code = _run(repo, 'git fetch && cd sub; git -C .. commit -m x', monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    'GIT_AUTHOR_NAME="Alex Ultra" git commit -m x',
+    "FOO='a b' git commit -m x",
+    '(git commit)',
+])
+def test_quoted_assignment_or_glued_paren_does_not_hide_the_verb(tmp_path, monkeypatch, command):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, command, monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("command", ['git commit -am --dry-run', 'git merge -nm --ff-only feat/x'])
+def test_bundled_short_flag_ending_in_value_option_consumes_value(tmp_path, monkeypatch, command):
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, command, monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_candidates_in_one_checkout_collapse_to_one_verdict(tmp_path):
+    """`false && cd sub; git commit` has candidates {repo, repo/sub} — one checkout, one verdict."""
+    repo = _make_repo(tmp_path)
+    (repo / "sub").mkdir()
+    assert ppw._distinct_checkouts({str(repo), str(repo / "sub")}) == [str(repo)]
+
+
+def test_commit_on_primary_feature_branch_not_judged_by_history_guard(tmp_path, monkeypatch):
+    """Primary on a feature branch is the checkout guard's business, not this commit rule."""
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "feat/x")
+    out, code = _run(repo, 'git commit -m x', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_commit_with_detached_head_allows(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "--detach")
+    out, code = _run(repo, 'git commit -m x', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_commit_approved_by_approval_cmd_allows(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path, approval_cmd='"exit 0"')
+    out, code = _run(repo, 'git commit -m x', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+# ── ON BY DEFAULT: a rig.yaml without the key enrolls; false / env=0 opt out ────────────────
+
+def _repo_with_rig_yaml(tmp_path: Path, text: str | None) -> Path:
+    repo = _make_repo(tmp_path, enroll=False)
+    if text is not None:
+        (repo / "rig.yaml").write_text(text)
+    return repo
+
+
+def test_rig_yaml_without_worktree_only_key_is_enforced_by_default(tmp_path, monkeypatch):
+    """garage-band's shape: rig.yaml present, no worktree_only key. Used to be exempt."""
+    repo = _repo_with_rig_yaml(tmp_path, "version: 1\nagent_hooks:\n  enabled: true\n  all: true\n")
+    out, code = _run(repo, 'git commit -m x', monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+    out, code = _run(repo, 'git checkout feat/x', monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_rig_yaml_without_agent_hooks_block_is_enforced_by_default(tmp_path, monkeypatch):
+    repo = _repo_with_rig_yaml(tmp_path, "version: 1\n")
+    out, code = _run(repo, 'git commit -m x', monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_rig_yaml_worktree_only_false_opts_out(tmp_path, monkeypatch):
+    repo = _repo_with_rig_yaml(tmp_path, "agent_hooks:\n  worktree_only: false\n")
+    out, code = _run(repo, 'git commit -m x', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("spelling", ["no", "off", "False", '"false"', "'false'", "false  # opt out"])
+def test_rig_yaml_falsy_spellings_opt_out(tmp_path, monkeypatch, spelling):
+    """The default flipped to ON, so a falsy spelling the parser misses would silently enforce."""
+    repo = _repo_with_rig_yaml(tmp_path, f"agent_hooks:\n  worktree_only: {spelling}\n")
+    out, code = _run(repo, 'git commit -m x', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_env_zero_opts_out_of_default(tmp_path, monkeypatch):
+    repo = _repo_with_rig_yaml(tmp_path, "version: 1\n")
+    out, code = _run(repo, 'git commit -m x', monkeypatch, {"RIG_WORKTREE_ONLY": "0"})
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_no_rig_yaml_anywhere_stays_unenforced(tmp_path, monkeypatch):
+    """A scratch `git init` dir with no rig.yaml up the tree is not enrolled."""
+    repo = _repo_with_rig_yaml(tmp_path, None)
+    out, code = _run(repo, 'git commit -m x', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -58,8 +58,8 @@ signature rather than a general "any Bash mutation" detector.
 Shares the **same** knob as the two sibling hooks — one feature, one flag:
 
 1. `RIG_WORKTREE_ONLY=1` (force on) / `=0` (force off).
-2. the repo's committed `rig.yaml` → `agent_hooks.worktree_only: true`.
-3. default OFF.
+2. the repo's committed `rig.yaml` → `agent_hooks.worktree_only: false` opts OUT.
+3. a `rig.yaml` without the key → **ON** (default); no `rig.yaml` up the tree → off.
 
 ## No self-service bypass — external approval only
 

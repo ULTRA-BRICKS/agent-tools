@@ -4,7 +4,29 @@
 
 Pins the repo's **PRIMARY worktree** to its default branch: BLOCKS a `git checkout` / `git
 switch` that would move the primary checkout — never a `git worktree add`-created **linked**
-worktree — onto anything other than the default branch (main/master). (Alex tg#6462/tg#6477.)
+worktree — onto anything other than the default branch (main/master), AND BLOCKS history-writing
+commands (`git commit` incl. `--amend`, `cherry-pick`, `merge`, `rebase`, `revert`, `am`) while the
+primary checkout sits ON the default branch. (Alex tg#6462/tg#6477; commit side: 2026-10-24.)
+
+## Commit / cherry-pick / merge / rebase on the primary checkout's default branch
+
+**The incident (2026-10-24):** two omp subagents ran plain `git commit` in
+`garage-band/projects/wall-plugs` — the primary checkout, on `main` — and four commits landed on
+local main. The write guard was off (no `worktree_only` key) and this hook only looked at
+checkout/switch, so nothing saw it. Now the command is denied with the exact fix:
+
+```
+rig worktree create <feature> --from origin/main -C <repo root>
+cd <repo root>/.worktrees/<feature>   # then git commit, push the branch, open a PR
+```
+
+Allowed (they write no history): `merge --ff-only`, `--abort` / `--quit`, `commit --dry-run`,
+`--help`, `git push`, `git add`. `git pull` is NOT gated either (it is the everyday sync of
+main); it can create a merge commit or rebase when local main has diverged, so use `git pull
+--ff-only`. Linked worktrees, a primary on a feature branch, a
+detached HEAD and non-enrolled repos are never judged here. `cd <dir> &&` earlier in the
+chain is followed, and `git -C <dir>` is honored, so the recommended `cd .worktrees/x && git
+commit` passes. Same hatch / `approval_cmd` external-approval path as the checkout guard.
 
 ## The gap this closes
 
@@ -39,15 +61,16 @@ stays at the shared `.git` — they diverge. Undetermined (git/resolve failure) 
 - `git worktree add` (a different worktree entirely — recommended alternative, shown in the
   block message).
 - Any `git checkout`/`git switch` inside a LINKED worktree (exactly where branch work belongs).
-- `git merge` / `git pull` / `git fetch` / `git worktree list` (not checkout/switch at all).
+- `git pull` / `git fetch` / `git worktree list` / `git merge --ff-only` (not checkout/switch and
+  no new commits).
 
 ## Per-repo opt-in
 
 Shares the **same** knob as `worktree-only-writes` — one feature, one flag:
 
 1. `RIG_WORKTREE_ONLY=1` (force on) / `=0` (force off).
-2. the repo's committed `rig.yaml` → `agent_hooks.worktree_only: true`.
-3. default OFF.
+2. the repo's committed `rig.yaml` → `agent_hooks.worktree_only: false` opts OUT.
+3. a `rig.yaml` without the key → **ON** (default); no `rig.yaml` up the tree → off.
 
 ## No self-service bypass — external approval only
 
@@ -138,12 +161,19 @@ checkout, ask the human directly — you can no longer flip your own bypass.
 
 ## Known scope limits (heuristic, not a sandbox)
 
-- A `cd other-repo && git checkout X` chain is judged against the ORIGINAL cwd's enrollment
-  unless the segment itself carries `git -C <dir>` (which IS honored and re-resolves both the
-  enrollment check and the default-branch/primary-worktree detection against that directory).
-- `git reset` / `git rebase` (branch-tip mutation without a HEAD-ref change) are out of scope
-  for v1 — the incident this closes was a `checkout`; scope-creeping into every ref-mutating
-  command risks false positives for a first cut.
+- `cd <dir>` earlier in the chain is followed for both the history guard and the checkout
+  guard, but only when it is certain to run: a conditional (`false && cd x`, `a || cd x`),
+  piped/backgrounded, `cd -` or `popd` makes every possible directory a candidate and a git
+  segment is denied if ANY candidate is a primary checkout on its default branch. `git -C <dir>`
+  is honored and re-resolves enrollment and default-branch/primary-worktree detection.
+- A `cd` into a worktree that does not exist yet when the hook runs (`rig worktree create f && cd
+  .worktrees/f && git commit`) cannot be followed, so that chained commit is denied: create the
+  worktree in one Bash call and commit from it in the next.
+- `git merge --ff-only <local-branch>` is allowed (it is the pull-like sync of main) but it also
+  lands an unpushed local branch on main; only a merge that creates a commit is denied.
+- `git reset` (branch-tip mutation without a commit) stays out of scope, as do `git commit`
+  spellings that hide the verb from a plain `git [-C d] <verb>` parse (`sh -c`, aliases, a git
+  wrapper script); the per-session omp/Claude bridge sees only the literal command string.
 - `git checkout .` / a bare path restore is excluded; an unusual `git checkout <treeish>
   <path>` with no `--` (ambiguous even to git itself) can still be misclassified as a branch
   switch — a false block on that rare shape now requires either doing the checkout in a linked
