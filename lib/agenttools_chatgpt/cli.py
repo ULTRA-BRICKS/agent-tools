@@ -13,6 +13,7 @@ import sqlite3
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+from . import coverage as coverage_command
 from .browser import BrowserLifecycle, Contract, PlaywrightAdapter, observe_tabs
 from .core import Guardian, Store
 from .service import ControlServer
@@ -282,6 +283,13 @@ def main(argv=None) -> int:
     observer.add_argument(
         "--interval", type=float, default=60, help="Observer polling seconds, 30 to 300"
     )
+    coverage_command.add_arguments(
+        subs.add_parser(
+            "coverage",
+            help="Reconcile active chats against enrollment and the owned browser; "
+            "dry run unless --apply",
+        )
+    )
     args = parser.parse_args(argv)
     try:
         run_workspace = getattr(args, "run_workspace", None)
@@ -293,6 +301,8 @@ def main(argv=None) -> int:
             from .monitor_observer import command
 
             return command(args)
+        if args.command == "coverage":
+            return coverage_command.command(args)
         store = Store(args.state, account=args.workspace)
         token_file = args.state.parent / "control.token"
         if args.command == "live-sol":

@@ -1,0 +1,14 @@
+# Render @SLUG@ (home or glide) and install as ~/.config/systemd/user/chatgpt-guardian-@SLUG@-coverage.timer,
+# next to the rendered coverage.service.template, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now chatgpt-guardian-@SLUG@-coverage.timer
+[Unit]
+Description=Guardian coverage reconciliation every 60 seconds (@SLUG@)
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=60
+AccuracySec=5
+Unit=chatgpt-guardian-@SLUG@-coverage.service
+
+[Install]
+WantedBy=timers.target

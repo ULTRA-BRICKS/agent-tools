@@ -156,7 +156,7 @@ renamed, deleted or migrated. An operator can point the default command at an
 existing scoped database without putting its path into `pm chatgpt`:
 
 ```json
-{"workspace":"glide.vc","state":"/absolute/existing/file.sqlite"}
+{ "workspace": "glide.vc", "state": "/absolute/existing/file.sqlite" }
 ```
 
 Deployment JSON schema (both properties required; no additional properties):
@@ -167,8 +167,8 @@ Deployment JSON schema (both properties required; no additional properties):
   "required": ["workspace", "state"],
   "additionalProperties": false,
   "properties": {
-    "workspace": {"enum": ["home", "glide.vc"]},
-    "state": {"type": "string", "pattern": "^/"}
+    "workspace": { "enum": ["home", "glide.vc"] },
+    "state": { "type": "string", "pattern": "^/" }
   }
 }
 ```
@@ -265,7 +265,7 @@ Restart remains observe only, resets stability, and preserves pending sends/stop
 
 ## Owner-approved continuation (`POST /continue`)
 
-A *complete* answer is not a *complete task*: a model can stop at its own turn limit or a tool quota and still report the turn as complete. The automatic recovery path never touches such a turn (it needs a verified `Thinking failed`). An owner can instead approve **one** `go` for **one exact turn**; the local trusted caller (pm, after the owner's Telegram tap) then posts that approval to the account-local control API of the Guardian that owns the chat.
+A _complete_ answer is not a _complete task_: a model can stop at its own turn limit or a tool quota and still report the turn as complete. The automatic recovery path never touches such a turn (it needs a verified `Thinking failed`). An owner can instead approve **one** `go` for **one exact turn**; the local trusted caller (pm, after the owner's Telegram tap) then posts that approval to the account-local control API of the Guardian that owns the chat.
 
 ```http
 POST /continue          Authorization: Bearer <that account's control token>
@@ -280,7 +280,7 @@ POST /continue          Authorization: Bearer <that account's control token>
 GET /continuations/<request_id>   -> {"ok":true,"request_id","status","reason","chat","expected_turn","approved_at","expires_at","queued_at","updated_at","sent_at","observed":{"model","effort","turn_state"}|null,"source":"operator"}
 ```
 
-The body is exactly those five fields; any extra key (including a caller-supplied `approved`) is a `400`. The route is not reachable without the account's bearer token, and the token is a Guardian credential no MCP tool exposes. The handler only validates and **queues**; it never touches the browser. Queue-time refusals are stored as `refused` receipts: `approval-expired`, `approval-in-future` (more than 30 s ahead), `not-enrolled` (the chat is not watched by *this* account's store, which is also how a cross-account request fails) and `turn-already-requested` (a queued/sent/uncertain request already owns that chat+turn; refused requests never do).
+The body is exactly those five fields; any extra key (including a caller-supplied `approved`) is a `400`. The route is not reachable without the account's bearer token, and the token is a Guardian credential no MCP tool exposes. The handler only validates and **queues**; it never touches the browser. Queue-time refusals are stored as `refused` receipts: `approval-expired`, `approval-in-future` (more than 30 s ahead), `not-enrolled` (the chat is not watched by _this_ account's store, which is also how a cross-account request fails) and `turn-already-requested` (a queued/sent/uncertain request already owns that chat+turn; refused requests never do).
 
 `status` is one of `queued` (`reason: dispatching` while the click is in flight), `refused`, `sent` (the exact go bubble was seen, `reason: acknowledged`) or `uncertain` (`unacknowledged`, `interrupted`, `restart-interrupted`). `uncertain` is final: a restart, replay or fresh approval never clicks again, and the matching attempt keeps the chat blocked until a human runs `resolve-send`.
 
@@ -288,7 +288,7 @@ The live `--apply` loop is the **only** sender. Each cycle it expires stale appr
 
 A reservation, the attempt row and the receipt share the durable SQLite store (`continuations` table with a partial unique index on the owning chat+turn), so duplicate callers, restarts and crashes cannot produce a second click. Receipts hold only metadata: no message bodies, page text or tokens. There is no optional source-text diagnostic; if one is ever added it must be bounded and metadata-only by default.
 
-The send is a normal attempt: monitoring labels it `last_go_source: operator` and correlates the following assistant reply exactly like an automatic send. A completed reply only means that *turn* finished.
+The send is a normal attempt: monitoring labels it `last_go_source: operator` and correlates the following assistant reply exactly like an automatic send. A completed reply only means that _turn_ finished.
 
 **View preparation.** A conversation scrolled away from its end reads as unobserved (the ordinary scroll-gap safety check is unchanged). Only when the first observation of an approved continuation has no readable turn, the dispatch calls the adapter's `prepare-view` once: after verifying the exact chat, the approved turn as latest turn, a non-generating state, no draft/attachment/challenge/quota/ambiguity and a present profile menu, it scrolls the conversation (and page) to its end — no focus, click, navigation, tab or model selection — and re-checks the page. `False` refuses the request as `view-not-ready` without a reservation. The normal observation, probe and pre-click re-read then run afresh.
 
@@ -323,6 +323,68 @@ only tells `startup` where the browser listens; the browser unit, `live --cdp` a
 (a host whose 9224 is taken by another tool moves all three, e.g. to 9226). Direct restarts do not stop `BindsTo=`
 dependents, and an explicit `systemctl --user stop` still keeps the unit stopped. The `-` prefix keeps a restore failure
 from killing the browser.
+
+## Coverage reconciliation (`coverage`, 0.3.5)
+
+`chatgpt-guardian --workspace home|glide.vc coverage --cdp-port PORT [--apply]` answers one question: is every
+ACTIVE chat of the account (a running or `Thinking failed` chat open in the owned browser, including newly opened
+ones; not every historical dialog) genuinely supervised? `--cdp-port` has no default: it must equal the browser's
+`--remote-debugging-port` (e.g. home 9226, glide.vc 9223). Evidence is only the persisted monitor snapshot, the recovery
+database (read-only) and the owned browser's loopback DevTools HTTP inventory after `startup.verify_browser`; there is no
+new CDP observer. `--help` and the default dry run write, start and send nothing and never create a file.
+
+The JSON report keeps the facts apart per chat: `enrolled` (a `watch:<chat>` control of `1`), `present` (exactly one
+open tab in the verified browser), `fresh_chat` (the chat's OWN observation is current and unique; a fresh snapshot
+alone does not make a chat fresh), `activity` (`running`, `failed`, `rate-limited`, `finished`, `idle`, `unknown`; `finished`
+needs a current complete status, an old `completion_observed_at` is history and never counts), `active` and
+`recovery_eligible` (service active, browser verified, enrolled, present, fresh and no hold, quota or unresolved send;
+mirrored as `eligibility_for_probe` with `model_proof: "unknown"`: a probe-level check, not validated model/send). `summary` counts them and lists
+`uncovered` visible chats (finished or unknown ones are listed, never enrolled, never sent to).
+
+Per-account flags live in `~/.config/agent-tools/chatgpt-guardian/<workspace>.coverage.json` (override: `--config`
+or `CHATGPT_GUARDIAN_COVERAGE_CONFIG`), for example
+`{"workspace": "home", "coverage_enabled": true, "auto_watch_active": true, "recovery_autostart": false}`. A missing
+file, or a missing flag, is `false`; an invalid file refuses (exit 2) with no effects. With `--apply` and
+`coverage_enabled` the only effects are:
+
+- `auto_watch_active`: enrol a chat that is fresh, unique in both the snapshot and the browser, running or
+  `Thinking failed`, and has NO `watch:` key (`INSERT OR IGNORE`). A manual `unwatch` (`0`) is never undone, and holds,
+  stops, quota, uncertain sends and models are never touched.
+- Restore: missing ENROLLED chats are reopened through `startup.restore` (max 6 pages, no navigation, reload or close of
+  existing tabs). The durable ledger `<state-stem>.coverage.sqlite` (next to the state database, mode 0600) allows ONE
+  attempt per missing chat per inventory (browser pid plus the set of enrolled chats open exactly once, computed
+  identically before and after a restore and including chats enrolled by the same run; blank or login tabs left by
+  a failed restore and duplicated chats do not change it) and at least 15 minutes between attempts, so redirected or
+  failed restores never accumulate blank tabs. Missing account, ambiguous or unowned browser, duplicate tabs and a full page ceiling are
+  reported as `blocked`. `--reset-restore --apply` is the owner action that forgets spent attempts.
+- `recovery_autostart` (default `false`): start (`systemctl --user start --no-block`) a recovery service whose
+  ActiveState is `failed`, never an `inactive` (manually stopped) one, only after the browser is verified, never with a
+  global `stop:*`, at most 3 attempts 5 minutes apart per failure (reset when the service is seen active). The browser is
+  never restarted.
+- Owner alert through `tg --title "ChatGPT Guardian" --tag problem --format plain` (no direct Bot API): service failed,
+  missing or duplicate pages, stale observation, uncovered active chat (a manual unwatch is reported in the JSON, not
+  alerted), a stalled current generation and an existing global `stop:*` hold (429 transport, human challenge, manual
+  stop): the exact hold text is reported once; the hold is never removed, resumed or retried. Concise Russian, one
+  batched message per run, deduplicated per account, chat, turn and state in the ledger across restarts; an unchanged
+  condition is not repeated, a cleared one re-arms after an hour and its record is pruned after that window, and a
+  failed delivery is recorded as `delivery-failed` (retried at most 5 times, 15 minutes apart), never as sent. Delivery
+  is at-least-once: a crash between the `tg` call and the ledger write can repeat one message.
+- Serialisation: an applied run (`--apply` with `coverage_enabled`) holds a non-blocking `flock` on
+  `<state-stem>.coverage.lock` for the whole run, released on any error; a second concurrent run reports
+  `"busy": true`, exit 0, and changes nothing (`--reset-restore` while busy is blocked, exit 1, instead). `startup
+--apply` takes the same lock (waits up to 60 seconds), so the
+  browser unit's own restore and the timer can never both open the same missing chat. Dry runs never lock or write.
+  The restore reservation is a check-and-set in one transaction and is never replaced by another caller. The ledger
+  schema and its scope row are created in a single transaction; an empty or scope-less empty ledger is initialised,
+  while a foreign scope, unrecognised tables or records without a scope are refused and never deleted or adopted.
+  The report has the same sections on every outcome, including early failures.
+
+Exit status is 1 when anything is `blocked`. Timer and service templates live in
+`systemd/chatgpt-guardian-coverage/coverage.{service,timer}.template`: render `@VENV_PYTHON@`, `@WORKSPACE@`,
+`@CDP_PORT@` (the service) and `@SLUG@` (`home` or `glide`, the timer), install as
+`~/.config/systemd/user/chatgpt-guardian-<slug>-coverage.{service,timer}` and run
+`systemctl --user daemon-reload && systemctl --user enable --now chatgpt-guardian-<slug>-coverage.timer`. The timer
+fires every 60 seconds; the service always passes `--apply` and the flags file decides what may happen.
 
 ## Verification
 

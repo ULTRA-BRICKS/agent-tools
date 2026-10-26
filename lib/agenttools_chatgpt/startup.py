@@ -19,17 +19,20 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote, urlsplit
 
+from .lock import AccountBusy, account_lock
 from .state import state_path
 from .urls import canonical_chat
 
 PORTS = {"home": 9224, "glide.vc": 9223}
 MAX_PAGES = 6
 DEADLINE_SECONDS = 30.0
+LOCK_WAIT_SECONDS = 60.0
 HTTP_TIMEOUT_SECONDS = 5.0
 MAX_BODY_BYTES = 1 << 20
 SETTLE_SECONDS = 5.0
@@ -348,13 +351,14 @@ def restore(
     settle: float = SETTLE_SECONDS,
     interval: float = SETTLE_INTERVAL_SECONDS,
     result: dict | None = None,
+    skip: frozenset[str] = frozenset(),
 ) -> dict:
     """Fill ``result`` as it goes so a failure still reports what was opened."""
     clock = clock or time.monotonic
     sleep = sleep or time.sleep
     started = clock()
     result = {} if result is None else result
-    result.update(workspace=workspace, apply=apply, opened=[], missing=[])
+    result.update(workspace=workspace, apply=apply, opened=[], missing=[], deferred=[])
 
     def budget() -> float:
         remaining = deadline - (clock() - started)
@@ -393,6 +397,10 @@ def restore(
         count, present = inspect_inventory(pages, enrolled)
         if chat in present:
             continue
+        if chat in skip:
+            # The caller's durable ledger already spent this chat's one attempt.
+            result["deferred"].append(chat.rsplit("/", 1)[1])
+            continue
         if count >= MAX_PAGES:
             raise StartupError("Page ceiling reached; refusing to open more tabs")
         label = chat.rsplit("/", 1)[1]
@@ -404,7 +412,7 @@ def restore(
                 result["uncertain"] = label
                 raise
             result["opened"].append(label)
-    present_after = len(enrolled) - len(result["missing"])
+    present_after = len(enrolled) - len(result["missing"]) - len(result["deferred"])
     result["already_open"] = present_after
     return result
 
@@ -427,6 +435,7 @@ def main(
     devtools: DevTools | None = None,
     state: Path | None = None,
     home: Path | None = None,
+    lock_wait: float = LOCK_WAIT_SECONDS,
 ) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m agenttools_chatgpt.startup",
@@ -448,21 +457,24 @@ def main(
     port = args.cdp_port or PORTS[args.workspace]
     result: dict = {}
     try:
-        restore(
-            args.workspace,
-            apply=args.apply,
-            state=state or state_path(args.workspace),
-            processes=processes or ProcFilesystem(),
-            devtools=devtools or ChromeDevTools(port),
-            home=home,
-            port=port,
-            result=result,
-        )
+        target = state or state_path(args.workspace)
+        # An applied run opens tabs: never concurrently with a coverage --apply run.
+        with account_lock(target, wait=lock_wait) if args.apply else nullcontext():
+            restore(
+                args.workspace,
+                apply=args.apply,
+                state=target,
+                processes=processes or ProcFilesystem(),
+                devtools=devtools or ChromeDevTools(port),
+                home=home,
+                port=port,
+                result=result,
+            )
         code = 0
     except UncertainCreation as exc:
         result.update(error=str(exc), rerun_checks_inventory_first=True)
         code = 1
-    except (StartupError, ValueError) as exc:
+    except (StartupError, ValueError, AccountBusy) as exc:
         result["error"] = str(exc)
         code = 1
     result.setdefault("workspace", args.workspace)

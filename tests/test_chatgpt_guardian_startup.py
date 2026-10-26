@@ -580,3 +580,10 @@ def test_lifecycle_templates_use_only_the_documented_tokens():
     for template in templates:
         tokens = set(re.findall(r"@[A-Z_]+@", template.read_text(encoding="utf-8")))
         assert tokens == {"@VENV_PYTHON@", "@CDP_PORT@"}, template
+
+
+def test_skipped_chat_is_deferred_not_opened(tmp_path):
+    dev = FakeDevTools([ONE])
+    result = run(tmp_path, dev, skip=frozenset([TWO]))
+    assert dev.created == [] and result["opened"] == []
+    assert result["deferred"] == ["two"] and result["already_open"] == 1

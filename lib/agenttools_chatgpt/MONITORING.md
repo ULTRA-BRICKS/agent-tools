@@ -16,6 +16,8 @@ Without flags, `monitor` opens the TUI in a terminal and prints a table in a pip
 
 Discovery does not enroll additional chats or authorize recovery. A third visible chat can be listed with `not-enrolled` while only two chats remain under automatic recovery. Chats in other browsers or closed conversations are outside this observer's coverage.
 
+The `coverage` command (see README) is the only component that may enroll a discovered chat, and only an active (running or `Thinking failed`) one with no existing watch control, when the account's `auto_watch_active` flag is on. Everything else here stays read-only.
+
 ## Evidence and time
 
 A sent attempt does not prove continuation. The observer must find the failed turn, the immediately following exact `го` user message and an assistant generation or completed answer associated with that next turn. Uncertain attempts remain uncertain. Existing completed evidence remains historical evidence even when that turn later leaves the visible DOM window.
@@ -26,7 +28,7 @@ If a response already recorded as complete is observed generating again, the com
 
 `last_go_at` is the recorded dispatch timestamp. `continuation_observed_at` and `completion_observed_at` are when evidence was observed, not reconstructed execution timestamps. `last_checked_at` is a successful actual DOM observation, not the most recent cached display refresh. `next_check_at` is the per-session deadline; the observer's next polling cycle can occur shortly after that deadline.
 
-`last_go_source` is `operator` when the latest attempt is a send made on an owner-approved continuation (`POST /continue`) and `automatic` otherwise; the `send-acknowledged`/`send-uncertain` events carry the same `source`. Operator sends are ordinary attempts, so the correlation above applies unchanged: the exact `го` message after the approved turn, then assistant evidence on that same turn. The approved turn may have been a `complete` answer, so a later `continuation: completed` still only means the *continuation turn* finished, never that the task is done.
+`last_go_source` is `operator` when the latest attempt is a send made on an owner-approved continuation (`POST /continue`) and `automatic` otherwise; the `send-acknowledged`/`send-uncertain` events carry the same `source`. Operator sends are ordinary attempts, so the correlation above applies unchanged: the exact `го` message after the approved turn, then assistant evidence on that same turn. The approved turn may have been a `complete` answer, so a later `continuation: completed` still only means the _continuation turn_ finished, never that the task is done.
 
 Attempts the Guardian reserved but never clicked (a refused or interrupted continuation, state `canceled`) are not reported by telemetry: they are not sends and must not appear as `send-uncertain`. They still consume the turn's identity and budget in the recovery store.
 

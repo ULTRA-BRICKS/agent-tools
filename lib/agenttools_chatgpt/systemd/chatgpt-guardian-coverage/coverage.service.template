@@ -1,0 +1,13 @@
+# Render @VENV_PYTHON@, @WORKSPACE@ (home or glide.vc) and @CDP_PORT@ (the --remote-debugging-port
+# of the account's dedicated browser unit; the only authority for the port), then install as
+# ~/.config/systemd/user/chatgpt-guardian-<home|glide>-coverage.service together with the rendered
+# coverage.timer.template, and run: systemctl --user daemon-reload
+# Effects are gated by the account's coverage flags file
+# (~/.config/agent-tools/chatgpt-guardian/@WORKSPACE@.coverage.json); with no file the run only reports.
+[Unit]
+Description=Guardian coverage reconciliation (@WORKSPACE@)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=120
+ExecStart=@VENV_PYTHON@ -m agenttools_chatgpt --workspace @WORKSPACE@ coverage --cdp-port @CDP_PORT@ --apply
