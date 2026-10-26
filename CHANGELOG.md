@@ -27,6 +27,7 @@
   `Wants/After=network-online.target`, which the user manager does not have. Behaviour change:
   `stop` with an enabled, systemd-answering unit now stops the unit (autostart stays installed)
   instead of exiting 3 with "run disable".
+- `local-path-in-gh` agent-hook (pre-bash, priority 40, fail-open; agent-tools#1002): blocks `tg` / `tg report` text (not `--photo`/`--file` uploads) and `gh pr`/`gh issue` create/edit/comment/review/close/reopen/merge, `gh release create|edit`, `gh api` writes to issues/pulls/comments/reviews/releases/graphql, and task-cli `new|change|check|attach|done|comment` text and `--proof`/`--screenshot` values whose text names a local filesystem path (tmp dirs, `/home/<user>`, `/Users/<user>`, `~/`, `$HOME`, Windows drive paths, `file://`, the runtime home dir, non-http(s) link targets). A local path cannot be opened on GitHub and is gone after a reboot, so it is a fake proof. Body files, heredocs, `$(cat file)` and files written earlier in the same command are judged by content. The BLOCKED message names the flag and token (home masked as `<home>`) and says to paste the content (fenced block / `<details>`) or upload the image and link the https URL. Only bypass: `RIG_HATCH_REQUEST_LOCAL_PATH_IN_GH` (one-time Telegram approval).
 - `python-only`: exact-path Allow entries for the four Guardian browser-injected DOM adapters
   (`lib/agenttools_chatgpt/{dom,live_dom,monitor_dom,conversation_root}.js`, run by Chromium in
   the ChatGPT page; agent-tools#969, Refs #891). No glob: other JS in that package still blocks.

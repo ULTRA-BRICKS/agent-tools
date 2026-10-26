@@ -27,6 +27,7 @@ HATCH_HOOKS = (
     "agent-hooks/block-raw-worktree-add/block_raw_worktree_add.py",
     "agent-hooks/block-reset-hard/block_reset_hard.py",
     "agent-hooks/decision-request-format/decision_request_format.py",
+    "agent-hooks/local-path-in-gh/local_path_in_gh.py",
     "agent-hooks/no-long-inline-process/no_long_inline_process.py",
     "agent-hooks/no-shell-file-edit/no_shell_file_edit.py",
     "agent-hooks/orchestrator-stays-thin/orchestrator_stays_thin.py",

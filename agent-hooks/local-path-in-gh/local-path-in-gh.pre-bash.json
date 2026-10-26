@@ -1,0 +1,9 @@
+{
+  "id": "local-path-in-gh",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/local-path-in-gh/local_path_in_gh.py",
+  "priority": 40,
+  "timeout_ms": 960000,
+  "on_error": "open",
+  "description": "Blocks text written to GitHub (or to a tracker through task-cli) that names a local filesystem path: `gh pr|issue create|edit|comment|review|close|reopen|merge` and `gh release create|edit` (--title/--body/--notes/--comment and the CONTENTS of --body-file/--notes-file/-F, incl. stdin heredocs and pipes), `gh api` writes to issues/pulls/comments/reviews/releases/graphql (-f/-F/--input values; the endpoint is never scanned), and `tg` / `tg report` text (--photo/--file uploads are not scanned), and `task new|create|change|check|attach|done|comment|status|accept` prose and --proof/--screenshot values. A path means /tmp, /var/tmp, /var/folders, /dev/shm, /run/user, /root, /home/<user>, /Users/<user>, ~/, $HOME, Windows drive paths, file:// URLs, the runtime home dir, and non-http(s) markdown/HTML link targets; https URLs, repo-relative paths and `<path>` placeholders are fine. Incident: a ticket criterion was 'proven' with a local tmp path that nobody on GitHub can open and that disappears at reboot (agent-tools#1002). The BLOCKED message names the flag and token (home masked as <home>) and says to paste the content as a fenced block or <details>, or upload the image and link the https URL. Deny-by-default, no self-service bypass: RIG_HATCH_REQUEST_LOCAL_PATH_IN_GH=\"<justification>\" <command> asks for a one-time Telegram approval (a bare 1 is rejected); one round-trip covers a whole chained command."
+}

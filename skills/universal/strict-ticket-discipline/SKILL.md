@@ -223,6 +223,14 @@ your own assertion is `adversarial-verification`.
   worth the sections above.
 - **Do NOT claim a proof exists when it does not** — be explicit about what is
   observable now versus only after the fix.
+- **Do NOT name a local file as a proof** — never a tmp-dir path, a home-dir path, `~/…`,
+  `$HOME`, or a `file://` URL in a PR, issue, comment, review, release note, or a `task`
+  field/`--proof`. Nobody reading GitHub can open it and it is gone after a reboot, so the
+  box is "proven" by nothing. A proof is **attached content or an http(s) link**: paste the
+  output as a fenced block (```` ```text ````) or inside `<details>`, upload the image and link its https URL, or
+  pass `task check --proof` an https URL / an existing image it uploads. Command examples use
+  repo-relative paths or `<path>` placeholders. The `local-path-in-gh` agent-hook blocks the
+  write mechanically (bypass: one-time Telegram hatch `RIG_HATCH_REQUEST_LOCAL_PATH_IN_GH`).
 
 ## Common mistakes
 
