@@ -58,6 +58,16 @@
   The selected-model panel proof, exact turn/account identity, draft/running/uncertain vetoes and the rule that a
   closed `Pro` label never implies Astra are unchanged, and two visible triggers still fail closed. The probe body is
   split into small helpers without changing its order of checks.
+- `agenttools-chatgpt` 0.3.12 (Refs #1039; 0.3.11 is reserved for the rotation work, so the rotation branch
+  must rebase onto this patch and may renumber): the read-only monitor no longer reports a conversation `complete`
+  from the `data-talvt-turn-state="complete"` marker alone. A newest unique turn with a user message and no assistant
+  side (no role element, agent-turn start, markdown, sub-agent activity or assistant-side media) is
+  `status: unanswered` (per-turn `assistant_absent`), still a current, valid observation. `complete` now needs an
+  answer in that same turn (assistant text, or assistant media inside a started assistant side); when neither an answer
+  nor the absence of one is proven (duplicate turn key, bare agent-turn marker, unmarked media, a turn with no user
+  bubble and no assistant side) it is `unknown`. Running, quota, draft, dialog, duplicate-root and uncertain-send
+  handling are unchanged, a sent-new user-only turn stays `unconfirmed`, and `unanswered` triggers no recovery, Retry
+  or Go.
 - Worktree-only guard is ON BY DEFAULT and now covers commits (agent-tools#1012, Refs #1012):
   `worktree-only-writes`, `pin-primary-worktree` and `block-devserver-primary` enforce in every
   repo that has a `rig.yaml` unless it sets `agent_hooks.worktree_only: false` (or the session
