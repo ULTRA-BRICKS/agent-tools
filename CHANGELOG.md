@@ -166,6 +166,11 @@ checkout -B`, `git switch -C/--force-create`, and `rm` with a recursive flag as 
 
 ### Fixed
 
+- `ci/leftover-grep/leftover_grep.py` (Refs #1036): the vendored module no longer trips the leftover-marker gate it
+  implements. A consumer's apply PR adds the file and the gate scans the added lines, so the focused-test syntax in the
+  docstring and the literal open-item words in the rule table and the FAIL message were reported as 5 BLOCK findings.
+  The words are now assembled from parts and the docstring reworded (output of the gate unchanged);
+  `tests/test_ci_leftover_grep_port_1036.py` runs the gate over every vendored launcher and module of the four ported slots.
 - `ci/dependency-review/dep-audit.sh`, `ci/leftover-grep/leftover-grep.sh`, `ci/review-threads/review-threads.sh` and
   `ci/secret-scan/secret-scan.sh` (Refs #1036): the gate logic moved to `dep_audit.py`, `leftover_grep.py`,
   `review_threads.py` and `secret_scan.py` next to each script (python-only policy: a shell script over 40 lines

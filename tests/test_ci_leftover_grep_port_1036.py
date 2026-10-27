@@ -265,3 +265,21 @@ def test_tab_edges_of_text_are_stripped_like_shell_read(tmp_path: Path):
     proc = _run(repo, {"LEFTOVER_BASE": "main"})
     assert proc.returncode == 1
     assert "::error file=a.ts,line=2::[debugger] debugger;\n" in proc.stdout
+
+
+def test_gate_does_not_trip_on_the_vendored_gate_files_it_ships_with(tmp_path: Path):
+    """rig vendors every launcher + module of these four slots into a consumer; that PR's diff is
+    scanned by this same gate, so no vendored file may contain a literal rule marker (focused-test
+    syntax, an untracked open-item word, a conflict marker, ...)."""
+    slots = ("dependency-review", "leftover-grep", "review-threads", "secret-scan")
+    vendored = {
+        f"ci/{slot}/{f.name}": f.read_text(encoding="utf-8")
+        for slot in slots
+        for f in sorted((REPO_ROOT / "ci" / slot).iterdir())
+        if f.suffix in (".py", ".sh") and not f.name.startswith("test_")
+    }
+    assert len(vendored) == 8
+    repo = _repo(tmp_path, {}, vendored)
+    proc = _run(repo, {"LEFTOVER_BASE": "main"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "0 blocking" in proc.stderr
