@@ -26,6 +26,17 @@ STALL_SECONDS = 900
 OBSERVATION_GRACE_SECONDS = 120
 DEFAULT_RETRY_SECONDS = 60
 DETAIL_LIMIT = 120
+# Sample error of a conversation tab the observer deliberately did not read (over its cap).
+UNOBSERVED_ERROR = "passive-cap"
+OBSERVATIONS = (
+    "current",
+    "stale",
+    "missing",
+    "duplicate",
+    "error",
+    "unobserved",
+    "unavailable",
+)
 
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 _UUID = re.compile(r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
@@ -133,11 +144,29 @@ def freshness(snapshot: dict, now: float) -> dict:
     if isinstance(snap.get("sessions"), list):
         sessions = [_session_view(s, now, snap["stale"]) for s in snap["sessions"]]
         snap["sessions"] = sessions
+        watched = [s for s in sessions if s.get("watched")]
+        unobserved = sum(s["observation"] == "unobserved" for s in sessions)
         snap["summary"] = dict(
             snap.get("summary", {}),
             running=sum(s["running"] is True for s in sessions),
             running_unknown=sum(
                 bool(s.get("watched")) and s["running"] is None for s in sessions
+            ),
+            # Enrolled chats by how their evidence stands; stale (seen, evidence too old)
+            # and missing (no page) are distinct.
+            observation_counts={
+                kind: sum(s["observation"] == kind for s in watched)
+                for kind in OBSERVATIONS
+            },
+            # Open conversation tabs the observer did not read (over its passive cap).
+            unobserved=unobserved,
+            # True only when the browser is connected, the snapshot is fresh, every enrolled
+            # chat has current evidence and no open conversation tab went unread.
+            coverage_complete=bool(
+                snap.get("connection") == "connected"
+                and not snap["stale"]
+                and not unobserved
+                and all(s["observation"] == "current" for s in watched)
             ),
         )
     return snap
@@ -295,6 +324,9 @@ def project_snapshot(
         old = previous_rows.get(chat, {})
         matches = groups.get(chat, [])
         sample = matches[0] if len(matches) == 1 else {}
+        # The observer left this conversation unread (over its passive cap): that outranks
+        # a duplicate-tab verdict, which would otherwise hide an unread conversation.
+        unread = any(m.get("error") == UNOBSERVED_ERROR for m in matches)
         present = bool(matches) if coverage_known else old.get("present", False)
         error = clean_detail(sample.get("error"))
         detail = clean_detail(sample.get("error_detail"))
@@ -341,6 +373,8 @@ def project_snapshot(
             )
         elif not matches:
             observation, detail = "missing", "no-page-for-url"
+        elif unread:
+            observation, detail = "unobserved", "beyond-passive-cap"
         elif len(matches) != 1:
             observation, detail = "duplicate", "multiple-pages-for-url"
         elif error:
@@ -376,6 +410,8 @@ def project_snapshot(
             reason = "browser-observation-unavailable"
         elif not matches:
             reason = "missing-page"
+        elif unread:
+            reason = "beyond-passive-cap"
         elif len(matches) != 1:
             reason = "duplicate-pages"
         elif error:
@@ -565,8 +601,17 @@ def project_snapshot(
         "connection": connection,
         "error_detail": clean_detail(health.get("error_detail")),
         "stale": not coverage_known,
-        "max_pages": health.get("max_pages", 6),
+        "max_pages": health.get("max_pages"),
+        "max_auxiliary_pages": health.get("max_auxiliary_pages"),
+        "min_available_mib": health.get("min_available_mib"),
+        "passive_cap": health.get("passive_cap"),
+        # Physical tabs. page_count is the total; the split is the sender's own classification.
         "page_count": health.get("page_count"),
+        "conversation_page_count": health.get("conversation_page_count"),
+        "auxiliary_page_count": health.get("auxiliary_page_count"),
+        # Why the sender's mutation admission is paused ("" = not paused, None = unknown).
+        # Passive evidence in `sessions` is collected regardless of it.
+        "resource_paused": health.get("resource_paused"),
         "interval_seconds": retry,
         "service": health.get("service", {}),
         "guardian_last_state": health.get("guardian_last_state", {}),

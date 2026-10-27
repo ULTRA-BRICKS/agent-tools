@@ -23,14 +23,14 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
+from . import live
 from .lock import AccountBusy, account_lock
 from .state import state_path
-from .urls import canonical_chat
+from .urls import canonical_chat, conversation_identity
 
 PORTS = {"home": 9224, "glide.vc": 9223}
-MAX_PAGES = 6
 DEADLINE_SECONDS = 30.0
 LOCK_WAIT_SECONDS = 60.0
 HTTP_TIMEOUT_SECONDS = 5.0
@@ -155,15 +155,7 @@ def verify_browser(
 
 def page_chat(page: dict) -> str | None:
     """Canonical chat for a page URL (project URLs normalized) or None."""
-    url = page.get("url")
-    if not isinstance(url, str):
-        return None
-    parts = urlsplit(url)
-    bare = parts._replace(query="", fragment="").geturl()
-    try:
-        return canonical_chat(bare)
-    except ValueError:
-        return None
+    return conversation_identity(page.get("url"))
 
 
 def snapshot(pages: list[dict]) -> tuple[tuple[str, str, str], ...]:
@@ -176,23 +168,30 @@ def snapshot(pages: list[dict]) -> tuple[tuple[str, str, str], ...]:
     )
 
 
-def inspect_inventory(pages: list[dict], enrolled: list[str]) -> tuple[int, set[str]]:
-    """Return (page count, present enrolled chats); duplicates fail closed."""
+def inspect_inventory(
+    pages: list[dict], enrolled: list[str]
+) -> tuple[int, int, set[str]]:
+    """Return (conversation pages, auxiliary pages, present enrolled chats).
+
+    Pages are classified by the sender's own primitive (`live.page_counts`), so restore and
+    sends share one definition of a conversation tab. Duplicates fail closed.
+    """
     wanted = set(enrolled)
     seen: dict[str, int] = {}
-    count = 0
+    urls = []
     for page in pages:
         if not isinstance(page, dict):
             raise StartupError("Unexpected DevTools page inventory")
         if page.get("type") != "page":
             continue
-        count += 1
+        urls.append(page.get("url"))
         chat = page_chat(page)
         if chat in wanted:
             seen[chat] = seen.get(chat, 0) + 1
     if any(n > 1 for n in seen.values()):
         raise StartupError("Ambiguous duplicate tabs for an enrolled chat")
-    return count, set(seen)
+    conversations, auxiliary = live.page_counts(urls)
+    return conversations, auxiliary, set(seen)
 
 
 class ChromeDevTools:
@@ -378,7 +377,7 @@ def restore(
             if clock() - started + interval >= deadline:
                 raise StartupError(str(exc)) from exc
             sleep(interval)
-    count, present = inspect_inventory(pages, enrolled)
+    _, _, present = inspect_inventory(pages, enrolled)
     if set(enrolled) - present:
         # restore-last-session may still be reopening tabs; wait for a stable inventory.
         settle_end = clock() + settle
@@ -392,17 +391,29 @@ def restore(
             if current == previous:
                 break
             previous = current
+    created: list[str] = []
     for chat in enrolled:
         pages = devtools.pages(budget())
-        count, present = inspect_inventory(pages, enrolled)
+        conversations, auxiliary, present = inspect_inventory(pages, enrolled)
         if chat in present:
             continue
         if chat in skip:
             # The caller's durable ledger already spent this chat's one attempt.
             result["deferred"].append(chat.rsplit("/", 1)[1])
             continue
-        if count >= MAX_PAGES:
-            raise StartupError("Page ceiling reached; refusing to open more tabs")
+        # Opening a tab is a mutation: the same admission policy as every send applies.
+        # The new conversation tab is counted before it exists, and so is every chat this
+        # run created that does not show as a conversation tab yet (still blank or
+        # loading): the hard conversation ceiling then holds once those tabs finish
+        # loading, whatever else opens meanwhile. Such a tab may also be counted as
+        # auxiliary until it loads; that over-count fails closed, and nothing is
+        # discounted without proof of which tab it is (create returns no target id).
+        unsettled = sum(opened not in present for opened in created)
+        paused = live.resource_pause(
+            conversations + unsettled + 1, auxiliary, live.available_memory()
+        )
+        if paused:
+            raise StartupError(f"Resource pause ({paused}); refusing to open more tabs")
         label = chat.rsplit("/", 1)[1]
         result["missing"].append(label)
         if apply:
@@ -412,6 +423,7 @@ def restore(
                 result["uncertain"] = label
                 raise
             result["opened"].append(label)
+            created.append(chat)
     present_after = len(enrolled) - len(result["missing"]) - len(result["deferred"])
     result["already_open"] = present_after
     return result

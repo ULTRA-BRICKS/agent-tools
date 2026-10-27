@@ -73,6 +73,7 @@ jobs:
             tests/test_chatgpt_guardian_operator.py \
             tests/test_chatgpt_guardian_operator_dom.py \
             tests/test_chatgpt_guardian_polling.py \
+            tests/test_chatgpt_guardian_resource_evidence.py \
             tests/test_chatgpt_guardian_service.py \
             tests/test_chatgpt_guardian_startup.py \
             -q -rs -p no:cacheprovider --junitxml="${RUNNER_TEMP}/guardian-junit.xml"

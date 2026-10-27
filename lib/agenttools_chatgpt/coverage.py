@@ -546,7 +546,12 @@ def _empty_report(
         "note": "",
         "blocked": [],
         "chats": [],
-        "browser": {"verified": False, "pages": 0},
+        "browser": {
+            "verified": False,
+            "pages": 0,
+            "conversation_pages": 0,
+            "auxiliary_pages": 0,
+        },
         "service": {"unit": UNITS[workspace], "active_state": "unknown"},
         "summary": {
             "fresh_snapshot": False,
@@ -557,6 +562,8 @@ def _empty_report(
             "active": 0,
             "recovery_eligible": 0,
             "uncovered": [],
+            "observation_complete": False,
+            "resource_paused": None,
         },
         "plan": {
             "enroll": [],
@@ -673,7 +680,13 @@ def _reconcile(
         page_total = sum(p.get("type") == "page" for p in pages)
     except (StartupError, ValueError) as exc:
         block("browser", str(exc))
-    report["browser"] = {"verified": live is not None, "pages": page_total}
+    conversation_pages = sum(live.values()) if live is not None else 0
+    report["browser"] = {
+        "verified": live is not None,
+        "pages": page_total,
+        "conversation_pages": conversation_pages,
+        "auxiliary_pages": page_total - conversation_pages,
+    }
 
     try:
         service = systemd.show(unit).get("ActiveState", "unknown")
@@ -703,6 +716,20 @@ def _reconcile(
         "uncovered": [
             r["chat"] for r in rows if not r["enrolled"] and (r["live_pages"] or 0) > 0
         ],
+        # The observer's own verdict: every enrolled chat has current evidence and no open
+        # conversation tab went unread. Independent of the sender's mutation pause below.
+        # Both are claims about the browser, so they need a fresh snapshot AND a browser
+        # this run just verified.
+        "observation_complete": bool(
+            snapshot_fresh
+            and live is not None
+            and snapshot.get("summary", {}).get("coverage_complete")
+        ),
+        # "" = admitted, a reason = paused, None = unknown (stale snapshot, browser not
+        # verified now).
+        "resource_paused": snapshot.get("resource_paused")
+        if snapshot_fresh and live is not None
+        else None,
     }
 
     # --- plan ---------------------------------------------------------------

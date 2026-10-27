@@ -34,6 +34,25 @@
   ancestors (e.g. the hidden `Thinking effort` placeholder) is excluded, so a full selected GPT-6 proof plus visible
   `Pro` / `5.6 Extra High` finalizes. One helper serves `menu-state` and `finalize-probe`; the label must still equal
   exactly `Pro` / `5.6 Extra High` (no prefix stripping), and the raw trigger signature still covers all text.
+- `agenttools-chatgpt` 0.3.8 (Refs #1020): passive evidence is separated from mutation admission. One non-conversation
+  tab (`/space?tab=all`) no longer blanks six legitimate conversations: the observer used to turn every session
+  `unknown` and the sender paused globally whenever the TOTAL page count exceeded 6. Mutation admission
+  (`live.resource_pause`: sends, Sol selection and `startup.restore`) now counts conversation tabs against a
+  conversation budget of 6 (hard ceiling, never raised or disabled; `--max-pages` still lowers it) and every other
+  page (`/space`, new tab, other chatgpt.com pages, external sites) against an explicit auxiliary budget of 2
+  (`AUXILIARY_PAGE_BUDGET`), under the same MemAvailable guard; reasons are `conversation-budget`,
+  `auxiliary-budget`, `low-memory`, `memory-unavailable`. A conversation URL is normalised once
+  (`urls.conversation_identity`: trailing slash, query, fragment and project `/g/g-p-<id>-<slug>/c/<uuid>` variants share
+  one identity); a duplicate tab counts physically and still vetoes that chat. `startup.restore` also counts tabs it
+  created in the same run that are still blank or loading. The read-only observer reads up to
+  `PASSIVE_CONVERSATION_CAP` = 6 distinct already-open conversations (enrolled first; one read per conversation) regardless
+  of any pause (never `/space`, external or blank pages), labels snapshots with `resource_paused`, `page_count`,
+  `conversation_page_count` and `auxiliary_page_count`, marks conversations over the cap `unobserved` (even if
+  duplicated), and reports `summary.observation_counts` (stale and missing distinct) and `summary.coverage_complete`,
+  which is never true while an enrolled chat is not current or a conversation went unread. `observer` gained
+  `--max-pages` / `--min-available-mib` so `resource_paused` can mirror the live service's limits. The coverage report
+  carries the same split, `observation_complete` and `resource_paused` (null = unknown). Running, draft, identity,
+  approval/permission UI, HTTP 401/403/429, quota and uncertain-send vetoes, retries and auto-clear are unchanged.
 - Worktree-only guard is ON BY DEFAULT and now covers commits (agent-tools#1012, Refs #1012):
   `worktree-only-writes`, `pin-primary-worktree` and `block-devserver-primary` enforce in every
   repo that has a `rig.yaml` unless it sets `agent_hooks.worktree_only: false` (or the session

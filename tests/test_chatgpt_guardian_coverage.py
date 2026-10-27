@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from agenttools_chatgpt import cli, coverage
+from agenttools_chatgpt import cli, coverage, live
 from agenttools_chatgpt.core import Store
 from agenttools_chatgpt.coverage import Config, Delivery, ServiceError, reconcile
 from agenttools_chatgpt.lock import lock_path
@@ -30,6 +30,12 @@ ALL_ON = Config(coverage_enabled=True, auto_watch_active=True, recovery_autostar
 ENABLED = Config(
     coverage_enabled=True, auto_watch_active=False, recovery_autostart=False
 )
+
+
+@pytest.fixture(autouse=True)
+def ample_memory(monkeypatch):
+    """Restore shares the sender's memory guard; pin the host reading."""
+    monkeypatch.setattr(live, "available_memory", lambda: 8 * 1024**3)
 
 
 def sample(chat, *, status="working", running=True, at=NOW, **extra):
@@ -54,6 +60,7 @@ def make_evidence(
     connection="connected",
     workspace="home",
     quota=True,
+    health=None,
 ):
     """Real persisted monitor evidence built by the real projection."""
     state = tmp_path / "state.sqlite"
@@ -75,6 +82,7 @@ def make_evidence(
             "connection": connection,
             "heartbeat_at": snapshot_at,
             "service": {"active": "active"},
+            **(health or {}),
         },
         snapshot_at,
     )
@@ -420,8 +428,71 @@ def test_restore_capacity_is_explicitly_blocked(tmp_path):
     report, *_ = run(state, devtools=dev)
     assert dev.created == []
     assert any(
-        b["scope"] == "restore" and "ceiling" in b["reason"] for b in report["blocked"]
+        b["scope"] == "restore" and "auxiliary-budget" in b["reason"]
+        for b in report["blocked"]
     )
+
+
+def test_report_carries_page_split_pause_reason_and_observation_completeness(tmp_path):
+    state = make_evidence(
+        tmp_path,
+        enrolled=(OLD, FJ),
+        samples=[sample(OLD), sample(FJ)],
+        health={"resource_paused": "low-memory"},
+    )
+    dev = FakeDevTools([OLD, FJ, "https://chatgpt.com/space?tab=all"])
+    report, *_ = run(state, devtools=dev, apply=False)
+    assert report["browser"] == {
+        "verified": True,
+        "pages": 3,
+        "conversation_pages": 2,
+        "auxiliary_pages": 1,
+    }
+    assert report["summary"]["resource_paused"] == "low-memory"
+    assert report["summary"]["observation_complete"] is True
+    assert report["summary"]["fresh"] == 2
+
+
+def test_report_is_not_complete_when_an_enrolled_chat_is_unobserved(tmp_path):
+    state = make_evidence(tmp_path, enrolled=(OLD, FJ), samples=[sample(OLD)])
+    report, *_ = run(state, devtools=FakeDevTools([OLD, FJ]), apply=False)
+    assert report["summary"]["observation_complete"] is False
+    assert report["summary"]["resource_paused"] is None  # the observer did not say
+
+
+def test_resource_pause_is_unknown_not_admitted_when_the_snapshot_is_stale(tmp_path):
+    state = make_evidence(
+        tmp_path,
+        enrolled=(OLD,),
+        samples=[sample(OLD)],
+        health={"resource_paused": ""},
+        snapshot_at=NOW - 3600,
+    )
+    report, *_ = run(state, devtools=FakeDevTools([OLD]), apply=False)
+    assert report["summary"]["fresh_snapshot"] is False
+    assert report["summary"]["resource_paused"] is None
+    assert report["summary"]["observation_complete"] is False
+
+
+def test_admission_and_completeness_are_unknown_when_the_browser_is_not_verified(
+    tmp_path,
+):
+    state = make_evidence(
+        tmp_path,
+        enrolled=(OLD,),
+        samples=[sample(OLD)],
+        health={"resource_paused": ""},
+    )
+    report, *_ = run(
+        state,
+        devtools=FakeDevTools([OLD]),
+        processes=FakeProcesses("home", HOME, PORT, browsers=[]),
+        apply=False,
+    )
+    assert report["summary"]["fresh_snapshot"] is True
+    assert report["browser"]["verified"] is False
+    assert report["summary"]["resource_paused"] is None
+    assert report["summary"]["observation_complete"] is False
 
 
 def test_restore_in_wrong_account_state_is_blocked(tmp_path):

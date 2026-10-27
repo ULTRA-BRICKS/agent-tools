@@ -28,3 +28,21 @@ def canonical_chat(raw: str) -> str:
     ):
         raise ValueError("Project conversation ID must be an exact UUID")
     return "https://chatgpt.com/c/" + chat_id
+
+
+def conversation_identity(url: object) -> str | None:
+    """The one identity of an open page URL, or None when it is not a conversation.
+
+    Trailing slash, query, fragment and project (`/g/g-p-<id>-<slug>/c/<uuid>`) variants of
+    one conversation all map to `https://chatgpt.com/c/<id>`. Everything else
+    (`/space?tab=all`, `about:blank`, other chatgpt.com pages, a project URL whose id is
+    not a UUID, any external site) is an auxiliary page. This is `canonical_chat` applied
+    to what a browser tab shows: query and fragment are dropped first, and a
+    non-conversation URL yields None instead of raising.
+    """
+    if not isinstance(url, str):
+        return None
+    try:
+        return canonical_chat(urlsplit(url)._replace(query="", fragment="").geturl())
+    except ValueError:
+        return None

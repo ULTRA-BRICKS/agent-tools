@@ -246,13 +246,13 @@ def main(argv=None) -> int:
         type=int,
         choices=range(1, 7),
         default=6,
-        help="Suspend observation above this total open-page ceiling (1..6, default 6)",
+        help="Conversation-tab budget; more pauses live DOM reads and every mutation (1..6, default 6; auxiliary non-conversation tabs have a separate fixed budget of 2)",
     )
     live.add_argument(
         "--min-available-mib",
         type=int,
         default=2048,
-        help="Suspend observation below host MemAvailable floor in MiB (default 2048)",
+        help="Pause live DOM reads and every mutation below this host MemAvailable floor in MiB (default 2048)",
     )
     sol = subs.add_parser(
         "live-sol",
@@ -282,6 +282,19 @@ def main(argv=None) -> int:
     )
     observer.add_argument(
         "--interval", type=float, default=60, help="Observer polling seconds, 30 to 300"
+    )
+    observer.add_argument(
+        "--max-pages",
+        type=int,
+        choices=range(1, 7),
+        default=6,
+        help="Conversation-tab budget used to label resource_paused; mirror the live service's --max-pages (1..6, default 6). Never limits reads",
+    )
+    observer.add_argument(
+        "--min-available-mib",
+        type=int,
+        default=2048,
+        help="MemAvailable floor in MiB used to label resource_paused; mirror the live service's flag (default 2048). Never limits reads",
     )
     coverage_command.add_arguments(
         subs.add_parser(

@@ -23,7 +23,7 @@ from .continuation import Continuations, dispatch_continuation
 from .core import Guardian, Observation, Store
 from .live_browser import LiveAdapter
 from .service import ControlServer
-from .urls import canonical_chat
+from .urls import canonical_chat, conversation_identity
 
 
 def validate_cdp(endpoint: str) -> str:
@@ -67,10 +67,7 @@ def enrolled_pages(context, chats: set[str]):
     for page in context.pages:
         if page.is_closed():
             continue
-        try:
-            chat = canonical_chat(page.url)
-        except ValueError:
-            continue
+        chat = conversation_identity(page.url)
         if chat in pages:
             pages[chat].append(page)
     return pages
@@ -86,20 +83,66 @@ async def watched_pages(context, store: Store, originals: dict[str, str]):
     return enrolled_pages(context, chats)
 
 
+# One admission policy for every browser mutation (sends, Sol selection, tab restore).
+# Conversation tabs are the monitored work; the budget is a hard ceiling that is never
+# raised and never disabled. Auxiliary tabs are every other open page: /space, a new
+# tab, other chatgpt.com pages and any external site. They are small, explicit and
+# counted, never ignored. Both budgets share the physical-memory guard below. Passive
+# read-only evidence is not governed by this policy (see monitor_observer).
+CONVERSATION_PAGE_BUDGET = 6
+AUXILIARY_PAGE_BUDGET = 2
+DEFAULT_MIN_AVAILABLE_MIB = 2048
+
+
+def page_counts(urls) -> tuple[int, int]:
+    """Physical (conversation, auxiliary) tab counts. A duplicate conversation tab counts."""
+    urls = list(urls)
+    conversations = sum(conversation_identity(url) is not None for url in urls)
+    return conversations, len(urls) - conversations
+
+
+def open_page_urls(pages) -> list[str]:
+    return [page.url for page in pages if not page.is_closed()]
+
+
 def resource_pause(
-    page_count: int,
+    conversation_pages: int,
+    auxiliary_pages: int,
     available_bytes: int | None,
     *,
-    max_pages: int = 6,
-    min_available_mib: int = 2048,
+    max_pages: int = CONVERSATION_PAGE_BUDGET,
+    max_auxiliary_pages: int = AUXILIARY_PAGE_BUDGET,
+    min_available_mib: int = DEFAULT_MIN_AVAILABLE_MIB,
 ) -> str:
-    if not 1 <= max_pages <= 6 or page_count > max_pages:
-        return "page-ceiling"
+    """Why mutation is paused, or "". Reasons are specific and never overlap."""
+    if not 1 <= max_pages <= CONVERSATION_PAGE_BUDGET or conversation_pages > max_pages:
+        return "conversation-budget"
+    if (
+        not 0 <= max_auxiliary_pages <= AUXILIARY_PAGE_BUDGET
+        or auxiliary_pages > max_auxiliary_pages
+    ):
+        return "auxiliary-budget"
     if available_bytes is None:
         return "memory-unavailable"
     if available_bytes < min_available_mib * 1024**2:
         return "low-memory"
     return ""
+
+
+def context_resource_pause(
+    context,
+    *,
+    max_pages: int = CONVERSATION_PAGE_BUDGET,
+    min_available_mib: int = DEFAULT_MIN_AVAILABLE_MIB,
+) -> str:
+    conversations, auxiliary = page_counts(open_page_urls(context.pages))
+    return resource_pause(
+        conversations,
+        auxiliary,
+        available_memory(),
+        max_pages=max_pages,
+        min_available_mib=min_available_mib,
+    )
 
 
 def available_memory() -> int | None:
@@ -221,11 +264,8 @@ def mutation_window_open(
         not stop.is_set()
         and time.monotonic() - started < limit
         and not transport.reason
-        and not resource_pause(
-            len(context.pages),
-            available_memory(),
-            max_pages=max_pages,
-            min_available_mib=min_available_mib,
+        and not context_resource_pause(
+            context, max_pages=max_pages, min_available_mib=min_available_mib
         )
         and len(context.pages) == page_count
         and not page.is_closed()
@@ -548,11 +588,17 @@ async def serve_live(args, store: Store) -> None:
                     for page in matches
                 }
                 try:
+                    conversations, auxiliary = page_counts(
+                        open_page_urls(context.pages)
+                    )
                     pause = resource_pause(
-                        len(context.pages),
+                        conversations,
+                        auxiliary,
                         available_memory(),
-                        max_pages=getattr(args, "max_pages", 6),
-                        min_available_mib=getattr(args, "min_available_mib", 2048),
+                        max_pages=getattr(args, "max_pages", CONVERSATION_PAGE_BUDGET),
+                        min_available_mib=getattr(
+                            args, "min_available_mib", DEFAULT_MIN_AVAILABLE_MIB
+                        ),
                     )
                     seeded.intersection_update(adapters)
                     for page in adapters if not pause else ():
@@ -596,9 +642,13 @@ async def serve_live(args, store: Store) -> None:
                                     context,
                                     transport,
                                     stop,
-                                    max_pages=getattr(args, "max_pages", 6),
+                                    max_pages=getattr(
+                                        args, "max_pages", CONVERSATION_PAGE_BUDGET
+                                    ),
                                     min_available_mib=getattr(
-                                        args, "min_available_mib", 2048
+                                        args,
+                                        "min_available_mib",
+                                        DEFAULT_MIN_AVAILABLE_MIB,
                                     ),
                                     private_display=getattr(
                                         args, "private_display", False
@@ -631,8 +681,12 @@ async def serve_live(args, store: Store) -> None:
                             transport,
                             stop,
                             pause=pause,
-                            max_pages=getattr(args, "max_pages", 6),
-                            min_available_mib=getattr(args, "min_available_mib", 2048),
+                            max_pages=getattr(
+                                args, "max_pages", CONVERSATION_PAGE_BUDGET
+                            ),
+                            min_available_mib=getattr(
+                                args, "min_available_mib", DEFAULT_MIN_AVAILABLE_MIB
+                            ),
                             private_display=getattr(args, "private_display", False),
                         )
                         if dispatched:
@@ -656,6 +710,8 @@ async def serve_live(args, store: Store) -> None:
                         "health",
                         {
                             "health": pause or "connected",
+                            "conversation_page_count": conversations,
+                            "auxiliary_page_count": auxiliary,
                             "workspace": args.workspace,
                             "watched": len(unique),
                             "mode": "apply" if args.apply else "observe",
@@ -712,7 +768,7 @@ async def select_live_sol(args, store: Store) -> bool:
                     "Expected one dedicated ordinary Chrome account context"
                 )
             context = browser.contexts[0]
-            pause = resource_pause(len(context.pages), available_memory())
+            pause = context_resource_pause(context)
             if pause:
                 raise ValueError("Sol helper paused: " + pause)
             pages = enrolled_pages(context, {chat})[chat]

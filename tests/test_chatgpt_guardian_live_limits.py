@@ -226,10 +226,10 @@ def test_poll_defaults_and_resource_limits(tmp_path, monkeypatch, private_displa
     assert captured[0].max_pages == 6
     assert captured[0].min_available_mib == 2048
     assert captured[0].private_display is private_display
-    assert live.resource_pause(7, 3 * 1024**3) == "page-ceiling"
-    assert live.resource_pause(6, 2 * 1024**3) == ""
-    assert live.resource_pause(4, 2 * 1024**3 - 1) == "low-memory"
-    assert live.resource_pause(4, None) == "memory-unavailable"
+    assert live.resource_pause(7, 0, 3 * 1024**3) == "conversation-budget"
+    assert live.resource_pause(6, 2, 2 * 1024**3) == ""
+    assert live.resource_pause(4, 0, 2 * 1024**3 - 1) == "low-memory"
+    assert live.resource_pause(4, 0, None) == "memory-unavailable"
 
 
 @pytest.mark.parametrize(
@@ -823,6 +823,12 @@ def test_page_cap_cli_refuses_outside_one_to_six(tmp_path, monkeypatch, limit):
         "disabled",
         "gap",
         "uncertain",
+        "budgets-ok",
+        "running-within-budgets",
+        "draft-within-budgets",
+        "seven-conversations",
+        "three-auxiliary",
+        "duplicate-query",
     ],
 )
 def test_confirmation_real_guardian_bounded_and_fails_closed(
@@ -842,6 +848,30 @@ def test_confirmation_real_guardian_bounded_and_fails_closed(
         monkeypatch.setattr(core, "time", fake_time)
         monkeypatch.setattr(live, "available_memory", lambda: 3 * 1024**3)
         observed = replace(FAILURE, verified=True, model="Astra")
+        within = change in (
+            "budgets-ok",
+            "running-within-budgets",
+            "draft-within-budgets",
+        )
+        if within or change == "seven-conversations":
+            # Six conversations (the budget) plus one non-conversation Space tab.
+            context.pages.extend(
+                page_at(f"https://chatgpt.com/c/conv-{i}")
+                for i in range(6 if change == "seven-conversations" else 5)
+            )
+        if within:
+            context.pages.append(page_at("https://chatgpt.com/space?tab=all"))
+        if change == "three-auxiliary":
+            context.pages.extend(
+                page_at(u)
+                for u in (
+                    "https://chatgpt.com/space?tab=all",
+                    "https://example.com/",
+                    "about:blank",
+                )
+            )
+        if change == "duplicate-query":
+            context.pages.append(page_at(CHAT + "?model=x"))
         if change == "historical":
             observed = replace(observed, active=False)
         if change == "nonfailure":
@@ -858,8 +888,9 @@ def test_confirmation_real_guardian_bounded_and_fails_closed(
             nonlocal observed
             waits.append(delay)
             clock[0] += 7 if change == "gap" else delay
-            if change in ("draft", "running"):
-                observed = replace(observed, **{change: True})
+            if change in ("draft", "running") or change.endswith("-within-budgets"):
+                field = "running" if change.startswith("running") else "draft"
+                observed = replace(observed, **{field: True})
             elif change == "turn":
                 observed = replace(observed, turn="changed")
             elif change == "mode":
@@ -895,11 +926,11 @@ def test_confirmation_real_guardian_bounded_and_fails_closed(
         )
         assert sum(waits) <= 35
         assert all(delay <= 3 for delay in waits)
-        if change in ("none", "uncertain"):
-            assert result == ("sent" if change == "none" else "uncertain-send")
+        if change in ("none", "uncertain", "budgets-ok"):
+            assert result == ("sent" if change != "uncertain" else "uncertain-send")
             adapter.send.assert_awaited_once()
             assert store.status()["attempts"][0]["state"] == (
-                "sent" if change == "none" else "uncertain"
+                "sent" if change != "uncertain" else "uncertain"
             )
             assert await live.confirm_failure(
                 guardian,
@@ -910,7 +941,7 @@ def test_confirmation_real_guardian_bounded_and_fails_closed(
                 stop,
                 max_pages=6,
                 min_available_mib=2048,
-            ) == ("deduplicated" if change == "none" else "unresolved-send")
+            ) == ("deduplicated" if change != "uncertain" else "unresolved-send")
             assert adapter.send.await_count == 1
         else:
             adapter.send.assert_not_called()

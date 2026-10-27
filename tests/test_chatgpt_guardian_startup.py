@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from agenttools_chatgpt import startup
+from agenttools_chatgpt import live, startup
 from agenttools_chatgpt.startup import (
     Browser,
     ChromeDevTools,
@@ -29,6 +29,12 @@ UUID = "12345678-1234-1234-1234-123456789abc"
 ONE = "https://chatgpt.com/c/" + UUID
 TWO = "https://chatgpt.com/c/two"
 PROJECT_ONE = "https://chatgpt.com/g/g-p-" + "a" * 32 + "-proj/c/" + UUID
+
+
+@pytest.fixture(autouse=True)
+def ample_memory(monkeypatch):
+    """Restore shares the sender's memory guard; pin the host reading."""
+    monkeypatch.setattr(live, "available_memory", lambda: 8 * 1024**3)
 
 
 def make_state(path, account="home", chats=(ONE, TWO), unwatched=(), consent=()):
@@ -228,9 +234,100 @@ def test_duplicate_existing_tabs_refused(tmp_path):
     assert dev.created == []
 
 
-def test_page_ceiling_refused(tmp_path):
+def test_auxiliary_page_budget_refuses_restore(tmp_path):
     dev = FakeDevTools([ONE] + ["about:blank"] * 5)
-    with pytest.raises(StartupError, match="ceiling"):
+    with pytest.raises(StartupError, match="auxiliary-budget"):
+        run(tmp_path, dev)
+    assert dev.created == []
+
+
+def test_external_pages_count_against_the_auxiliary_budget(tmp_path):
+    dev = FakeDevTools(
+        [
+            ONE,
+            "https://chatgpt.com/space?tab=all",
+            "https://example.com/",
+            "about:blank",
+        ]
+    )
+    with pytest.raises(StartupError, match="auxiliary-budget"):
+        run(tmp_path, dev)
+    assert dev.created == []
+
+
+def test_conversation_budget_refuses_restore(tmp_path):
+    others = [f"https://chatgpt.com/c/other-{i}" for i in range(5)]
+    dev = FakeDevTools([ONE] + others)
+    with pytest.raises(StartupError, match="conversation-budget"):
+        run(tmp_path, dev)
+    assert dev.created == []
+
+
+def test_space_tab_does_not_consume_the_conversation_budget(tmp_path):
+    others = [f"https://chatgpt.com/c/other-{i}" for i in range(4)]
+    dev = FakeDevTools([ONE, "https://chatgpt.com/space?tab=all"] + others)
+    result = run(tmp_path, dev)
+    assert dev.created == [TWO] and result["opened"] == ["two"]
+
+
+class LoadingTabsDevTools(FakeDevTools):
+    """Every created tab still shows about:blank while the next creation is considered."""
+
+    def create(self, url, timeout):
+        self.created.append(url)
+        self.pages_now.append({"type": "page", "url": "about:blank"})
+
+
+def test_tabs_created_in_this_run_still_loading_count_toward_the_ceiling(tmp_path):
+    others = [f"https://chatgpt.com/c/other-{i}" for i in range(4)]
+    state = make_state(
+        tmp_path / "s.sqlite", chats=(ONE, TWO, "https://chatgpt.com/c/three")
+    )
+    dev = LoadingTabsDevTools(others)
+    with pytest.raises(StartupError, match="conversation-budget"):
+        run(tmp_path, dev, state=state)
+    assert dev.created == [ONE, "https://chatgpt.com/c/three"]
+
+
+def test_a_pending_restored_tab_never_discounts_real_auxiliary_tabs(tmp_path):
+    dev = LoadingTabsDevTools(
+        ["https://chatgpt.com/space?tab=all", "https://example.com/"]
+    )
+    state = make_state(tmp_path / "s.sqlite", chats=(ONE, TWO))
+    with pytest.raises(StartupError, match="auxiliary-budget"):
+        run(tmp_path, dev, state=state)
+    assert dev.created == [ONE]
+
+
+class ConcurrentTabDevTools(FakeDevTools):
+    """A created tab stays blank and an unrelated conversation tab opens at the same time."""
+
+    def create(self, url, timeout):
+        self.created.append(url)
+        self.pages_now.append({"type": "page", "url": "about:blank"})
+        self.pages_now.append(
+            {"type": "page", "url": "https://chatgpt.com/c/opened-meanwhile"}
+        )
+
+
+def test_unrelated_new_conversation_does_not_release_a_pending_restored_tab(tmp_path):
+    others = [f"https://chatgpt.com/c/other-{i}" for i in range(4)]
+    state = make_state(tmp_path / "s.sqlite", chats=(ONE, TWO))
+    dev = ConcurrentTabDevTools(others)
+    with pytest.raises(StartupError, match="conversation-budget"):
+        run(tmp_path, dev, state=state)
+    assert dev.created == [ONE]
+
+
+@pytest.mark.parametrize(
+    "memory, reason", [(1024**2, "low-memory"), (None, "memory-unavailable")]
+)
+def test_restore_is_refused_under_the_memory_guard(
+    tmp_path, monkeypatch, memory, reason
+):
+    monkeypatch.setattr(live, "available_memory", lambda: memory)
+    dev = FakeDevTools([ONE])
+    with pytest.raises(StartupError, match=reason):
         run(tmp_path, dev)
     assert dev.created == []
 

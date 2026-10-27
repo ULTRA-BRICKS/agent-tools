@@ -120,11 +120,18 @@ existing exact Astra quota and per-chat consent checks.
 
 `--poll-interval` defaults to 60 seconds and accepts finite values of at least 30;
 the live loop always waits at least 60 seconds between passive cycles.
-Model probes occur only during a failure burst. `--max-pages` defaults to 6 total
-open pages and accepts only 1 through 6; more than six always suspends recovery.
-`--min-available-mib` defaults to 2048 MiB of host MemAvailable.
-Exceeding the page ceiling or falling below the memory floor suspends DOM reads;
-unavailable memory information also suspends them. Memory uses Linux
+Model probes occur only during a failure burst. `--max-pages` is the conversation-tab
+budget: it defaults to 6 and accepts only 1 through 6; more conversation tabs always
+pause mutation. A conversation tab is any open page showing
+`https://chatgpt.com/c/<id>` or `/g/g-p-<id>-<slug>/c/<id>` (trailing slash, query and
+fragment ignored); a duplicate tab of one conversation counts and also vetoes that chat.
+Every other open page is auxiliary (`/space?tab=all`, a new tab, other chatgpt.com pages,
+any external site) and counts against a fixed auxiliary budget of 2. Over either budget
+mutation (sends, Sol selection, tab restore) is paused with the specific reason
+`conversation-budget` or `auxiliary-budget`. `--min-available-mib` defaults to
+2048 MiB of host MemAvailable; below it, or with unavailable memory information, mutation is
+paused as `low-memory` or `memory-unavailable`. The live loop suspends its own DOM reads
+under any pause; the read-only observer does not (see MONITORING.md). Memory uses Linux
 `/proc/meminfo`; unsupported hosts fail closed. Chrome is never killed.
 
 Existing browser `response` events latch durable global manual stop on HTTP 429
@@ -311,7 +318,7 @@ profile and port and is the only loopback listener, uses loopback HTTP `GET /jso
 inventory before every creation. Existing pages are never navigated, reloaded, activated or closed;
 no message is sent and no control, model or quota state changes. Project URLs count as the same chat.
 It refuses on another account, missing database, unowned or duplicate browser, duplicate tabs for a
-chat, or more than 6 pages. A creation that times out is never retried in the same run: the output
+chat, or the shared page budget (6 conversation tabs plus at most 2 auxiliary tabs) or memory guard refusing one more conversation tab. A creation that times out is never retried in the same run: the output
 reports `uncertain` and a rerun checks the inventory first. Output is metadata JSON only.
 
 Unit drop-in templates live in `systemd/chatgpt-guardian-{home,glide}-browser.service.d/lifecycle.conf.template`
@@ -350,12 +357,12 @@ file, or a missing flag, is `false`; an invalid file refuses (exit 2) with no ef
 - `auto_watch_active`: enrol a chat that is fresh, unique in both the snapshot and the browser, running or
   `Thinking failed`, and has NO `watch:` key (`INSERT OR IGNORE`). A manual `unwatch` (`0`) is never undone, and holds,
   stops, quota, uncertain sends and models are never touched.
-- Restore: missing ENROLLED chats are reopened through `startup.restore` (max 6 pages, no navigation, reload or close of
+- Restore: missing ENROLLED chats are reopened through `startup.restore` (the default page budgets and memory guard, 6 conversation + 2 auxiliary tabs and 2048 MiB; no navigation, reload or close of
   existing tabs). The durable ledger `<state-stem>.coverage.sqlite` (next to the state database, mode 0600) allows ONE
   attempt per missing chat per inventory (browser pid plus the set of enrolled chats open exactly once, computed
   identically before and after a restore and including chats enrolled by the same run; blank or login tabs left by
   a failed restore and duplicated chats do not change it) and at least 15 minutes between attempts, so redirected or
-  failed restores never accumulate blank tabs. Missing account, ambiguous or unowned browser, duplicate tabs and a full page ceiling are
+  failed restores never accumulate blank tabs. Missing account, ambiguous or unowned browser, duplicate tabs and an exhausted page budget or memory guard are
   reported as `blocked`. `--reset-restore --apply` is the owner action that forgets spent attempts.
 - `recovery_autostart` (default `false`): start (`systemctl --user start --no-block`) a recovery service whose
   ActiveState is `failed`, never an `inactive` (manually stopped) one, only after the browser is verified, never with a

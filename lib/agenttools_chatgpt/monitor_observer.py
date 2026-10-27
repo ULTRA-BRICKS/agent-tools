@@ -14,22 +14,26 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import scripts
-from .monitor import MonitorStore, clean_detail, project_snapshot, read_source
+from . import live, scripts
+from .monitor import (
+    UNOBSERVED_ERROR,
+    MonitorStore,
+    clean_detail,
+    project_snapshot,
+    read_source,
+)
+from .urls import conversation_identity
 
 DOM_SCRIPT = scripts.load("monitor_dom.js")
+# Conversation pages read per cycle. Deliberately not tied to the sender's mutation budget:
+# reads are one bounded 5 s evaluate per page against an already-open tab (no new tab,
+# navigation, click or activation), but each still wakes a renderer, so the number stays
+# at the memory envelope the Guardian is sized for rather than growing with the tab count.
+PASSIVE_CONVERSATION_CAP = 6
 UNITS = {
     "home": "chatgpt-guardian-home.service",
     "glide.vc": "chatgpt-guardian-glide.service",
 }
-
-
-def canonical_url(url: str) -> str | None:
-    match = re.fullmatch(
-        r"https://chatgpt\.com/(?:g/g-p-[a-f0-9]{32}(?:-[A-Za-z0-9-]+)?/)?c/([A-Za-z0-9_-]+)/?",
-        url,
-    )
-    return "https://chatgpt.com/c/" + match[1] if match else None
 
 
 def error_detail(exc: BaseException, stage: str) -> str:
@@ -40,25 +44,62 @@ def error_detail(exc: BaseException, stage: str) -> str:
     return "cdp-unreachable: " + text if stage == "connect" else text
 
 
-async def collect_samples(pages, previous, cache, now, *, force_chats=(), max_pages=6):
-    """Sample due pages only. Cached records retain their real check timestamps."""
+async def collect_samples(
+    pages,
+    previous,
+    cache,
+    now,
+    *,
+    force_chats=(),
+    priority_chats=frozenset(),
+    passive_cap=PASSIVE_CONVERSATION_CAP,
+):
+    """Sample due conversation pages only. Cached records retain their real check times.
+
+    Non-conversation pages (/space, new tab, external sites) are never read. At most
+    `passive_cap` distinct conversations are read per cycle, enrolled chats first and then
+    in tab order, and only their first tab; an unread conversation gets an explicit
+    `passive-cap` sample instead of a guessed state. This is independent of the sender's
+    mutation budget: a mutation pause never blanks evidence that can still be read.
+    """
     from playwright.async_api import Error as BrowserError
 
     prior = {s["chat"]: s for s in (previous or {}).get("sessions", [])}
     rows = []
     seen = set()
+    candidates = []
+    first_page = {}
     for page in pages:
-        chat = canonical_url(page.url)
-        if not chat or page.is_closed():
+        if page.is_closed():
             continue
+        chat = conversation_identity(page.url)
+        if chat:
+            candidates.append((page, chat))
+            first_page.setdefault(chat, page)
+    # The cap counts distinct conversations (enrolled first, then tab order), so a
+    # duplicate tab neither takes a slot nor needs a read: its chat is a duplicate
+    # whatever the page shows.
+    readable = sorted(first_page, key=lambda chat: chat not in priority_chats)[
+        :passive_cap
+    ]
+    for page, chat in candidates:
         seen.add(chat)
         old = prior.get(chat, {})
-        if len(pages) > max_pages:
+        if chat not in readable:
+            cache.pop(chat, None)
             rows.append(
                 {
                     "chat": chat,
-                    "error": "page-ceiling",
-                    "error_detail": f"more than {max_pages} pages open; DOM observation paused",
+                    "error": UNOBSERVED_ERROR,
+                    "title": old.get("title", ""),
+                }
+            )
+        elif page is not first_page[chat]:
+            rows.append(
+                {
+                    "chat": chat,
+                    "error": "duplicate-tab",
+                    "error_detail": "second tab of this conversation; not read",
                     "title": old.get("title", ""),
                 }
             )
@@ -199,7 +240,14 @@ class WriterLock:
 
 
 async def observe(
-    source: Path, workspace: str, endpoint: str, *, once=False, interval=60
+    source: Path,
+    workspace: str,
+    endpoint: str,
+    *,
+    once=False,
+    interval=60,
+    max_pages=live.CONVERSATION_PAGE_BUDGET,
+    min_available_mib=live.DEFAULT_MIN_AVAILABLE_MIB,
 ):
     if not re.fullmatch(r"http://127\.0\.0\.1:[1-9][0-9]{0,4}", endpoint):
         raise ValueError("Observer endpoint must be exact http://127.0.0.1:<port>")
@@ -244,21 +292,60 @@ async def observe(
                         raise RuntimeError(
                             "Expected exactly one dedicated account context"
                         )
-                    pages = browser.contexts[0].pages
+                    pages = list(browser.contexts[0].pages)
                     old = {s["chat"]: s for s in (previous or {}).get("sessions", [])}
                     force = {
                         a["chat"]
                         for a in attempts
                         if a["wall"] > (old.get(a["chat"], {}).get("last_go_at") or 0)
                     }
-                    samples = await collect_samples(
-                        pages, previous, cache, now, force_chats=force
+                    watched = {
+                        k[6:]
+                        for k, v in controls.items()
+                        if k.startswith("watch:") and v == "1"
+                    }
+                    conversations, auxiliary = live.page_counts(
+                        live.open_page_urls(pages)
                     )
-                    health.update(connection="connected", page_count=len(pages))
-                    if len(pages) > 6:
-                        health["limitations"] = [
-                            "Page ceiling exceeded; DOM observation paused, inventory only."
-                        ]
+                    paused = live.resource_pause(
+                        conversations,
+                        auxiliary,
+                        live.available_memory(),
+                        max_pages=max_pages,
+                        min_available_mib=min_available_mib,
+                    )
+                    samples = await collect_samples(
+                        pages,
+                        previous,
+                        cache,
+                        now,
+                        force_chats=force,
+                        priority_chats=watched,
+                    )
+                    unread = {
+                        s["chat"] for s in samples if s.get("error") == UNOBSERVED_ERROR
+                    }
+                    limitations = []
+                    if paused:
+                        limitations.append(
+                            f"Mutation paused ({paused}); read-only evidence of open conversation pages continues."
+                        )
+                    if unread:
+                        limitations.append(
+                            f"{len(unread)} conversation(s) beyond the passive cap of {PASSIVE_CONVERSATION_CAP} are not observed."
+                        )
+                    health.update(
+                        connection="connected",
+                        page_count=conversations + auxiliary,
+                        conversation_page_count=conversations,
+                        auxiliary_page_count=auxiliary,
+                        resource_paused=paused,
+                        max_pages=max_pages,
+                        max_auxiliary_pages=live.AUXILIARY_PAGE_BUDGET,
+                        min_available_mib=min_available_mib,
+                        passive_cap=PASSIVE_CONVERSATION_CAP,
+                        limitations=limitations,
+                    )
                 except (
                     BrowserError,
                     OSError,
@@ -318,6 +405,8 @@ def command(args) -> int:
                 args.cdp,
                 once=args.once,
                 interval=args.interval,
+                max_pages=args.max_pages,
+                min_available_mib=args.min_available_mib,
             )
         )
     else:
