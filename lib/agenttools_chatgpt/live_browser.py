@@ -120,44 +120,16 @@ class LiveAdapter(PlaywrightAdapter):
 
         candidate = None
         try:
+            # Responsive layouts retain a hidden duplicate. Match the DOM proof's
+            # visible-only uniqueness, then keep all selected-model and node checks.
             trigger = self.page.locator(
-                'button[aria-label="Select ChatGPT model"][data-codex-intelligence-trigger="true"]'
+                'button[aria-label="Select ChatGPT model"][data-codex-intelligence-trigger="true"]:visible'
             )
-            if await trigger.count() != 1:
-                return
-            if (await self._menu_state())["open"]:
-                return
-            if not await safe():
+            if not await self._trigger_ready(trigger, safe):
                 return
             await trigger.click(timeout=1500)
             try:
-                deadline = time.monotonic() + 1.5
-                entered_full = False
-                while time.monotonic() < deadline and await safe():
-                    state = await self._menu_state()
-                    if state["selected"]:
-                        break
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return
-                    if not entered_full:
-                        full = self.page.get_by_role(
-                            "menuitem", name="Select model", exact=True
-                        )
-                        if await full.count() == 1 and await safe():
-                            await full.click(timeout=max(1, remaining * 1000))
-                            entered_full = True
-                            continue
-                    await asyncio.sleep(min(0.05, remaining))
-                else:
-                    return
-                if (
-                    time.monotonic() >= deadline
-                    or not await safe()
-                    or len(state["selected"]) != 1
-                ):
-                    return
-                model = self.labels.get(state["selected"][0], "")
+                model = await self._selected_model(safe)
                 if not model:
                     return
                 captured_at = time.monotonic()
@@ -165,8 +137,7 @@ class LiveAdapter(PlaywrightAdapter):
                     self.script, {"action": "probe", "labels": self.labels}
                 )
             finally:
-                if self.page.url == url:
-                    await self.page.keyboard.press("Escape")
+                await self._escape_if_on(url)
             effort = ""
             if model == "Sol":
                 if not await safe():
@@ -176,37 +147,81 @@ class LiveAdapter(PlaywrightAdapter):
                     if (await self._menu_state())["effort"] == ["Extra High, 4 of 5."]:
                         effort = "Extra High"
                 finally:
-                    if self.page.url == url:
-                        await self.page.keyboard.press("Escape")
-            # Closing updates the trigger asynchronously; capture only its stable
-            # closed signature, retaining independent full-panel model evidence.
-            previous = None
-            for _ in range(20):
-                if not await safe():
-                    return
-                state = await self._menu_state()
-                wanted = "Pro" if model == "Astra" else "5.6 Extra High"
-                if (
-                    not state["open"]
-                    and state["label"] == wanted
-                    and previous == state["signature"]
-                ):
-                    self.probe = await self.page.evaluate_handle(
-                        self.script,
-                        {
-                            "action": "finalize-probe",
-                            "probe": candidate,
-                            "model": model,
-                            "effort": effort,
-                        },
-                    )
-                    self.probed_at = captured_at
-                    return
-                previous = state["signature"]
-                await asyncio.sleep(0.05)
+                    await self._escape_if_on(url)
+            if await self._finalize_closed_probe(model, effort, candidate, safe):
+                self.probed_at = captured_at
         finally:
             if candidate is not None:
                 await candidate.dispose()
+
+    async def _escape_if_on(self, url: str) -> None:
+        if self.page.url == url:
+            await self.page.keyboard.press("Escape")
+
+    async def _trigger_ready(self, trigger, safe) -> bool:
+        if await trigger.count() != 1:
+            return False
+        if (await self._menu_state())["open"]:
+            return False
+        return await safe()
+
+    async def _selected_model(self, safe) -> str:
+        """Model label from the opened panel's single selected row, else empty."""
+        deadline = time.monotonic() + 1.5
+        entered_full = False
+        while time.monotonic() < deadline and await safe():
+            state = await self._menu_state()
+            if state["selected"]:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            if not entered_full:
+                full = self.page.get_by_role(
+                    "menuitem", name="Select model", exact=True
+                )
+                if await full.count() == 1 and await safe():
+                    await full.click(timeout=max(1, remaining * 1000))
+                    entered_full = True
+                    continue
+            await asyncio.sleep(min(0.05, remaining))
+        else:
+            return ""
+        if (
+            time.monotonic() >= deadline
+            or not await safe()
+            or len(state["selected"]) != 1
+        ):
+            return ""
+        return self.labels.get(state["selected"][0], "")
+
+    async def _finalize_closed_probe(self, model, effort, candidate, safe) -> bool:
+        # Closing updates the trigger asynchronously; capture only its stable
+        # closed signature, retaining independent full-panel model evidence.
+        previous = None
+        wanted = "Pro" if model == "Astra" else "5.6 Extra High"
+        for _ in range(20):
+            if not await safe():
+                return False
+            state = await self._menu_state()
+            if (
+                not state["open"]
+                and state["label"] == wanted
+                and previous == state["signature"]
+            ):
+                self.probe = await self.page.evaluate_handle(
+                    self.script,
+                    {
+                        "action": "finalize-probe",
+                        "probe": candidate,
+                        "model": model,
+                        "effort": effort,
+                    },
+                )
+                return True
+            previous = state["signature"]
+            await asyncio.sleep(0.05)
+        return False
 
     async def select_sol(
         self, store: Store, chat: str, expected: Observation | None = None
@@ -291,18 +306,7 @@ class LiveAdapter(PlaywrightAdapter):
                     final = self._parse_observation(
                         await self.page.evaluate(self.script, {"probe": self.probe})
                     )
-                    verified = (
-                        final.identity == observed.identity
-                        and final.model == "Sol"
-                        and final.effort == "Extra High"
-                        and final.verified
-                        and not (
-                            final.running
-                            or final.draft
-                            or final.challenge
-                            or final.ambiguous
-                        )
-                    )
+                    verified = self._sol_confirmed(final, observed)
                     if not verified:
                         await self._clear_probe()
                     return verified
@@ -317,6 +321,16 @@ class LiveAdapter(PlaywrightAdapter):
                     self.probe = None
                     await self._quarantine()
                     return False
+
+    @staticmethod
+    def _sol_confirmed(final: Observation, observed: Observation) -> bool:
+        return (
+            final.identity == observed.identity
+            and final.model == "Sol"
+            and final.effort == "Extra High"
+            and final.verified
+            and not (final.running or final.draft or final.challenge or final.ambiguous)
+        )
 
     async def observe(self) -> Observation:
         from playwright.async_api import Error as BrowserError

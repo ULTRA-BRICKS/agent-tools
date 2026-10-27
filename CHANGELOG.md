@@ -53,6 +53,11 @@
   `--max-pages` / `--min-available-mib` so `resource_paused` can mirror the live service's limits. The coverage report
   carries the same split, `observation_complete` and `resource_paused` (null = unknown). Running, draft, identity,
   approval/permission UI, HTTP 401/403/429, quota and uncertain-send vetoes, retries and auto-clear are unchanged.
+- `agenttools-chatgpt` 0.3.10 (Refs #1034): the active model probe counts only the rendered (`:visible`) model
+  trigger before requiring exactly one candidate, so a hidden responsive duplicate no longer blocks model proof.
+  The selected-model panel proof, exact turn/account identity, draft/running/uncertain vetoes and the rule that a
+  closed `Pro` label never implies Astra are unchanged, and two visible triggers still fail closed. The probe body is
+  split into small helpers without changing its order of checks.
 - Worktree-only guard is ON BY DEFAULT and now covers commits (agent-tools#1012, Refs #1012):
   `worktree-only-writes`, `pin-primary-worktree` and `block-devserver-primary` enforce in every
   repo that has a `rig.yaml` unless it sets `agent_hooks.worktree_only: false` (or the session
