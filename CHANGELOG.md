@@ -166,6 +166,11 @@ checkout -B`, `git switch -C/--force-create`, and `rm` with a recursive flag as 
 
 ### Fixed
 
+- `ci/codeql/workflow-selfgate.yml` (Refs #1036): the SARIF gate's `is_source_suppressed` no longer declares and assigns
+  `local re=...$(...)` in one statement (shellcheck SC2155, reported by actionlint in every consumer's managed
+  `codeql.yml`). Declaration and assignment are split; suppression matching is unchanged. New
+  `tests/test_ci_shell_lint_1036.py` runs actionlint over every `ci/*/workflow*.yml` template and pins the selfgate
+  suppression semantics.
 - `gh ship` version-bump and screenshot gates now work on a GitHub PR whose diff GitHub refuses to
   serve (HTTP 406 above 20000 lines, also for `gh pr diff --name-only`; agent-tools#1023). The file
   list comes from the paginated pull-request files API, accepted only when it holds exactly the PR's
