@@ -166,6 +166,15 @@ checkout -B`, `git switch -C/--force-create`, and `rm` with a recursive flag as 
 
 ### Fixed
 
+- `ci/dependency-review/dep-audit.sh`, `ci/leftover-grep/leftover-grep.sh`, `ci/review-threads/review-threads.sh` and
+  `ci/secret-scan/secret-scan.sh` (Refs #1036): the gate logic moved to `dep_audit.py`, `leftover_grep.py`,
+  `review_threads.py` and `secret_scan.py` next to each script (python-only policy: a shell script over 40 lines
+  cannot be edited in this repo), and each `.sh` is now a 13-line POSIX-sh launcher with the same path, arguments,
+  environment knobs, tool argv, messages and exit codes. This removes the shellcheck SC2015 (`A && B || C` in the
+  dep-audit verdict and the leftover-grep console rule) and SC2016 (GraphQL `$variables` literal in review-threads)
+  findings and the shfmt findings every consumer saw in its managed copies. `rig apply` vendors the `.py` companion
+  with the launcher; a consumer must keep both files together and have `python3`. The modules are default-ruff clean.
+  `tests/test_ci_shell_lint_1036.py` now also runs shellcheck over every `ci/*/*.sh`.
 - `ci/codeql/workflow-selfgate.yml` (Refs #1036): the SARIF gate's `is_source_suppressed` no longer declares and assigns
   `local re=...$(...)` in one statement (shellcheck SC2155, reported by actionlint in every consumer's managed
   `codeql.yml`). Declaration and assignment are split; suppression matching is unchanged. New

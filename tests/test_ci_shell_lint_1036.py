@@ -1,4 +1,4 @@
-"""Catalog CI workflow templates stay actionlint clean — agent-tools#1036.
+"""Catalog CI scripts and workflow templates stay shellcheck/actionlint clean — agent-tools#1036.
 
 Every `ci/<slot>/workflow*.yml` template is copied verbatim into consumer repos by rig. A
 consumer running actionlint (which runs shellcheck over each `run:` script) on its managed copy
@@ -6,8 +6,8 @@ cannot fix a finding by hand — the next `rig apply` rewrites the file — so f
 here, at the source. #1036 fixed SC2155 (declare+assign `local re=...$(...)`) in the codeql
 selfgate `is_source_suppressed` function.
 
-  1. lint gate — actionlint over every ci workflow template (skipped only when actionlint or
-     shellcheck is not installed).
+  1. lint gate — shellcheck over every ci shell script and actionlint over every ci workflow
+     template (skipped only when the tool is not installed).
   2. behavior  — the SC2155 rewrite keeps the selfgate suppression semantics.
 
 Run::
@@ -17,6 +17,7 @@ Run::
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shutil
@@ -29,6 +30,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CI = REPO_ROOT / "ci"
 CODEQL_SELFGATE = CI / "codeql" / "workflow-selfgate.yml"
 CI_WORKFLOWS = sorted(CI.glob("*/workflow*.yml"))
+CI_SCRIPTS = sorted(CI.glob("*/*.sh"))
+# The Python modules the four launchers exec. Consumers lint them with their own ruff config:
+# ruff defaults (88 columns) or e.g. line-length 100 + target py38 (ExpenseSyncBot ruff.toml).
+GATE_MODULES = [
+    CI / "dependency-review" / "dep_audit.py",
+    CI / "leftover-grep" / "leftover_grep.py",
+    CI / "review-threads" / "review_threads.py",
+    CI / "secret-scan" / "secret_scan.py",
+]
+RUFF_CONFIGS = {"defaults": [], "line100-py38": ["--line-length", "100", "--target-version", "py38"]}
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +51,37 @@ def test_workflow_glob_is_not_vacuous():
     """A renamed directory must not silently empty the parametrized gate."""
     assert CODEQL_SELFGATE in CI_WORKFLOWS
     assert CI / "tests" / "workflow.yml" in CI_WORKFLOWS
+    for name in ("dependency-review/dep-audit.sh", "leftover-grep/leftover-grep.sh",
+                 "review-threads/review-threads.sh", "secret-scan/secret-scan.sh"):
+        assert CI / name in CI_SCRIPTS
+
+
+@pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck not installed")
+@pytest.mark.parametrize("script", CI_SCRIPTS, ids=lambda p: str(p.relative_to(REPO_ROOT)))
+def test_ci_script_is_shellcheck_clean(script: Path):
+    """Consumers run shellcheck on their vendored copies and cannot fix a finding by hand."""
+    res = subprocess.run(["shellcheck", "--", str(script)], capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+@pytest.mark.skipif(shutil.which("ruff") is None, reason="ruff not installed")
+@pytest.mark.parametrize("config", RUFF_CONFIGS)
+@pytest.mark.parametrize("module", GATE_MODULES, ids=lambda p: p.name)
+def test_gate_module_is_ruff_clean_under_consumer_configs(module: Path, config: str):
+    """Written so BOTH 88 and 100 column formatting leave the file unchanged (magic trailing commas
+    and short strings), since vendored copies get linted with whatever config the consumer has."""
+    extra = RUFF_CONFIGS[config]
+    for argv in (["check"], ["format", "--check"]):
+        res = subprocess.run(["ruff", *argv, "--isolated", *extra, str(module)], capture_output=True, text=True, timeout=120)
+        assert res.returncode == 0, res.stdout + res.stderr
+
+
+@pytest.mark.parametrize("module", GATE_MODULES, ids=lambda p: p.name)
+def test_gate_module_runs_on_python38(module: Path):
+    """Deploy hosts may run python3.8: no 3.9+ syntax and no str.removeprefix/removesuffix."""
+    tree = ast.parse(module.read_text(encoding="utf-8"), feature_version=(3, 8))
+    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    assert not attrs & {"removeprefix", "removesuffix"}
 
 
 @pytest.mark.skipif(

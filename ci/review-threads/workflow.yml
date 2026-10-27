@@ -6,8 +6,8 @@
 # add to branch protection (Settings -> Branches -> required checks -> "review-threads").
 #
 # INSTALL: copy to .github/workflows/review-threads.yml AND keep the gate script at
-# ci/review-threads/review-threads.sh (vendor the ci/ dir, or copy the script and adjust
-# the run: path). To make it a HARD block, add the check "review-threads" to branch
+# ci/review-threads/review-threads.sh AND its sibling review_threads.py (the launcher execs
+# it; vendor the ci/ dir, or copy both files and adjust the run: path). To make it a HARD block, add the check "review-threads" to branch
 # protection (admin-only, one-time).
 #
 # TAMPER-RESISTANCE — why `pull_request_target` AND a pinned base checkout:

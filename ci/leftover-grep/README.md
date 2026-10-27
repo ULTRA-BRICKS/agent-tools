@@ -15,12 +15,12 @@ Fail a PR on the classic "oops, left it in" leftovers — scanned on the lines t
 
 ```bash
 cp ci/leftover-grep/workflow.yml .github/workflows/leftover-grep.yml
-# The workflow runs `bash ci/leftover-grep/leftover-grep.sh`, so the script must be present
-# at that path — vendor the ci/ dir, or copy the script and adjust the run: path:
-cp ci/leftover-grep/leftover-grep.sh .github/scripts/leftover-grep.sh
-# Local pre-push (the script is bash — `set -o pipefail`/`IFS=$'\t'` — so run it with bash,
-# not a POSIX `sh`/dash, which would die on `set -o pipefail`):
-bash ci/leftover-grep/leftover-grep.sh
+# The workflow runs `bash ci/leftover-grep/leftover-grep.sh`, so the launcher must be present
+# at that path — vendor the ci/ dir (the launcher execs the sibling leftover_grep.py; python3
+# is required), or copy BOTH files and adjust the run: path:
+cp ci/leftover-grep/leftover-grep.sh ci/leftover-grep/leftover_grep.py .github/scripts/
+# Local pre-push (the launcher is POSIX sh; the logic is Python, stdlib only):
+sh ci/leftover-grep/leftover-grep.sh
 ```
 
 ## Enforcement — a REQUIRED check, or it does not block the merge button

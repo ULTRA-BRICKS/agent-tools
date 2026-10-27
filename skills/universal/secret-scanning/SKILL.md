@@ -81,5 +81,6 @@ Use the escape hatch for **proven non-secrets** (documented example keys like
 
 - `git-hooks/no-secrets-scan` — the local pre-commit gitleaks wrapper.
 - `ci/secret-scan/secret-scan.yml` — pinned GitHub Actions workflow (block tier).
-- `ci/secret-scan/secret-scan.sh` — generic shell runner for any CI (block + opt-in warn).
+- `ci/secret-scan/secret-scan.sh` — generic runner for any CI (block + opt-in warn): a short POSIX-sh launcher for
+  `ci/secret-scan/secret_scan.py`, so it needs `python3` and both files side by side.
 - `ci/secret-scan/gitleaks.toml` / `gitleaks-warn.toml` — the block / warn tier configs.

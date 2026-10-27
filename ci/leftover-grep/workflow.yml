@@ -5,7 +5,8 @@
 # Scans only the lines the PR ADDS (vs the base) so it doesn't punish pre-existing debt.
 #
 # INSTALL: copy to .github/workflows/leftover-grep.yml AND keep the gate script at
-# ci/leftover-grep/leftover-grep.sh (vendor the ci/ dir, or copy + adjust the run: path).
+# ci/leftover-grep/leftover-grep.sh AND its sibling leftover_grep.py (the launcher execs it;
+# vendor the ci/ dir, or copy both files + adjust the run: path).
 #
 # KNOBS (env on the step): LEFTOVER_INCLUDE / LEFTOVER_EXCLUDE (which files), TICKET_REGEX
 # (what makes a TODO "tracked"), ALLOW_CONSOLE=1 (console.log -> warning not failure).

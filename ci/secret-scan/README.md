@@ -10,16 +10,17 @@ local git-hook (`../../git-hooks/no-secrets-scan`) so the same guard runs in two
 
 ## What's here
 
-| File                 | For                          | Does                                                          |
-| -------------------- | ---------------------------- | ------------------------------------------------------------ |
-| `secret-scan.yml`    | **GitHub Actions**           | Installs the **gitleaks OSS binary** (pinned version) and scans the tree — NO `gitleaks-action`, NO org license. Drop into `.github/workflows/`. |
-| `secret-scan.sh`     | **Any other CI** (GitLab/Jenkins/Buildkite/cron) | POSIX-sh gitleaks runner; installs gitleaks if missing; block + optional warn tier. |
-| `gitleaks.toml`      | **Block-tier config**        | High-confidence ruleset (extends gitleaks defaults) + allowlist. Copy as repo `.gitleaks.toml`, or point `GITLEAKS_CONFIG`/`SECRET_SCAN_CONFIG` at it. |
-| `gitleaks-warn.toml` | **Warn-tier config**         | Fuzzy heuristics (entropy, suspicious var names). Warn-only — never blocks. |
+| File                 | For                                              | Does                                                                                                                                                   |
+| -------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `secret-scan.yml`    | **GitHub Actions**                               | Installs the **gitleaks OSS binary** (pinned version) and scans the tree — NO `gitleaks-action`, NO org license. Drop into `.github/workflows/`.       |
+| `secret-scan.sh`     | **Any other CI** (GitLab/Jenkins/Buildkite/cron) | POSIX-sh launcher for `secret_scan.py` (vendor both; needs `python3`): gitleaks runner; installs gitleaks if missing; block + optional warn tier.      |
+| `gitleaks.toml`      | **Block-tier config**                            | High-confidence ruleset (extends gitleaks defaults) + allowlist. Copy as repo `.gitleaks.toml`, or point `GITLEAKS_CONFIG`/`SECRET_SCAN_CONFIG` at it. |
+| `gitleaks-warn.toml` | **Warn-tier config**                             | Fuzzy heuristics (entropy, suspicious var names). Warn-only — never blocks.                                                                            |
 
 ## Quick start
 
 **GitHub Actions:**
+
 ```bash
 cp ci/secret-scan/secret-scan.yml  .github/workflows/secret-scan.yml
 cp ci/secret-scan/gitleaks.toml    .gitleaks.toml   # optional: customize rules/allowlist
@@ -27,12 +28,14 @@ git add .github/workflows/secret-scan.yml .gitleaks.toml && git commit -m "ci: s
 ```
 
 **Other CI** (a shell step in your pipeline):
+
 ```yaml
 # GitLab CI example
 secret-scan:
   script:
     - sh ci/secret-scan/secret-scan.sh
 ```
+
 ```bash
 # Jenkins / Buildkite / cron — same one-liner:
 sh ci/secret-scan/secret-scan.sh
@@ -86,7 +89,7 @@ paths   = ['''(.*?)/fixtures/''']
 
 The gitleaks **Action** requires a paid `GITLEAKS_LICENSE` on GitHub **organizations** (it
 refuses to run without one — `"[org] is an organization. License key is required."`). The
-gitleaks **binary** is MIT/open and is the *same engine with the same ruleset* — the Action
+gitleaks **binary** is MIT/open and is the _same engine with the same ruleset_ — the Action
 is just a wrapper around it. So `secret-scan.yml` downloads the pinned binary and runs
 `gitleaks dir` directly: identical detection, zero license, works on org repos. `secret-scan.sh`
 does the same for non-GitHub CI.

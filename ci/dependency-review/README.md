@@ -5,7 +5,8 @@ tooling, no GitHub Advanced Security and no paid action.
 
 - **`workflow.yml`** — GitHub Actions gate. Runs `dep-audit.sh` (below). Drop into
   `.github/workflows/`.
-- **`dep-audit.sh`** — generic multi-ecosystem audit (bun / npm / pnpm / yarn audit,
+- **`dep-audit.sh`** — POSIX-sh launcher for `dep_audit.py` (same directory; keep both files
+  together, `python3` required): generic multi-ecosystem audit (bun / npm / pnpm / yarn audit,
   pip-audit, cargo-audit, govulncheck). Audits the **whole tree**. Works in any CI or locally.
 
 ## Why not `actions/dependency-review-action`?

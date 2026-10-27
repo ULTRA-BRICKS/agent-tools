@@ -55,6 +55,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEP_AUDIT = REPO_ROOT / "ci" / "dependency-review" / "dep-audit.sh"
 DEP_WF = REPO_ROOT / "ci" / "dependency-review" / "workflow.yml"
 LEFTOVER = REPO_ROOT / "ci" / "leftover-grep" / "leftover-grep.sh"
+LEFTOVER_PY = REPO_ROOT / "ci" / "leftover-grep" / "leftover_grep.py"
 LEFTOVER_WF = REPO_ROOT / "ci" / "leftover-grep" / "workflow.yml"
 CODEQL_WF = REPO_ROOT / "ci" / "codeql" / "workflow-selfgate.yml"
 
@@ -262,11 +263,17 @@ def test_dep_audit_pip_audit_is_not_resolving():
     (`-r`/`-e`/`--requirement` without `--no-deps`) builds the PR's sdists (runs setup.py) ->
     arbitrary PR code under a privileged trigger (RCE). Pin that the invocation never gains a
     resolving flag without `--no-deps`, so a future edit can't silently reopen the hole."""
-    code = _executable_lines(DEP_AUDIT.read_text())
-    for m in re.finditer(r"pip-audit\b[^\n|;]*(?:\s-r\b|\s-e\b|--requirement\b)", code):
-        assert "--no-deps" in m.group(0), (
-            f"resolving pip-audit without --no-deps (RCE under pull_request_target): {m.group(0)!r}"
+    code = (DEP_AUDIT.with_name("dep_audit.py")).read_text()
+    # Every pip-audit argv list literal in the Python port (the only way it is invoked).
+    argvs = re.findall(r"\[\s*\"pip-audit\"[^\]]*\]", code)
+    assert argvs, "dep_audit.py must invoke pip-audit via argv lists"
+    for argv in argvs:
+        assert "--no-deps" in argv, (
+            f"resolving pip-audit without --no-deps (RCE under pull_request_target): {argv!r}"
         )
+        assert '"-e"' not in argv, f"editable pip-audit run (RCE): {argv!r}"
+    # No string-built / shell invocation of pip-audit that could bypass the argv guard.
+    assert not re.search(r"shell\s*=\s*True|os\.system|os\.popen", code)
 
 
 def test_dep_audit_python_audits_pinned_requirements_as_data(tmp_path: Path):
@@ -780,10 +787,10 @@ def test_leftover_script_has_two_dot_fallback(tmp_path: Path):
     when there is none, switch to the two-dot range — so the diff range can't silently revert to
     an unconditional three-dot that fatals every shallow PR."""
     code = "\n".join(
-        ln for ln in LEFTOVER.read_text().splitlines() if not ln.lstrip().startswith("#")
+        ln for ln in LEFTOVER_PY.read_text().splitlines() if not ln.lstrip().startswith("#")
     )
-    assert "git merge-base" in code, "must probe for a reachable merge base"
-    assert '"$base..$LEFTOVER_HEAD"' in code, "must fall back to the two-dot range"
+    assert '"merge-base"' in code, "must probe for a reachable merge base"
+    assert 'f"{base}..{head}"' in code, "must fall back to the two-dot range"
 
 
 def test_leftover_workflow_pr_head_fetch_is_not_shallow():
@@ -799,7 +806,7 @@ def test_leftover_docs_match_full_fetch_and_script_fallback_contract():
     """The shipped workflow should promise full-fetch three-dot semantics, while the script
     documents two-dot as a fallback only for direct/local or stale copied callers."""
     readme = LEFTOVER_WF.with_name("README.md").read_text()
-    script = LEFTOVER.read_text()
+    script = LEFTOVER_PY.read_text()
     workflow = LEFTOVER_WF.read_text()
     readme_flat = " ".join(readme.split())
     assert "official workflow fetches" in readme
@@ -943,13 +950,16 @@ def test_leftover_real_conflict_start_marker_blocks(tmp_path: Path):
 
 
 def test_leftover_script_does_not_read_emit_lines_via_process_substitution():
-    """Guard the fix: the script must NOT pipe emit_lines through `< <(...)` (which swallows
-    its failure). It writes to a temp file and gates on the exit status."""
+    """Guard the fix: a failing git diff / git ls-files must fail the gate CLOSED, not be
+    swallowed into an empty scan. The Python port checks the git return code and maps a
+    failure to `None`, which main() turns into the FAIL exit 1 before any scanning."""
     code = "\n".join(
-        ln for ln in LEFTOVER.read_text().splitlines() if not ln.lstrip().startswith("#")
+        ln for ln in LEFTOVER_PY.read_text().splitlines() if not ln.lstrip().startswith("#")
     )
-    assert "done < <(emit_lines)" not in code
-    assert "if ! emit_lines >" in code
+    assert code.count("if proc.returncode != 0:") >= 2, "diff and ls-files must check status"
+    assert "if lines is None:" in code
+    assert "could not compute the lines to scan" in code
+    assert "check=True" not in code
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RT_WF = REPO_ROOT / "ci" / "review-threads" / "workflow.yml"
 RT_SH = REPO_ROOT / "ci" / "review-threads" / "review-threads.sh"
+RT_PY = REPO_ROOT / "ci" / "review-threads" / "review_threads.py"
 RT_README = REPO_ROOT / "ci" / "review-threads" / "README.md"
 
 
@@ -206,7 +207,7 @@ def test_pr_number_resolution_covers_every_trigger():
 
 def test_gate_script_reads_pr_number_env():
     """The env-resolved PR number must actually feed the script (PR_NUMBER or $1)."""
-    text = RT_SH.read_text()
+    text = RT_PY.read_text()
     assert "PR_NUMBER" in text, "script must consume the PR_NUMBER env the workflow sets"
 
 
@@ -406,23 +407,34 @@ class _FakeForgejo:
                 if body is not None:
                     self.wfile.write(json.dumps(body).encode())
 
+            def _rejects(self) -> bool:
+                """Send the configured failure response (redirect / status / bad token); True if sent."""
+                if redirect:
+                    self._send(302, headers={"Location": "http://example.invalid/"})
+                elif status:
+                    self._send(status, {"message": "boom"})
+                elif token is not None and self.headers.get("Authorization") != f"token {token}":
+                    self._send(401, {"message": "unauthorized"})
+                else:
+                    return False
+                return True
+
+            def _reviews_page(self, query: str):
+                q = parse_qs(query)
+                page = int(q.get("page", ["1"])[0])
+                limit = min(int(q.get("limit", ["50"])[0]), page_cap)
+                chunk = reviews[(page - 1) * limit: page * limit]
+                headers = {"X-Total-Count": str(len(reviews))} if total_header else {}
+                return self._send(200, [{"id": r["id"], "state": "COMMENT"} for r in chunk], headers)
+
             def do_GET(self):  # noqa: N802 - http.server API
                 fake.requests.append(self.path)
                 url = urlparse(self.path)
-                if redirect:
-                    return self._send(302, headers={"Location": "http://example.invalid/"})
-                if status:
-                    return self._send(status, {"message": "boom"})
-                if token is not None and self.headers.get("Authorization") != f"token {token}":
-                    return self._send(401, {"message": "unauthorized"})
+                if self._rejects():
+                    return None
                 prefix = "/api/v1/repos/o/r/pulls/7/reviews"
                 if url.path == prefix:
-                    q = parse_qs(url.query)
-                    page = int(q.get("page", ["1"])[0])
-                    limit = min(int(q.get("limit", ["50"])[0]), page_cap)
-                    chunk = reviews[(page - 1) * limit: page * limit]
-                    headers = {"X-Total-Count": str(len(reviews))} if total_header else {}
-                    return self._send(200, [{"id": r["id"], "state": "COMMENT"} for r in chunk], headers)
+                    return self._reviews_page(url.query)
                 if url.path.startswith(prefix + "/") and url.path.endswith("/comments"):
                     rid = int(url.path.split("/")[-2])
                     review = next(r for r in reviews if r["id"] == rid)

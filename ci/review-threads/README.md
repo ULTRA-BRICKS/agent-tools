@@ -19,7 +19,7 @@ if any remain. A "thread" is a review comment conversation; "resolved" is the gr
 
 | File | For | Does |
 | ---- | --- | ---- |
-| `review-threads.sh` | **Any CI** + ship preflight | `gh api graphql` paginates threads (GitHub) or reads the Forgejo REST API (Forgejo / Gitea Actions), counts unresolved, exits non-zero if > 0. |
+| `review-threads.sh` + `review_threads.py` | **Any CI** + ship preflight | `gh api graphql` paginates threads (GitHub) or reads the Forgejo REST API (Forgejo / Gitea Actions), counts unresolved, exits non-zero if > 0. |
 | `workflow.yml` | **GitHub Actions** | Runs the script as a PR check named `review-threads`. |
 
 ## Quick start
@@ -27,9 +27,9 @@ if any remain. A "thread" is a review comment conversation; "resolved" is the gr
 ```bash
 cp ci/review-threads/workflow.yml .github/workflows/review-threads.yml
 # The workflow runs `bash ci/review-threads/review-threads.sh`, so the script must be
-# present at that path in your repo — vendor the ci/ dir, or copy the script and adjust
+# present at that path in your repo — vendor the ci/ dir, or copy the launcher and `review_threads.py` together and adjust
 # the `run:` path (e.g. to .github/scripts/):
-cp ci/review-threads/review-threads.sh .github/scripts/review-threads.sh   # then edit the run: path
+cp ci/review-threads/review-threads.sh ci/review-threads/review_threads.py .github/scripts/   # then edit the run: path
 # REQUIRED to actually block (not optional — see "Enforcement" below):
 #   Settings -> Branches -> required checks -> add "review-threads"
 #   AND enable "Require conversation resolution before merging".
@@ -63,7 +63,7 @@ in the repo README.
 
 In a CI job whose `$GITHUB_SERVER_URL` is not `https://github.com` (Forgejo / Gitea Actions),
 the script uses the **Forgejo REST API v1** instead of `gh` + GraphQL (neither exists there).
-It needs only `bash` and stdlib `python3`; the API base is `$GITHUB_API_URL` (else
+It needs only stdlib `python3` (the `.sh` is a thin POSIX launcher for `review_threads.py`); the API base is `$GITHUB_API_URL` (else
 `$GITHUB_SERVER_URL/api/v1`) and the token is the job token the workflow already passes as
 `GH_TOKEN`. The resolution rule is the one [`../ship/`](../ship/)'s Forgejo provider uses:
 every review's comments are read; a conversation is what Forgejo's UI shows as one — every
