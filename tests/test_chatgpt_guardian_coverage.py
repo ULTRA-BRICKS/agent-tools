@@ -360,6 +360,7 @@ def test_finished_and_unknown_visible_chats_are_uncovered_without_effects(tmp_pa
     assert set(report["summary"]["uncovered"]) == {"fj-finish", "third"}
     assert dev.created == []
     assert not any("fj-finish" in m for m in notify.messages)
+    assert not any(d["kind"] == "uncovered-active" for d in report["diagnostics"])
 
 
 # --- requirement 3: restore ------------------------------------------------
@@ -509,76 +510,76 @@ def test_restore_never_runs_without_the_enable_flag_or_apply(tmp_path):
         assert dev.created == []
 
 
-# --- requirement 4: owner alerts -------------------------------------------
+# --- requirement 4: local diagnostics -------------------------------------------
 
 
-def test_failed_service_alerts_once_in_russian_and_persists(tmp_path):
+def test_failed_service_remains_a_local_diagnostic_across_runs(tmp_path):
     state = make_evidence(tmp_path, samples=[sample(OLD)])
-    first = FakeNotifier()
-    run(state, systemd=FakeSystemd("failed"), notify=first)
-    assert len(first.messages) == 1
-    assert re.search("[А-Яа-я]", first.messages[0])
-    assert "https://" not in first.messages[0]
-    again = FakeNotifier()
-    run(state, systemd=FakeSystemd("failed"), notify=again, now=NOW + 120)
-    assert again.messages == []
+    for offset in (0, 120, 3600):
+        report, _, _, notify = run(state, systemd=FakeSystemd("failed"), now=NOW + offset)
+        assert notify.messages == []
+        assert report["plan"]["alerts"] == report["effects"]["alerts"] == []
+        assert any(d["kind"] == "service-failed" for d in report["diagnostics"])
 
 
-def test_alert_delivery_failure_is_recorded_truthfully_then_retried(tmp_path):
+def test_legacy_failed_delivery_is_retained_without_retry(tmp_path):
     state = make_evidence(tmp_path, samples=[sample(OLD)])
-    report, *_ = run(
-        state, systemd=FakeSystemd("failed"), notify=FakeNotifier(ok=False)
-    )
-    assert report["effects"]["alerts"][0]["status"] == "delivery-failed"
-    status, detail = (
-        sqlite3.connect(coverage.ledger_path(state))
-        .execute("SELECT status, detail FROM alerts")
-        .fetchone()
-    )
-    assert status == "delivery-failed" and "tg exited 1" in detail
-    soon = FakeNotifier()
-    run(state, systemd=FakeSystemd("failed"), notify=soon, now=NOW + 60)
-    assert soon.messages == []
-    later = FakeNotifier()
-    report, *_ = run(state, systemd=FakeSystemd("failed"), notify=later, now=NOW + 3600)
-    assert len(later.messages) == 1
-    assert report["effects"]["alerts"][0]["status"] == "sent"
+    ledger = coverage.Ledger(coverage.ledger_path(state), "home")
+    legacy = {"legacy-service": ("service-failed", "delivery-failed", "TimeoutExpired", 1)}
+    ledger.settle_alerts(NOW, set(legacy), set(), legacy)
+    with sqlite3.connect(ledger.path) as db:
+        before = db.execute("SELECT * FROM alerts ORDER BY key").fetchall()
+    for offset in (60, 3600, 86400):
+        report, _, _, notify = run(state, systemd=FakeSystemd("failed"), now=NOW + offset)
+        assert notify.messages == [] and report["effects"]["alerts"] == []
+    with sqlite3.connect(ledger.path) as db:
+        assert db.execute("SELECT * FROM alerts ORDER BY key").fetchall() == before
 
 
-def test_missing_page_alert_after_failed_restore_is_deduped(tmp_path):
+def test_missing_page_after_failed_restore_is_reported_locally(tmp_path):
     state = make_evidence(tmp_path, enrolled=(OLD, FJ), samples=[sample(OLD)])
     dev = LoginRedirectDevTools([OLD])
     notify = FakeNotifier()
-    run(state, devtools=dev, notify=notify)
-    run(state, devtools=dev, notify=notify, now=NOW + 60)
-    assert len(notify.messages) == 1
-    assert "fj-finish"[:8] in notify.messages[0]
+    first, *_ = run(state, devtools=dev, notify=notify)
+    assert first["effects"]["opened"] == ["fj-finish"]
+    assert not any(d["key"] == "missing:fj-finish" for d in first["diagnostics"])
+    second, *_ = run(state, devtools=dev, notify=notify, now=NOW + 60)
+    assert any(d["key"] == "missing:fj-finish" and d["kind"] == "missing-pages"
+               for d in second["diagnostics"])
+    assert second["plan"]["restore_deferred"] == ["fj-finish"]
+    assert row_of(second, FJ)["present"] is False
+    assert row_of(second, FJ)["live_pages"] == 0
+    assert notify.messages == []
+    assert dev.created == [FJ]
 
 
-def test_stale_observation_alert(tmp_path):
+def test_stale_observation_remains_a_local_diagnostic(tmp_path):
     state = make_evidence(tmp_path, samples=[sample(OLD)], snapshot_at=NOW - 1000)
-    notify = FakeNotifier()
-    run(state, notify=notify)
-    assert len(notify.messages) == 1
+    report, _, _, notify = run(state)
+    assert notify.messages == []
+    assert any(d["kind"] == "stale-observation" for d in report["diagnostics"])
 
 
-def test_uncovered_active_alert_when_auto_watch_is_off_and_not_repeated(tmp_path):
+def test_uncovered_active_chat_is_reported_locally_when_auto_watch_is_off(tmp_path):
     state = make_evidence(tmp_path, samples=[sample(OLD), sample(FJ)])
     notify = FakeNotifier()
     dev = FakeDevTools([OLD, FJ])
-    run(state, config=ENABLED, devtools=dev, notify=notify)
-    run(state, config=ENABLED, devtools=dev, notify=notify, now=NOW + 60)
-    assert len(notify.messages) == 1 and "fj-finish"[:8] in notify.messages[0]
-
-
-def test_chat_enrolled_this_run_is_not_alerted_as_uncovered(tmp_path):
-    state = make_evidence(tmp_path, samples=[sample(OLD), sample(FJ)])
-    notify = FakeNotifier()
-    run(state, devtools=FakeDevTools([OLD, FJ]), notify=notify)
+    for offset in (0, 60):
+        report, *_ = run(state, config=ENABLED, devtools=dev, notify=notify, now=NOW + offset)
+        assert any(d["kind"] == "uncovered-active" for d in report["diagnostics"])
     assert notify.messages == []
+    assert "watch:" + FJ not in controls_of(state)
 
 
-def test_stalled_current_generation_alerts_once_per_stall(tmp_path):
+def test_chat_enrolled_this_run_is_not_reported_as_uncovered(tmp_path):
+    state = make_evidence(tmp_path, samples=[sample(OLD), sample(FJ)])
+    report, _, _, notify = run(state, devtools=FakeDevTools([OLD, FJ]))
+    assert notify.messages == []
+    assert not any(d["kind"] == "uncovered-active" for d in report["diagnostics"])
+    assert controls_of(state)["watch:" + FJ] == "1"
+
+
+def test_stalled_current_generation_remains_a_local_diagnostic(tmp_path):
     state = make_evidence(tmp_path, samples=[sample(OLD)])
     controls, attempts = read_source(state, "home")
     stalled = project_snapshot(
@@ -598,59 +599,38 @@ def test_stalled_current_generation_alerts_once_per_stall(tmp_path):
     notify = FakeNotifier()
     report, *_ = run(state, notify=notify, now=NOW + 1000)
     assert row_of(report, OLD)["stalled"] is True
-    assert len(notify.messages) == 1
+    assert any(d["kind"] == "stalled-generation" for d in report["diagnostics"])
+    assert notify.messages == []
     run(state, notify=notify, now=NOW + 1060)
-    assert len(notify.messages) == 1
+    assert notify.messages == []
 
 
-def test_resolved_alert_rearms_only_after_quiet_period(tmp_path, monkeypatch):
-    # Short quiet period so every run stays inside the fixture snapshot's freshness.
-    monkeypatch.setattr(coverage, "ALERT_REARM_SECONDS", 100)
+def test_flapping_service_does_not_rearm_owner_notifications(tmp_path):
     state = make_evidence(tmp_path, samples=[sample(OLD)])
     notify = FakeNotifier()
-    run(state, systemd=FakeSystemd("failed"), notify=notify)
-    run(state, systemd=FakeSystemd("active"), notify=notify, now=NOW + 10)
-    run(state, systemd=FakeSystemd("failed"), notify=notify, now=NOW + 20)
-    assert len(notify.messages) == 1  # flapping inside the quiet period
-    run(state, systemd=FakeSystemd("active"), notify=notify, now=NOW + 30)
-    run(state, systemd=FakeSystemd("failed"), notify=notify, now=NOW + 140)
-    assert len(notify.messages) == 2
+    for offset, active in ((0, "failed"), (10, "active"), (20, "failed"),
+                           (30, "active"), (140, "failed")):
+        report, *_ = run(state, systemd=FakeSystemd(active), notify=notify, now=NOW + offset)
+        assert report["plan"]["alerts"] == report["effects"]["alerts"] == []
+        assert any(d["kind"] == "service-failed" for d in report["diagnostics"]) == (active == "failed")
+    assert notify.messages == []
 
 
-def test_subprocess_notifier_uses_tg_problem_tag_without_shell(monkeypatch):
+def test_legacy_notifier_entry_point_refuses_to_launch_telegram(monkeypatch):
     calls = []
-
-    class Done:
-        returncode = 0
-        stderr = ""
-
-    monkeypatch.setattr(
-        coverage.subprocess,
-        "run",
-        lambda argv, **kw: calls.append((argv, kw)) or Done(),
-    )
-    assert coverage.tg_notifier("сообщение").ok
-    argv, kw = calls[0]
-    assert argv == [
-        "tg",
-        "--title",
-        "ChatGPT Guardian",
-        "--tag",
-        "problem",
-        "--format",
-        "plain",
-        "сообщение",
-    ]
-    assert kw.get("shell") in (None, False) and kw["timeout"] <= 60
+    monkeypatch.setattr(coverage.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    result = coverage.tg_notifier("passive observation")
+    assert result.ok is False and "local-only" in result.detail
+    assert calls == []
 
 
-def test_subprocess_notifier_reports_missing_tg(monkeypatch):
+def test_quiet_policy_does_not_require_a_telegram_executable(monkeypatch):
     def boom(*a, **k):
-        raise FileNotFoundError("tg")
+        raise AssertionError("No external process may be started")
 
     monkeypatch.setattr(coverage.subprocess, "run", boom)
     result = coverage.tg_notifier("x")
-    assert result.ok is False and result.detail
+    assert result.ok is False and "local-only" in result.detail
 
 
 # --- recovery autostart ----------------------------------------------------
@@ -710,14 +690,13 @@ def test_autostart_is_bounded_by_cooldown_and_attempt_cap(tmp_path):
     assert len(systemd.started) == coverage.AUTOSTART_MAX_ATTEMPTS
 
 
-def test_autostart_failure_is_recorded_and_alerted(tmp_path):
+def test_autostart_failure_is_recorded_and_reported_locally(tmp_path):
     state = make_evidence(tmp_path, samples=[sample(OLD)])
-    notify = FakeNotifier()
-    report, *_ = run(
-        state, systemd=FakeSystemd("failed", fail_start=True), notify=notify
-    )
+    report, _, _, notify = run(state, systemd=FakeSystemd("failed", fail_start=True))
     assert report["effects"]["autostart"]["outcome"] == "failed"
-    assert len(notify.messages) == 1
+    assert notify.messages == []
+    assert any(d["key"].startswith("autostart-failed:") for d in report["diagnostics"])
+    assert coverage.Ledger(coverage.ledger_path(state), "home").autostart_rows() == [(NOW, "failed")]
 
 
 def test_recovery_is_reset_after_the_service_is_seen_active(tmp_path):
@@ -1110,33 +1089,36 @@ def global_hold(state, value=HOLD):
     ).connection.commit()
 
 
-def test_global_recovery_hold_alerts_once_and_is_never_lifted(tmp_path):
+def test_global_recovery_hold_is_local_and_is_never_lifted(tmp_path):
     state = make_evidence(tmp_path, samples=[sample(OLD)])
     global_hold(state)
     notify = FakeNotifier()
     systemd = FakeSystemd("active")
     for step in range(5):
-        run(state, notify=notify, systemd=systemd, now=NOW + 5 * step)
-    held = [m for m in notify.messages if HOLD in m]
-    assert len(held) == 1 and len(notify.messages) == 1
+        report, *_ = run(state, notify=notify, systemd=systemd, now=NOW + 5 * step)
+        assert any(d["kind"] == "recovery-hold" for d in report["diagnostics"])
+    assert notify.messages == []
     assert controls_of(state)["stop:*"] == HOLD and systemd.started == []
 
 
-def test_failed_global_hold_delivery_is_recorded_truthfully(tmp_path):
+def test_global_hold_never_creates_an_owner_delivery_attempt(tmp_path):
     state = make_evidence(tmp_path, samples=[sample(OLD)])
     global_hold(state, "human challenge")
-    report, *_ = run(state, notify=FakeNotifier(ok=False))
-    assert [a["status"] for a in report["effects"]["alerts"]] == ["delivery-failed"]
+    report, _, _, notify = run(state, notify=FakeNotifier(ok=False))
+    assert report["effects"]["alerts"] == [] and notify.messages == []
+    assert any(d["kind"] == "recovery-hold" for d in report["diagnostics"])
+    assert coverage.Ledger(coverage.ledger_path(state), "home").alert_rows() == {}
 
 
-def test_changed_global_hold_alerts_again(tmp_path):
+def test_changed_global_hold_updates_diagnostics_without_a_message(tmp_path):
     state = make_evidence(tmp_path, samples=[sample(OLD)])
     global_hold(state, "human challenge")
     run(state)
     global_hold(state, "manual stop")
     again, _, _, notify = run(state, now=NOW + 10)
-    assert [a["status"] for a in again["effects"]["alerts"]] == ["sent"]
-    assert "manual stop" in notify.messages[0]
+    assert again["effects"]["alerts"] == [] and notify.messages == []
+    assert any(d["kind"] == "recovery-hold" and "manual stop" in d["line"]
+               for d in again["diagnostics"])
 
 
 def test_inactive_service_under_hold_is_never_started_or_alerted_as_failed(tmp_path):
@@ -1146,18 +1128,21 @@ def test_inactive_service_under_hold_is_never_started_or_alerted_as_failed(tmp_p
     report, _, _, notify = run(state, systemd=systemd)
     assert systemd.started == [] and report["effects"]["autostart"] is None
     assert not any("failed" in m for m in notify.messages)
+    assert not any(d["kind"] == "service-failed" for d in report["diagnostics"])
 
 
-def test_cleared_alerts_are_pruned_after_the_rearm_window(tmp_path):
+def test_legacy_cleared_delivery_records_survive_quiet_windows(tmp_path):
     state = make_evidence(tmp_path, samples=[sample(OLD)])
-    run(state, systemd=FakeSystemd("failed"))
-    run(state, systemd=FakeSystemd("active"), now=NOW + 60)
-    rows = coverage.Ledger(coverage.ledger_path(state), "home").alert_rows()
-    assert rows and all(r["cleared_at"] is not None for r in rows.values())
-    later = NOW + coverage.ALERT_REARM_SECONDS + 120
-    run(state, systemd=FakeSystemd("active"), now=later)
-    rows = coverage.Ledger(coverage.ledger_path(state), "home").alert_rows()
-    assert not any(key.startswith("service:") for key in rows)
+    ledger = coverage.Ledger(coverage.ledger_path(state), "home")
+    legacy = {"service:legacy": ("service-failed", "sent", "OK tg#100", 1)}
+    ledger.settle_alerts(NOW, set(legacy), set(), legacy)
+    ledger.settle_alerts(NOW + 60, set(), set(), {})
+    assert ledger.alert_rows()["service:legacy"]["cleared_at"] == NOW + 60
+    with sqlite3.connect(ledger.path) as db:
+        before = db.execute("SELECT * FROM alerts ORDER BY key").fetchall()
+    run(state, systemd=FakeSystemd("active"), now=NOW + coverage.ALERT_REARM_SECONDS + 120)
+    with sqlite3.connect(ledger.path) as db:
+        assert db.execute("SELECT * FROM alerts ORDER BY key").fetchall() == before
 
 
 def test_report_schema_is_identical_on_early_failure(tmp_path):

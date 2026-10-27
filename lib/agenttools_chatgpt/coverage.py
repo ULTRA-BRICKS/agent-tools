@@ -12,7 +12,7 @@ HTTP inventory after ``startup.verify_browser``; no new CDP observer exists. Wit
 * reopen missing enrolled chats through ``startup.restore`` (one attempt per chat per
   inventory, durable);
 * start a FAILED recovery service (``recovery_autostart``, bounded; never an inactive one);
-* send one deduplicated Russian owner alert through ``tg``.
+* retain local diagnostics for the repair coordinator; never send owner alerts.
 
 Stops, quota, uncertain sends, models and the browser itself are never touched.
 """
@@ -37,6 +37,7 @@ from .core import Store
 from .lock import AccountBusy, account_lock
 from .monitor import MonitorStore, _recovery, clean_detail, read_source
 from .monitor_observer import UNITS
+from .notification_policy import COORDINATOR_ONLY, notification_mode
 from .startup import (
     HTTP_TIMEOUT_SECONDS,
     ChromeDevTools,
@@ -93,6 +94,7 @@ class Config:
     coverage_enabled: bool = False
     auto_watch_active: bool = False
     recovery_autostart: bool = False
+    notification_mode: str = COORDINATOR_ONLY
 
 
 @dataclass(frozen=True)
@@ -106,6 +108,11 @@ class Systemd(Protocol):
     def start(self, unit: str) -> None: ...
 
 
+# Compatibility surface only: all notify parameters are deliberately inert.
+# Legacy ALERT_* / NOTIFY_TIMEOUT_SECONDS constants, _compose and
+# Ledger.settle_alerts remain for historical ledger tooling and fixtures.
+# Coordinator-only reconciliation neither invokes these helpers nor mutates
+# notification history; removing their compatibility surface is separate work.
 Notifier = Callable[[str], Delivery]
 
 
@@ -132,14 +139,17 @@ def load_config(workspace: str, path: Path | None = None) -> Config:
     if (
         not isinstance(raw, dict)
         or raw.get("workspace") != workspace
-        or not set(raw) <= {"workspace", *CONFIG_KEYS}
+        or not set(raw) <= {"workspace", *CONFIG_KEYS, "notification_mode"}
         or any(not isinstance(raw[k], bool) for k in CONFIG_KEYS if k in raw)
     ):
         raise ValueError(
             "Invalid coverage configuration: expected the account's workspace and "
             "boolean " + ", ".join(CONFIG_KEYS)
         )
-    return Config(**{k: raw[k] for k in CONFIG_KEYS if k in raw})
+    return Config(
+        **{k: raw[k] for k in CONFIG_KEYS if k in raw},
+        notification_mode=notification_mode(raw.get("notification_mode", COORDINATOR_ONLY)),
+    )
 
 
 def ledger_path(state: Path) -> Path:
@@ -388,32 +398,12 @@ class SystemdUser:
 
 
 def tg_notifier(text: str) -> Delivery:
-    """Owner alert through the supported ``tg`` CLI (no direct Bot API)."""
-    try:
-        done = subprocess.run(
-            [
-                "tg",
-                "--title",
-                "ChatGPT Guardian",
-                "--tag",
-                "problem",
-                "--format",
-                "plain",
-                text,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=NOTIFY_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return Delivery(False, clean_detail(type(exc).__name__ + ": " + str(exc)))
-    if done.returncode != 0:
-        return Delivery(
-            False,
-            clean_detail("tg exited " + str(done.returncode) + ": " + done.stderr),
-        )
-    return Delivery(True)
+    """Compatibility boundary: passive text is never authority to contact the owner.
+
+    Kept for existing callers, but no process is launched. User escalation belongs
+    to the repair coordinator after it has verified exhaustion and a concrete action.
+    """
+    return Delivery(False, "local-only: owner escalation belongs to repair coordinator")
 
 
 def inventory_signature(pid: int, live: Mapping[str, int], enrolled: set[str]) -> str:
@@ -541,6 +531,9 @@ def _empty_report(
         "apply": apply,
         "port": port,
         "config": asdict(config),
+        # Canonical policy field; config preserves its matching input snapshot.
+        "notification_mode": config.notification_mode,
+        "diagnostics": [],
         "generated_at": now,
         "busy": False,
         "note": "",
@@ -664,7 +657,6 @@ def _reconcile(
         controls, attempts = read_source(state, workspace)
         snapshot = MonitorStore(state, workspace).read(now)
         restore_rows = ledger.restore_rows()
-        alert_rows = ledger.alert_rows()
         autostart_rows = ledger.autostart_rows()
     except (ValueError, sqlite3.Error, OSError) as exc:
         block("state", str(exc))
@@ -884,7 +876,7 @@ def _reconcile(
             Alert(
                 "autostart-exhausted:" + unit,
                 "service-failed",
-                "автозапуск " + unit + " исчерпан, нужно вмешательство владельца",
+                "достигнут локальный лимит попыток автозапуска " + unit,
             )
         )
     if "stop:*" in controls:
@@ -895,7 +887,7 @@ def _reconcile(
                 "recovery-hold",
                 "восстановление остановлено глобальной паузой «"
                 + hold
-                + "»: Guardian ничего не отправляет и не возобновляет, снять паузу может только владелец",
+                + "»: локальный запуск подавлен, пауза сохранена",
             )
         )
     if live is None:
@@ -983,47 +975,11 @@ def _reconcile(
                 )
             )
 
-    active_keys = {a.key for a in conditions}
-    to_send: list[Alert] = []
-    rearm: set[str] = set()
-    for alert in conditions:
-        row = alert_rows.get(alert.key)
-        if row is None:
-            to_send.append(alert)
-        elif row["status"] == "sent":
-            if row["cleared_at"] is not None:
-                if now - row["cleared_at"] >= ALERT_REARM_SECONDS:
-                    to_send.append(alert)
-                else:
-                    rearm.add(alert.key)
-        elif (
-            row["attempts"] < ALERT_MAX_DELIVERY_ATTEMPTS
-            and now - row["last_at"] >= ALERT_RETRY_SECONDS
-        ):
-            to_send.append(alert)
-    plan["alerts"] = [a.key for a in to_send]
-    outcomes: dict[str, tuple[str, str, str, int]] = {}
-    if permitted and to_send:
-        try:
-            delivery = notify(_compose(workspace, to_send))
-        except (OSError, subprocess.SubprocessError) as exc:
-            delivery = Delivery(
-                False, clean_detail(type(exc).__name__ + ": " + str(exc))
-            )
-        status = "sent" if delivery.ok else "delivery-failed"
-        for alert in to_send:
-            previous = alert_rows.get(alert.key)
-            attempts_made = (
-                previous["attempts"] + 1
-                if previous and previous["status"] == "delivery-failed"
-                else 1
-            )
-            outcomes[alert.key] = (alert.kind, status, delivery.detail, attempts_made)
-            effects["alerts"].append(
-                {"key": alert.key, "kind": alert.kind, "status": status}
-            )
-    if permitted and (outcomes or alert_rows):
-        ledger.settle_alerts(now, active_keys, rearm, outcomes)
+    # Coverage owns observation and safe repair, not user escalation. Its raw
+    # conditions do not prove repair exhaustion or a specific owner-only action.
+    # Preserve old sent/uncertain/failed records; do not drain or rearm them.
+    report["diagnostics"] = [asdict(alert) for alert in conditions]
+    plan["alerts"] = []
     return report
 
 

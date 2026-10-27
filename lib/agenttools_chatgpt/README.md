@@ -1,5 +1,7 @@
 # ChatGPT Guardian
 
+> Since version 0.3.9, coverage keeps findings in local diagnostics and never sends Telegram messages. The repair coordinator owns exceptional requests for owner action. The supported `notification_mode` is `coordinator-only`; see [Notification policy](NOTIFICATION-POLICY.md) for the current contract.
+
 A reusable, observe-first Python package for controlled recovery of a current ChatGPT UI failure. It sends only the exact text `го`. It does not use private ChatGPT APIs, automate account login, solve CAPTCHA, extract cookies/tokens, install stealth patches, or attach to a home browser. Linux and macOS are supported; profile ownership uses `flock`.
 
 The previous ChatGPT delivery bundle is absent. This package reconstructs the requested behavior from the requirements; it does not inherit the previous bundle's asserted tests or live compatibility.
@@ -350,9 +352,10 @@ mirrored as `eligibility_for_probe` with `model_proof: "unknown"`: a probe-level
 
 Per-account flags live in `~/.config/agent-tools/chatgpt-guardian/<workspace>.coverage.json` (override: `--config`
 or `CHATGPT_GUARDIAN_COVERAGE_CONFIG`), for example
-`{"workspace": "home", "coverage_enabled": true, "auto_watch_active": true, "recovery_autostart": false}`. A missing
-file, or a missing flag, is `false`; an invalid file refuses (exit 2) with no effects. With `--apply` and
-`coverage_enabled` the only effects are:
+`{"workspace": "home", "coverage_enabled": true, "auto_watch_active": true, "recovery_autostart": false, "notification_mode": "coordinator-only"}`.
+Missing boolean flags default to `false`; the notification mode defaults to `coordinator-only` and other mode
+values are rejected. An invalid file refuses (exit 2) with no effects. With `--apply` and `coverage_enabled`
+the only effects are:
 
 - `auto_watch_active`: enrol a chat that is fresh, unique in both the snapshot and the browser, running or
   `Thinking failed`, and has NO `watch:` key (`INSERT OR IGNORE`). A manual `unwatch` (`0`) is never undone, and holds,
@@ -368,14 +371,14 @@ file, or a missing flag, is `false`; an invalid file refuses (exit 2) with no ef
   ActiveState is `failed`, never an `inactive` (manually stopped) one, only after the browser is verified, never with a
   global `stop:*`, at most 3 attempts 5 minutes apart per failure (reset when the service is seen active). The browser is
   never restarted.
-- Owner alert through `tg --title "ChatGPT Guardian" --tag problem --format plain` (no direct Bot API): service failed,
-  missing or duplicate pages, stale observation, uncovered active chat (a manual unwatch is reported in the JSON, not
-  alerted), a stalled current generation and an existing global `stop:*` hold (429 transport, human challenge, manual
-  stop): the exact hold text is reported once; the hold is never removed, resumed or retried. Concise Russian, one
-  batched message per run, deduplicated per account, chat, turn and state in the ledger across restarts; an unchanged
-  condition is not repeated, a cleared one re-arms after an hour and its record is pruned after that window, and a
-  failed delivery is recorded as `delivery-failed` (retried at most 5 times, 15 minutes apart), never as sent. Delivery
-  is at-least-once: a crash between the `tg` call and the ledger write can repeat one message.
+- Local diagnostics: failed services, missing or duplicate pages, stale observations, uncovered active chats,
+  stalled current generation and existing global holds remain available in the JSON `diagnostics` list.
+  `plan.alerts` and `effects.alerts` remain empty. Inspect the report with the same `coverage --cdp-port PORT`
+  command without `--apply`, or inspect the existing `chatgpt-guardian-<slug>-coverage.service` user journal.
+  The repair coordinator alone decides whether verified exhaustion and an unavoidable owner action justify
+  contacting the owner. Coverage never invokes Telegram, retries old delivery attempts, rearms notifications,
+  or prunes their historical evidence. Legacy alert data is retained without becoming a dependency of safe repair;
+  the scope and restore/autostart records keep their existing validation.
 - Serialisation: an applied run (`--apply` with `coverage_enabled`) holds a non-blocking `flock` on
   `<state-stem>.coverage.lock` for the whole run, released on any error; a second concurrent run reports
   `"busy": true`, exit 0, and changes nothing (`--reset-restore` while busy is blocked, exit 1, instead). `startup
