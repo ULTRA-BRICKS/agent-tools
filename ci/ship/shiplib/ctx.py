@@ -168,6 +168,9 @@ class Ctx:
         self.own_repo_slugs_resolved = False
         # version_shot.py
         self.pr_diff = ""
+        self.pr_files: list[str] | None = None  # the PR's changed paths once read (pr_files.py)
+        self.pr_files_from_api = False  # the list came from the files API: GitHub refused `pr diff --name-only`
+        self.pr_files_head = ""  # PR head commit the files-API list was read at
         self.posted_image = False
         self.ui_touching = False
 

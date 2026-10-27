@@ -12,6 +12,7 @@ import os
 import re
 
 from shiplib.ctx import ShipExit
+from shiplib.pr_files import pr_changed_files, version_file_diff
 
 # POSIX [[:space:]] as grep/awk see it.
 WS = " \t\n\v\f\r"
@@ -352,6 +353,17 @@ def base_tip_version_value(ctx, file: str) -> str:
     return version_value(ctx, _grep_lines(shown.out.split("\n"), "^" + _WS_CLASS + "*" + ere))
 
 
+def _pr_diff_text(ctx, vfile: str) -> tuple[str | None, str]:
+    """The PR diff the version gate reads: the full diff, or on GitHub (which answers HTTP 406 above
+    20000 lines) the version file's merge-base -> head diff built from its contents (pr_files.py).
+    Only `diff_section_of(ctx, vfile)` reads ctx.pr_diff, so a one-file diff is all it needs."""
+    if not ctx.pr_files_from_api:
+        diff = ctx.gh("pr", "diff", ctx.pr, stderr="devnull")
+        if diff.rc == 0:
+            return diff.out.rstrip("\n"), ""  # bash PR_DIFF (command-substitution strips trailing newlines)
+    return version_file_diff(ctx, vfile)
+
+
 def _version_bump_gate(ctx) -> None:
     if ctx.env.get("SHIP_SKIP_VERSION_BUMP", "0") == "1" and not ctx.no_vbump_ok:
         ctx.no_vbump_ok = "SHIP_SKIP_VERSION_BUMP=1 (env)"
@@ -359,10 +371,10 @@ def _version_bump_gate(ctx) -> None:
         ctx.out("[ship] version-bump gate OVERRIDDEN — reason: %s" % ctx.no_vbump_ok)
         return
     pr = ctx.pr
-    files = ctx.gh("pr", "diff", pr, "--name-only", stderr="devnull")
-    if files.rc != 0:
-        raise ctx.refuse("Refusing: could not list changed files for PR #%s — cannot evaluate the version-bump gate (override with --no-version-bump-ok <reason> if intended)." % pr)
-    if not any_shippable_source(ctx, files.out.rstrip("\n") + "\n"):
+    files, why = pr_changed_files(ctx)
+    if files is None:
+        raise ctx.refuse("Refusing: could not list changed files for PR #%s — cannot evaluate the version-bump gate: %s (override with --no-version-bump-ok <reason> if intended)." % (pr, why))
+    if not any_shippable_source(ctx, "\n".join(files) + "\n"):
         ctx.out("[ship] version-bump gate: PR #%s changes no shippable source (docs/tests/CI only) — no bump required." % pr)
         return
     # Shippable source changed -> this ship is a release. The version field must have moved.
@@ -379,10 +391,10 @@ def _version_bump_gate(ctx) -> None:
     if vfile_rc != 0:
         ctx.out("[ship] version-bump gate: no version file (pyproject.toml/package.json) found at repo root — skipping (set SHIP_VERSION_FILES for a non-standard layout).")
         return
-    diff = ctx.gh("pr", "diff", pr, stderr="devnull")
-    if diff.rc != 0:
-        raise ctx.refuse("Refusing: could not read the diff for PR #%s — cannot evaluate the version-bump gate (override with --no-version-bump-ok <reason> if intended)." % pr)
-    ctx.pr_diff = diff.out.rstrip("\n")  # bash PR_DIFF (command-substitution strips trailing newlines)
+    diff, why = _pr_diff_text(ctx, vfile)
+    if diff is None:
+        raise ctx.refuse("Refusing: could not read the diff for PR #%s — cannot evaluate the version-bump gate: %s (override with --no-version-bump-ok <reason> if intended)." % (pr, why))
+    ctx.pr_diff = diff
     if not version_line_bumped(ctx, vfile):
         ctx.err("Refusing: PR #%s changes shippable source but the version in %s is UNCHANGED — this ship is a release, so bump the version (skill: bump-version-on-release)." % (pr, vfile))
         ctx.err("  Semver: patch for a fix, minor for a feature, major for a breaking change. Edit %s's version field, push, re-run ship." % vfile)
@@ -573,16 +585,15 @@ def _screenshot_gate(ctx) -> None:
 
     ui_touching = False
     if ctx.ui_path_regex:
-        files = ctx.gh("pr", "diff", ctx.pr, "--name-only", stderr="devnull")
-        if files.rc == 0:
-            try:
-                rx = re.compile(ere_to_python(ctx.ui_path_regex))
-            except re.error:
-                rx = None  # grep exits 2 on a bad regex: the `&&` list just does not set the flag
-            if rx is not None and any(rx.search(ln) for ln in files.out.rstrip("\n").split("\n")):
-                ui_touching = True
-        else:
-            raise ctx.refuse("Refusing: could not list changed files for PR #%s — cannot evaluate the screenshot gate." % ctx.pr)
+        files, why = pr_changed_files(ctx)
+        if files is None:
+            raise ctx.refuse("Refusing: could not list changed files for PR #%s — cannot evaluate the screenshot gate: %s." % (ctx.pr, why))
+        try:
+            rx = re.compile(ere_to_python(ctx.ui_path_regex))
+        except re.error:
+            rx = None  # grep exits 2 on a bad regex: the `&&` list just does not set the flag
+        if rx is not None and any(rx.search(ln) for ln in files):
+            ui_touching = True
     ctx.ui_touching = ui_touching
     if not ui_touching:
         return

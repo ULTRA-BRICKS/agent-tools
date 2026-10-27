@@ -212,7 +212,10 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   `__version__` when pyproject declares a dynamic version) vs the PR base — a ship
   of source is a release, so `--version` stays a real freshness signal instead of a stale
   literal (skill: `bump-version-on-release`); override a genuine no-release ship with
-  `--no-version-bump-ok <reason>` or `SHIP_SKIP_VERSION_BUMP=1`;
+  `--no-version-bump-ok <reason>` or `SHIP_SKIP_VERSION_BUMP=1`. A PR GitHub refuses to serve as a
+  diff (HTTP 406 above 20000 lines) is still evaluated: the file list is read from the paginated files
+  API and trusted only when it holds exactly the PR's `changedFiles` files, and the version comes from
+  the version file's contents at the PR head and merge-base; anything else refuses;
 - the **review-quorum bar is met** (Guard-B of the self-merge-authority program) — the PR's task
   code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token, else a purely descriptive
   ALL-CAPS/hyphenated code (`SME-ROADMAP-WORKTREE-NOTE`-shaped, 3+ segments, no digits) — all

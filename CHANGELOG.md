@@ -142,6 +142,12 @@ checkout -B`, `git switch -C/--force-create`, and `rm` with a recursive flag as 
 
 ### Fixed
 
+- `gh ship` version-bump and screenshot gates now work on a GitHub PR whose diff GitHub refuses to
+  serve (HTTP 406 above 20000 lines, also for `gh pr diff --name-only`; agent-tools#1023). The file
+  list comes from the paginated pull-request files API, accepted only when it holds exactly the PR's
+  `changedFiles` files, the PR is within the API's 3000-file cap and the head did not move; the version
+  value comes from the version file's contents at the PR head and merge-base. Any mismatch or API
+  error still refuses, there is no new override, and the Forgejo provider is unchanged.
 - `omp-hook-bridge` (agent-tools#1003): the omp MAIN session now runs `stop` hooks. Only a subagent's
   `yield` mapped to `stop`, so an interactive/orchestrator omp session — which ends a turn with plain
   text — never ran `stop-completion-selfcheck` (or any Stop hook): 0 of ~5,400 recorded yields were
