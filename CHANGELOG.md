@@ -22,6 +22,18 @@
   per-chat freshness also honours `check_stale`; one deduplicated owner alert reports an existing global `stop:*` hold
   without touching it; the `tg` notifier passes `--title "ChatGPT Guardian"`; cleared alerts are pruned after the
   re-arm window; the report schema is identical on early failures.
+- `agenttools-chatgpt` 0.3.6 (Refs #1020): the observer no longer calls a readable DOM fresh when the conversation did
+  not synchronize. `monitor_dom.js` reads the page's existing Resource Timing entries (read-only: no request, reload,
+  navigation or buffer clearing) for the newest completed same-origin read of exactly this chat
+  (`/backend-api/conversation/<id>` or `/conversations/<id>`, optionally followed by a query that is never read); a newest HTTP 429/401/403/5xx yields the sanitized
+  observation error `conversation-sync-http-<status>` (status, reason and timing only) instead of a checked complete
+  or working status, and a newer success supersedes an older failure. Other chats, query/encoded/foreign-origin
+  paths, unrelated telemetry, bogus statuses and missing entries never block. An explicit app load-error page with no turns is `conversation-load-failed`. No retry, auto-clear or send-guard change.
+- `agenttools-chatgpt` 0.3.7 (Refs #1020): the closed model-trigger label used by the active model probe is the exact
+  rendered text a user sees: text under `aria-hidden`, `hidden`, `display:none`, `visibility:hidden` or `opacity:0`
+  ancestors (e.g. the hidden `Thinking effort` placeholder) is excluded, so a full selected GPT-6 proof plus visible
+  `Pro` / `5.6 Extra High` finalizes. One helper serves `menu-state` and `finalize-probe`; the label must still equal
+  exactly `Pro` / `5.6 Extra High` (no prefix stripping), and the raw trigger signature still covers all text.
 - Worktree-only guard is ON BY DEFAULT and now covers commits (agent-tools#1012, Refs #1012):
   `worktree-only-writes`, `pin-primary-worktree` and `block-devserver-primary` enforce in every
   repo that has a `rig.yaml` unless it sets `agent_hooks.worktree_only: false` (or the session

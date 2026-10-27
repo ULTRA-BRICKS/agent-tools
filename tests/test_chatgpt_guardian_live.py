@@ -277,6 +277,115 @@ def test_hidden_measurement_does_not_replace_rendered_model_label(model):
     run(case, html=html)
 
 
+CLOSE_LABEL = "trigger.textContent=(window.model==='GPT-5.6 Sol'?'5.6 ':'')+window.effort;"
+PLACEHOLDER = (
+    '<span><span aria-hidden="true" style="opacity:0;position:absolute">'
+    "<span>Thinking effort</span></span>"
+    '<span aria-hidden="false" style="opacity:1"><span>\'+LABEL+\'</span></span></span>'
+)
+
+
+def placeholder_html(visible_js, *, extra=""):
+    """Closed trigger whose rendered text is `visible_js`, plus a hidden placeholder."""
+    assert CLOSE_LABEL in MENU_HTML
+    return MENU_HTML.replace(
+        CLOSE_LABEL,
+        extra + "const LABEL=" + visible_js + ";trigger.innerHTML='" + PLACEHOLDER + "';",
+    )
+
+
+SOL_SETUP = """() => {
+  window.model='GPT-5.6 Sol';window.effort='Extra High';
+  for(const radio of document.querySelector('#full').children){
+    const selected=radio.textContent===window.model;
+    radio.setAttribute('aria-checked',String(selected));radio.setAttribute('data-model-selected',String(selected));
+  }
+  document.querySelector('[role=status]').textContent='Extra High, 4 of 5.';
+}"""
+
+
+@pytest.mark.parametrize("model", ["Astra", "Sol"])
+def test_opacity_zero_placeholder_does_not_block_exact_visible_label(model):
+    html = placeholder_html("(window.model==='GPT-5.6 Sol'?'5.6 ':'')+window.effort")
+
+    async def case(page, adapter):
+        if model == "Sol":
+            await page.evaluate(SOL_SETUP)
+        trigger = page.locator("[data-codex-intelligence-trigger]")
+        await adapter.probe_model()
+        assert adapter.probe is not None
+        label = "Pro" if model == "Astra" else "5.6 Extra High"
+        assert await trigger.inner_text() == "Thinking effort\n" + label
+        assert await trigger.text_content() == "Thinking effort" + label
+        assert (await adapter._menu_state())["label"] == label
+        observed = await page.evaluate(adapter.script, {"probe": adapter.probe})
+        assert observed["verified"] and observed["model"] == model
+        assert observed["effort"] == ("" if model == "Astra" else "Extra High")
+        assert await page.evaluate("window.switches") == 0
+        assert not await page.evaluate("Boolean(window.clicks)")
+
+    run(case, html=html)
+
+
+@pytest.mark.parametrize(
+    "label_js, setup, reveal",
+    [
+        ("'Max'", None, False),
+        ("'Pro'", "full.firstElementChild.textContent='GPT-9'", False),
+        ("'Pro'", "full.firstElementChild.removeAttribute('data-model-selected')", False),
+        ("'Pro5.6 Extra High'", None, False),
+        ("'Pro'", None, True),
+    ],
+    ids=[
+        "unsupported-visible",
+        "model-unknown",
+        "model-missing",
+        "contradictory-labels",
+        "visible-placeholder",
+    ],
+)
+def test_hidden_label_with_unproven_state_never_finalizes(label_js, setup, reveal):
+    html = placeholder_html(label_js)
+    if reveal:
+        html = html.replace('aria-hidden="true" style="opacity:0;position:absolute"', 'style="position:absolute"')
+
+    async def case(page, adapter):
+        if setup:
+            await page.evaluate(setup.replace("full.", "document.querySelector('#full')."))
+        await adapter.probe_model()
+        assert adapter.probe is None
+        assert await page.evaluate("window.switches") == 0
+        assert not await page.evaluate("Boolean(window.clicks)")
+
+    run(case, html=html)
+
+
+def test_changed_trigger_identity_never_finalizes():
+    html = placeholder_html("'Pro'").replace(
+        "';},40);",
+        "';const fresh=trigger.cloneNode(true);trigger.replaceWith(fresh);},40);",
+        1,
+    )
+
+    async def case(page, adapter):
+        await adapter.probe_model()
+        assert adapter.probe is None or await adapter.probe.json_value() is None
+
+    run(case, html=html)
+
+
+def test_working_or_draft_state_is_not_safe_with_placeholder_label():
+    html = placeholder_html("'Pro'")
+
+    async def case(page, adapter):
+        await page.locator("[contenteditable]").evaluate("e=>{e.textContent='draft'}")
+        observed = await adapter.observe()
+        assert observed.draft
+        assert not observed.safe_failure()
+
+    run(case, html=html)
+
+
 @pytest.mark.parametrize("state", ["running", "draft", "manual-stop", "complete"])
 def test_nonrecoverable_latest_state_never_probes_model_menu(tmp_path, state):
     from agenttools_chatgpt.core import Guardian, Store
