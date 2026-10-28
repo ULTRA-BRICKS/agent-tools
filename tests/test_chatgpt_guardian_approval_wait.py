@@ -134,6 +134,24 @@ def assert_protected(o):
     assert not approval.flagged(o) and not approval.pending(o)
 
 
+def passive(html):
+    """What `pm monitor` records for this page: the real passive metadata script."""
+    seen = {}
+
+    async def case(page, adapter):
+        from agenttools_chatgpt import scripts
+
+        seen["s"] = await page.evaluate(scripts.load("monitor_dom.js"))
+
+    run_dom(case, html)
+    return seen["s"]
+
+
+def assert_passive_working(s):
+    assert s["running"] is True and s["status"] == "working"
+    assert "approval_wait" not in s
+
+
 # --- real DOM: when a card counts ---------------------------------------------------------------
 
 
@@ -1005,3 +1023,59 @@ def test_a_real_5xx_during_a_blocked_visit_still_counts_as_transient(
         assert calm.retry is None and calm.last_ok_at is None
 
     run(case())
+
+
+# --- the passive monitor agrees with the adapter -------------------------------------------------
+
+
+def test_passive_monitor_reports_the_current_card_as_waiting_not_generating():
+    s = passive(pending())
+    assert s["status"] == "awaiting-approval"
+    assert s["running"] is False and s["approval_wait"] is True
+    assert s["turn"] == NEW_TURN and s["turns"][-1]["assistant_state"] == "in_progress"
+    assert REASONING not in json.dumps(s) and "Allow" not in json.dumps(s)
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        pending(after='<button aria-label="Stop">Stop</button>'),
+        pending(
+            composer=COMPOSER.replace(
+                "<p data-empty-paragraph",
+                "<p>half a thought</p><p data-empty-paragraph",
+            )
+        ),
+        pending(card=f"<blockquote>{CARD}</blockquote>"),
+        pending(card=f"<div hidden>{CARD}</div>"),
+        page_html(
+            turn(OLD_TURN, THINKING.replace("in_progress", "complete") + CARD),
+            turn(NEW_TURN, THINKING),
+        ),
+    ],
+    ids=["stop", "draft", "quoted", "hidden", "old-turn"],
+)
+def test_passive_monitor_keeps_every_other_page_working(html):
+    assert_passive_working(passive(html))
+
+
+def test_passive_monitor_leaves_an_answered_turn_complete():
+    s = passive(page_html(turn(OLD_TURN, THINKING + CARD), turn(NEW_TURN, ANSWER)))
+    assert s["running"] is False and s["status"] != "awaiting-approval"
+    assert "approval_wait" not in s
+
+
+@pytest.mark.parametrize(
+    "dialog", ['<div role="dialog">x</div>', '<div role="alert">Heads up</div>']
+)
+def test_passive_monitor_keeps_a_page_with_another_claimant_working(dialog):
+    assert_passive_working(passive(pending(after=dialog)))
+
+
+def test_passive_monitor_keeps_a_page_without_a_profile_menu_working():
+    html = page_html(
+        turn(OLD_TURN, '<div data-user-message-bubble="true">go</div>'),
+        turn(NEW_TURN, THINKING + CARD),
+        profile=False,
+    )
+    assert_passive_working(passive(html))

@@ -533,6 +533,8 @@ The tab may leave the paused card to read the next chat, so one card never starv
 accepted, denied, answered or sent: every Go and continuation gate refuses it (a continuation is refused as
 `running`), even when the ordinary running flag is false. Two visible cards, a card of an older turn,
 a lookalike inside a user bubble or quote, Stop, a draft or a challenge keep today's protected behaviour.
+The passive monitor (`pm monitor`) reports such a page as `status: awaiting-approval`, `running: false` (not counted as
+generating) when nothing else owns the page; its row `reason` and blocked count are unchanged.
 
 **Running responses.** When the owned tab shows an active response (the existing adapter's running signal) the patrol
 does not navigate away, does not send a Go, does not open a second tab and never clicks Stop. The slot becomes an

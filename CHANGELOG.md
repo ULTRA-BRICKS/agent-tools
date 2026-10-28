@@ -160,9 +160,15 @@
   because the repository's complexity gate (`rig lint check`) already fails `core.py`, `continuation.py`,
   `browser.py`, `live.py` and `live_dom.js` before this change, and the Python-only gate admits no new JavaScript
   file, so touching or adding those was not possible without unrelated refactors or policy changes.
-  Limitations: offline-tested; the real-DOM cases need a local Chromium and were skipped on the test server, the shared
-  card finder is unit-tested under node on a minimal fake DOM instead; the monitor's page sample still calls the paused
-  turn `working`.
+  The passive monitor now agrees: `monitor_dom.js` (the page-side metadata read of `pm monitor`) reports a page whose
+  latest, uniquely keyed, `in_progress` turn holds the one current card (shared `approvalFacts`, no Stop) as `status`
+  `awaiting-approval`, `running` false and `approval_wait` true, so the generating/running counts no longer include it.
+  It claims this only when nothing else owns the page: no Stop, quota alert, failure status, visible draft or
+  attachment, dialog, page alert, captcha/login evidence, and a profile menu is present; any doubt keeps `working`.
+  The raw turn `assistant_state`/`generation_active` stay `in_progress`. Metadata only; no approval text leaves the page.
+  Limitations: the monitor row `reason` and the `summary.blocked` count are NOT changed (`monitor.py` and
+  `monitor_observer.py` already fail the complexity gate, so they are untouched); the row shows the status and
+  `running: false`. The real-DOM cases need a local Chromium; no live account was acted on.
 - Worktree-only guard is ON BY DEFAULT and now covers commits (agent-tools#1012, Refs #1012):
   `worktree-only-writes`, `pin-primary-worktree` and `block-devserver-primary` enforce in every
   repo that has a `rig.yaml` unless it sets `agent_hooks.worktree_only: false` (or the session

@@ -824,3 +824,35 @@ def test_stale_or_missing_samples_do_not_erase_or_invent_completion():
     assert "completion-invalidated" not in _kinds(stale)
     missing = project(previous=done, samples=[], now=NOW + 60)
     assert row(missing)["completion_observed_at"] == NOW
+
+
+def _waiting():
+    return sample(status="awaiting-approval", running=False, approval_wait=True)
+
+
+def test_a_pending_platform_approval_is_not_counted_as_running_or_completed():
+    snap = project(samples=[_waiting()])
+    r = row(snap)
+    assert r["running"] is False and r["status"] == "awaiting-approval"
+    assert r["completion_observed_at"] is None and r["continuation"] != "completed"
+    assert snap["summary"]["running"] == 0 and snap["summary"]["completed_24h"] == 0
+
+
+def test_a_user_only_turn_beside_a_pending_approval_is_not_resumed():
+    s = _waiting()
+    s["turns"][-1].update(assistant_present=False, assistant_started=False)
+    r = row(project(samples=[s]))
+    assert r["continuation_observed_at"] is None and r["running"] is False
+
+
+def test_the_waiting_row_survives_storage_and_later_freshness(tmp_path):
+    from agenttools_chatgpt.monitor import MonitorStore
+
+    p = tmp_path / "state.sqlite"
+    source(p)
+    store = MonitorStore(p, "glide.vc")
+    store.record(project(samples=[_waiting()]))
+    soon = store.read(NOW + 30)
+    assert row(soon)["status"] == "awaiting-approval" and soon["summary"]["running"] == 0
+    later = row(store.read(NOW + 400))
+    assert later["observation"] == "stale" and later["running"] is None
