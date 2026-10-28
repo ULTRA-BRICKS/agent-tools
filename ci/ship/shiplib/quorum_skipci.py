@@ -50,6 +50,29 @@ _ISSUE_URL_RE = re.compile(
 )
 
 
+# ALL-CAPS-dash-number tokens that are NOT tickets: encodings, hash/crypto and date standards, and
+# model families that PR prose mentions (`UTF-8`, `SHA-256`, `ISO-8601`, `GLM-5`). A PR body naming one
+# must not point the quorum gate at a task of that name (agent-tools#924, #914). Kept short and
+# unambiguous on purpose: a prefix that can also be a real project key (MD, RFC, CVE, SSL, HTTP) is
+# NOT listed, so such a ticket code still derives.
+_NON_TICKET_PREFIXES = frozenset(
+    {
+        "UTF", "SHA", "ISO", "AES", "TLS",
+        "GPT", "GLM", "QWEN", "KIMI", "LLAMA", "CLAUDE", "OPUS", "SONNET", "HAIKU", "GEMINI", "GROK",
+        "MIMO", "DEEPSEEK",
+    }
+)
+
+
+def _first_ticket_like_prefix_num(lines: list[str]) -> str:
+    """First `PREFIX-<n>` token that is not a known non-ticket standard/model name, else ""."""
+    for line in lines:
+        for m in _PREFIX_NUM_RE.finditer(line):
+            if m.group(0).split("-", 1)[0] not in _NON_TICKET_PREFIXES:
+                return m.group(0)
+    return ""
+
+
 def review_quorum_extract_ticket(ctx, text: str) -> str:
     """First ticket-like token in `text` (HYP-n, PREFIX-n, descriptive ALL-CAPS, `Fixes #n`, own-repo
     issue URL as `#n`), or "" — see the bash comments for the accepted residuals; never raises."""
@@ -58,10 +81,9 @@ def review_quorum_extract_ticket(ctx, text: str) -> str:
         m = _HYP_RE.search(line)
         if m:
             return _upper(m.group(0))
-    for line in lines:
-        m = _PREFIX_NUM_RE.search(line)
-        if m:
-            return m.group(0)
+    prefixed = _first_ticket_like_prefix_num(lines)
+    if prefixed:
+        return prefixed
     for line in lines:
         for cand in _CANDIDATE_RE.findall(line):
             if _DESCRIPTIVE_RE.fullmatch(cand):
@@ -564,12 +586,15 @@ def run(ctx) -> None:
     ctx.qerr = ""
 
     ctx.task_code = ctx.env.get("REVIEW_TASK_CODE", "")
+    task_code_source = "$REVIEW_TASK_CODE"
     if not ctx.task_code:
         ctx.task_code = review_quorum_extract_ticket(ctx, ctx.branch)
+        task_code_source = "the branch name"
     if not ctx.task_code:
         res = ctx.gh("pr", "view", ctx.pr, "--json", "body", "-q", '.body // ""', stderr="devnull")
         body = res.out.rstrip("\n") if res.rc == 0 else ""
         ctx.task_code = review_quorum_extract_ticket(ctx, body)
+        task_code_source = "the PR body"
 
     task_code = ctx.task_code
     if not task_code:
@@ -709,5 +734,6 @@ def run(ctx) -> None:
         review_quorum_refuse_or_hatch(
             ctx,
             f"bar NOT met for {task_code} — {ctx.qiter}/{ctx.min_iter} iterations, "
-            f"{ctx.qroles_n}/{ctx.min_roles} distinct roles{roles_seen}{models_summary}{err_part}{foreign_part}",
+            f"{ctx.qroles_n}/{ctx.min_roles} distinct roles{roles_seen}{models_summary}{err_part}{foreign_part}"
+            f" [task code {task_code} taken from {task_code_source}; set $REVIEW_TASK_CODE to override]",
         )

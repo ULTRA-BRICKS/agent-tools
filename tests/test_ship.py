@@ -7593,6 +7593,32 @@ def test_review_quorum_issue_url_accepts_live_pr_slug_after_repo_rename(tmp_path
     assert got == ["#105", "#105", "#12", ""], got
 
 
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        # standards and model names (UTF-8, SHA-256, GLM-5, ISO-8601) are not tickets, so the
+        # keyword-anchored ref that follows is derived instead (#924, #914)
+        ("RFC-12 is the ticket, not UTF-8", "RFC-12"),
+        ("Refs #705. Review task code: 705.\nwrong text encoding, not UTF-8", "#705"),
+        ("Fixes #165\nthe SHA-256 of the file", "#165"),
+        ("uses GLM-5 for review. Closes #914", "#914"),
+        ("see ISO-8601 dates\nResolves #12", "#12"),
+        # the strong ticket token HYP-n still comes first, a lone PREFIX-n is still derived
+        ("HYP-12 and Refs #5", "HYP-12"),
+        ("ABC-12", "ABC-12"),
+        # a non-ticket token alone yields no task code (a clear refusal), never a task named after it
+        ("only prose with UTF-8 and GLM-5", ""),
+        # two different keyword-anchored refs are ambiguous, never the first in document order
+        ("Refs #1 and Fixes #2", ""),
+    ],
+)
+def test_review_quorum_ignores_non_ticket_prefixed_tokens(tmp_path, body, expected):
+    got = _extract_ticket_with_own_repo(
+        [body], cwd=tmp_path, origin_repo="acme/widgets", live_pr_url=None
+    )
+    assert got == [expected], got
+
+
 def test_review_quorum_issue_url_origin_slug_still_works_when_gh_url_lookup_fails(tmp_path):
     """The live-PR-URL lookup is additive: when `gh pr view --json url` fails (offline), the
     checkout origin alone still identifies the own repo, exactly as before."""
