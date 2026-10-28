@@ -143,7 +143,9 @@ same latch once per watched page attachment, if available. No private API reques
 response body, headers, cookies or tokens are read. No timer clears a stop, and no
 model switch bypasses it. The in-process hold is read from the durable `stop:*`
 control, so only an explicit `resume` releases it (the running service resumes at once
-without a restart) and a new 429/401/403 latches again. Event listeners detach on
+without a restart) and a new 429/401/403 latches again. Under `live --single-tab` the patrol
+may also release the exact machine 429 hold, but only on verified same-endpoint transport
+evidence (see "Single-tab patrol"), never on a timer. Event listeners detach on
 service exit.
 
 A visible dialog is a human challenge only on positive login/CAPTCHA evidence (CAPTCHA
@@ -395,6 +397,122 @@ Exit status is 1 when anything is `blocked`. Timer and service templates live in
 `~/.config/systemd/user/chatgpt-guardian-<slug>-coverage.{service,timer}` and run
 `systemctl --user daemon-reload && systemctl --user enable --now chatgpt-guardian-<slug>-coverage.timer`. The timer
 fires every 60 seconds; the service always passes `--apply` and the flags file decides what may happen.
+
+## Single-tab patrol (`live --single-tab`, 0.3.13)
+
+`chatgpt-guardian --workspace home|glide.vc live --cdp http://127.0.0.1:PORT --apply --single-tab` runs the account
+with ONE owned conversation tab instead of one tab per chat. It is a mode of the same `live` owner, not another
+daemon: the same CDP owner lock, recovery database, idempotency/attempt ledger, control endpoint, transport latch,
+sender, owner-approved continuation ledger and dedicated profile. Both modes take the owner lock, so they cannot run
+side by side. A legacy `live` launch (without `--single-tab`) never touches the single-tab marker on its own: while the
+mode is recorded it is refused, and only the explicit rollback below retires it. Nothing scans conversation history,
+calls an API for chat lists or opens a second browser.
+
+Known limitations, stated plainly: navigating away from an ACTIVE response has no permitted live proof, so the patrol
+never does it (see "Running responses"); a machine 429 hold is released only by verified same-endpoint transport
+evidence and otherwise stays pending for the owner or an authorized coordinator (see "429 and cooldown"); a Go receipt
+is not a confirmed continuation; not every enrolled chat is sent to, only a verified structural failure is.
+
+Settings (all flags of `live`; the rotation flags are refused without `--single-tab`):
+
+| Flag                                                                                    | Default   | Meaning                                                                                              |
+| --------------------------------------------------------------------------------------- | --------- | ---------------------------------------------------------------------------------------------------- |
+| `--single-tab`                                                                          | off       | Enable the patrol for this account.                                                                  |
+| `--rotation-min` / `--rotation-max`                                                     | 240 / 360 | Seconds BETWEEN VISIT STARTS; one fresh uniform draw per visit. Safe range 120 to 900, min <= max.   |
+| `--confirm-wait`                                                                        | 45        | In-visit wait (20 to 60 s) for the assistant response that follows a Go.                             |
+| `--retire-single-tab`                                                                   | off       | Deliberate rollback to the legacy loop; only while holding the account lock (see below).             |
+| `--poll-interval`, `--max-pages`, `--min-available-mib`, `--private-display`, `--apply` | as before | Housekeeping tick (30 s minimum, default 60), resource guard, display handling and apply, unchanged. |
+
+**Rotation state** (`<state-stem>.rotation.json`, next to the account's database, mode 0600, stdlib-only module
+`rotation.py`) persists the queue, cursor, current target, next due time, the start of the last visit, any explicit
+deferral, last Go, any cooldown, the 429 transport evidence and the owned URLs. Every write is atomic (temp file, fsync,
+replace). Schema and account are validated on every load: a wrong-account, corrupt or symlinked file refuses to start
+the service (exit 2) and is never overwritten. Each account draws from its own system-entropy generator.
+
+**The interval is between visit starts.** One draw per visit is made when the visit STARTS (before the navigation, and
+persisted) and the next visit is due exactly that draw later, so the 20 to 60 s in-visit confirmation is INSIDE the
+240 to 360 s, never added to it: a 55 s confirmation with a 360 s draw is a 360 s gap between starts, not 415 s. The
+measured gap is the draw plus sub-second scheduler latency (the loop wakes at the due instant with a 0.25 s floor). A
+restart in the middle of a visit keeps its anchor. A genuine overrun (the visit, or a cooldown, outlasts its draw, a due
+time already past after downtime, an implausible clock) is never a catch-up burst and never due at once: it is an
+EXPLICIT persisted `deferred` state (`reason`: `overrun`, `overdue`, `clock`, `cooldown`, `running-protected`,
+`protected:*`; visible in telemetry) scheduled as one fresh draw from now (from the end of a running cooldown), cleared
+when the next visit starts. A first start also waits one full interval. The two accounts do not synchronise.
+
+**Queue.** Enrolled chats (`watch:<chat>` = `1`) join the queue in canonical order and stay in it; the full permanent URL
+(project path included, query and fragment dropped) is stored next to the canonical identity, taken from `--watch`, an
+open tab or an earlier entry, never from a history scan. Chats under a per-chat or global `stop:` are skipped and keep
+their pause. The chat of the oldest unexpired owner approval jumps the queue once without moving the cursor, so every
+other chat is still visited once per lap. A chat without an open tab is expected queued state, not an observation failure.
+
+**A visit** (only at the due time): navigate the one owned tab to the next chat (no new tab is opened while an owned tab
+exists), read only that conversation (passive adapter plus the monitor's metadata DOM read) and classify it
+`working`, `complete`, `rate-limited`, `challenge`, `draft`, `unreadable:*`, `redirected`, `nav-error:*` or a failure.
+Navigation clicks nothing: no Stop, no model menu, no Send. Only a verified structural failure (newest, uniquely keyed,
+cancelled turn with exactly one `Thinking failed` status, as in the legacy recovery) may receive a Go; a completed final
+answer, a running response and anything uncertain never do, and no completion verdict is invented.
+
+**Go admission** is the existing Guardian path and all of it must hold: the account's own recovery database and rotation
+file, the exact visited chat and head (stable for 20 s, re-read immediately before the click), an empty composer, no running
+response, no hold or stop, no unresolved or deduplicated attempt for that turn, a verified model (Astra, or Sol Extra High
+with consent), no quota latch, and a rendered, unique tab in the resource budget. The patrol never selects a model or
+effort, never switches a branch, never edits or deletes a message, never forges a tool approval and never clicks Stop.
+After a click the bounded `--confirm-wait` correlates the Go with the NEXT assistant response (running or complete); a reply
+that arrives later is correlated on the chat's next visit. The Go record is persisted before the click, so a crash
+leaves `interrupted`, the attempt stays unresolved in the recovery database, and a restart never repeats it.
+
+**One tab and consolidation.** Guardian-owned means "a conversation tab whose chat is in the queue or in the persisted owned
+URLs"; login pages, `/space`, blank pages and other conversations are never read, navigated or closed. When several owned
+tabs exist the patrol records ALL their URLs first and then closes only extras that read as idle (empty composer, not
+running, no challenge, no unresolved send, readable); any other extra is reported in `tabs.protected` and left open. A
+nonempty draft, an authentication screen or any sign-in page pauses the patrol (`protected-tab`, `login-flow`) instead of
+opening a second tab, and the draft is neither read nor erased.
+
+**429 and cooldown.** A transport 429 (the legacy `stop:*` machine hold) now also writes a durable cooldown from the real
+`Retry-After` (delta seconds or HTTP date, clamped to 60 s to 24 h; 15 minutes when the header is absent) and records the
+exact endpoint path (no query) of every 429 and, for a restricted endpoint only, every later 2xx of that same path, as
+the browser's own `response` events showed them (never DOM text, never a request of our own). Until the cooldown ends
+nothing is read, navigated or sent, a cooldown that outlasts the rotation due time defers the next visit by one fresh draw
+after it ends, and no account, model or endpoint is rotated to get around it.
+
+An elapsed deadline NEVER clears the hold and never permits a Go. At most it permits ONE read-only check visit (the
+normal paced navigation and read; the legacy owner also keeps observing under a hold), after which the account is silent
+again for a fresh 15 minute cooldown unless a new 429 set a longer one. The machine hold (`stop:*` equal to the 429 text,
+recorded together with its own cooldown) is released ONLY when the cooldown is over AND every restricted endpoint has a
+strictly later success of the SAME exact path AND no 401/403/quota sighting is newer than any of those successes; the
+release deletes exactly that one control (compare and delete), so a user pause, challenge, quota latch, per-chat stop or a
+different `stop:*` is never cleared, and a Go afterwards still needs the normal admission. A fresh success of another
+endpoint (the conversation list) never hides a newer 429 of an exact chat read. A hold without the patrol's own evidence
+(a legacy hold, a foreign one, an elapsed cooldown with no recorded endpoint) is not auto-cleared: telemetry reports
+`429 hold pending: needs verified same-endpoint success / existing authorized coordinator` and `chatgpt-guardian resume`
+stays the manual action. Evidence is persisted across restarts. Limitation: a restricted endpoint the tab never requests
+again (a deleted chat, a list call the page no longer makes) cannot be verified, and the hold then stays pending.
+
+**Running responses.** When the owned tab shows an active response (the existing adapter's running signal) the patrol
+does not navigate away, does not send a Go, does not open a second tab and never clicks Stop. The slot becomes an
+explicit `deferred` / `running-protected` visit (persisted, visible in `rotation.deferred` and `last_visit`), the next
+attempt is one fresh draw later with no burst, and ordinary rotation resumes only when the tab is idle. A tab already on
+the chat being visited is just read (nothing to navigate). This is deliberate and not a complete solution: navigating
+away from an active response has no permitted live proof, so that path is disabled, not verified.
+
+**Legacy coverage and startup restore.** While the patrol runs it holds the existing per-account lock for its whole life
+(the same one `coverage --apply` and `startup --apply` take), so `coverage --apply` reports `busy` and `startup --apply`
+(the browser unit's `ExecStartPost`) is refused: neither can reopen every enrolled chat. The independent passive observer
+is unaffected. The lock is dropped with the process. After a browser restart the one-shot startup restore may run before
+the patrol is back; the patrol then consolidates the reopened tabs. Drop that `ExecStartPost` line from the browser
+drop-in when the account is permanently single-tab.
+
+**The marker survives a conflicting launch.** The `mode:single-tab` control marks the recorded mode. A second legacy
+`live` launch while a patrol runs fails on the account lock and leaves the marker untouched; a legacy launch with no
+patrol is also refused while the mode is recorded. Rollback is deliberate and exclusive: `live --retire-single-tab`
+(without `--single-tab`) takes the account lock, retires the marker only while holding it, then starts the legacy loop.
+
+**Telemetry.** `status` gains a `rotation` block and `monitor --json` is annotated with it (see `MONITORING.md`); accounts
+that never ran in single-tab mode keep exactly the old output.
+
+Rollback: replace `--single-tab` with `--retire-single-tab` in the unit and restart that one service (it refuses while a
+patrol still runs). The rotation file is left in place and ignored; holds, pauses, quota, attempts and the browser are
+untouched. Plain removal of `--single-tab` is refused while the marker is recorded, so a stray legacy start cannot undo it.
 
 ## Verification
 

@@ -58,6 +58,49 @@
   The selected-model panel proof, exact turn/account identity, draft/running/uncertain vetoes and the rule that a
   closed `Pro` label never implies Astra are unchanged, and two visible triggers still fail closed. The probe body is
   split into small helpers without changing its order of checks.
+- `agenttools-chatgpt` 0.3.12 (Refs #1039; 0.3.11 is reserved for the rotation work, so the rotation branch
+  must rebase onto this patch and may renumber): the read-only monitor no longer reports a conversation `complete`
+  from the `data-talvt-turn-state="complete"` marker alone. A newest unique turn with a user message and no assistant
+  side (no role element, agent-turn start, markdown, sub-agent activity or assistant-side media) is
+  `status: unanswered` (per-turn `assistant_absent`), still a current, valid observation. `complete` now needs an
+  answer in that same turn (assistant text, or assistant media inside a started assistant side); when neither an answer
+  nor the absence of one is proven (duplicate turn key, bare agent-turn marker, unmarked media, a turn with no user
+  bubble and no assistant side) it is `unknown`. Running, quota, draft, dialog, duplicate-root and uncertain-send
+  handling are unchanged, a sent-new user-only turn stays `unconfirmed`, and `unanswered` triggers no recovery, Retry
+  or Go.
+- `agenttools-chatgpt` 0.3.13 (Refs #1038; 0.3.11 was the working number of this branch, rebased on the 0.3.12
+  observer patch above): native single-tab patrol, `chatgpt-guardian live --single-tab`. One owned conversation tab per
+  account visits a persisted queue of enrolled chats on an independently randomized `--rotation-min`/`--rotation-max`
+  interval (default 240-360 s, safe range 120-900 s) that is counted BETWEEN VISIT STARTS: the one draw of a visit is
+  made when it starts and the in-visit `--confirm-wait` (default 45 s, 20-60 s) is inside the interval, never added to
+  it. It reads only the visited conversation and sends at most one Go for a verified structurally failed latest turn
+  through the existing Guardian reservation (no model switching, no Stop click, no second tab), then correlates the Go
+  with the next assistant response. New stdlib-only `rotation.py` persists queue, cursor, current target, next due
+  time, the start of the last visit and an explicit `deferred` state atomically and validates schema and account on
+  load (a wrong-account or corrupt file refuses to start; a restart, even in the middle of a visit, keeps the anchor;
+  an overrun, a downtime or a cooldown that outlasts the draw is a visible deferral scheduled one fresh draw from now,
+  never a catch-up burst). New `patrol.py` is the loop: it holds the per-account tab lock for its whole life so
+  `coverage --apply` and `startup --apply` cannot reopen every enrolled chat (the independent observer still runs),
+  consolidates extra proven Guardian-owned tabs only after persisting their URLs and proving them idle, never touches
+  user, login or draft tabs, and keeps the owner-approved continuation path. A tab that shows an ACTIVE RESPONSE is
+  never navigated away from, sent to or closed: the slot becomes a persisted `running-protected` deferral and
+  rotation resumes only when the tab is idle. The real `Retry-After` becomes a durable cooldown, and an elapsed
+  deadline NEVER clears the machine 429 hold or permits a Go: it permits at most one read-only check visit. The hold
+  (and only that exact `stop:*` text, by compare and delete) is released only when the browser's own response events
+  show a strictly later success of the SAME exact endpoint path for every restricted endpoint, with no newer 401/403 or
+  quota sighting; a fresh conversation-list 200 does not hide a newer per-chat 429. A hold without that evidence stays
+  and is reported as `429 hold pending: needs verified same-endpoint success / existing authorized coordinator`.
+  A legacy `live` launch never erases the single-tab marker: it is refused while the mode is recorded and while a
+  patrol holds the account lock; the new `--retire-single-tab` is the deliberate rollback, valid only while holding that
+  lock. `status` and `monitor --json` gain a read-only `rotation` block (current chat, queue, last visit with its start,
+  deferral, next navigation, last Go and its correlated confirmation, 429 evidence, queued vs current vs paused) via the
+  new `rotation_view.py`; accounts that never ran single-tab keep the old output. `cli.py` was split into
+  `build_parser`, `dispatch` and small handlers (and `serve` into helpers) with unchanged behaviour. In that view
+  `summary.coverage_complete` preserves the observer's verdict: a queued chat that was never visited no longer turns it
+  true. Limitations:
+  navigating away from an active response has no permitted live proof and is disabled, not verified; 429 recovery is
+  verified-only and may stay pending for an endpoint the tab never requests again; a Go receipt is not a confirmed
+  continuation; enrolled chats that are not verified structural failures are visited, never sent to.
 - Worktree-only guard is ON BY DEFAULT and now covers commits (agent-tools#1012, Refs #1012):
   `worktree-only-writes`, `pin-primary-worktree` and `block-devserver-primary` enforce in every
   repo that has a `rig.yaml` unless it sets `agent_hooks.worktree_only: false` (or the session

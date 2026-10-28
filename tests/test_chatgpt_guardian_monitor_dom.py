@@ -19,13 +19,17 @@ CHAT = "https://chatgpt.com/c/" + ID
 GO = "\u0433\u043e"
 
 
-def turn(key, state, user="Task", assistant="markdown", started=True, failed=False):
+def turn(
+    key, state, user="Task", assistant="markdown", started=True, failed=False, extra=""
+):
     """One wrapper holds the user bubble and the assistant side, as on the page."""
     body = {
         "markdown": '<div role="group" aria-label="Assistant" data-markdown-copy>Answer</div>',
         "subagent": '<section data-testid="chatgpt-subagent-activity">Agents</section>',
         "legacy": '<div data-message-author-role="assistant">Answer</div>',
         "empty": '<div data-message-author-role="assistant"></div>',
+        "image": '<div data-message-author-role="assistant"><img alt="" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></div>',
+        "media": '<figure><img alt="" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></figure>',
         None: "",
     }[assistant]
     # `True` is the legacy activity header; "canvas" is the current collapsed
@@ -41,7 +45,7 @@ def turn(key, state, user="Task", assistant="markdown", started=True, failed=Fal
         f'<div><div data-talvt-turn-state="{state}">{header}'
         f'<div data-chatgpt-search-unit-key="fallback-turn-0:0:user" data-chatgpt-search-message-ids="{key}">'
         f'<div><div data-user-message-bubble="true">{user}</div></div></div>{marker}'
-        "</div></div></div></div>"
+        f"</div></div></div>{extra}</div>"
     )
 
 
@@ -276,6 +280,92 @@ CASES.update(
         ).replace('<button aria-label="Open profile menu">Account</button>', ""),
     }
 )
+
+
+def user_only(key, user="Go", extra=""):
+    """The newest user message with no assistant side at all, still tagged complete."""
+    return turn(key, "complete", user=user, assistant=None, started=False, extra=extra)
+
+
+# Synthetic stand-in for a generic page error: its real DOM was never captured, so the tests
+# only claim that the observation does not depend on where such text sits.
+GENERIC_ERROR = (
+    "<div><span>Something went wrong. Please try again.</span>"
+    '<button type="button">Retry</button></div>'
+)
+QUOTED_ERROR = "Something went wrong. Please try again. <button>Retry</button>"
+IMAGE = '<img alt="" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">'
+DRAFT_COMPOSER = COMPOSER.replace("<p><br></p>", "<p>draft</p>")
+QUOTA_ALERT = '<div role="alert">You have reached the usage limit reached for now</div>'
+
+CASES.update(
+    {
+        "unanswered-sole-turn": canvas_page(user_only(T1)),
+        "unanswered-after-answered-turn": canvas_page(
+            user_only(T2), turn(T1, "complete")
+        ),
+        "unanswered-new-turn-id": canvas_page(user_only(T3), user_only(T2)),
+        "unanswered-quoted-error-in-latest-user": canvas_page(
+            user_only(T2, user=QUOTED_ERROR), turn(T1, "complete")
+        ),
+        "unanswered-generic-retry-in-turn": canvas_page(
+            user_only(T1, extra=GENERIC_ERROR)
+        ),
+        "unanswered-generic-retry-outside-turns": canvas_page(
+            user_only(T1), extra=GENERIC_ERROR
+        ),
+        "unanswered-with-draft": canvas_page(user_only(T1)).replace(
+            COMPOSER, DRAFT_COMPOSER
+        ),
+        "unanswered-unknown-dialog": canvas_page(
+            user_only(T1), extra=dialog('<h2>Rename chat</h2><input aria-label="Name">')
+        ),
+        "unanswered-quota-alert": canvas_page(user_only(T1), extra=QUOTA_ALERT),
+        "unanswered-signed-out": canvas_page(user_only(T1)).replace(
+            '<button aria-label="Open profile menu">Account</button>', ""
+        ),
+        "unanswered-stop-visible": canvas_page(user_only(T1), stop=True),
+        "unanswered-in-progress": canvas_page(
+            turn(T1, "in_progress", assistant=None, started=False)
+        ),
+        "unanswered-duplicate-turn-key": canvas_page(
+            user_only(T2), turn(T2, "complete")
+        ),
+        "unanswered-duplicate-roots": page(
+            root(inner=user_only(T1)) + root(inner=user_only(T1)), stop=False
+        ),
+        "answered-text": canvas_page(turn(T1, "complete")),
+        "answered-image-only": canvas_page(
+            turn(T1, "complete", assistant="image", started=False)
+        ),
+        "answered-subagent-only": canvas_page(
+            turn(T1, "complete", assistant="subagent", started=False)
+        ),
+        "marker-only-complete": canvas_page(turn(T1, "complete", assistant=None)),
+        "empty-role-complete": canvas_page(
+            turn(T1, "complete", assistant="empty", started=False)
+        ),
+        "answered-image-with-marker": canvas_page(
+            turn(T1, "complete", assistant="media", started=True)
+        ),
+        "complete-without-user-or-assistant": canvas_page(
+            user_only(T1).replace(
+                '<div data-user-message-bubble="true">Go</div>', "<div></div>"
+            )
+        ),
+        "user-attachment-outside-bubble": canvas_page(user_only(T1, extra=IMAGE)),
+        "unanswered-user-image-in-bubble": canvas_page(
+            user_only(T1, user=IMAGE + "Do this")
+        ),
+        "answered-quoted-error-in-earlier-user": canvas_page(
+            turn(T2, "complete"), turn(T1, "complete", user=QUOTED_ERROR)
+        ),
+        "unmarked-media-complete": canvas_page(
+            turn(T1, "complete", assistant="media", started=False)
+        ),
+        "go-user-only-complete": go_case(user_only(T2, user=GO)),
+    }
+)
 # Pages whose conversation root must be accepted by both scripts.
 ACCEPTED = {
     "uuid-root",
@@ -298,6 +388,7 @@ ROOT_REFUSALS = {
     "two-visible-one-matching": "root-ambiguous",
     "two-visible-wrong-and-right": "root-ambiguous",
     "all-hidden": "root-not-visible",
+    "unanswered-duplicate-roots": "root-ambiguous",
 }
 
 
@@ -617,3 +708,152 @@ def test_only_challenges_latch_a_durable_human_stop(results, tmp_path, name, lat
     assert ("stop:" + observed.chat in controls) is latched
     if latched:
         assert controls["stop:" + observed.chat] == "human challenge"
+
+
+UNANSWERED = [
+    "unanswered-sole-turn",
+    "unanswered-after-answered-turn",
+    "unanswered-new-turn-id",
+    "unanswered-quoted-error-in-latest-user",
+    "unanswered-generic-retry-in-turn",
+    "unanswered-generic-retry-outside-turns",
+    "unanswered-with-draft",
+    "unanswered-unknown-dialog",
+    "unanswered-signed-out",
+    "unanswered-user-image-in-bubble",
+]
+
+
+@pytest.mark.parametrize("name", UNANSWERED)
+def test_latest_user_only_turn_tagged_complete_is_unanswered_not_complete(
+    results, name
+):
+    monitor = results[name]["monitor"]
+    assert "error" not in monitor
+    assert monitor["status"] == "unanswered"
+    assert monitor["running"] is False and monitor["stop_visible"] is False
+    latest = monitor["turns"][-1]
+    assert latest["assistant_state"] == "complete"
+    assert latest["assistant_absent"] is True
+    assert latest["assistant_started"] is False and latest["assistant_present"] is False
+    # A page error is a diagnostic only: no action field is ever derived from it.
+    assert not any("retry" in key or "action" in key for key in monitor)
+
+
+def test_previous_answer_is_not_credited_to_a_new_latest_user(results):
+    monitor = results["unanswered-after-answered-turn"]["monitor"]
+    older, latest = monitor["turns"]
+    assert older["assistant_absent"] is False and older["assistant_present"] is True
+    assert latest["assistant_absent"] is True and latest["id"] == T2
+    assert monitor["status"] == "unanswered"
+
+
+def test_changed_current_turn_id_follows_the_newest_turn(results):
+    monitor = results["unanswered-new-turn-id"]["monitor"]
+    assert monitor["turn"] == T3
+    assert [t["assistant_absent"] for t in monitor["turns"]] == [True, True]
+    other = results["unanswered-sole-turn"]["monitor"]
+    assert other["turn"] == T1
+    assert monitor["progress_token"] != other["progress_token"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "answered-text",
+        "answered-image-only",
+        "answered-subagent-only",
+        "answered-image-with-marker",
+        "answered-quoted-error-in-earlier-user",
+        "canvas-older-only",
+    ],
+)
+def test_turns_with_assistant_evidence_stay_complete(results, name):
+    monitor = results[name]["monitor"]
+    assert monitor["status"] == "complete"
+    assert monitor["turns"][-1]["assistant_absent"] is False
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "unmarked-media-complete",
+        "marker-only-complete",
+        "empty-role-complete",
+        "complete-without-user-or-assistant",
+        "user-attachment-outside-bubble",
+    ],
+)
+def test_complete_tag_without_an_answer_or_proof_of_absence_is_unknown(results, name):
+    monitor = results[name]["monitor"]
+    assert monitor["status"] == "unknown"
+    assert monitor["turns"][-1]["assistant_absent"] is False
+
+
+def test_duplicate_turn_key_is_unknown_not_unanswered(results):
+    monitor = results["unanswered-duplicate-turn-key"]["monitor"]
+    assert monitor["status"] == "unknown"
+    assert monitor["turns"][-1]["assistant_absent"] is True
+
+
+@pytest.mark.parametrize("name", ["unanswered-stop-visible", "unanswered-in-progress"])
+def test_running_state_outranks_an_absent_response(results, name):
+    monitor = results[name]["monitor"]
+    assert monitor["status"] == "working" and monitor["running"] is True
+
+
+def test_quota_alert_still_outranks_an_absent_response(results):
+    monitor = results["unanswered-quota-alert"]["monitor"]
+    assert monitor["status"] == "quota-or-rate-limit" and monitor["restricted"] is True
+
+
+def test_unanswered_turn_leaves_the_live_controls_unchanged(results):
+    assert results["unanswered-with-draft"]["live"]["draft"] is True
+    assert results["unanswered-sole-turn"]["live"]["draft"] is False
+    dialog_live = results["unanswered-unknown-dialog"]["live"]
+    assert dialog_live["ambiguous"] is True
+    assert "dialog:unknown" in dialog_live["evidence"].split(";")
+    assert results["unanswered-signed-out"]["live"]["ambiguous"] is True
+    # The recovery adapter never reads a user-only turn as a failure to repair.
+    assert results["unanswered-sole-turn"]["live"]["active"] is False
+
+
+def project(monitor, attempts=(), controls=None):
+    from agenttools_chatgpt.monitor import project_snapshot
+
+    now = 1792254000.0
+    sample = dict(monitor, chat=CHAT, checked_at=now)
+    return project_snapshot(
+        "glide.vc",
+        {"watch:" + CHAT: "1"} if controls is None else controls,
+        list(attempts),
+        [sample],
+        None,
+        {"connection": "connected", "heartbeat_at": now - 5},
+        now,
+    )["sessions"][0]
+
+
+def test_unanswered_is_a_current_valid_observation_not_an_error_or_stale(results):
+    row = project(results["unanswered-sole-turn"]["monitor"])
+    assert row["observation"] == "current" and row["error"] == ""
+    assert row["status"] == "unanswered"
+    assert row["running"] is False
+    assert row["reason"] == ""
+
+
+def test_sent_new_user_only_turn_is_not_started_or_completed(results):
+    now = 1792254000.0
+    attempt = {
+        "chat": CHAT,
+        "turn": T1,
+        "generation": T1,
+        "wall": now - 30,
+        "state": "sent",
+    }
+    row = project(results["go-user-only-complete"]["monitor"], [attempt])
+    assert row["status"] == "unanswered"
+    assert row["continuation"] == "unconfirmed"
+    assert row["continuation_turn"] == ""
+    assert row["continuation_observed_at"] is None
+    assert row["completion_observed_at"] is None

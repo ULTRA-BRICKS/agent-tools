@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agenttools-chatgpt"
-version = "0.3.10"
+version = "0.3.13"
 description = "Observe-first ChatGPT Guardian with durable conservative recovery controls"
 readme = "README.md"
 requires-python = ">=3.10"

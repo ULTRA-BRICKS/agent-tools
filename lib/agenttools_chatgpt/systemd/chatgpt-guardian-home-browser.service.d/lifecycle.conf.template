@@ -6,6 +6,9 @@
 # job, so BindsTo= dependents (the Guardian) are not stopped. An explicit
 # `systemctl --user stop` still leaves the unit stopped. RestartSec=60 and the
 # StartLimit* settings stay as in the base unit.
+# Single-tab patrol (`live --single-tab`): the patrol holds the account lock, so this restore is refused while it runs;
+# after a browser restart it may reopen the enrolled chats once and the patrol then consolidates them to one tab.
+# Delete the ExecStartPost line below when the account is permanently single-tab.
 [Service]
 Restart=always
 RestartMode=direct

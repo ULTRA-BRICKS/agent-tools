@@ -52,7 +52,7 @@ def ensure_token(path: Path) -> str:
     return token
 
 
-async def serve(args, store: Store):
+def _serve_settings(args) -> tuple[Contract, list[str]]:
     contract = Contract.load(Path(args.contract) if args.contract else None)
     if args.apply and not contract.verified_account_ui:
         raise ValueError(
@@ -63,6 +63,63 @@ async def serve(args, store: Store):
         raise ValueError(
             "run requires --chat; manual mode opens the login browser only"
         )
+    return contract, chats
+
+
+async def _challenged(context, store: Store, contract: Contract) -> bool:
+    """Inspect every open page; a login or challenge screen becomes a durable stop."""
+    blocked = False
+    for page in context.pages:
+        observed = await asyncio.wait_for(
+            PlaywrightAdapter(page, contract).observe(), timeout=5
+        )
+        if observed.challenge:
+            await asyncio.to_thread(store.stop, observed.chat or "*", "human challenge")
+            blocked = True
+    return blocked
+
+
+async def _open_chats(
+    context, chats: list[str], store: Store, contract: Contract
+) -> None:
+    """URLs are explicit enrollment; navigation opens existing chats, never submits a prompt."""
+    for chat in chats:
+        store.enroll(chat)
+    for chat in chats:
+        if any(page.url.rstrip("/") == chat for page in context.pages):
+            continue
+        if await _challenged(context, store, contract):
+            break
+        page = await context.new_page()
+        await page.goto(chat, wait_until="domcontentloaded", timeout=30000)
+
+
+async def _watch_once(
+    context, contract: Contract, guardian: Guardian, store: Store, chats, args
+) -> None:
+    # Inspect every owned permanent chat for quota/challenge; enrollment is separate.
+    adapters = [
+        PlaywrightAdapter(page, contract)
+        for page in context.pages
+        if not page.is_closed()
+    ]
+    samples = await observe_tabs(adapters, record_safety=guardian.record_safety)
+    controls = await asyncio.to_thread(store.controls)
+    for adapter, observed, captured_at in samples:
+        chat = observed.chat
+        if controls.get("watch:" + chat) == "1" and chat in chats:
+            reason = await asyncio.wait_for(
+                guardian.run_once(adapter, initial=observed, observed_at=captured_at),
+                timeout=10,
+            )
+            print(
+                json.dumps({"chat": chat, "state": reason, "apply": args.apply}),
+                flush=True,
+            )
+
+
+async def serve(args, store: Store):
+    contract, chats = _serve_settings(args)
     lifecycle = BrowserLifecycle(Path(args.profile_root), args.workspace, args.browser)
     control = ControlServer(
         store, ensure_token(Path(args.token_file)), args.control_port
@@ -78,52 +135,9 @@ async def serve(args, store: Store):
         if context is None:
             await stop.wait()
             return
-        for chat in chats:
-            store.enroll(chat)
-        # URLs are explicit enrollment; navigation opens existing chats, never submits a prompt.
-        for chat in chats:
-            existing = [page for page in context.pages if page.url.rstrip("/") == chat]
-            if existing:
-                continue
-            blocked = False
-            for page in context.pages:
-                observed = await asyncio.wait_for(
-                    PlaywrightAdapter(page, contract).observe(), timeout=5
-                )
-                if observed.challenge:
-                    await asyncio.to_thread(
-                        store.stop, observed.chat or "*", "human challenge"
-                    )
-                    blocked = True
-            if blocked:
-                break
-            page = await context.new_page()
-            await page.goto(chat, wait_until="domcontentloaded", timeout=30000)
+        await _open_chats(context, chats, store, contract)
         while not stop.is_set():
-            # Inspect every owned permanent chat for quota/challenge; enrollment is separate.
-            adapters = [
-                PlaywrightAdapter(page, contract)
-                for page in context.pages
-                if not page.is_closed()
-            ]
-            samples = await observe_tabs(adapters, record_safety=guardian.record_safety)
-            controls = await asyncio.to_thread(store.controls)
-            for adapter, observed, captured_at in samples:
-                chat = observed.chat
-                watched = controls.get("watch:" + chat) == "1"
-                if watched and chat in chats:
-                    reason = await asyncio.wait_for(
-                        guardian.run_once(
-                            adapter, initial=observed, observed_at=captured_at
-                        ),
-                        timeout=10,
-                    )
-                    print(
-                        json.dumps(
-                            {"chat": chat, "state": reason, "apply": args.apply}
-                        ),
-                        flush=True,
-                    )
+            await _watch_once(context, contract, guardian, store, chats, args)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=1)
             except asyncio.TimeoutError:
@@ -135,6 +149,41 @@ async def serve(args, store: Store):
             control.close()
 
 
+def run_live(args, store: Store) -> None:
+    """`live`: the legacy multi-tab owner, or the single-tab patrol; never both."""
+    if args.single_tab:
+        if args.retire_single_tab:
+            raise ValueError("--retire-single-tab cannot be combined with --single-tab")
+        from .patrol import serve_single_tab
+
+        asyncio.run(serve_single_tab(args, store))
+        return
+    stray = (args.rotation_min, args.rotation_max, args.confirm_wait)
+    if any(value is not None for value in stray):
+        raise ValueError(
+            "--rotation-min, --rotation-max and --confirm-wait require --single-tab"
+        )
+    from .live import serve_live
+    from .rotation import guard_legacy_launch
+
+    # A legacy launch never erases the single-tab marker on its own: it is refused while the
+    # mode is recorded, and only an explicit rollback, holding the account lock, retires it.
+    guard_legacy_launch(store, retire=args.retire_single_tab)
+    asyncio.run(serve_live(args, store))
+
+
+def status_payload(store: Store, workspace: str) -> dict:
+    from .rotation_view import block
+
+    status = store.status()
+    view = block(store.path, workspace, status["controls"])
+    return {
+        "state": str(store.path.absolute()),
+        **status,
+        **({"rotation": view} if view else {}),
+    }
+
+
 def poll_interval(raw: str) -> float:
     value = float(raw)
     if not math.isfinite(value) or value < 30:
@@ -144,7 +193,7 @@ def poll_interval(raw: str) -> float:
     return value
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="chatgpt-guardian",
         description="Observe ChatGPT failures; apply is explicit and fail closed",
@@ -254,6 +303,39 @@ def main(argv=None) -> int:
         default=2048,
         help="Pause live DOM reads and every mutation below this host MemAvailable floor in MiB (default 2048)",
     )
+    live.add_argument(
+        "--single-tab",
+        action="store_true",
+        help="Native single-tab patrol: ONE owned conversation tab visits a persisted queue of "
+        "enrolled chats on a randomized interval, sends at most one Go for a verified failed "
+        "turn and verifies the next response. Mutually exclusive with the legacy multi-tab "
+        "loop (same owner lock); disables coverage restore-all",
+    )
+    live.add_argument(
+        "--rotation-min",
+        type=float,
+        default=None,
+        help="Single-tab only: shortest seconds between navigations (default 240, 120 to 900)",
+    )
+    live.add_argument(
+        "--rotation-max",
+        type=float,
+        default=None,
+        help="Single-tab only: longest seconds between navigations (default 360, at most 900)",
+    )
+    live.add_argument(
+        "--confirm-wait",
+        type=float,
+        default=None,
+        help="Single-tab only: in-visit wait for the response after a Go (default 45, 20 to 60)",
+    )
+    live.add_argument(
+        "--retire-single-tab",
+        action="store_true",
+        help="Deliberate rollback to the legacy multi-tab loop: retires the recorded single-tab "
+        "mode while holding the account lock (refused while a patrol runs). Without it a legacy "
+        "launch is refused while the single-tab mode is recorded",
+    )
     sol = subs.add_parser(
         "live-sol",
         help="Explicitly select/verify Sol Extra High for one consented idle enrolled chat after Astra quota; never sends",
@@ -303,75 +385,120 @@ def main(argv=None) -> int:
             "dry run unless --apply",
         )
     )
+    return parser
+
+
+def _live_sol(args, store: Store) -> None:
+    from .live import select_live_sol
+
+    if not asyncio.run(select_live_sol(args, store)):
+        raise ValueError(
+            "Sol selection refused or unverified; inspect chat and controls before retrying"
+        )
+    print(
+        json.dumps(
+            {
+                "chat": canonical_chat(args.chat),
+                "model": "Sol",
+                "effort": "Extra High",
+                "verified": True,
+                "sent": False,
+            }
+        )
+    )
+
+
+def _run(args, store: Store) -> None:
+    args.token_file = args.token_file or str(args.state.parent / "control.token")
+    asyncio.run(serve(args, store))
+
+
+def _init(args, store: Store) -> None:
+    token_file = args.state.parent / "control.token"
+    ensure_token(token_file)
+    print(
+        json.dumps(
+            {"state": str(args.state), "token_file": str(token_file), "mode": "observe"}
+        )
+    )
+
+
+def _status(args, store: Store) -> None:
+    print(json.dumps(status_payload(store, args.workspace)))
+
+
+def _stop_or_resume(args, store: Store) -> None:
+    getattr(store, args.command)(canonical_chat(args.chat) if args.chat != "*" else "*")
+
+
+def _watch(args, store: Store) -> None:
+    store.set_control(
+        "watch:" + canonical_chat(args.chat), "1" if args.command == "watch" else "0"
+    )
+
+
+def _sol_opt(args, store: Store) -> None:
+    store.opt_in_sol(canonical_chat(args.chat), args.command == "sol-opt-in")
+
+
+def _quota_clear(args, store: Store) -> None:
+    store.clear_quota()
+
+
+def _resolve_send(args, store: Store) -> None:
+    store.resolve(canonical_chat(args.chat), args.turn, args.generation)
+
+
+# Commands that act on the account's recovery Store, selected by subcommand name.
+STORE_COMMANDS = {
+    "live-sol": _live_sol,
+    "live": run_live,
+    "run": _run,
+    "init": _init,
+    "status": _status,
+    "stop": _stop_or_resume,
+    "resume": _stop_or_resume,
+    "quota-clear": _quota_clear,
+    "resolve-send": _resolve_send,
+    "watch": _watch,
+    "unwatch": _watch,
+    "sol-opt-in": _sol_opt,
+    "sol-opt-out": _sol_opt,
+}
+
+
+def _resolve_scope(args) -> None:
+    run_workspace = getattr(args, "run_workspace", None)
+    if args.workspace and run_workspace and args.workspace != run_workspace:
+        raise ValueError("Conflicting workspace options")
+    args.workspace = args.workspace or run_workspace or "home"
+    args.state = state_path(args.workspace, args.state)
+
+
+def dispatch(args) -> int:
+    _resolve_scope(args)
+    if args.command == "observer":
+        from .monitor_observer import command
+
+        return command(args)
+    if args.command == "monitor":
+        from .rotation_view import monitor_command
+
+        return monitor_command(args)
+    if args.command == "coverage":
+        return coverage_command.command(args)
+    handler = STORE_COMMANDS.get(args.command)
+    if handler is None:
+        raise ValueError("Unknown command: " + str(args.command))
+    handler(args, Store(args.state, account=args.workspace))
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        run_workspace = getattr(args, "run_workspace", None)
-        if args.workspace and run_workspace and args.workspace != run_workspace:
-            raise ValueError("Conflicting workspace options")
-        args.workspace = args.workspace or run_workspace or "home"
-        args.state = state_path(args.workspace, args.state)
-        if args.command in ("monitor", "observer"):
-            from .monitor_observer import command
-
-            return command(args)
-        if args.command == "coverage":
-            return coverage_command.command(args)
-        store = Store(args.state, account=args.workspace)
-        token_file = args.state.parent / "control.token"
-        if args.command == "live-sol":
-            from .live import select_live_sol
-
-            if not asyncio.run(select_live_sol(args, store)):
-                raise ValueError(
-                    "Sol selection refused or unverified; inspect chat and controls before retrying"
-                )
-            print(
-                json.dumps(
-                    {
-                        "chat": canonical_chat(args.chat),
-                        "model": "Sol",
-                        "effort": "Extra High",
-                        "verified": True,
-                        "sent": False,
-                    }
-                )
-            )
-        elif args.command == "live":
-            from .live import serve_live
-
-            asyncio.run(serve_live(args, store))
-        elif args.command == "run":
-            args.token_file = args.token_file or str(token_file)
-            asyncio.run(serve(args, store))
-        elif args.command == "init":
-            ensure_token(token_file)
-            print(
-                json.dumps(
-                    {
-                        "state": str(args.state),
-                        "token_file": str(token_file),
-                        "mode": "observe",
-                    }
-                )
-            )
-        elif args.command == "status":
-            print(json.dumps({"state": str(store.path.absolute()), **store.status()}))
-        elif args.command in ("stop", "resume"):
-            getattr(store, args.command)(
-                canonical_chat(args.chat) if args.chat != "*" else "*"
-            )
-        elif args.command == "quota-clear":
-            store.clear_quota()
-        elif args.command == "resolve-send":
-            store.resolve(canonical_chat(args.chat), args.turn, args.generation)
-        elif args.command in ("watch", "unwatch"):
-            store.set_control(
-                "watch:" + canonical_chat(args.chat),
-                "1" if args.command == "watch" else "0",
-            )
-        else:
-            store.opt_in_sol(canonical_chat(args.chat), args.command == "sol-opt-in")
-        return 0
+        return dispatch(args)
     except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
         parser.exit(
             2,
