@@ -684,3 +684,94 @@ def test_a_stream_of_429s_is_not_written_once_per_response(tmp_path, monkeypatch
     assert (
         rig.rotation.cooldown["until"] == WALL0 + 10 + 1.99 + 600
     )  # memory is current
+
+
+@pytest.mark.parametrize("http_status", [429, 401, 403])
+def test_a_new_transport_error_cannot_overwrite_an_existing_owner_global_pause(
+    tmp_path, monkeypatch, http_status
+):
+    """A later response never replaces a human-owned stop with an auto-releasable hold."""
+    rig = rig_with(tmp_path, monkeypatch)
+    rig.store.stop("*", "owner paused everything")
+    rig.clock.t = 10
+    rig.transport.respond(http_status, READ_A, retry_after=60)
+    assert held(rig) == "owner paused everything"
+    if http_status == 429:
+        rig.clock.t = 5000
+        rig.transport.respond(200, READ_A)
+        assert held(rig) == "owner paused everything"
+
+
+@pytest.mark.parametrize("reason", ["human challenge", "quota exhausted"])
+@pytest.mark.parametrize("http_status", [429, 401, 403])
+def test_a_new_transport_error_cannot_overwrite_an_existing_challenge_or_quota_pause(
+    tmp_path, monkeypatch, http_status, reason
+):
+    """Auth/quota pauses are owner-visible stops too: no machine response rewrites them."""
+    rig = rig_with(tmp_path, monkeypatch)
+    rig.store.stop("*", reason)
+    rig.clock.t = 10
+    rig.transport.respond(http_status, READ_A, retry_after=60)
+    assert held(rig) == reason
+
+
+def test_a_machine_429_hold_is_still_set_by_a_live_429(tmp_path, monkeypatch):
+    rig = rig_with(tmp_path, monkeypatch)
+    assert held(rig) is None
+    rig.clock.t = 10
+    rig.transport.respond(429, READ_A, retry_after=60)
+    assert held(rig) == HOLD
+    rig.clock.t = 5000
+    rig.transport.respond(200, READ_A)
+    assert held(rig) == HOLD  # a response alone never releases; the patrol tick does
+
+
+def test_an_auth_failure_strengthens_a_machine_429_hold_but_not_the_reverse(
+    tmp_path, monkeypatch
+):
+    rig = rig_with(tmp_path, monkeypatch)
+    rig.clock.t = 10
+    rig.transport.respond(429, READ_A, retry_after=60)
+    assert held(rig) == HOLD
+    rig.transport.respond(401, READ_A)
+    assert held(rig) == "human challenge"  # no longer the exact machine hold
+    assert rig.transport.reason == "human challenge"
+    rig.transport.respond(429, READ_A, retry_after=60)
+    assert held(rig) == "human challenge"
+    assert (
+        rig.transport.reason == "human challenge"
+    )  # the guard still owns its own latch
+
+
+@pytest.mark.parametrize("http_status", [429, 401, 403])
+def test_a_replayed_resource_entry_cannot_overwrite_an_owner_pause(
+    tmp_path, monkeypatch, http_status
+):
+    async def case():
+        rig = rig_with(tmp_path, monkeypatch)
+        rig.store.stop("*", "owner paused everything")
+        page = AsyncMock()
+        page.evaluate.return_value = [
+            {"url": "https://chatgpt.com" + READ_A, "status": http_status}
+        ]
+        await rig.transport.seed(page)
+        assert held(rig) == "owner paused everything"
+        assert rig.transport.reason == ""
+
+    run(case())
+
+
+def test_an_owner_pause_survives_the_patrol_tick_after_a_late_429(
+    tmp_path, monkeypatch
+):
+    async def case():
+        rig = rig_with(tmp_path, monkeypatch)
+        rig.store.stop("*", "owner paused everything")
+        rig.clock.t = 10
+        rig.transport.respond(429, READ_A, retry_after=60)
+        rig.transport.respond(200, READ_A)
+        await late_tick(rig)
+        assert held(rig) == "owner paused everything"
+        assert sends(rig) == 0 and attempts(rig.store) == []
+
+    run(case())

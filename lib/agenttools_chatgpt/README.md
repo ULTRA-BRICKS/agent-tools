@@ -143,7 +143,9 @@ same latch once per watched page attachment, if available. No private API reques
 response body, headers, cookies or tokens are read. No timer clears a stop, and no
 model switch bypasses it. The in-process hold is read from the durable `stop:*`
 control, so only an explicit `resume` releases it (the running service resumes at once
-without a restart) and a new 429/401/403 latches again. Under `live --single-tab` the patrol
+without a restart) and a new 429/401/403 latches again, but never over an existing owner,
+challenge or quota `stop:*`: it is written with `INSERT OR IGNORE`, so a human pause is
+preserved (0.3.14). Under `live --single-tab` the patrol
 may also release the exact machine 429 hold, but only on verified same-endpoint transport
 evidence (see "Single-tab patrol"), never on a timer. Event listeners detach on
 service exit.
@@ -407,6 +409,10 @@ sender, owner-approved continuation ledger and dedicated profile. Both modes tak
 side by side. A legacy `live` launch (without `--single-tab`) never touches the single-tab marker on its own: while the
 mode is recorded it is refused, and only the explicit rollback below retires it. Nothing scans conversation history,
 calls an API for chat lists or opens a second browser.
+
+The patrol opens and settles its rotation file (interrupted sends, overdue due time) only after it holds BOTH the owner
+lock and the account lock (0.3.14): a second launch that loses either lock refuses before touching the rotation file,
+so it can never rewrite the running patrol's in-flight Go record.
 
 Known limitations, stated plainly: navigating away from an ACTIVE response has no permitted live proof, so the patrol
 never does it (see "Running responses"); a machine 429 hold is released only by verified same-endpoint transport

@@ -101,6 +101,14 @@
   navigating away from an active response has no permitted live proof and is disabled, not verified; 429 recovery is
   verified-only and may stay pending for an endpoint the tab never requests again; a Go receipt is not a confirmed
   continuation; enrolled chats that are not verified structural failures are visited, never sent to.
+- `agenttools-chatgpt` 0.3.14 (Refs #1038): two data-safety guards of the single-tab patrol, no new dispatch path.
+  (1) The transport guard now latches a 429/401/403 with an atomic `INSERT OR IGNORE`, so a later response can never
+  overwrite an existing owner, challenge or quota `stop:*` (which the patrol's exact-match release could otherwise
+  have deleted); an auth failure may still strengthen the patrol's own machine 429 hold into `human challenge`, and a
+  429 never downgrades it. (2) `live --single-tab` validates its settings first but opens and settles the rotation
+  file (`Rotation.open`: interrupted `sending` -> `interrupted`, overdue due time redraw) only AFTER it holds both the
+  LiveOwner lock and the account lock, so a contender that loses either lock changes no Go record, attempt state or
+  schedule. Approval priority, thresholds and denied operations are unchanged.
 - Worktree-only guard is ON BY DEFAULT and now covers commits (agent-tools#1012, Refs #1012):
   `worktree-only-writes`, `pin-primary-worktree` and `block-devserver-primary` enforce in every
   repo that has a `rig.yaml` unless it sets `agent_hooks.worktree_only: false` (or the session

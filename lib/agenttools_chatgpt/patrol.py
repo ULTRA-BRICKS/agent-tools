@@ -141,6 +141,32 @@ class PatrolTransport(live.TransportGuard):
             and parsed.path.startswith(("/backend-api/", "/api/auth/", "/auth/"))
         )
 
+    def record(self, url: str, status: int) -> None:
+        """Atomically latch transport failures WITHOUT replacing any existing owner stop.
+
+        A later authentication failure may strengthen a machine 429 hold, never downgrade it,
+        and no response rewrites an owner, challenge or quota pause. `INSERT OR IGNORE` is
+        required: check-then-stop would race an owner's manual pause. The parent `seed` calls
+        this override too, so replayed resource entries cannot overwrite a stop either.
+        """
+        if not self._chatgpt_api(url) or status not in (429, 401, 403):
+            return
+        reason = MACHINE_429_HOLD if status == 429 else "human challenge"
+        with self.store.connect() as db:
+            db.execute("INSERT OR IGNORE INTO controls VALUES('stop:*', ?)", (reason,))
+            if status in (401, 403):
+                db.execute(
+                    "UPDATE controls SET value=? WHERE key='stop:*' AND value=?",
+                    (reason, MACHINE_429_HOLD),
+                )
+            (stored,) = db.execute(
+                "SELECT value FROM controls WHERE key='stop:*'"
+            ).fetchone()
+        # Own the latch only when the durable stop carries this guard's reason: a different
+        # stop (owner pause) or a stronger one this guard wrote earlier stays as it is.
+        if stored == reason:
+            self.latched = reason
+
     def on_response(self, response) -> None:
         # The browser's own responses are the only transport evidence. A live 429 carries the
         # real Retry-After; its endpoint and cooldown are durable before the hold exists, so a
@@ -834,8 +860,15 @@ def _setting(args, name: str, default: float) -> float:
     return default if value is None else value
 
 
-def _open_session(args, store: Store):
-    """Validate every setting and open the rotation BEFORE any browser work."""
+def _validate_session(args):
+    """Validate every setting BEFORE any browser work, without touching the rotation state.
+
+    `Rotation.open` settles interrupted sends and overdue schedules, so it MUST NOT run until
+    LiveOwner and the account lock are both held: a losing contender may never rewrite the
+    owner's in-flight Go record.
+    """
+    if args.workspace not in rotation.ACCOUNTS:
+        raise rotation.RotationError("account must be home or glide.vc")
     endpoint = live.validate_cdp(args.cdp)
     low, high = rotation.DEFAULT_INTERVAL
     interval = rotation.validate_interval(
@@ -847,10 +880,7 @@ def _open_session(args, store: Store):
     poll = getattr(args, "poll_interval", POLL_SECONDS)
     if not 30 <= poll < float("inf"):
         raise ValueError("poll interval must be finite and at least 30 seconds")
-    machine = rotation.Rotation.open(
-        rotation.rotation_path(store.path), args.workspace, interval=interval
-    )
-    return endpoint, machine, wait, poll
+    return endpoint, interval, wait, poll
 
 
 async def _run(patrol: Patrol, browser, args, stop: asyncio.Event, poll: float) -> None:
@@ -903,7 +933,7 @@ async def serve_single_tab(args, store: Store) -> None:
 
     from .cli import ensure_token
 
-    endpoint, machine, confirm_wait, poll = _open_session(args, store)
+    endpoint, interval, confirm_wait, poll = _validate_session(args)
     watch = {canonical_chat(raw): rotation.permanent_url(raw) for raw in args.watch}
     guardian = Guardian(store, apply=args.apply)
     stop = asyncio.Event()
@@ -919,6 +949,9 @@ async def serve_single_tab(args, store: Store) -> None:
     root = Path.home() / ".local/share/agent-tools/chatgpt-guardian"
     with ExitStack() as stack, live.LiveOwner(root, endpoint):
         await _hold_account(stack, store, stop)
+        machine = rotation.Rotation.open(
+            rotation.rotation_path(store.path), args.workspace, interval=interval
+        )
         # Telemetry marker: the monitor and status views report the account as single-tab.
         await asyncio.to_thread(store.set_control, rotation.MODE_CONTROL, "1")
         await asyncio.to_thread(Continuations(store).recover_interrupted)

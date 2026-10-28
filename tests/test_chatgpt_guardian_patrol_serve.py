@@ -9,7 +9,7 @@ import asyncio
 import json
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -213,3 +213,138 @@ def test_a_429_response_through_the_real_transport_guard_starts_the_durable_cool
     assert machine.cooldown["source"] == "retry-after"
     assert machine.cooldown["until"] == pytest.approx(time.time() + 600, abs=5)
     assert store.controls()["stop:*"] == patrol.MACHINE_429_HOLD
+
+
+def _denied_owner(*_args):
+    @contextmanager
+    def denied(*_a):
+        raise RuntimeError("another owner already running")
+        yield  # unreachable: makes this a generator for @contextmanager
+
+    return denied()
+
+
+def _go_machine(state, finish):
+    """An in-flight Go: "sending" is the state `begin_go` leaves, the others advance it."""
+    path = rotation.rotation_path(state)
+    machine = rotation.Rotation.open(path, "home")
+    machine.begin_go(CHAT, "latest-user-turn")
+    if finish == "sent-unconfirmed":
+        machine.finish_go("sent")
+    elif finish == "uncertain":
+        machine.finish_go("uncertain")
+    elif finish == "sent-confirmed":
+        machine.finish_go("sent")
+        machine.confirm_go("running", "response-turn")
+    return path
+
+
+def test_a_second_refused_owner_must_not_rewrite_an_inflight_go(tmp_path, monkeypatch):
+    """The contender may parse options but must not settle state before owning both locks."""
+    store = Store(tmp_path / "home" / "state.sqlite", account="home")
+    path = rotation.rotation_path(store.path)
+    machine = rotation.Rotation.open(path, "home")
+    machine.begin_go(CHAT, "latest-user-turn")
+    before = path.read_bytes()
+    Boundary(monkeypatch, store.path)
+    monkeypatch.setattr(live, "LiveOwner", _denied_owner)
+    with pytest.raises(RuntimeError, match="another owner"):
+        asyncio.run(patrol.serve_single_tab(args_for(), store))
+    assert path.read_bytes() == before
+    assert rotation.Rotation.read(path, "home").go["state"] == "sending"
+
+
+@pytest.mark.parametrize(
+    "finish", ["sending", "sent-unconfirmed", "sent-confirmed", "uncertain"]
+)
+def test_a_contender_denied_the_owner_lock_mutates_no_go_or_schedule(
+    tmp_path, monkeypatch, finish
+):
+    store = Store(tmp_path / "home" / "state.sqlite", account="home")
+    path = _go_machine(store.path, finish)
+    stale = rotation.Rotation.read(path, "home")
+    stale.next_due = time.time() - 36000  # overdue: Rotation.open would redraw it
+    stale.save()
+    before = path.read_bytes()
+    Boundary(monkeypatch, store.path)
+    monkeypatch.setattr(live, "LiveOwner", _denied_owner)
+    with pytest.raises(RuntimeError, match="another owner"):
+        asyncio.run(patrol.serve_single_tab(args_for(), store))
+    assert path.read_bytes() == before
+    assert rotation.MODE_CONTROL not in store.controls()
+
+
+@pytest.mark.parametrize("finish", ["sending", "sent-unconfirmed", "uncertain"])
+def test_a_contender_denied_the_account_lock_mutates_nothing(
+    tmp_path, monkeypatch, finish
+):
+    store = Store(tmp_path / "home" / "state.sqlite", account="home")
+    path = _go_machine(store.path, finish)
+    before = path.read_bytes()
+    boundary = Boundary(monkeypatch, store.path)
+    monkeypatch.setattr(patrol, "ACCOUNT_LOCK_WAIT", 0)
+    with (
+        account_lock(store.path),
+        pytest.raises(RuntimeError, match="account lock"),
+    ):
+        asyncio.run(patrol.serve_single_tab(args_for(), store))
+    assert path.read_bytes() == before
+    assert boundary.attached == []
+
+
+def test_restart_after_owning_both_locks_still_settles_an_interrupted_send(
+    tmp_path, monkeypatch
+):
+    store = Store(tmp_path / "home" / "state.sqlite", account="home")
+    path = _go_machine(store.path, "sending")
+    Boundary(monkeypatch, store.path)
+    asyncio.run(patrol.serve_single_tab(args_for(), store))
+    go = rotation.Rotation.read(path, "home").go
+    assert go["state"] == "interrupted" and go["chat"] == CHAT
+
+
+def test_a_sent_unconfirmed_go_survives_a_restart_unchanged(tmp_path, monkeypatch):
+    store = Store(tmp_path / "home" / "state.sqlite", account="home")
+    path = _go_machine(store.path, "sent-unconfirmed")
+    Boundary(monkeypatch, store.path)
+    asyncio.run(patrol.serve_single_tab(args_for(), store))
+    go = rotation.Rotation.read(path, "home").go
+    assert go["state"] == "sent" and go["confirmation"] == "unconfirmed"
+
+
+def test_a_failing_rotation_open_after_ownership_releases_both_locks(
+    tmp_path, monkeypatch
+):
+    state = tmp_path / "home" / "state.sqlite"
+    store = Store(state, account="home")
+    rotation.rotation_path(state).write_text("{ broken")
+    Boundary(monkeypatch, state)
+    exited = []
+
+    @contextmanager
+    def owner(*_a):
+        try:
+            yield
+        finally:
+            exited.append(True)
+
+    monkeypatch.setattr(live, "LiveOwner", owner)
+    with pytest.raises(rotation.RotationError):
+        asyncio.run(patrol.serve_single_tab(args_for(), store))
+    assert exited == [True]
+    with account_lock(state):
+        pass
+    assert rotation.MODE_CONTROL not in store.controls()
+
+
+def test_an_unknown_workspace_is_refused_before_any_lock_or_control_server(
+    tmp_path, monkeypatch
+):
+    store = Store(tmp_path / "home" / "state.sqlite", account="home")
+    boundary = Boundary(monkeypatch, store.path)
+    entered = []
+    monkeypatch.setattr(live, "LiveOwner", lambda *a: entered.append(a))
+    monkeypatch.setattr(patrol, "ControlServer", Mock(side_effect=entered.append))
+    with pytest.raises(rotation.RotationError, match="home or glide.vc"):
+        asyncio.run(patrol.serve_single_tab(args_for(workspace="typo"), store))
+    assert entered == [] and boundary.attached == []
