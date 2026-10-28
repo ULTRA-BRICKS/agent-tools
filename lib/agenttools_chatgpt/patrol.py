@@ -36,11 +36,10 @@ import signal
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import live, rotation
+from . import backoff, live, rotation
 from .continuation import Continuations
 from .core import Guardian, Observation, Store
 from .live import process_continuation
@@ -59,10 +58,7 @@ MIN_WAIT = 0.25
 # Recorded when a live 429 arrives while a machine hold already stands without any evidence of
 # ours (a legacy owner or a replayed seed latched it): no response ever targets this path, so
 # such a hold can never be released by the patrol's own evidence.
-FOREIGN_HOLD = "/hold-without-evidence"
-DEFAULT_COOLDOWN = 900.0
-COOLDOWN_FLOOR = 60.0
-COOLDOWN_CEILING = 86400.0
+FOREIGN_HOLD = rotation.FOREIGN_HOLD
 POLL_SECONDS = 60.0
 ACCOUNT_LOCK_WAIT = 150.0
 SAMPLE_GAP = 3.0
@@ -99,30 +95,6 @@ def auth_url(url: str) -> bool:
     if parts.netloc in AUTH_HOSTS:
         return True
     return parts.netloc == "chatgpt.com" and parts.path.startswith(AUTH_PATHS)
-
-
-def retry_after_seconds(value: object, now: float) -> float | None:
-    """Seconds a Retry-After header asks for (delta-seconds or HTTP-date), else None."""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if text.isascii() and text.isdigit() and len(text) <= 12:
-        return float(int(text))
-    try:
-        when = parsedate_to_datetime(text)
-    except (TypeError, ValueError):
-        return None
-    if when is None or when.tzinfo is None:
-        return None
-    return when.timestamp() - now
-
-
-def cooldown_for(header: object, now: float) -> tuple[float, str]:
-    """(deadline, source): the real Retry-After, clamped, or the conservative default."""
-    asked = retry_after_seconds(header, now)
-    seconds = DEFAULT_COOLDOWN if asked is None else asked
-    seconds = min(COOLDOWN_CEILING, max(COOLDOWN_FLOOR, seconds))
-    return now + seconds, "default" if asked is None else "retry-after"
 
 
 class PatrolTransport(live.TransportGuard):
@@ -184,15 +156,18 @@ class PatrolTransport(live.TransportGuard):
         path = urlsplit(response.url).path
         status = response.status
         if status == 429:
-            until, source = cooldown_for(response.headers.get("retry-after"), now)
             if self._foreign_hold():
                 self.machine.note_restricted(FOREIGN_HOLD, now)
             self.machine.note_restricted(path, now)
-            self.machine.set_cooldown(until, "http-429", source, MACHINE_429_HOLD)
+            # The deadline is max(adaptive ladder, the real Retry-After): see rotation.note_429.
+            self.machine.note_429(response.headers.get("retry-after"))
         elif status in (401, 403):
             self.machine.note_blocked(now)
         elif 200 <= status < 300:
             self.machine.note_success(path, now)
+            self.machine.note_target_success(path, now)
+        elif 500 <= status < 600:
+            self.machine.note_server_error()
 
     def _foreign_hold(self) -> bool:
         """A machine 429 hold that already stands although the patrol has no evidence for it
@@ -331,6 +306,7 @@ class Patrol:
         picked = self.rotation.pick(
             lambda chat: not rotation.pause_reason(readable, chat),
             prefer=None if self.checking else await self._approved_chat(),
+            probe=self.checking,
         )
         owned = self._owned_pages()
         # Protected extras are re-read only at a due visit, never every minute.
@@ -365,6 +341,8 @@ class Patrol:
             "auxiliary_page_count": auxiliary,
             "transport": self.transport.reason,
             "transport_hold": rotation.HOLD_PENDING if pending else "",
+            "pressure_level": self.rotation.pressure.level,
+            "retry_pending": sum(e.retry is not None for e in self.rotation.queue),
             "visit": None,
             **extra,
         }
@@ -377,16 +355,26 @@ class Patrol:
         An elapsed deadline never clears a hold. Only the exact machine 429 hold, with its own
         cooldown and endpoint evidence, is ever released, and only when the browser's responses
         show a later success of every restricted endpoint (rotation.hold_unverified). Until
-        then the elapsed deadline permits one read-only check visit and never a Go.
+        then the elapsed deadline permits one paced read-only check visit and never a Go. A
+        hold this process holds no evidence for (a legacy owner latched it) becomes an explicit
+        unverifiable state with the same paced diagnostics; the clock never clears it.
         """
         self.checking = False
         if self.rotation.cooling():
+            return "cooldown", controls
+        if (
+            controls.get("stop:*") == MACHINE_429_HOLD
+            and self.rotation.cooldown is None
+        ):
+            self.rotation.adopt_legacy_hold()
             return "cooldown", controls
         machine = self._machine_hold(controls)
         if self.rotation.cooldown is not None and not machine:
             self.rotation.clear_hold()  # the deadline is over and no 429 hold stands
         if machine:
             controls = await self._judge_hold(controls)
+            if self.rotation.cooling():
+                return "cooldown", controls
         if self.checking:
             return "", controls
         if "stop:*" in controls or self.transport.reason:
@@ -404,6 +392,9 @@ class Patrol:
     async def _judge_hold(self, controls: dict) -> dict:
         """A machine 429 hold whose cooldown is over: release it only when verified."""
         why = self.rotation.hold_unverified()
+        if why == "no-restriction-evidence":
+            self.rotation.adopt_legacy_hold()  # cooldown record without any endpoint evidence
+            return controls
         if not why:
             return await self._release()
         self.checking = why in CHECKABLE
@@ -521,8 +512,14 @@ class Patrol:
             min_available_mib=self.config.min_available_mib,
         )
 
-    async def _patrol_tab(self, entry: rotation.Entry) -> tuple[object | None, str]:
-        """The one tab to drive, or why none may be: the ceiling forbids a second tab."""
+    async def _patrol_tab(
+        self, entry: rotation.Entry, recheck: bool = False
+    ) -> tuple[object | None, str]:
+        """The one tab to drive, or why none may be: the ceiling forbids a second tab.
+
+        A `recheck` reloads the chat the tab already shows, so that tab is checked exactly like
+        one that is navigated away (draft, challenge, running response).
+        """
         owned = self._owned_pages()
         if not owned:
             if self.tab is not None and not self.tab.is_closed():
@@ -538,7 +535,7 @@ class Patrol:
         )
         first = ""
         for page in ordered:
-            away = conversation_identity(page.url) != entry.chat
+            away = recheck or conversation_identity(page.url) != entry.chat
             reason = await self._leave_blocked(page, away)
             if not reason:
                 return page, ""
@@ -564,7 +561,10 @@ class Patrol:
                 "connected", visit={"chat": None, "outcome": "nothing-visitable"}
             )
         entry, advance = picked
-        page, blocked = await self._patrol_tab(entry)
+        # A check under a hold, or a chat that carries a failure, is a controlled read-only
+        # retry: the page is loaded again (once) even when it already shows that chat.
+        recheck = self.checking or entry.retry is not None
+        page, blocked = await self._patrol_tab(entry, recheck)
         if page is None:
             outcome = (
                 "running-protected" if blocked == "running" else "protected:" + blocked
@@ -574,8 +574,8 @@ class Patrol:
                 "resource-paused" if blocked.startswith("resource") else "protected-tab"
             )
             return self._health(health, blocked=blocked)
-        self.rotation.begin_visit(entry)
-        outcome = await self._guarded(page, entry, controls)
+        self.rotation.begin_visit(entry, probe=recheck)
+        outcome = await self._guarded(page, entry, controls, recheck)
         self.rotation.end_visit(entry, outcome, advance)
         if self.checking:
             await self._after_check()
@@ -583,20 +583,19 @@ class Patrol:
 
     async def _after_check(self) -> None:
         """The single read-only check visit is over: release if its responses verified the
-        hold, otherwise stay silent again for a fresh default cooldown (a new 429 wins)."""
+        hold, otherwise stay silent again for a paced quiet period (a new 429 wins)."""
         if not self.rotation.hold_unverified():
             self.controls = await self._release()
         elif not self.rotation.cooling():
-            until = self.rotation.clock() + DEFAULT_COOLDOWN
-            self.rotation.set_cooldown(
-                until, "hold-recheck", "default", MACHINE_429_HOLD
-            )
+            self.rotation.rearm_probe()
 
-    async def _guarded(self, page, entry: rotation.Entry, controls: dict) -> str:
+    async def _guarded(
+        self, page, entry: rotation.Entry, controls: dict, recheck: bool
+    ) -> str:
         from playwright.async_api import Error as BrowserError
 
         try:
-            return await self._read_and_act(page, entry, controls)
+            return await self._read_and_act(page, entry, controls, recheck)
         except (BrowserError, asyncio.TimeoutError) as exc:
             self.guardian.stability.pop(entry.chat, None)
             return "error:" + type(exc).__name__
@@ -628,8 +627,10 @@ class Patrol:
             bool(self.transport.reason) and not self.checking
         )
 
-    async def _read_and_act(self, page, entry: rotation.Entry, controls: dict) -> str:
-        if conversation_identity(page.url) != entry.chat:
+    async def _read_and_act(
+        self, page, entry: rotation.Entry, controls: dict, recheck: bool = False
+    ) -> str:
+        if recheck or conversation_identity(page.url) != entry.chat:
             failure = await self._navigate(page, entry)
             if failure:
                 return failure
@@ -860,6 +861,18 @@ def _setting(args, name: str, default: float) -> float:
     return default if value is None else value
 
 
+def _backoff_settings(args) -> backoff.BackoffConfig | None:
+    """The explicit backoff overrides, validated; None keeps the stored settings."""
+    chosen = {key: getattr(args, "backoff_" + key, None) for key in ("base", "cap")}
+    chosen = {key: value for key, value in chosen.items() if value is not None}
+    if not chosen:
+        return None
+    try:
+        return backoff.BackoffConfig(**chosen).validated()
+    except backoff.BackoffError as exc:
+        raise rotation.RotationError(str(exc)) from exc
+
+
 def _validate_session(args):
     """Validate every setting BEFORE any browser work, without touching the rotation state.
 
@@ -880,7 +893,7 @@ def _validate_session(args):
     poll = getattr(args, "poll_interval", POLL_SECONDS)
     if not 30 <= poll < float("inf"):
         raise ValueError("poll interval must be finite and at least 30 seconds")
-    return endpoint, interval, wait, poll
+    return endpoint, interval, wait, poll, _backoff_settings(args)
 
 
 async def _run(patrol: Patrol, browser, args, stop: asyncio.Event, poll: float) -> None:
@@ -933,7 +946,7 @@ async def serve_single_tab(args, store: Store) -> None:
 
     from .cli import ensure_token
 
-    endpoint, interval, confirm_wait, poll = _validate_session(args)
+    endpoint, interval, confirm_wait, poll, tuning = _validate_session(args)
     watch = {canonical_chat(raw): rotation.permanent_url(raw) for raw in args.watch}
     guardian = Guardian(store, apply=args.apply)
     stop = asyncio.Event()
@@ -950,7 +963,10 @@ async def serve_single_tab(args, store: Store) -> None:
     with ExitStack() as stack, live.LiveOwner(root, endpoint):
         await _hold_account(stack, store, stop)
         machine = rotation.Rotation.open(
-            rotation.rotation_path(store.path), args.workspace, interval=interval
+            rotation.rotation_path(store.path),
+            args.workspace,
+            interval=interval,
+            backoff=tuning,
         )
         # Telemetry marker: the monitor and status views report the account as single-tab.
         await asyncio.to_thread(store.set_control, rotation.MODE_CONTROL, "1")

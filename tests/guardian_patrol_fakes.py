@@ -88,6 +88,7 @@ class World:
         self.head_change_on_active_read: dict[str, int] = {}
         self.flapping: set[str] = set()
         self.nav_error = False
+        self.goto_hook = None  # called with (page, url) on every navigation; may raise
         self.reads: dict[str, int] = {}
         self.active_reads: dict[str, int] = {}
 
@@ -214,6 +215,8 @@ class FakePage:
             from playwright.async_api import Error
 
             raise Error("net::ERR_FAILED")
+        if self.world.goto_hook:
+            self.world.goto_hook(self, url)
         self.url = self.world.redirects.get(url, url)
 
     async def close(self, **kwargs):

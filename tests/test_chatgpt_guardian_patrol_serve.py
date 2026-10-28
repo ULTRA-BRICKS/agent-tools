@@ -206,12 +206,13 @@ def test_a_429_response_through_the_real_transport_guard_starts_the_durable_cool
     response = SimpleNamespace(
         url="https://chatgpt.com/backend-api/conversation",
         status=429,
-        headers={"retry-after": "600"},
+        headers={"retry-after": "7200"},
     )
     callback(response)
     machine = rotation.Rotation.read(rotation.rotation_path(store.path), "home")
-    assert machine.cooldown["source"] == "retry-after"
-    assert machine.cooldown["until"] == pytest.approx(time.time() + 600, abs=5)
+    assert machine.cooldown["source"] == "retry-after"  # larger than the 600 s ladder
+    assert machine.cooldown["until"] == pytest.approx(time.time() + 7200, abs=5)
+    assert machine.pressure.level == 1
     assert store.controls()["stop:*"] == patrol.MACHINE_429_HOLD
 
 

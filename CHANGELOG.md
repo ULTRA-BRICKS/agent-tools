@@ -120,6 +120,26 @@
   file (`Rotation.open`: interrupted `sending` -> `interrupted`, overdue due time redraw) only AFTER it holds both the
   LiveOwner lock and the account lock, so a contender that loses either lock changes no Go record, attempt state or
   schedule. Approval priority, thresholds and denied operations are unchanged.
+- `agenttools-chatgpt` 0.3.15 (Refs #1038): adaptive backoff for transient 429/network errors in the single-tab patrol
+  (plan: `docs/superpowers/plans/2026-10-28-guardian-adaptive-backoff.md`), offline-tested only. A 429 now pauses the
+  account until ONE retry deadline, `max(adaptive, Retry-After, minimum spacing)`, with no second interval after it:
+  `adaptive = low + (high - low) * u` over `[ladder, ladder * 1.25]` (`ladder = 600 * 2^(level-1)`, up to 3600), shifted to
+  `[2880, 3600]` at the cap so jitter survives there (zero-jitter gaps are exactly 600, 1200, 2400 s); one level per
+  failure episode (a burst of subresource 429s is one), a larger server delay is never shortened or capped, retries
+  persist at the cap with no drop, and the level falls by ONE after 3 clean visits (a clean visit needs a fresh 2xx of
+  that chat's own read endpoint in the visit; a DOM outcome alone, a stale 2xx or an unrelated 200 never lowers it and
+  such a visit is neutral); visit spacing under pressure follows the ladder.
+  Under a machine 429 hold the due visit is a paced controlled read-only probe of the chat whose read endpoint is
+  unverified, alternating with the ordinary cursor check so one failing chat never takes every slot (a tab already on
+  it is loaded once, only when idle); the hold still clears only on a later same-path 2xx
+  with no newer 401/403/quota, and a legacy hold becomes an explicit `legacy-unverifiable` state probed at the cap
+  cadence. Timeouts and 5xx keep the chat queued with a bounded per-chat `retry` (300 to 1800 s), never a hold; due
+  retries alternate with cursor order, so a failing chat cannot starve the rest or count as fresh. Rotation schema 2
+  (lossless in-memory migration from 1, written only by the patrol; `status`/`monitor` never write) adds `pressure`,
+  `backoff` settings, per-chat `retry`/`last_ok_at`/`confirmed_at`; `rotation` telemetry gains `pressure` and `coverage`;
+  new `live --single-tab --backoff-base/--backoff-cap`. New modules `backoff.py`, `rotation_stats.py`,
+  `rotation_evidence.py` (split out of `rotation.py`). Removed `patrol.cooldown_for`, `DEFAULT_COOLDOWN`,
+  `COOLDOWN_FLOOR`, `COOLDOWN_CEILING`. A schema 2 rotation file is not readable by 0.3.14.
 - Worktree-only guard is ON BY DEFAULT and now covers commits (agent-tools#1012, Refs #1012):
   `worktree-only-writes`, `pin-primary-worktree` and `block-devserver-primary` enforce in every
   repo that has a `rig.yaml` unless it sets `agent_hooks.worktree_only: false` (or the session

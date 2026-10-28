@@ -450,35 +450,32 @@ def test_visit_bookkeeping_is_recorded(tmp_path):
 # --- cooldown ------------------------------------------------------------------------------------
 
 
-def test_a_cooldown_that_outlasts_the_due_time_defers_the_next_visit_without_a_rush(
+def test_a_cooldown_that_outlasts_the_due_time_is_itself_the_next_retry_deadline(
     tmp_path,
 ):
-    """The visit is never due at the instant a cooldown ends: one fresh draw after its end."""
+    """The cooldown end IS the deadline: no second interval is drawn after it (0.3.15)."""
     clock = Clock()
     machine = opened(tmp_path, clock=clock, rng=Dice(0.5, 0.0))
     machine.set_cooldown(NOW + 1000, "retry-after", "retry-after", "hold text")
     assert machine.deferred == {"reason": "cooldown", "at": NOW}
-    assert machine.due_at() == NOW + 1000 + 240
+    assert machine.due_at() == NOW + 1000
+    assert set(machine.cooldown) == {"until", "reason", "source", "hold"}
     clock.now = NOW + 999.9
     assert machine.cooling() and not machine.is_due()
     clock.now = NOW + 1000
-    assert not machine.cooling() and not machine.is_due()  # ended, but not rushed
-    clock.now = NOW + 1000 + 239.9
-    assert not machine.is_due()
-    clock.now = NOW + 1240
-    assert machine.is_due()
-    clock.now = NOW + 1100  # a restart in between keeps the deferred due time
-    assert opened(tmp_path, clock=clock).due_at() == NOW + 1240
+    assert not machine.cooling() and machine.is_due()
+    clock.now = NOW + 900  # a restart before the due time keeps the deadline exactly
+    assert opened(tmp_path, clock=clock).due_at() == NOW + 1000
 
 
-def test_a_longer_cooldown_moves_the_deferred_visit_again(
+def test_a_longer_cooldown_moves_the_deadline_and_never_adds_an_interval(
     tmp_path,
 ):
     clock = Clock()
     machine = opened(tmp_path, clock=clock, rng=Dice(0.5, 0.0, 1.0))
     machine.set_cooldown(NOW + 1000, "a", "retry-after", "hold")
     machine.set_cooldown(NOW + 3000, "b", "retry-after", "hold")
-    assert machine.due_at() == NOW + 3000 + 360
+    assert machine.due_at() == NOW + 3000 == machine.cooldown["until"]
 
 
 def test_an_earlier_cooldown_never_delays_or_defers_the_rotation(tmp_path):
@@ -761,7 +758,7 @@ def corrupt(tmp_path, mutate):
     "mutate",
     [
         lambda d: d.update(account="glide.vc"),
-        lambda d: d.update(schema=2),
+        lambda d: d.update(schema=3),
         lambda d: d.update(schema="1"),
         lambda d: d.update(extra=1),
         lambda d: d.pop("queue"),

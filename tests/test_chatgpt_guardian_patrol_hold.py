@@ -77,8 +77,11 @@ def test_the_check_visit_is_single_then_the_account_is_silent_again(
         page = rig.context.pages[0]
         assert page.calls == ["goto"]
         assert rig.rotation.cooldown["reason"] == "hold-recheck"
-        assert rig.rotation.cooldown["until"] == WALL0 + 5000 + patrol.DEFAULT_COOLDOWN
-        for moment in (5001.0, 5400.0, 5899.0):
+        quiet = rig.rotation.cooldown["until"] - (WALL0 + 5000)
+        assert (
+            600 <= quiet <= 750
+        )  # one rung of the ladder, no strike for a clean check
+        for moment in (5001.0, 5300.0, 5599.0):
             rig.clock.t = moment
             report = await rig.patrol.tick()
             assert report["health"] == "cooldown" and report["visit"] is None
@@ -152,8 +155,8 @@ def test_the_home_counterexample_four_endpoints_stay_held_until_each_recovers(
         rig.clock.t = 9500
         rig.transport.respond(200, READ_A)
         report = await late_tick(
-            rig, 9901
-        )  # after the re-armed cooldown of the last check
+            rig, 11000
+        )  # past the re-armed quiet period of the check
         assert held(rig) is None and report["transport_hold"] == ""
 
     run(case())
@@ -252,7 +255,7 @@ def test_a_matching_success_after_the_latest_429_releases_only_the_machine_hold(
         rig.clock.t = 80
         rig.transport.respond(200, READ_A)
         before = rig.store.controls()
-        await late_tick(rig, 100.0)  # the cooldown is over, not yet the next visit
+        await late_tick(rig, 800.0)  # the cooldown is over, not yet the next visit
         after = rig.store.controls()
         assert before["stop:*"] == HOLD and "stop:*" not in after
         assert {k for k in before if k != "stop:*"} <= set(after)
@@ -328,7 +331,9 @@ def test_a_hold_without_the_patrols_own_evidence_stays_pending_and_silent(
         rig = rig_with(tmp_path, monkeypatch)
         rig.store.stop("*", HOLD)
         report = await late_tick(rig, 100000)
-        assert held(rig) == HOLD and report["health"].startswith("stopped")
+        assert (
+            held(rig) == HOLD and report["health"] == "cooldown"
+        )  # unverifiable, paced
         assert report["transport_hold"] == rotation.HOLD_PENDING
         assert rig.io.reads == 0 and rig.context.created == 0 and sends(rig) == 0
 
@@ -343,7 +348,7 @@ def test_an_elapsed_cooldown_record_without_restriction_evidence_stays_silent(
         rig.store.stop("*", HOLD)
         rig.rotation.set_cooldown(WALL0 + 60, "http-429", "retry-after", HOLD)
         report = await late_tick(rig)
-        assert held(rig) == HOLD and report["health"].startswith("stopped")
+        assert held(rig) == HOLD and report["health"] == "cooldown"
         assert rig.io.reads == 0 and sends(rig) == 0
 
     run(case())
@@ -369,7 +374,9 @@ def test_a_quota_sighting_during_the_check_visit_voids_the_older_successes(
         rig = make_rig(
             tmp_path,
             monkeypatch,
-            kinds={CHATS[0]: "quota"},
+            kinds={
+                CHATS[1]: "quota"
+            },  # the probe visits the chat of the unverified endpoint
             real_transport=True,
         )
         rig.clock.t = 10
@@ -432,7 +439,7 @@ def test_a_new_429_during_the_check_visit_restarts_the_cooldown_from_its_retry_a
         rig.transport.seed = seed
         report = await late_tick(rig, 5000)
         assert report["visit"]["outcome"] == "cooldown"
-        assert rig.rotation.cooldown["until"] == WALL0 + 5000 + 1200
+        assert 1200 <= rig.rotation.cooldown["until"] - (WALL0 + 5000) <= 1500
         assert (
             rig.rotation.cooldown["reason"] == "http-429"
         )  # not replaced by the re-arm
@@ -555,7 +562,7 @@ def test_a_query_string_never_makes_a_different_endpoint(tmp_path, monkeypatch):
     rig.transport.respond(200, READ_A + "?include_has_versions=true")
     assert rig.rotation.transport["restricted"] == {READ_A: WALL0 + 10}
     assert rig.rotation.hold_unverified() == "cooldown"  # Retry-After first
-    rig.clock.t = 100
+    rig.clock.t = 800
     assert rig.rotation.hold_unverified() == ""
 
 
@@ -682,7 +689,7 @@ def test_a_stream_of_429s_is_not_written_once_per_response(tmp_path, monkeypatch
         rig.transport.respond(429, READ_A, retry_after=600)
     assert len(writes) <= 6
     assert (
-        rig.rotation.cooldown["until"] == WALL0 + 10 + 1.99 + 600
+        rig.rotation.cooldown["until"] >= WALL0 + 10 + 1.99 + 600
     )  # memory is current
 
 

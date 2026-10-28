@@ -258,8 +258,8 @@ def test_a_429_cooldown_blocks_reads_navigation_and_go_until_it_ends(
         rig = make_rig(tmp_path, monkeypatch, kinds=failed(0), urls=(URLS[CHATS[0]],))
         machine_hold(rig, 1000)
         due = rig.rotation.due_at()
-        # The cooldown outlasts the draw: the visit is deferred to one fresh draw AFTER it ends.
-        assert WALL0 + 1000 + 240 <= due <= WALL0 + 1000 + 360
+        # The cooldown outlasts the draw: its end is the one retry deadline, no interval after it.
+        assert due == WALL0 + 1000
         assert rig.rotation.deferred["reason"] == "cooldown"
         for moment in (240, 500, 999.999):
             rig.clock.t = moment
@@ -287,7 +287,7 @@ def test_at_the_exact_cooldown_end_the_clock_alone_releases_nothing_and_rushes_n
         )  # an elapsed clock is no evidence
         assert controls["stop:" + CHATS[4]] == "pet project"
         assert "astra_quota" in controls
-        assert report["visit"] is None and report["health"].startswith("stopped")
+        assert report["visit"] is None and report["health"] == "cooldown"
         assert untouched(rig)  # nothing read, navigated or sent
 
     run(case())
@@ -309,7 +309,7 @@ def test_a_user_pause_is_never_released_by_an_elapsed_cooldown(tmp_path, monkeyp
     run(case())
 
 
-def test_a_legacy_429_hold_without_cooldown_evidence_needs_a_manual_resume(
+def test_a_legacy_429_hold_without_cooldown_evidence_is_an_explicit_unverifiable_state(
     tmp_path, monkeypatch
 ):
     async def case():
@@ -317,7 +317,9 @@ def test_a_legacy_429_hold_without_cooldown_evidence_needs_a_manual_resume(
         rig.store.stop("*", patrol.MACHINE_429_HOLD)
         rig.clock.t = 100000.0
         report = await rig.patrol.tick()
-        assert report["health"].startswith("stopped")
+        assert (
+            report["health"] == "cooldown"
+        )  # explicit unverified state, silent for the cap
         assert rig.store.controls()["stop:*"] == patrol.MACHINE_429_HOLD
         assert untouched(rig)
 
@@ -348,18 +350,18 @@ def response(status, headers=None, url="https://chatgpt.com/backend-api/conversa
 
 
 @pytest.mark.parametrize(
-    "headers, seconds, source",
+    "headers, low, high, source",
     [
-        ({"retry-after": "120"}, 120.0, "retry-after"),
-        ({"retry-after": "5"}, patrol.COOLDOWN_FLOOR, "retry-after"),
-        ({"retry-after": "999999999"}, patrol.COOLDOWN_CEILING, "retry-after"),
-        ({}, patrol.DEFAULT_COOLDOWN, "default"),
-        ({"retry-after": "soon"}, patrol.DEFAULT_COOLDOWN, "default"),
-        ({"retry-after": "-30"}, patrol.DEFAULT_COOLDOWN, "default"),
+        ({"retry-after": "120"}, 600.0, 750.0, "adaptive"),
+        ({"retry-after": "5"}, 600.0, 750.0, "adaptive"),
+        ({"retry-after": "999999999"}, 999999999.0, 999999999.0, "retry-after"),
+        ({}, 600.0, 750.0, "adaptive"),
+        ({"retry-after": "soon"}, 600.0, 750.0, "adaptive"),
+        ({"retry-after": "-30"}, 600.0, 750.0, "adaptive"),
     ],
 )
 def test_the_transport_guard_turns_a_real_retry_after_into_a_durable_cooldown(
-    tmp_path, headers, seconds, source
+    tmp_path, headers, low, high, source
 ):
     store = Store(tmp_path / "s.sqlite", account="home")
     machine = rotation.Rotation.open(
@@ -367,7 +369,7 @@ def test_the_transport_guard_turns_a_real_retry_after_into_a_durable_cooldown(
     )
     guard = patrol.PatrolTransport(Mock(), store, machine)
     guard.on_response(response(429, headers))
-    assert machine.cooldown["until"] == WALL0 + seconds
+    assert low <= machine.cooldown["until"] - WALL0 <= high  # max(ladder, Retry-After)
     assert machine.cooldown["source"] == source
     assert machine.cooldown["hold"] == patrol.MACHINE_429_HOLD
     assert store.controls()["stop:*"] == patrol.MACHINE_429_HOLD
@@ -385,9 +387,9 @@ def test_retry_after_may_be_an_http_date(tmp_path):
         tmp_path / "r.json", "home", clock=lambda: WALL0, rng=random.Random(1)
     )
     guard = patrol.PatrolTransport(Mock(), store, machine)
-    when = "Fri, 15 Jan 2027 08:05:00 GMT"  # WALL0 is 2027-01-15T08:00:00Z
+    when = "Fri, 15 Jan 2027 10:00:00 GMT"  # WALL0 is 2027-01-15T08:00:00Z: two hours
     guard.on_response(response(429, {"retry-after": when}))
-    assert machine.cooldown["until"] == pytest.approx(WALL0 + 300)
+    assert machine.cooldown["until"] == pytest.approx(WALL0 + 7200)
 
 
 @pytest.mark.parametrize(

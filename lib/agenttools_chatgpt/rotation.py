@@ -11,6 +11,8 @@ deterministic and the two accounts never share a seed. The state machine never t
 browser or the network; only `retire_mode`/`guard_legacy_launch` use the recovery Store's
 controls and the per-account lock. The 429 evidence ledger holds what the browser's own
 responses showed, per exact endpoint path; it is the only basis for releasing a machine hold.
+The adaptive pressure (backoff.py) and the per-chat retry records live in the same file; the
+retry, probe and telemetry helpers are in rotation_stats.py.
 
 Past bugs it guards against: the confirmation wait was added to the interval instead of being
 part of it (the draw is made once, at the START of a visit); a downtime or a cooldown must never
@@ -18,7 +20,10 @@ cause a catch-up burst (an overdue or overrun due time is an explicit `deferred`
 "now"); a clock alone released a 429 hold although a fresh list 200 coexisted with new per-chat
 429s; a backwards clock must not park the patrol for hours; a corrupt or foreign-account file
 must refuse rather than be overwritten; and a half-written file must never replace a good one
-(temp file, fsync, atomic replace).
+(temp file, fsync, atomic replace); a burst of late 429s redrew the due time once per response,
+an adaptive cooldown was followed by a second adaptive interval (the 429 retry is ONE deadline:
+max(Retry-After, jittered adaptive pause, minimum spacing)), and a failed visit left no durable
+per-chat retry. Only an overdue restart or an overrun is an explicit redraw from now.
 """
 
 from __future__ import annotations
@@ -27,7 +32,6 @@ import json
 import math
 import os
 import random
-import re
 import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
@@ -35,10 +39,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from . import backoff, rotation_stats
+from .backoff import BackoffConfig, BackoffError, Pressure, max_level
 from .lock import AccountBusy, account_lock
+from .rotation_evidence import TRANSPORT_LIMIT, TransportEvidence, endpoint_ok
+from .rotation_stats import FOREIGN_HOLD, RETRY_REASON_LIMIT, chat_uuid, endpoint_chat
 from .urls import canonical_chat
 
-SCHEMA = 1
+SCHEMA = 2
 # Durable marker in the account's recovery controls: set by the patrol once it holds the account
 # lock, shown by the telemetry, and the reason a legacy `live` launch is refused. The lock itself
 # (not this marker) is what stops coverage/startup restore-all while a patrol runs.
@@ -50,18 +58,13 @@ CONFIRM_WAIT_RANGE = (20.0, 60.0)
 DEFAULT_CONFIRM_WAIT = 45.0
 GO_STATES = ("sending", "sent", "uncertain", "interrupted")
 CONFIRMATIONS = ("unconfirmed", "running", "completed")
-COOLDOWN_SOURCES = ("retry-after", "default")
+COOLDOWN_SOURCES = ("retry-after", "default", "adaptive")
 OWNED_URL_LIMIT = 64
 ACCOUNTS = ("home", "glide.vc")
 # The exact text live.TransportGuard writes for a transport 429; a test pins the two together.
 MACHINE_429_HOLD = "transport HTTP 429; manual resume required"
 HOLD_PENDING = "429 hold pending: needs verified same-endpoint success / existing authorized coordinator"
-TRANSPORT_LIMIT = 128
-ENDPOINT_PATTERN = re.compile(r"/[A-Za-z0-9._~%/-]{1,200}")
 UNVERIFIED_SHOWN = 8
-# A repeat of an already-recorded transport state (a stream of 401s, a polling endpoint that
-# keeps succeeding) is persisted at most this often; every transition is persisted at once.
-EVIDENCE_SAVE_GAP = 1.0
 
 _KEYS = frozenset(
     {
@@ -80,9 +83,14 @@ _KEYS = frozenset(
         "visit_started_at",
         "deferred",
         "transport",
+        "pressure",
+        "backoff",
     }
 )
-_ENTRY_KEYS = frozenset({"chat", "url", "visits", "last_visit_at", "last_outcome"})
+_KEYS_V1 = _KEYS - {"pressure", "backoff"}
+_ENTRY_KEYS_V1 = frozenset({"chat", "url", "visits", "last_visit_at", "last_outcome"})
+_ENTRY_KEYS = _ENTRY_KEYS_V1 | {"retry", "last_ok_at", "confirmed_at"}
+_RETRY_KEYS = frozenset({"at", "reason", "failures", "since"})
 _GO_KEYS = frozenset(
     {
         "chat",
@@ -209,6 +217,10 @@ class Entry:
     visits: int = 0
     last_visit_at: float | None = None
     last_outcome: str = ""
+    # {"at", "reason", "failures", "since"} while a failed visit still awaits its retry.
+    retry: dict | None = None
+    last_ok_at: float | None = None  # last CLEAN visit; a failed visit never sets it
+    confirmed_at: float | None = None  # last 2xx of this chat's own read endpoint
 
     def to_json(self) -> dict:
         return {
@@ -217,6 +229,9 @@ class Entry:
             "visits": self.visits,
             "last_visit_at": self.last_visit_at,
             "last_outcome": self.last_outcome,
+            "retry": self.retry,
+            "last_ok_at": self.last_ok_at,
+            "confirmed_at": self.confirmed_at,
         }
 
 
@@ -233,6 +248,23 @@ def _optional_number(value: object) -> bool:
     return value is None or _number(value)
 
 
+def _checked_retry(raw: object) -> dict | None:
+    if raw is None:
+        return None
+    ok = (
+        isinstance(raw, dict)
+        and set(raw) == _RETRY_KEYS
+        and _number(raw["at"])
+        and isinstance(raw["reason"], str)
+        and len(raw["reason"]) <= RETRY_REASON_LIMIT
+        and _integer(raw["failures"], 1)
+        and _number(raw["since"])
+    )
+    if not ok:
+        raise RotationError("rotation retry record is invalid")
+    return dict(raw)
+
+
 def _entry(raw: object) -> Entry:
     if not isinstance(raw, dict) or set(raw) != _ENTRY_KEYS:
         raise RotationError("rotation queue entry has unexpected fields")
@@ -246,10 +278,19 @@ def _entry(raw: object) -> Entry:
         not _integer(raw["visits"])
         or not _optional_number(raw["last_visit_at"])
         or not isinstance(raw["last_outcome"], str)
+        or not _optional_number(raw["last_ok_at"])
+        or not _optional_number(raw["confirmed_at"])
     ):
         raise RotationError("rotation queue entry has invalid bookkeeping")
     return Entry(
-        raw["chat"], url, raw["visits"], raw["last_visit_at"], raw["last_outcome"]
+        raw["chat"],
+        url,
+        raw["visits"],
+        raw["last_visit_at"],
+        raw["last_outcome"],
+        _checked_retry(raw["retry"]),
+        raw["last_ok_at"],
+        raw["confirmed_at"],
     )
 
 
@@ -336,15 +377,11 @@ def _checked_started(raw: object) -> float | None:
     return raw
 
 
-def _endpoint_ok(path: object) -> bool:
-    return isinstance(path, str) and ENDPOINT_PATTERN.fullmatch(path) is not None
-
-
 def _evidence_map(raw: object) -> bool:
     return (
         isinstance(raw, dict)
         and len(raw) <= TRANSPORT_LIMIT
-        and all(_endpoint_ok(path) and _number(at) for path, at in raw.items())
+        and all(endpoint_ok(path) and _number(at) for path, at in raw.items())
     )
 
 
@@ -391,12 +428,56 @@ def _checked_owned(raw: object) -> list[str]:
     return list(raw)
 
 
-def validate(raw: object, account: str) -> dict:
-    """Return the state with every field checked, or raise RotationError."""
-    if not isinstance(raw, dict) or set(raw) != _KEYS:
+def _migrate_v1(raw: dict) -> dict:
+    """Schema 1 -> 2 in memory: every old field is copied unchanged; pressure starts at zero.
+
+    Queue order, cursor, visit counts, Go record, owned URLs and evidence are untouched; the old
+    shape is still checked strictly, so a corrupt v1 file refuses exactly as before.
+    """
+    if set(raw) != _KEYS_V1:
         raise RotationError("rotation state has unexpected fields")
-    if type(raw["schema"]) is not int or raw["schema"] != SCHEMA:
+    queue, cooldown = raw["queue"], raw["cooldown"]
+    if not isinstance(queue, list):
+        raise RotationError("rotation queue must be a list")
+    if not all(isinstance(e, dict) and set(e) == _ENTRY_KEYS_V1 for e in queue):
+        raise RotationError("rotation queue entry has unexpected fields")
+    if cooldown is not None and not (
+        isinstance(cooldown, dict) and set(cooldown) == _COOLDOWN_KEYS
+    ):
+        raise RotationError("rotation cooldown record is invalid")
+    fresh = {"retry": None, "last_ok_at": None, "confirmed_at": None}
+    return {
+        **raw,
+        "schema": SCHEMA,
+        "pressure": Pressure().to_json(),
+        "backoff": BackoffConfig().to_json(),
+        "queue": [{**entry, **fresh} for entry in queue],
+        "cooldown": cooldown,
+    }
+
+
+def _checked_pressure(raw: dict) -> tuple[BackoffConfig, Pressure]:
+    try:
+        cfg = BackoffConfig.from_json(raw["backoff"])
+        return cfg, Pressure.from_json(raw["pressure"], cfg)
+    except BackoffError as exc:
+        raise RotationError(str(exc)) from exc
+
+
+def validate(raw: object, account: str) -> dict:
+    """Return the state with every field checked, or raise RotationError.
+
+    A schema 1 file is migrated in memory (`migrated` is True); only `Rotation.open` persists it.
+    """
+    if not isinstance(raw, dict) or type(raw.get("schema")) is not int:
+        raise RotationError("rotation state has unexpected fields")
+    if raw["schema"] not in (1, SCHEMA):
         raise RotationError("rotation state schema is not supported")
+    migrated = raw["schema"] == 1
+    if migrated:
+        raw = _migrate_v1(raw)
+    if set(raw) != _KEYS:
+        raise RotationError("rotation state has unexpected fields")
     if raw["account"] != account:
         raise RotationError("rotation state belongs to a different account")
     interval = raw["interval"]
@@ -408,8 +489,10 @@ def validate(raw: object, account: str) -> dict:
         raise RotationError("rotation current target is not a conversation")
     if not _number(raw["next_due"]):
         raise RotationError("rotation due time is invalid")
+    cfg, pressure = _checked_pressure(raw)
     return {
         **raw,
+        "migrated": migrated,
         "queue": queue,
         "last_visit": _checked_visit(raw["last_visit"]),
         "go": _checked_go(raw["go"]),
@@ -419,6 +502,8 @@ def validate(raw: object, account: str) -> dict:
         "visit_started_at": _checked_started(raw["visit_started_at"]),
         "deferred": _checked_deferred(raw["deferred"]),
         "transport": _checked_transport(raw["transport"]),
+        "backoff": cfg,
+        "pressure": pressure,
     }
 
 
@@ -482,7 +567,7 @@ def _upgrade_urls(entries: list[Entry], urls: Mapping[str, str]) -> None:
             entry.url = seen
 
 
-class Rotation:
+class Rotation(TransportEvidence):
     """Persisted patrol schedule for one account. Every mutator saves atomically."""
 
     def __init__(
@@ -513,6 +598,13 @@ class Rotation:
         self.visit_started_at: float | None = state.get("visit_started_at")
         self.deferred: dict | None = state.get("deferred")
         self.transport: dict = state.get("transport") or _no_evidence()
+        self.backoff: BackoffConfig = state.get("backoff") or BackoffConfig()
+        self.pressure: Pressure = state.get("pressure") or Pressure()
+        self.stale = state.get(
+            "migrated", False
+        )  # a migrated file is rewritten on open
+        self.retrying = False  # the running visit retries a chat that carries a failure
+        self._in_visit = False
         self._evidence_saved = -math.inf
 
     @classmethod
@@ -524,8 +616,13 @@ class Rotation:
         interval: tuple[float, float] = DEFAULT_INTERVAL,
         clock: Callable[[], float] = time.time,
         rng=None,
+        backoff: BackoffConfig | None = None,
     ) -> Rotation:
-        """Load (validating schema and account) or start fresh, then settle the schedule."""
+        """Load (validating schema and account) or start fresh, then settle the schedule.
+
+        An explicit `backoff` replaces the stored settings (validated); without one the stored
+        settings, or the conservative defaults, apply.
+        """
         if account not in ACCOUNTS:
             raise RotationError("account must be home or glide.vc")
         low, high = validate_interval(*interval)
@@ -538,6 +635,15 @@ class Rotation:
             rng if rng is not None else random.SystemRandom(),
             read_state(path, account),
         )
+        if backoff is not None:
+            try:
+                backoff = backoff.validated()
+            except BackoffError as exc:
+                raise RotationError(str(exc)) from exc
+            if backoff != machine.backoff:
+                machine.backoff = backoff
+                machine.pressure.level = min(machine.pressure.level, max_level(backoff))
+                machine.stale = True
         machine._settle()
         return machine
 
@@ -562,7 +668,7 @@ class Rotation:
         The redraw is an explicit `deferred` state counted from now (or from the end of a running
         cooldown), never a catch-up burst. A first start is not a deferral.
         """
-        changed = self.fresh
+        changed = self.fresh or self.stale
         if self.go and self.go["state"] == "sending":
             self.go["state"] = "interrupted"
             changed = True
@@ -575,7 +681,7 @@ class Rotation:
             changed = True
         if changed:
             self.save()
-        self.fresh = False
+        self.fresh = self.stale = False
 
     def _base(self, now: float) -> float:
         """The earliest instant a fresh draw may count from: now, or the end of a cooldown."""
@@ -584,14 +690,29 @@ class Rotation:
     def _implausible_due(self, now: float) -> str:
         if self.next_due <= now:
             return "overdue"
-        if self.next_due > self._base(now) + self.interval[1]:
+        limit = self.effective_interval()[1]
+        if self.pressure.transient_streak:
+            limit = max(limit, self.backoff.transient_cap)
+        if self.next_due > self._base(now) + limit:
             return "clock"
         return ""
 
+    def effective_interval(self) -> list[float]:
+        """The range a visit draw falls in now: the base interval or the delay window."""
+        return backoff.effective_interval(
+            self.pressure.level, self.interval, self.backoff
+        )
+
     def draw(self) -> float:
-        """One interval in seconds, uniform over [low, high], from the injected generator."""
+        """One interval in seconds, uniform over [low, high], from the injected generator.
+
+        Under pressure the visit spacing is at least the adaptive pause of the level, with the
+        same draw, so the spacing never undercuts the jittered ladder.
+        """
         low, high = self.interval
-        return min(high, max(low, low + (high - low) * self.rng.random()))
+        u = self.rng.random()
+        base = min(high, max(low, low + (high - low) * u))
+        return max(base, backoff.adaptive_delay(self.pressure.level, self.backoff, u))
 
     def save(self) -> None:
         write_atomic(
@@ -612,6 +733,8 @@ class Rotation:
                 "visit_started_at": self.visit_started_at,
                 "deferred": self.deferred,
                 "transport": self.transport,
+                "pressure": self.pressure.to_json(),
+                "backoff": self.backoff.to_json(),
             },
         )
 
@@ -629,6 +752,12 @@ class Rotation:
         return self.clock() >= self.due_at()
 
     def set_cooldown(self, until: float, reason: str, source: str, hold: str) -> None:
+        """Hold until `until`, which then IS the next retry deadline (no second interval after it).
+
+        The retry deadline is max(server Retry-After, jittered adaptive pause, minimum spacing):
+        the caller already folded the first two into `until`, and `next_due` already carries the
+        spacing draw of the visit start. A later or longer deadline extends both.
+        """
         if not _number(until) or source not in COOLDOWN_SOURCES:
             raise RotationError("cooldown needs a finite deadline and a known source")
         if self.cooldown and self.cooldown["until"] >= until:
@@ -640,12 +769,12 @@ class Rotation:
             "source": source,
             "hold": hold,
         }
-        rebased = until >= self.next_due
-        if rebased:
-            # The cooldown outlasts the draw of the running visit: never due the instant it ends.
-            self._defer("cooldown", float(until))
+        moved = until > self.next_due
+        if moved:
+            self.deferred = {"reason": "cooldown", "at": self.clock()}
+            self.next_due = float(until)
         # A stream of 429s only moves the deadline later by a fraction of a second each time.
-        self._persist_evidence(first or rebased)
+        self._persist_evidence(first or moved)
 
     def clear_hold(self) -> None:
         """The machine 429 hold is gone (released or never held): forget its cooldown and evidence."""
@@ -654,7 +783,7 @@ class Rotation:
         self.save()
 
     def _defer(self, reason: str, base: float) -> None:
-        """An explicit persisted deferral: one fresh draw counted from `base`, flagged `reason`."""
+        """An explicit persisted deferral: one draw counted from `base`, flagged `reason`."""
         self.deferred = {"reason": reason, "at": self.clock()}
         self.next_due = base + self.draw()
 
@@ -685,42 +814,38 @@ class Rotation:
         return changed
 
     def pick(
-        self, eligible: Callable[[str], bool], prefer: str | None = None
+        self,
+        eligible: Callable[[str], bool],
+        prefer: str | None = None,
+        *,
+        probe: bool = False,
     ) -> tuple[Entry, bool] | None:
         """The next entry to visit and whether it is the in-order choice (advances the cursor).
 
         A preferred chat (an owner-approved continuation) may jump the queue without moving the
-        cursor, so it can never starve the rest of the lap.
+        cursor, so it can never starve the rest of the lap. A chat whose retry is still in the
+        future is skipped (kept, never dropped) and due retries alternate with cursor order. A
+        `probe` (a check visit under a 429 hold) targets the known chat of an unverified
+        endpoint on every other slot, oldest visit first; the slot after a failing chat goes to
+        the ordinary cursor choice, so one failing chat never takes every read slot.
         """
-        count = len(self.queue)
-        first = next(
-            (
-                self.queue[(self.cursor + offset) % count]
-                for offset in range(count)
-                if eligible(self.queue[(self.cursor + offset) % count].chat)
-            ),
-            None,
-        )
-        if first is None:
-            return None
-        jump = next(
-            (e for e in self.queue if e.chat == prefer and eligible(e.chat)), None
-        )
-        if jump is not None and jump is not first:
-            return jump, False
-        return first, True
+        return rotation_stats.pick_entry(self, eligible, prefer, probe)
 
-    def begin_visit(self, entry: Entry) -> None:
+    def begin_visit(self, entry: Entry, probe: bool = False) -> None:
         """The visit starts now: this is the anchor, and the one draw of the visit is made here.
 
         The next visit is due `draw` seconds after this START, so the in-visit confirmation wait
         is part of the interval, never added to it. Persisted before any navigation, so a restart
-        in the middle of the visit keeps the anchor.
+        in the middle of the visit keeps the anchor. `probe` marks a controlled read-only
+        retry (a check under a hold, or a chat carrying a failure) for the statistics.
         """
         now = self.clock()
         self.visit_started_at = now
         self.deferred = None
         self.current = entry.chat
+        self.retrying = entry.retry is not None
+        self._in_visit = True
+        self.pressure.begin(probe)
         self.next_due = now + self.draw()
         self.save()
 
@@ -738,6 +863,8 @@ class Rotation:
             "outcome": outcome,
         }
         self.current = entry.chat
+        rotation_stats.settle_visit(self, entry, outcome, started, now)
+        self._in_visit = False
         if advance:
             self.cursor = (self.queue.index(entry) + 1) % len(self.queue)
         if self.next_due <= now:
@@ -772,102 +899,73 @@ class Rotation:
         self._defer(reason, self._base(now))
         self.save()
 
-    # -- 429 transport evidence ---------------------------------------------------------------
-    #
-    # The ledger of what the browser's own responses showed, per exact endpoint path. It is the
-    # only evidence on which the machine 429 hold may ever be released: no clock, no DOM, no
-    # probe of our own.
+    # -- adaptive pressure and the 429 hold ---------------------------------------------------
 
-    def note_restricted(self, path: object, at: float) -> None:
-        """A 429 for `path` at `at`. An endpoint that cannot be tracked exactly blocks release."""
-        t = self.transport
-        restricted = t["restricted"]
-        if not _endpoint_ok(path):
-            self.note_blocked(at)
-            return
-        full = path not in restricted and len(restricted) >= TRANSPORT_LIMIT
-        if full and not self._evict_verified():
-            self.note_blocked(at)
-            return
-        if at > restricted.get(path, -math.inf):
-            fresh = path not in restricted
-            voids = t["succeeded"].get(path, -math.inf) > restricted.get(
-                path, -math.inf
-            )
-            restricted[path] = at
-            self._persist_evidence(fresh or voids)
+    def note_429(self, header: object = None) -> None:
+        """A live 429 response: update the pressure and the cooldown deadline.
 
-    def _evict_verified(self) -> bool:
-        """Make room by forgetting the oldest endpoint that already has a later success."""
-        t = self.transport
-        done = [
-            p
-            for p, at in t["restricted"].items()
-            if t["succeeded"].get(p, -math.inf) > at
-        ]
-        if not done:
-            return False
-        oldest = min(done, key=lambda p: t["succeeded"][p])
-        del t["restricted"][oldest]
-        t["succeeded"].pop(oldest, None)
-        return True
-
-    def note_success(self, path: object, at: float) -> None:
-        """A 2xx for `path`: counted only for an endpoint that was restricted, and only if later."""
-        t = self.transport
-        if not _endpoint_ok(path) or path not in t["restricted"]:
-            return
-        done = t["succeeded"].get(path, -math.inf)
-        if at > t["restricted"][path] and at > done:
-            first = done <= t["restricted"][path]
-            t["succeeded"][path] = at
-            self._persist_evidence(first)
-
-    def note_blocked(self, at: float) -> None:
-        """A newer 401/403/quota (or an untrackable 429) voids every older success."""
-        t = self.transport
-        blocked = t["blocked_at"]
-        if blocked is None or at > blocked:
-            voids = blocked is None or any(
-                ok > blocked for ok in t["succeeded"].values()
-            )
-            t["blocked_at"] = at
-            self._persist_evidence(voids)
-
-    def _persist_evidence(self, transition: bool) -> None:
-        """Save now for a transition; a repeat of a recorded state rides on the next save."""
-        now = self.clock()
-        if transition or now - self._evidence_saved >= EVIDENCE_SAVE_GAP:
-            self._evidence_saved = now
-            self.save()
-
-    def hold_unverified(self) -> str:
-        """Why the machine 429 hold may not be released now; empty only when it is verified.
-
-        Verified means: the cooldown (the real Retry-After) is over, every endpoint that was
-        restricted has a strictly later success of the SAME exact path, and no auth/quota signal
-        is newer than any of those successes. An elapsed clock alone is never enough.
+        The deadline is `max(adaptive, server)`: the adaptive pause of the ladder (one strike per
+        failure episode, so a burst costs one level) and the real Retry-After, which is never
+        shortened and never capped. A burst only ever extends the deadline by its server delay.
         """
-        t = self.transport
-        if not t["restricted"]:
-            return "no-restriction-evidence"
-        if self.cooling():
-            return "cooldown"
-        if self.unverified_paths():
-            return "unverified"
-        blocked = t["blocked_at"]
-        if blocked is not None and any(
-            t["succeeded"][path] <= blocked for path in t["restricted"]
-        ):
-            return "blocked-newer"
-        return ""
+        now = self.clock()
+        cfg, pressure = self.backoff, self.pressure
+        asked = backoff.retry_after_seconds(header, now)
+        server_until = now + (max(0.0, asked) if asked is not None else 0.0)
+        strike = pressure.strike_429(now, self.cooling(), cfg)
+        if strike or not self.cooling():
+            u = self.rng.random()
+            adaptive_until = now + backoff.adaptive_delay(
+                max(pressure.level, 1), cfg, u
+            )
+        else:
+            adaptive_until = self.cooldown["until"]
+        source = "retry-after" if server_until > adaptive_until else "adaptive"
+        self.set_cooldown(
+            max(adaptive_until, server_until), "http-429", source, MACHINE_429_HOLD
+        )
+        if strike:
+            self._persist_evidence(True)
 
-    def unverified_paths(self) -> list[str]:
-        t = self.transport
-        return sorted(
-            p
-            for p, at in t["restricted"].items()
-            if t["succeeded"].get(p, -math.inf) <= at
+    def note_server_error(self) -> None:
+        """A 5xx answered a request of the running visit: that visit counts as transient."""
+        if self._in_visit:
+            self.pressure.transient_issue = self.pressure.issued
+
+    def note_target_success(self, path: object, at: float) -> None:
+        """A 2xx of a chat's own read endpoint confirms that target (an unrelated 200 never does)."""
+        found = endpoint_chat(path) if isinstance(path, str) else None
+        if not found or not found[1]:
+            return
+        for entry in self.queue:
+            if chat_uuid(entry.chat) == found[0]:
+                entry.confirmed_at = at
+                self.pressure.last_confirmed_at = at
+                self._persist_evidence(False)
+                return
+
+    def adopt_legacy_hold(self) -> None:
+        """A machine 429 hold with no evidence of ours (a legacy owner latched it).
+
+        It is recorded as an explicitly unverifiable endpoint, never cleared by the clock, and
+        read-only diagnostic probes continue at the cap cadence.
+        """
+        now = self.clock()
+        self.note_restricted(FOREIGN_HOLD, now)
+        self.set_cooldown(
+            now + self.backoff.cap, "legacy-hold", "adaptive", MACHINE_429_HOLD
+        )
+
+    def rearm_probe(self) -> None:
+        """A read-only probe saw neither a 429 nor the matching 2xx: pause again, no strike."""
+        paths = self.unverified_paths()
+        if paths and all(p == FOREIGN_HOLD for p in paths):
+            delay = self.backoff.cap
+        else:
+            level = max(self.pressure.level, 1)
+            delay = backoff.adaptive_delay(level, self.backoff, self.rng.random())
+        self.set_cooldown(
+            self.clock() + delay, "hold-recheck", "adaptive", MACHINE_429_HOLD
         )
 
     # -- Go record ----------------------------------------------------------------------------
@@ -945,8 +1043,17 @@ class Rotation:
                     "visits": entry.visits,
                     "last_visit_at": entry.last_visit_at,
                     "last_outcome": entry.last_outcome,
+                    "retry": entry.retry,
+                    "last_ok_at": entry.last_ok_at,
+                    "confirmed_at": entry.confirmed_at,
                 }
             )
+        excluded = [
+            {"chat": row["chat"], "reason": row["reason"]}
+            for row in rows
+            if row["state"] == "paused"
+        ]
+        held = controls.get("stop:*") == MACHINE_429_HOLD
         due = self.due_at()
         return {
             "mode": "single-tab",
@@ -962,6 +1069,8 @@ class Rotation:
             "cooldown": self.cooldown,
             "transport": self._transport_view(controls),
             "tabs": self.tabs,
+            "pressure": rotation_stats.pressure_view(self, held),
+            "coverage": rotation_stats.coverage_view(self, excluded),
             "queue": rows,
         }
 

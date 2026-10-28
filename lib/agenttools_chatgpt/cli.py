@@ -158,10 +158,17 @@ def run_live(args, store: Store) -> None:
 
         asyncio.run(serve_single_tab(args, store))
         return
-    stray = (args.rotation_min, args.rotation_max, args.confirm_wait)
+    stray = (
+        args.rotation_min,
+        args.rotation_max,
+        args.confirm_wait,
+        args.backoff_base,
+        args.backoff_cap,
+    )
     if any(value is not None for value in stray):
         raise ValueError(
-            "--rotation-min, --rotation-max and --confirm-wait require --single-tab"
+            "--rotation-min, --rotation-max, --confirm-wait, --backoff-base and "
+            "--backoff-cap require --single-tab"
         )
     from .live import serve_live
     from .rotation import guard_legacy_launch
@@ -328,6 +335,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Single-tab only: in-visit wait for the response after a Go (default 45, 20 to 60)",
+    )
+    live.add_argument(
+        "--backoff-base",
+        type=float,
+        default=None,
+        help="Single-tab only: first pause in seconds after a 429 (default 600, 300 to 3600); "
+        "repeated 429s double it up to --backoff-cap, a larger Retry-After always wins",
+    )
+    live.add_argument(
+        "--backoff-cap",
+        type=float,
+        default=None,
+        help="Single-tab only: longest adaptive pause in seconds (default 3600, at most 86400)",
     )
     live.add_argument(
         "--retire-single-tab",

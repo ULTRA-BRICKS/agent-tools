@@ -421,19 +421,24 @@ is not a confirmed continuation; not every enrolled chat is sent to, only a veri
 
 Settings (all flags of `live`; the rotation flags are refused without `--single-tab`):
 
-| Flag                                                                                    | Default   | Meaning                                                                                              |
-| --------------------------------------------------------------------------------------- | --------- | ---------------------------------------------------------------------------------------------------- |
-| `--single-tab`                                                                          | off       | Enable the patrol for this account.                                                                  |
-| `--rotation-min` / `--rotation-max`                                                     | 240 / 360 | Seconds BETWEEN VISIT STARTS; one fresh uniform draw per visit. Safe range 120 to 900, min <= max.   |
-| `--confirm-wait`                                                                        | 45        | In-visit wait (20 to 60 s) for the assistant response that follows a Go.                             |
-| `--retire-single-tab`                                                                   | off       | Deliberate rollback to the legacy loop; only while holding the account lock (see below).             |
-| `--poll-interval`, `--max-pages`, `--min-available-mib`, `--private-display`, `--apply` | as before | Housekeeping tick (30 s minimum, default 60), resource guard, display handling and apply, unchanged. |
+| Flag                                                                                    | Default    | Meaning                                                                                                              |
+| --------------------------------------------------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------------------------------- |
+| `--single-tab`                                                                          | off        | Enable the patrol for this account.                                                                                  |
+| `--rotation-min` / `--rotation-max`                                                     | 240 / 360  | Seconds BETWEEN VISIT STARTS; one fresh uniform draw per visit. Safe range 120 to 900, min <= max.                   |
+| `--confirm-wait`                                                                        | 45         | In-visit wait (20 to 60 s) for the assistant response that follows a Go.                                             |
+| `--backoff-base` / `--backoff-cap`                                                      | 600 / 3600 | Seconds of the first 429 pause and the longest adaptive pause (300 to 3600 / base to 86400), see "429 and cooldown". |
+| `--retire-single-tab`                                                                   | off        | Deliberate rollback to the legacy loop; only while holding the account lock (see below).                             |
+| `--poll-interval`, `--max-pages`, `--min-available-mib`, `--private-display`, `--apply` | as before  | Housekeeping tick (30 s minimum, default 60), resource guard, display handling and apply, unchanged.                 |
 
-**Rotation state** (`<state-stem>.rotation.json`, next to the account's database, mode 0600, stdlib-only module
-`rotation.py`) persists the queue, cursor, current target, next due time, the start of the last visit, any explicit
-deferral, last Go, any cooldown, the 429 transport evidence and the owned URLs. Every write is atomic (temp file, fsync,
-replace). Schema and account are validated on every load: a wrong-account, corrupt or symlinked file refuses to start
-the service (exit 2) and is never overwritten. Each account draws from its own system-entropy generator.
+**Rotation state** (`<state-stem>.rotation.json`, next to the account's database, mode 0600, stdlib-only modules
+`rotation.py`, `rotation_evidence.py`, `rotation_stats.py`, `backoff.py`) persists the queue (with each chat's durable
+`retry` record), cursor, current target, next due time, the start of the last visit, any explicit deferral, last Go, any
+cooldown, the adaptive pressure and its settings, the 429 transport evidence and the owned URLs. Every write is atomic
+(temp file, fsync, replace). Schema and account are validated on every load: a wrong-account, corrupt or symlinked file
+refuses to start the service (exit 2) and is never overwritten. Schema 1 (0.3.13/0.3.14) is migrated losslessly in
+memory (queue order, cursor, visit counts, Go record, owned URLs and evidence are copied unchanged, pressure starts at
+zero) and rewritten as schema 2 only when the patrol opens it; `status` and `monitor` never write. A schema 2 file is not
+readable by 0.3.14. Each account draws from its own system-entropy generator.
 
 **The interval is between visit starts.** One draw per visit is made when the visit STARTS (before the navigation, and
 persisted) and the next visit is due exactly that draw later, so the 20 to 60 s in-visit confirmation is INSIDE the
@@ -474,25 +479,49 @@ running, no challenge, no unresolved send, readable); any other extra is reporte
 nonempty draft, an authentication screen or any sign-in page pauses the patrol (`protected-tab`, `login-flow`) instead of
 opening a second tab, and the draft is neither read nor erased.
 
-**429 and cooldown.** A transport 429 (the legacy `stop:*` machine hold) now also writes a durable cooldown from the real
-`Retry-After` (delta seconds or HTTP date, clamped to 60 s to 24 h; 15 minutes when the header is absent) and records the
-exact endpoint path (no query) of every 429 and, for a restricted endpoint only, every later 2xx of that same path, as
-the browser's own `response` events showed them (never DOM text, never a request of our own). Until the cooldown ends
-nothing is read, navigated or sent, a cooldown that outlasts the rotation due time defers the next visit by one fresh draw
-after it ends, and no account, model or endpoint is rotated to get around it.
+**429 and cooldown (adaptive backoff, 0.3.15).** A transport 429 (the legacy `stop:*` machine hold) writes a durable
+cooldown and records the exact endpoint path (no query) of every 429 and, for a restricted endpoint only, every later
+2xx of that same path, as the browser's own `response` events showed them (never DOM text, never a request of our own).
+The cooldown deadline is `now + max(adaptive, Retry-After)` and is the ONE next retry deadline (never a second
+interval after it; the ordinary minimum spacing only applies when it is longer). `adaptive` is drawn uniformly in
+`[ladder, ladder * 1.25]` with `ladder = base * 2^(level-1)` (600, 1200, 2400, 3600 s with the defaults `base` 600 and
+`cap` 3600), shifted to `[cap / 1.25, cap]` = 2880 to 3600 s at the cap so the jitter survives there. `Retry-After` is read as delta seconds or an HTTP date and is NEVER shortened or capped: a 15 s header
+cannot shorten the 10 minute ladder, a 3 day header stays 3 days. A burst of 429s (one page load fires dozens) inside one
+issued visit or probe is ONE failure episode and one level; a 429 outside our own cooldown after 120 quiet seconds is a
+new episode. Pressure level rises by one per episode up to the cap and stays there indefinitely (no retry limit, no
+drop); it falls by ONE level after 3 clean visits. A clean visit needs a fresh 2xx of that chat's own read endpoint in the
+visit (a DOM outcome alone is never evidence; a visit without it is neutral and changes nothing), and no 429 or 5xx. An
+unrelated 200 (avatar, list, another chat) never lowers it. Under pressure the spacing of ordinary visits is at least
+the ladder (`max(base draw, adaptive)`), so recovery is gradual; at level 0 the interval is exactly the 240 to 360 s
+draw. A late burst never moves the deadline again. Until the
+cooldown ends nothing is read, navigated or sent for that account (the other account has its own file, lock and
+pressure), and no account, model or endpoint is rotated to get around it.
 
-An elapsed deadline NEVER clears the hold and never permits a Go. At most it permits ONE read-only check visit (the
-normal paced navigation and read; the legacy owner also keeps observing under a hold), after which the account is silent
-again for a fresh 15 minute cooldown unless a new 429 set a longer one. The machine hold (`stop:*` equal to the 429 text,
+Timeouts, navigation errors and 5xx answers during a visit are TRANSIENT: the chat keeps a durable per-chat `retry`
+(`300, 600, 1200, 1800 s`, bounded, never a hold or a `stop:*`), two consecutive transient visits also push the account's
+next visit by the same bounded delay, and a clean visit resets it. A failed visit stays enrolled, never counts as fresh,
+successful or done (`last_ok_at` is set only by a clean visit), and due retries alternate with cursor order so one failing
+chat uses at most every second slot and never starves the rest. Owner-paused or stopped chats stay enrolled in the queue
+as explicit exclusions (`coverage.excluded`), never erased.
+
+An elapsed deadline NEVER clears the hold and never permits a Go. It permits one paced CONTROLLED read-only probe per
+due slot: the known chat whose read endpoint is still unverified (oldest visit first; without a mappable endpoint the
+ordinary cursor chat, whose page load fetches the list), alternating with the ordinary cursor check so that one chat
+that keeps answering 429 never takes every slot and the others still get paced read-only visits (a neighbour's success
+never clears the hold). A tab already showing that chat is loaded again once, only when
+it is idle (no draft, challenge or running response); nothing is clicked or sent. A probe that sees neither a 429 nor the
+matching 2xx leaves a quiet period of one ladder rung without a strike. The machine hold (`stop:*` equal to the 429 text,
 recorded together with its own cooldown) is released ONLY when the cooldown is over AND every restricted endpoint has a
 strictly later success of the SAME exact path AND no 401/403/quota sighting is newer than any of those successes; the
 release deletes exactly that one control (compare and delete), so a user pause, challenge, quota latch, per-chat stop or a
 different `stop:*` is never cleared, and a Go afterwards still needs the normal admission. A fresh success of another
 endpoint (the conversation list) never hides a newer 429 of an exact chat read. A hold without the patrol's own evidence
-(a legacy hold, a foreign one, an elapsed cooldown with no recorded endpoint) is not auto-cleared: telemetry reports
-`429 hold pending: needs verified same-endpoint success / existing authorized coordinator` and `chatgpt-guardian resume`
-stays the manual action. Evidence is persisted across restarts. Limitation: a restricted endpoint the tab never requests
-again (a deleted chat, a list call the page no longer makes) cannot be verified, and the hold then stays pending.
+(a legacy hold, a foreign one, a cooldown with no recorded endpoint) becomes an explicit `legacy-unverifiable` state
+(`pressure.hold_state`): it is never cleared by the clock, read-only diagnostic probes continue every `cap` seconds, and
+`chatgpt-guardian resume` stays the manual action; telemetry reports
+`429 hold pending: needs verified same-endpoint success / existing authorized coordinator`. Evidence is persisted across
+restarts. Limitation: a restricted endpoint the tab never requests again (a deleted chat) cannot be verified, and the
+hold then stays pending. Offline-tested only; nothing here claims a universally safe ChatGPT request rate.
 
 **Running responses.** When the owned tab shows an active response (the existing adapter's running signal) the patrol
 does not navigate away, does not send a Go, does not open a second tab and never clicks Stop. The slot becomes an
@@ -513,8 +542,12 @@ drop-in when the account is permanently single-tab.
 patrol is also refused while the mode is recorded. Rollback is deliberate and exclusive: `live --retire-single-tab`
 (without `--single-tab`) takes the account lock, retires the marker only while holding it, then starts the legacy loop.
 
-**Telemetry.** `status` gains a `rotation` block and `monitor --json` is annotated with it (see `MONITORING.md`); accounts
-that never ran in single-tab mode keep exactly the old output.
+**Telemetry.** `status` gains a `rotation` block and `monitor --json` is annotated with it (see `MONITORING.md`):
+besides the queue it reports `pressure` (level, effective interval, failure streak, earliest retry and its reason, the
+persisted next due, the last confirmed target 2xx, controlled probes, observed 429 responses, the success rate over a
+bounded window of actual visits, the hold state) and `coverage` (never-clean chats, oldest-unvisited age, retry
+pending, remaining in this pass, explicit exclusions). Accounts that never ran in single-tab mode keep exactly the old
+output. Ordinary Telegram stays silent about 429s and retries.
 
 Rollback: replace `--single-tab` with `--retire-single-tab` in the unit and restart that one service (it refuses while a
 patrol still runs). The rotation file is left in place and ignored; holds, pauses, quota, attempts and the browser are
