@@ -523,6 +523,17 @@ endpoint (the conversation list) never hides a newer 429 of an exact chat read. 
 restarts. Limitation: a restricted endpoint the tab never requests again (a deleted chat) cannot be verified, and the
 hold then stays pending. Offline-tested only; nothing here claims a universally safe ChatGPT request rate.
 
+**Pending platform approval (0.3.16).** A native tool-permission card (`data-codex-approval-surface`, one visible form
+button inside the latest `in_progress` turn, no Stop, no draft, no challenge/quota/uncertain state) is the platform waiting
+for a human, not a response being generated. `approval.py` merges the card facts of the same page read into an
+`ApprovalObservation` that keeps `turn_state: in_progress` and sets `approval_wait` (a plain observation, a missing or
+malformed fact means false); the visit outcome is `permission-blocked`, the queue row shows `state: permission-blocked`,
+`reason: pending-platform-approval` with its usual visit provenance, and the chat is neither failed, done nor complete.
+The tab may leave the paused card to read the next chat, so one card never starves the account. Nothing is clicked,
+accepted, denied, answered or sent: every Go and continuation gate refuses it (a continuation is refused as
+`running`), even when the ordinary running flag is false. Two visible cards, a card of an older turn,
+a lookalike inside a user bubble or quote, Stop, a draft or a challenge keep today's protected behaviour.
+
 **Running responses.** When the owned tab shows an active response (the existing adapter's running signal) the patrol
 does not navigate away, does not send a Go, does not open a second tab and never clicks Stop. The slot becomes an
 explicit `deferred` / `running-protected` visit (persisted, visible in `rotation.deferred` and `last_visit`), the next

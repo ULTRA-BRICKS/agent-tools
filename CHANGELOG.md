@@ -140,6 +140,29 @@
   new `live --single-tab --backoff-base/--backoff-cap`. New modules `backoff.py`, `rotation_stats.py`,
   `rotation_evidence.py` (split out of `rotation.py`). Removed `patrol.cooldown_for`, `DEFAULT_COOLDOWN`,
   `COOLDOWN_FLOOR`, `COOLDOWN_CEILING`. A schema 2 rotation file is not readable by 0.3.14.
+- `agenttools-chatgpt` 0.3.16 (Refs #1038): a real, CURRENT native platform approval card no longer pins the whole
+  single-tab queue. The new `approvalFacts` helper of `conversation_root.js` reports, in the SAME `page.evaluate` as `live_dom.js`, whether exactly ONE
+  visible `data-codex-approval-surface` card with a form button sits inside the latest turn (not in a user bubble,
+  markdown output or a quote; hidden copies ignored; two visible cards or an older-turn card do not count), whether
+  Stop is visible and the latest turn key. `approval.merge` turns the structural `in_progress` + no-Stop read into an
+  `ApprovalObservation` (`approval_wait`, default false; any missing, malformed or disagreeing fact returns today's
+  observation unchanged) only when there is no draft, challenge, quota alert, failure status or uncertain page state.
+  The raw `in_progress` stays recorded in `turn_state`; the effective visit outcome is `permission-blocked` (queue row
+  `state` `permission-blocked`, `reason` `pending-platform-approval`, with the usual visits/last visit/next due), a
+  neutral visit: never failed, done or complete, no pressure change, no retry record (a real 5xx of its own requests still counts as transient). An approval observation never
+  passes `safe_failure` or `operator_candidate` even with `running` false and always reads `in_progress`, so every Go
+  and continuation gate (including an explicitly requested continuation, refused as `running`) vetoes it; the patrol
+  also never takes the Go branch for it. The single tab may leave the paused card to read the next chat (no Stop, no
+  draft, fresh precise identity); a card flag without that identity, a Stop, a draft or a challenge keeps the tab
+  protected exactly as before. A queued continuation for such a chat is still refused and the visit stays
+  `permission-blocked`. Nothing clicks, accepts, denies or answers the card, and nothing is sent to its chat.
+  Design note: the new field lives on a subclass in `approval.py` and the page-side facts in `conversation_root.js`
+  because the repository's complexity gate (`rig lint check`) already fails `core.py`, `continuation.py`,
+  `browser.py`, `live.py` and `live_dom.js` before this change, and the Python-only gate admits no new JavaScript
+  file, so touching or adding those was not possible without unrelated refactors or policy changes.
+  Limitations: offline-tested; the real-DOM cases need a local Chromium and were skipped on the test server, the shared
+  card finder is unit-tested under node on a minimal fake DOM instead; the monitor's page sample still calls the paused
+  turn `working`.
 - Worktree-only guard is ON BY DEFAULT and now covers commits (agent-tools#1012, Refs #1012):
   `worktree-only-writes`, `pin-primary-worktree` and `block-devserver-primary` enforce in every
   repo that has a `rig.yaml` unless it sets `agent_hooks.worktree_only: false` (or the session
