@@ -20,6 +20,9 @@ In **autonomous** mode (harness mode autonomous, or the user says autonomous):
 - Do **not** invent a "gate-behavior hold for a human" class (including a
   "hold for Alex"). That class does not exist.
 - Autonomous agents send key status via `tg --tag report`, not chat-only.
+- If `main` (or a release branch) is red, or a deploy is stuck, and no repair
+  is in flight, **start the repair immediately; never ask the owner whether
+  to**. Details and the escalation limits: `skill://repair-red-main`.
 - If extra-approval is wrongly ON, **fix that knob** —
   `github.ruleset.require_extra_approval_for_unattributed_changes`, mode-gated
   by [rig-cli#404](https://git.hyperide.ai/ultrabricks/rig-cli/pull/404). A red test
