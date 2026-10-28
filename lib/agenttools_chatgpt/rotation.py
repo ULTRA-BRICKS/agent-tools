@@ -40,7 +40,14 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from . import backoff, rotation_stats
-from .backoff import BackoffConfig, BackoffError, Pressure, max_level
+from .backoff import (
+    PENDING_PLATFORM_APPROVAL,
+    PERMISSION_BLOCKED,
+    BackoffConfig,
+    BackoffError,
+    Pressure,
+    max_level,
+)
 from .lock import AccountBusy, account_lock
 from .rotation_evidence import TRANSPORT_LIMIT, TransportEvidence, endpoint_ok
 from .rotation_stats import FOREIGN_HOLD, RETRY_REASON_LIMIT, chat_uuid, endpoint_chat
@@ -1023,22 +1030,27 @@ class Rotation(TransportEvidence):
 
     # -- telemetry ----------------------------------------------------------------------------
 
+    def _row_state(self, entry: Entry, controls: Mapping[str, str]) -> tuple[str, str]:
+        """(state, reason) of one queue row: an owner pause wins over a pending approval."""
+        paused = pause_reason(controls, entry.chat)
+        if paused:
+            return "paused", paused
+        if entry.last_outcome == PERMISSION_BLOCKED:
+            return PERMISSION_BLOCKED, PENDING_PLATFORM_APPROVAL
+        return ("current" if entry.chat == self.current else "queued"), ""
+
     def snapshot(self, controls: Mapping[str, str] | None = None) -> dict:
         """Operator view: current chat, queue size, last visit, next navigation, last Go."""
         controls = controls or {}
         now = self.clock()
         rows = []
         for entry in self.queue:
-            paused = pause_reason(controls, entry.chat)
+            state, reason = self._row_state(entry, controls)
             rows.append(
                 {
                     "chat": entry.chat,
-                    "state": "paused"
-                    if paused
-                    else "current"
-                    if entry.chat == self.current
-                    else "queued",
-                    "reason": paused,
+                    "state": state,
+                    "reason": reason,
                     "current": entry.chat == self.current,
                     "visits": entry.visits,
                     "last_visit_at": entry.last_visit_at,

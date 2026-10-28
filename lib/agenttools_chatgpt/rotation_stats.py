@@ -134,7 +134,9 @@ def visit_kind(machine, entry, outcome: str, started: float) -> str:
     kind = backoff.outcome_kind(outcome)
     if p.last_429_at is not None and p.last_429_at >= started:
         kind = "429"
-    if kind == "unproven" and p.transient_issue == p.issued:
+    # A blocked visit is neutral, but a real 5xx of its own requests still counts (429 wins).
+    blocked = kind == "neutral" and outcome == backoff.PERMISSION_BLOCKED
+    if (kind == "unproven" or blocked) and p.transient_issue == p.issued:
         kind = "transient"  # a 5xx answered one of this visit's own requests
     if kind == "unproven":
         proven = entry.confirmed_at is not None and entry.confirmed_at >= started

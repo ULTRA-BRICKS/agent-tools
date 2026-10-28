@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, replace
 
-from . import scripts
+from . import approval, scripts
 from .browser import PlaywrightAdapter
 from .core import MutationRefusal, Observation, Store, protected_dispatch
 
@@ -29,6 +29,7 @@ class LiveAdapter(PlaywrightAdapter):
         # the default mode remains the automatic failed-turn recovery, unchanged.
         self.operator = operator
         self.script = scripts.load("live_dom.js")
+        self.observe_script = approval.observe_script(self.script, scripts.shared())
         self.probe = None
         self.probed_at = 0.0
         self.probe_lock = probe_lock or asyncio.Lock()
@@ -330,24 +331,33 @@ class LiveAdapter(PlaywrightAdapter):
             and final.effort == "Extra High"
             and final.verified
             and not (final.running or final.draft or final.challenge or final.ambiguous)
+            and not approval.flagged(final)
         )
+
+    async def _read(self) -> Observation:
+        """The structural observation plus the card facts of the same instant, merged."""
+        raw = await self.page.evaluate(
+            self.observe_script, self._args(probe=self.probe)
+        )
+        if isinstance(raw, dict) and set(raw) == {"structural", "approval"}:
+            return approval.merge(
+                self._parse_observation(raw["structural"]), raw["approval"]
+            )
+        # Any other answer is the plain structural read: no card facts, so never an approval.
+        return self._parse_observation(raw)
 
     async def observe(self) -> Observation:
         from playwright.async_api import Error as BrowserError
 
         try:
-            structural = self._parse_observation(
-                await self.page.evaluate(self.script, self._args(probe=self.probe))
-            )
+            structural = await self._read()
             if not self.allow_active_probe:
                 return structural
             if not self._gate(replace(structural, verified=True)):
                 return structural
             if self.probe is None or time.monotonic() - self.probed_at > 5:
                 await self.probe_model()
-            return self._parse_observation(
-                await self.page.evaluate(self.script, self._args(probe=self.probe))
-            )
+            return await self._read()
         except (BrowserError, ValueError, TypeError):
             await self._clear_probe()
             return Observation("", "", "")

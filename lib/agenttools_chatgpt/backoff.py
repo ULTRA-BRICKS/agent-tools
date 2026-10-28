@@ -57,7 +57,11 @@ _PRESSURE_KEYS = frozenset(
         "recent",
     }
 )
-_NEUTRAL = frozenset({"challenge", "rate-limited", "redirected"})
+# A native approval card waits on a human: the visit read the chat fine but learned nothing about
+# transport health, and the chat is neither failed, done nor complete.
+PERMISSION_BLOCKED = "permission-blocked"
+PENDING_PLATFORM_APPROVAL = "pending-platform-approval"
+_NEUTRAL = frozenset({"challenge", "rate-limited", "redirected", PERMISSION_BLOCKED})
 
 
 class BackoffError(ValueError):

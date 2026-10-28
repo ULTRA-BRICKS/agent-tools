@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import random
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from agenttools_chatgpt import core, live, patrol, rotation
+from agenttools_chatgpt.approval import ApprovalObservation
 from agenttools_chatgpt.core import Guardian, MutationRefusal, Observation, Store
 from agenttools_chatgpt.urls import conversation_identity
 
@@ -61,7 +62,9 @@ class Clock:
 @dataclass
 class Chat:
     chat: str
-    kind: str = "complete"  # failed | working | complete | quota | unreadable
+    kind: str = (
+        "complete"  # failed | working | complete | quota | unreadable | approval
+    )
     turn: str = ""
     draft: str = ""
     challenge: bool = False
@@ -73,6 +76,8 @@ class Chat:
     finish_after: float = 600.0
     ambiguous: bool = False
     turns_seen: list = field(default_factory=list)
+    # Fields forced onto every observation of this chat (a stop, quota or draft beside a card).
+    overlay: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.turn = self.turn or f"aaaaaaaa-0000-4000-8000-{self.chat[-12:]}"
@@ -129,7 +134,13 @@ class World:
         failed = phase == "failed"
         turn = self.read_head(chat, verified)
         proven = verified and failed and bool(chat.model)
-        return Observation(
+        return replace(self._page(chat, phase, turn, proven, failed), **chat.overlay)
+
+    def _page(self, chat: Chat, phase: str, turn: str, proven: bool, failed: bool):
+        # Only the page's pending native approval card yields the approval observation.
+        kind = ApprovalObservation if phase == "approval" else Observation
+        extra = {"approval_wait": True} if phase == "approval" else {}
+        return kind(
             chat.chat,
             turn,
             turn,
@@ -141,9 +152,12 @@ class World:
             draft=bool(chat.draft),
             ambiguous=chat.ambiguous,
             quota=phase == "quota",
-            turn_state={"failed": "cancelled", "working": "in_progress"}.get(
-                phase, "complete"
-            ),
+            turn_state={
+                "failed": "cancelled",
+                "working": "in_progress",
+                "approval": "in_progress",
+            }.get(phase, "complete"),
+            **extra,
         )
 
     def sample(self, chat: Chat) -> dict:
@@ -160,7 +174,9 @@ class World:
                 "assistant_present": chat.kind != "failed",
             }
         ]
-        running = phase == "working"
+        # A pending platform approval still reads as in_progress with no Stop: the monitor sample
+        # carries no card knowledge, so patrol must not let it re-pin the account.
+        running = phase in ("working", "approval")
         if chat.go_turn:
             started = self.clock.mono() >= chat.go_at + chat.reply_delay
             turns.append(
@@ -178,6 +194,7 @@ class World:
         status = {
             "failed": "Thinking failed",
             "working": "working",
+            "approval": "working",
             "quota": "quota-or-rate-limit",
         }.get(phase, "complete")
         return {
@@ -185,7 +202,7 @@ class World:
             "turn": turns[-1]["id"],
             "turns": turns,
             "running": running,
-            "stop_visible": running,
+            "stop_visible": phase == "working",
             "status": status,
             "failure_evidence": "",
             "progress_token": f"{turns[-1]['id']}:{status}",

@@ -25,7 +25,10 @@ later success of every restricted endpoint does) and at most permits one read-on
 
 Past bugs it avoids: confirm_failure's quota fallback switches models; this path never selects a
 model. A refused or interrupted send keeps its (chat, turn) identity consumed (core.Store), so a
-restart can never repeat a Go.
+restart can never repeat a Go. A native platform approval card on the latest `in_progress` turn
+(no Stop) once read as a running response and pinned the single tab, starving every other queued
+chat; it is now the neutral `permission-blocked` visit (queue reason `pending-platform-approval`),
+the tab may leave it, and nothing is ever clicked, answered or sent for it.
 """
 
 from __future__ import annotations
@@ -39,7 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import backoff, live, rotation
+from . import approval, backoff, live, rotation
 from .continuation import Continuations
 from .core import Guardian, Observation, Store
 from .live import process_continuation
@@ -231,6 +234,7 @@ class GoAdapter:
         if (
             not self.allowed()
             or not live.structural_failure(structural)
+            or approval.flagged(structural)
             or structural.identity != self.candidate.identity
         ):
             await self._safety(structural)
@@ -457,6 +461,9 @@ class Patrol:
         A draft, an authentication screen, or an ACTIVE RESPONSE. Navigating away from a running
         response has no permitted live proof, so it is deliberately disabled: the tab is left
         alone, nothing is clicked (no Stop), and the visit becomes an explicit deferral.
+        A clearly paused platform approval card is not a response being generated: with no Stop,
+        no draft, no challenge and a precise identity, leaving it reads the next chat without
+        answering or cancelling anything; an approval flag without that identity stays protected.
         `away=False` asks only whether the tab may be kept as the keeper of a consolidation.
         """
         observed = await self.io.read(page)
@@ -464,7 +471,29 @@ class Patrol:
             return "draft"
         if observed.challenge:
             return "challenge"
-        return "running" if away and observed.running else ""
+        if away and observed.running:
+            return "running"
+        if (
+            away
+            and approval.flagged(observed)
+            and not self._card_on_this_tab(page.url, observed)
+        ):
+            return "approval-unverified"
+        return ""
+
+    @staticmethod
+    def _card_on_this_tab(url: str, observed: Observation) -> bool:
+        """A card flag is trusted for leaving only with a precise identity on this very tab.
+
+        `approval.pending` already needs chat, turn and generation and no Stop/draft/challenge/
+        quota/ambiguity; the chat must also be the tab's own conversation, and the turn must be
+        the generation the page script reported for it (a mismatch means a moving head).
+        """
+        return (
+            approval.pending(observed)
+            and observed.chat == conversation_identity(url)
+            and observed.turn == observed.generation
+        )
 
     async def _close_blocked(self, page) -> str:
         """Why an extra owned tab may not be closed: anything but a provably idle, empty tab."""
@@ -474,6 +503,7 @@ class Patrol:
             ("draft", observed.draft),
             ("challenge", observed.challenge),
             ("running", observed.running),
+            ("pending-approval", approval.flagged(observed)),
             ("pending-go", unresolved),
             ("unreadable", observed.chat == ""),
         )
@@ -640,12 +670,14 @@ class Patrol:
             return "cooldown"
         sample = await self.io.sample(page)
         await asyncio.to_thread(self.guardian.record_safety, observed)
-        approved = await self._dispatch_approval(page, entry)
+        approved = await self._dispatch_approval(page, entry, observed)
         if approved:
             return approved
         return await self._classify(page, entry, observed, sample, controls)
 
-    async def _dispatch_approval(self, page, entry: rotation.Entry) -> str:
+    async def _dispatch_approval(
+        self, page, entry: rotation.Entry, observed: Observation
+    ) -> str:
         """An owner approval is dispatched only while the tab is on its own chat."""
         if not self.config.apply or self.checking:
             return ""
@@ -670,7 +702,13 @@ class Patrol:
             min_available_mib=cfg.min_available_mib,
             private_display=cfg.private_display,
         )
-        return "" if result is None else "approval:" + result[1]
+        if result is None:
+            return ""
+        if result[1] != "sent" and approval.pending(observed):
+            # The refusal receipt stays in the continuation ledger; the visit itself is the
+            # neutral blocked state, not a clean "approval:*" visit that would clear retries.
+            return backoff.PERMISSION_BLOCKED
+        return "approval:" + result[1]
 
     async def _classify(
         self, page, entry, observed: Observation, sample: dict, controls
@@ -683,9 +721,11 @@ class Patrol:
             return "rate-limited"
         if observed.draft:
             return "draft"
-        if live.structural_failure(observed):
+        if live.structural_failure(observed) and not approval.flagged(observed):
             return await self._failed(page, entry, observed, controls)
         await self._reconcile_go(entry.chat, sample)
+        if approval.pending(observed) and not sample.get("stop_visible"):
+            return backoff.PERMISSION_BLOCKED
         if observed.running or sample.get("running"):
             return "working"
         if sample.get("status") == "complete" or observed.turn_state == "complete":
