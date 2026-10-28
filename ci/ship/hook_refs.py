@@ -7,7 +7,7 @@ descriptors (`cmd`), the bridge commands in the harness settings, the omp/pi ext
 and the `AGENT_TOOLS_ROOT` pointer the `gh ship` delegator sources. When ship's post-merge
 cleanup then deletes the worktree, every one of those hooks fails, and an `on_error: open` hook
 silently stops gating for every agent session on the machine (agent-tools#905:
-runpod-offload-gate after PR #904).
+runpod-offload-gate (now server-offload-gate) after PR #904).
 
 How it is reached: ship.sh's cleanup runs `python3 -I hook_refs.py <worktree> <main-checkout>`
 before removing each PR worktree and keeps the tree when this exits non-zero (and once more

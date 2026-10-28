@@ -630,31 +630,31 @@ def _gpu_load_in(command: str, queued: bool = False) -> Optional[bool]:
     return result
 
 
-# ── offloaded commands: `runpod-run` (skill runpod-offload) ──────────────────────
-# This hook's own block message sends a suite to `runpod-run -- <command>`: it rsyncs the
-# checkout to a Runpod pod and runs `<command>` THERE over ssh, so its words describe remote
+# ── offloaded commands: `server-run` (skill server-offload) ──────────────────────
+# This hook's own block message sends a suite to `server-run -- <command>`: it rsyncs the
+# checkout to the server and runs `<command>` THERE over ssh, so its words describe remote
 # work and the local process is an rsync + ssh. Exempted per SIMPLE COMMAND, so a heavy
-# command chained around it (`runpod-run -- x && bun test`) and a command substitution the
-# local shell expands into its argv (`runpod-run -- echo "$(bun test)"`) are still classified.
+# command chained around it (`server-run -- x && bun test`) and a command substitution the
+# local shell expands into its argv (`server-run -- echo "$(bun test)"`) are still classified.
 # Only the INSTALLED script is exempt (review findings: a name alone is spoofable — a shell
-# function `runpod-run() { shift; "$@"; }`, or a `/tmp/runpod-run` that forwards to python —
+# function `server-run() { shift; "$@"; }`, or a `/tmp/server-run` that forwards to python —
 # and a header check is forgeable, drifts with the script and would open a FIFO): the program
-# must resolve, after symlinks, to the runpod-offload skill script rig installs
-# (`~/.agents/skills/runpod-offload/runpod-run`) or the copy in this hook's own agent-tools
+# must resolve, after symlinks, to the server-offload skill script rig installs
+# (`~/.agents/skills/server-offload/server-run`) or the copy in this hook's own agent-tools
 # checkout or one of its registered git worktrees. A bare name resolves via PATH (what the
 # shell does), an absolute or `~/` path as is; a relative path is never exempt. A command that
 # could re-point ANY name in its LOCAL part gets no exemption at all: one that defines a
-# function (whatever its name: zsh expands `function runpod${dash}run(){…}` to `runpod-run`;
-# review finding) or an alias, assigns PATH, or uses `hash -p`. What follows a runpod-run's
-# `--` runs on the pod and is not scanned (`_local_text`). Residual: a function or PATH change made
+# function (whatever its name: zsh expands `function server${dash}run(){…}` to `server-run`;
+# review finding) or an alias, assigns PATH, or uses `hash -p`. What follows a server-run's
+# `--` runs on the server and is not scanned (`_local_text`). Residual: a function or PATH change made
 # by an EARLIER call of a persistent shell, or by a sourced file, is invisible to a pre-bash
 # hook; this is a memory gate, not a sandbox.
-_OFFLOAD_COMMANDS = frozenset({"runpod-run"})
-_OFFLOAD_SKILL = Path("runpod-offload") / "runpod-run"  # under a skills dir
+_OFFLOAD_COMMANDS = frozenset({"server-run"})
+_OFFLOAD_SKILL = Path("server-offload") / "server-run"  # under a skills dir
 _OFFLOAD_RIG_INSTALL = Path("~") / ".agents" / "skills" / _OFFLOAD_SKILL
 _OFFLOAD_IN_CHECKOUT = Path("skills") / "universal" / _OFFLOAD_SKILL
 # Re-pointing syntax, matched on the LOCAL tokens (quotes removed, as the shell removes them
-# from a function or alias name; a runpod-run's remote tail cut, see `_local_text`).
+# from a function or alias name; a server-run's remote tail cut, see `_local_text`).
 _DEFINES_FUNCTION = r"\bfunction\s|\(\s*\)\s*[{(]"  # `function x`, `x()`, `x ( ) {`
 _DEFINES_ALIAS = r"\balias\b"
 # PATH, zsh's `path` array (not a `--path=` flag), `fpath`/`FPATH` (autoload lookup) and HOME
@@ -678,7 +678,7 @@ _REPOINTING = re.compile(
     ))
 )
 # Programs that run shell code this hook cannot see, which may define functions or change
-# PATH (`source ~/x; runpod-run -- bun test`, `builtin source ~/x`; review findings).
+# PATH (`source ~/x; server-run -- bun test`, `builtin source ~/x`; review findings).
 _RUNS_UNSEEN_SHELL_CODE = frozenset({"source", ".", "eval", "autoload", "emulate", "builtin"})
 # Wrapper options (`timeout -k 30`, `nice -n 5`, `sudo -u x`, `env -u X`) whose value is the
 # next word, so the value is not mistaken for the program. The `/proc` side of the same walk
@@ -729,7 +729,7 @@ def _install_and_worktrees(root: Path) -> set[Path]:
 
 
 def _trusted_offload_scripts() -> set[str]:
-    """Real paths of the runpod-run scripts the exemption trusts (see the block comment): the
+    """Real paths of the server-run scripts the exemption trusts (see the block comment): the
     rig install, and the copy in this checkout or one of its registered git worktrees (the
     same reach the review-cli handoff gives review-cli's)."""
     checkout = Path(__file__).resolve().parents[2]
@@ -750,13 +750,13 @@ def _resolve_program(program: str) -> Optional[str]:
 
 
 def _is_trusted_offload_program(program: str) -> bool:
-    """`program` — a command word or argv word naming runpod-run — is the installed script."""
+    """`program` — a command word or argv word naming server-run — is the installed script."""
     return _resolve_program(program) in _trusted_offload_scripts()
 
 
 def _local_text(command: str, remote_from: Callable[[list[str]], int]) -> str:
     """`command`'s tokens, space-joined, without what runs elsewhere: each simple command's
-    words from `remote_from(words)` on (a runpod-run's `-- <command>` runs on the pod, so a
+    words from `remote_from(words)` on (a server-run's `-- <command>` runs on the server, so a
     `PATH=` or function there re-points nothing here; review finding)."""
     out: list[str] = []
     words: list[str] = []
@@ -838,7 +838,7 @@ def _behind_identity_wrapper(words: list[str], program_at: int) -> bool:
 
 
 def _is_offloaded(words: list[str]) -> bool:
-    """The simple command runs the installed `runpod-run` script (see `_OFFLOAD_COMMANDS`)."""
+    """The simple command runs the installed `server-run` script (see `_OFFLOAD_COMMANDS`)."""
     i = _program_index(words)
     return (
         i < len(words)
@@ -849,7 +849,7 @@ def _is_offloaded(words: list[str]) -> bool:
 
 
 def _offload_remote_from(words: list[str]) -> int:
-    """Where an installed runpod-run's remote command starts (after its `--`); `len(words)`
+    """Where an installed server-run's remote command starts (after its `--`); `len(words)`
     for anything else, which runs here in full."""
     if not _is_offloaded(words):
         return len(words)
@@ -858,8 +858,8 @@ def _offload_remote_from(words: list[str]) -> int:
 
 
 def _drop_offloaded_commands(command: str) -> str:
-    """`command` without its offloaded `runpod-run` simple commands (`_without_simple_commands`)."""
-    return _without_simple_commands(command, "runpod-run", _is_offloaded, _offload_remote_from)
+    """`command` without its offloaded `server-run` simple commands (`_without_simple_commands`)."""
+    return _without_simple_commands(command, "server-run", _is_offloaded, _offload_remote_from)
 
 
 # ── review-cli handoff: review-cli admits its own runs (review-cli#614) ────────────
@@ -869,7 +869,7 @@ def _drop_offloaded_commands(command: str) -> str:
 # ceiling is therefore QUEUED there instead — two gates for the same thing only made agents
 # retry. Such a review is still blocked here on the emergency signals (MemAvailable floor,
 # PSI limit, wired share, jetsam level), which mean "do not start anything now".
-# Same rigor as runpod-run: the `review` program must resolve (PATH lookup or absolute/`~/`
+# Same rigor as server-run: the `review` program must resolve (PATH lookup or absolute/`~/`
 # path, symlinks resolved) to `<root>/bin/review` of the review-cli the operator installed
 # — the checkout `~/.local/bin/review` resolves to — or of one of its registered git
 # worktrees, with no function/alias/PATH/`hash -p` re-pointing in the command. Whether
@@ -948,8 +948,8 @@ def review_cli_handoff(command: str) -> Optional[str]:
         roots.add(root)
         return True
 
-    # `_offload_remote_from`: a runpod-run's remote tail elsewhere in the command runs on the
-    # pod, so re-pointing syntax there must not stop the handoff either.
+    # `_offload_remote_from`: a server-run's remote tail elsewhere in the command runs on the
+    # server, so re-pointing syntax there must not stop the handoff either.
     rest = _without_simple_commands(command, "review", admitted, _offload_remote_from)
     if rest == command or len(roots) != 1:
         return None
@@ -960,8 +960,8 @@ def classify_heavy_operation(command: str) -> Optional[str]:
     """Return a short human label for the heavy operation `command` runs, or None.
 
     Kept free of subprocesses (no sysctl, no `/proc` scan) so it's directly unit-testable;
-    its only I/O is the `runpod-run` provenance check (a PATH lookup and realpath, only for a
-    command that names runpod-run). Token-based: a heavy-operation word trapped
+    its only I/O is the `server-run` provenance check (a PATH lookup and realpath, only for a
+    command that names server-run). Token-based: a heavy-operation word trapped
     inside a MULTI-WORD quoted argument (a commit message, a `--title`) is one
     shlex token and never matches a bare-word check — see module docstring. A
     SINGLE-WORD quoted argument (`git commit -m "pytest"`) is NOT distinguishable
@@ -1028,7 +1028,7 @@ def classify_heavy_operation(command: str) -> Optional[str]:
 # ceiling, budget and swap checks then refused exactly that (2026-10-15 13:44Z: `bun test
 # ./tests/session-topic-integration.test.ts -t …` blocked for "7 heavy runner(s) already
 # live"). Such a run is gated on the emergency signals only, like a review handed to
-# review-cli. The operand rule is runpod-offload-gate's (`_pytest_verdict` and friends,
+# review-cli. The operand rule is server-offload-gate's (`_pytest_verdict` and friends,
 # copied: hooks are standalone stdlib scripts): an existing path is judged by what it is; a
 # path that does not exist here (another checkout, a `cd` earlier in the chain) is a
 # directory when its last component has no extension. No operand at all is the whole suite.
@@ -1797,12 +1797,12 @@ def _runner_label(argv: list[str]) -> Optional[str]:
 
 
 def _is_offload_process(info: _ProcInfo) -> bool:
-    """A real `runpod-run` process (`bash /…/runpod-run -- bun test`): the suite in its argv,
-    and the ssh/rsync children carrying it, run on a Runpod pod, not here. The script word
+    """A real `server-run` process (`bash /…/server-run -- bun test`): the suite in its argv,
+    and the ssh/rsync children carrying it, run on the server, not here. The script word
     must be ABSOLUTE (how the kernel passes a shebang script reached via PATH or a full path)
     and pass `_is_trusted_offload_program`; a bare or relative word depends on a cwd/PATH
     this scan cannot pin, the same rule the command side applies to relative paths. A
-    process merely NAMED runpod-run is counted like any other."""
+    process merely NAMED server-run is counted like any other."""
     for word in info.argv:
         if _basename(word) in _OFFLOAD_COMMANDS:
             return word.startswith("/") and _is_trusted_offload_program(word)
@@ -1915,7 +1915,7 @@ def scan_live_runners(
     workers — collapses into its topmost match; a review's seat CLIs collapse into the review
     process, since the budget's cost is per review fan-out). Each entry's footprint is its
     whole tree's (`tree_footprint`). This hook's own ancestry is excluded: an agent running the hook from inside a suite
-    would otherwise count itself. So is every real `runpod-run` tree: its suite runs remotely.
+    would otherwise count itself. So is every real `server-run` tree: its suite runs remotely.
     Sessions are identified by pid only; `describe_live_runners` adds the titles (a `tg-ctl`
     subprocess) and is called only on the block path."""
     if table is None:
@@ -2287,8 +2287,8 @@ def decide(
         # Not for a review handed to review-cli or a 1-2 file run: the advice would name the very
         # command just blocked on an emergency signal (round-3 review finding).
         message += (
-            "A full test suite, mypy or a docker-backed integration run belongs on a Runpod pod "
-            "anyway (`runpod-run -- <command>`, skill runpod-offload); locally run one or two "
+            "A full test suite, mypy or a docker-backed integration run belongs on the server "
+            "anyway (`server-run -- <command>`, skill server-offload); locally run one or two "
             "test files at most. "
         )
     message += (

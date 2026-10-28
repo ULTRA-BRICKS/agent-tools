@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""server-run — run one heavy command on the owner's server instead of this workstation.
+
+Carrier: the `server-offload` UNIVERSAL SKILL (skills/universal/server-offload/); rig copies the
+skill dir to ~/.agents/skills/server-offload/, so the provisioned command is
+~/.agents/skills/server-offload/server-run (symlink it into ~/.local/bin once per machine).
+
+    server-run -- bun test                          # the checkout of the cwd, full suite, on the server
+    server-run -- bash -c 'bun install && bun run test'
+    server-run --fetch coverage -- bun run test:coverage   # copy ./coverage back afterwards
+    server-run --dry-run -- bun test                # print the plan, touch nothing
+    server-run --status                             # load, memory, free slots, remote checkouts
+    server-run --clean [--older-than-days 3]        # delete idle remote checkouts (default 3 days)
+    server-run --clean --this                       # delete this checkout's remote copy
+
+One run: (1) rsync the checkout (git-tracked plus untracked-not-ignored files; uncommitted work
+included; .git, node_modules, .venv never travel — the server keeps its own across runs) to
+~/work/sr/<repo>-<8 hex of the checkout path>; (2) a one-commit git snapshot there, so tests that
+call `git ls-files` work; (3) wait for one of 3 job slots on the server; (4) run the command under
+`nice -n 10 timeout` in the same sub-directory, streaming output, and exit with ITS exit code;
+(5) copy each --fetch path back. Environment: SERVER_RUN_HOST (default ultra@65.21.40.51).
+Exit codes of its own: 2 usage, 22 no slot free within --queue-timeout, 124 timeout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import os
+import re
+import shlex
+import subprocess
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+
+DEFAULT_HOST = "ultra@65.21.40.51"
+REMOTE_ROOT = "work/sr"  # relative to the remote $HOME
+SLOTS = 3
+EXIT_USAGE = 2
+EXIT_NO_SLOT = 22
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30"]
+# Never copied to the server and never deleted there by the mirror: the server keeps its own.
+KEEP_REMOTE = ("/.git", "node_modules", ".venv")
+REMOTE_PATH = "$HOME/.bun/bin:$HOME/.local/bin:$PATH"
+
+
+def host() -> str:
+    return os.environ.get("SERVER_RUN_HOST", DEFAULT_HOST)
+
+
+def git_toplevel(cwd: Path) -> Path:
+    out = subprocess.run(
+        ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=False
+    )
+    if out.returncode != 0:
+        sys.exit("server-run: not inside a git checkout (run it from the repo you want to test)")
+    return Path(out.stdout.strip())
+
+
+def remote_dirname(top: Path) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", top.name)
+    return f"{safe}-{hashlib.sha1(str(top).encode()).hexdigest()[:8]}"
+
+
+def _is_file_or_link(path: Path) -> bool:
+    """A path worth syncing: a file or symlink (even dangling); a gitlink/submodule directory is not."""
+    return os.path.islink(path) or os.path.isfile(path)
+
+
+def tracked_and_untracked(top: Path) -> bytes:
+    out = subprocess.run(
+        ["git", "-C", str(top), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        capture_output=True,
+        check=True,
+    )
+    # A path deleted in the work tree is still listed as cached; rsync would fail on it.
+    names = [n for n in out.stdout.split(b"\0") if n and _is_file_or_link(top / os.fsdecode(n))]
+    return b"\0".join(names) + b"\0" if names else b""
+
+
+def remote_script(dirname: str, subdir: str, command: str, timeout: int, queue_timeout: int) -> str:
+    """The bash program that runs on the server: snapshot, take a slot, run the command."""
+    work = f"$HOME/{REMOTE_ROOT}/{dirname}"
+    cd_sub = f"mkdir -p {shlex.quote(subdir)} && cd {shlex.quote(subdir)} || exit 2" if subdir else ":"
+    return f"""set -u
+export PATH="{REMOTE_PATH}" LC_ALL=C.UTF-8
+cd "{work}" || exit 2
+if [ ! -d .git ]; then git init -q; printf 'node_modules\\n.venv\\n' >> .git/info/exclude; fi
+git update-ref -d HEAD 2>/dev/null; git add -A >/dev/null && git -c core.hooksPath=/dev/null -c user.name=server-run -c user.email=server-run@localhost commit -q --allow-empty -m snapshot && git gc --auto -q 2>/dev/null
+mkdir -p "$HOME/{REMOTE_ROOT}/.slots"
+got=0
+end=$(( $(date +%s) + {queue_timeout} ))
+while [ "$got" = 0 ]; do
+  for s in $(seq 1 {SLOTS}); do
+    exec 9>"$HOME/{REMOTE_ROOT}/.slots/$s"
+    if flock -n 9; then got=1; break; fi
+  done
+  [ "$got" = 1 ] && break
+  [ "$(date +%s)" -ge "$end" ] && {{ echo "server-run: no free slot in {queue_timeout}s" >&2; exit {EXIT_NO_SLOT}; }}
+  sleep 5
+done
+touch .sr-last-run
+{cd_sub}
+nice -n 10 timeout --foreground {timeout} bash -c {shlex.quote(command)}
+"""
+
+
+def run(argv: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, check=False, **kw)
+
+
+def ssh(script: str) -> int:
+    return run(["ssh", *SSH_OPTS, host(), "bash -c " + shlex.quote(script)]).returncode
+
+
+def prune_script(dirname: str) -> str:
+    """Delete remote files that are not in the list on stdin (rsync cannot --delete with --files-from)."""
+    return f"""export LC_ALL=C; cd "$HOME/{REMOTE_ROOT}/{dirname}" || exit 2
+comm -z -23 <(find . \\( -path ./.git -o -name node_modules -o -name .venv \\) -prune -o \\( -type f -o -type l \\) -printf '%P\\0' | sort -z) <(sort -z) | xargs -0 -r rm -f --
+find . -mindepth 1 -type d -empty -not -path './.git' -not -path './.git/*' -not -path '*/node_modules' -not -path '*/node_modules/*' -not -path '*/.venv' -not -path '*/.venv/*' -delete
+"""
+
+
+def rsync_up(top: Path, dirname: str) -> int:
+    excludes = [f"--exclude={e}" for e in KEEP_REMOTE]
+    mkdir = run(["ssh", *SSH_OPTS, host(), f"mkdir -p {REMOTE_ROOT}/{dirname}"]).returncode
+    if mkdir:
+        return mkdir
+    names = tracked_and_untracked(top)
+    code = run(
+        ["rsync", "-rlpt", "--from0", "--files-from=-", *excludes, "-e", "ssh " + " ".join(SSH_OPTS),
+         f"{top}/", f"{host()}:{REMOTE_ROOT}/{dirname}/"],
+        input=names,
+    ).returncode
+    if code:
+        return code
+    return run(["ssh", *SSH_OPTS, host(), "bash -c " + shlex.quote(prune_script(dirname))], input=names).returncode
+
+
+def rsync_down(top: Path, dirname: str, rel: str) -> int:
+    dest = top / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    src = f"{host()}:{REMOTE_ROOT}/{dirname}/{rel.rstrip('/')}"
+    return run(["rsync", "-rlpt", "-e", "ssh " + " ".join(SSH_OPTS), src, str(dest.parent) + "/"]).returncode
+
+
+def status() -> int:
+    script = f"""cd "$HOME/{REMOTE_ROOT}" 2>/dev/null || {{ echo "no checkouts yet"; exit 0; }}
+echo "load: $(cut -d' ' -f1-3 /proc/loadavg) on $(nproc) cores; $(free -g | awk '/Mem/ {{print $7" GB available of "$2" GB"}}')"
+busy=0; for s in $(seq 1 {SLOTS}); do ( exec 9>".slots/$s"; flock -n 9 ) 2>/dev/null || busy=$((busy+1)); done
+echo "slots: $busy/{SLOTS} busy"
+for d in */; do d=${{d%/}}; [ -d "$d" ] && printf '%s  %s  last run %s\\n' "$d" "$(du -sh "$d" 2>/dev/null | cut -f1)" "$( [ -e "$d/.sr-last-run" ] && stat -c %y "$d/.sr-last-run" | cut -d. -f1 || echo never)"; done
+df -h "$HOME" | tail -1 | awk '{{print "disk: "$4" free ("$5" used)"}}'
+"""
+    return ssh(script)
+
+
+def clean(days: int, only: str | None) -> int:
+    if only:
+        find = f'echo {shlex.quote(only)}'
+    else:
+        find = f'find . -mindepth 1 -maxdepth 1 -type d -not -name ".slots" -mtime +{days} -printf "%f\\n"'
+    script = f"""cd "$HOME/{REMOTE_ROOT}" 2>/dev/null || exit 0
+for d in $({find}); do
+  [ -f "$d/.sr-last-run" ] && [ -n "$(find "$d/.sr-last-run" -mtime -{days} 2>/dev/null)" ] && [ -z "{only or ''}" ] && continue
+  rm -rf -- "$d" && echo "removed $d"
+done
+"""
+    return ssh(script)
+
+
+@contextlib.contextmanager
+def checkout_lock(dirname: str) -> Iterator[None]:
+    """Two runs of one checkout would sync over each other on the server: serialize them here."""
+    lock_dir = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "server-run"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with open(lock_dir / f"{dirname}.lock", "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def main(argv: list[str] | None = None) -> int:
+    args_in = sys.argv[1:] if argv is None else argv
+    if "--" in args_in:
+        i = args_in.index("--")
+        opts, command = args_in[:i], args_in[i + 1 :]
+    else:
+        opts, command = args_in, []
+    p = argparse.ArgumentParser(prog="server-run", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--status", action="store_true")
+    p.add_argument("--clean", action="store_true")
+    p.add_argument("--this", action="store_true", help="with --clean: only this checkout's remote copy")
+    p.add_argument("--older-than-days", type=int, default=3)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--fetch", action="append", default=[], metavar="PATH", help="repo-relative path to copy back")
+    p.add_argument("--timeout", type=int, default=3600, help="seconds, exit 124 (default 3600)")
+    p.add_argument("--queue-timeout", type=int, default=3600, help="seconds to wait for a slot (default 3600)")
+    a = p.parse_args(opts)
+    if a.this and not a.clean:
+        p.error("--this only works with --clean")
+    if min(a.timeout, a.queue_timeout, a.older_than_days) < 1:
+        p.error("--timeout, --queue-timeout and --older-than-days must be at least 1")
+    for rel in a.fetch:
+        if os.path.isabs(rel) or ".." in Path(rel).parts or not Path(rel).parts:
+            p.error(f"--fetch {rel}: must be a path inside the repo")
+
+    if a.status:
+        return status()
+    cwd = Path.cwd()
+    if a.clean:
+        only = remote_dirname(git_toplevel(cwd)) if a.this else None
+        return clean(a.older_than_days, only)
+    if not command:
+        print("server-run: no command (usage: server-run [options] -- <command...>)", file=sys.stderr)
+        return EXIT_USAGE
+
+    top = git_toplevel(cwd)
+    dirname = remote_dirname(top)
+    subdir = "" if cwd == top else str(cwd.relative_to(top))
+    cmd = shlex.join(command)
+    script = remote_script(dirname, subdir, cmd, a.timeout, a.queue_timeout)
+    if a.dry_run:
+        print(f"host:    {host()}\nremote:  ~/{REMOTE_ROOT}/{dirname}/{subdir}\ncommand: {cmd}\nfetch:   {a.fetch}\n--- remote script ---\n{script}")
+        return 0
+    with checkout_lock(dirname):
+        code = rsync_up(top, dirname)
+        if code:
+            print(f"server-run: rsync to {host()} failed (exit {code})", file=sys.stderr)
+            return code
+        code = ssh(script)
+        for rel in a.fetch:
+            if rsync_down(top, dirname, rel):
+                print(f"server-run: could not fetch {rel}", file=sys.stderr)
+        return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

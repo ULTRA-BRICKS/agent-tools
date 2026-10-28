@@ -1,11 +1,11 @@
-# runpod-offload-gate
+# server-offload-gate
 
 **Point:** `pre-bash` · **Fail policy:** `open` · **Priority:** 37 (just before
 `heavy-op-memory-gate`) · **Applies to:** every session, subagents included
 
-In a repo that says heavy work runs on Runpod, a whole test suite, a tree-wide `mypy` or a
+In a repo that says heavy work runs on the server, a whole test suite, a tree-wide `mypy` or a
 docker build does not run on the workstation. The hook blocks the whole-suite shape locally and
-hands back the one-line Runpod equivalent.
+hands back the one-line `server-run` equivalent.
 
 ## Why
 
@@ -14,14 +14,14 @@ sessions in parallel) thrashed to a manual reset twice. 10-10: one session's sub
 dozens of concurrent `bun test ./tests` full suites plus `review diff`. 10-11: three concurrent
 `review diff` runs, `uv run mypy` + `pytest` with testcontainers docker and several `bun test`
 runs lost 26 GB in two minutes on an already-full swap; the kernel OOM killer never fired. The
-projects' `AGENTS.md` files already said *"Heavy work runs on Runpod: locally a single test file
-at most; full suite / mypy / integration tests go to a Runpod pod via `runpod-run`"* — and the
+projects' `AGENTS.md` files already said *"Heavy work runs on the server: locally a single test file
+at most; full suite / mypy / integration tests go to the server via `server-run`"* — and the
 agents ran the suites anyway. The doc was advice; this hook is the rule.
 
 ## When it fires
 
 Only in a repo that opts in: an `AGENTS.md` or `CLAUDE.md` at the cwd or any parent directory
-contains `runpod-run` or the phrase `Heavy work runs on Runpod`. Elsewhere it never blocks.
+contains `server-run` or the phrase `Heavy work runs on the server`. Elsewhere it never blocks.
 
 | Shape | Blocked | Still allowed |
 | --- | --- | --- |
@@ -42,15 +42,15 @@ extension (`tests/unit`), as a file otherwise (`tests/unit/test_x.py`).
 ## The message
 
 ```
-Blocked (runpod-offload-gate): this runs pytest on a directory ('tests/': a whole tree of tests)
-on the workstation, and this repo's AGENTS.md says heavy work runs on Runpod (/home/u/repo/AGENTS.md).
-… Run the same command on a pod instead — same checkout synced, output streamed back, pod deleted after:
-  runpod-run -- bash -c 'uv run pytest tests/'
-(`runpod-run --dry-run -- …` prints the plan and price; …) Locally, ONE test file is fine …
+Blocked (server-offload-gate): this runs pytest on a directory ('tests/': a whole tree of tests)
+on the workstation, and this repo's AGENTS.md says heavy work runs on the server (/home/u/repo/AGENTS.md).
+… Run the same command on the server instead — same checkout synced, output streamed back, exit code returned:
+  server-run -- bash -c 'uv run pytest tests/'
+(`server-run --dry-run -- …` prints the plan; …) Locally, ONE test file is fine …
 ```
 
 The original command is quoted verbatim with `shlex.quote`, so a `cd x && A && B` chain lands on
-the pod as one `bash -c` script.
+the server as one `bash -c` script.
 
 ## Detection is argv-aware
 
@@ -67,7 +67,7 @@ quotes) allows: fail-open, like the descriptor's `on_error`.
 ## Escape hatch
 
 The same deny-by-default Telegram hatch every hard-block hook in this catalog uses:
-`RIG_HATCH_REQUEST_RUNPOD_OFFLOAD_GATE="<written justification>"` as an inline prefix on the
+`RIG_HATCH_REQUEST_SERVER_OFFLOAD_GATE="<written justification>"` as an inline prefix on the
 command asks the human live and proceeds only on a real-time approval. A blank value, a bare
 `1`/`true`, or a single token like `pytest` is rejected without a Telegram call. No env flag
 disables the gate.
@@ -83,13 +83,13 @@ This hook is the only one that knows a repo has somewhere *better* to run the wo
 ## Test
 
 ```bash
-chmod +x runpod_offload_gate.py
-echo '{"args":{"command":"uv run pytest tests/"},"cwd":"/path/to/opted-in/repo"}' | ./runpod_offload_gate.py; echo " exit=$?"
-# → block, exit=10, message ends with the runpod-run one-liner
-echo '{"args":{"command":"uv run pytest tests/unit/test_x.py"},"cwd":"/path/to/opted-in/repo"}' | ./runpod_offload_gate.py; echo " exit=$?"
+chmod +x server_offload_gate.py
+echo '{"args":{"command":"uv run pytest tests/"},"cwd":"/path/to/opted-in/repo"}' | ./server_offload_gate.py; echo " exit=$?"
+# → block, exit=10, message ends with the server-run one-liner
+echo '{"args":{"command":"uv run pytest tests/unit/test_x.py"},"cwd":"/path/to/opted-in/repo"}' | ./server_offload_gate.py; echo " exit=$?"
 # → allow, exit=0
-echo '{"args":{"command":"uv run pytest tests/"},"cwd":"/tmp"}' | ./runpod_offload_gate.py; echo " exit=$?"
+echo '{"args":{"command":"uv run pytest tests/"},"cwd":"/tmp"}' | ./server_offload_gate.py; echo " exit=$?"
 # → allow, exit=0 (no AGENTS.md opt-in above /tmp)
 ```
 
-Unit tests: `uv run --with pytest python -m pytest tests/test_runpod_offload_gate.py -q`.
+Unit tests: `uv run --with pytest python -m pytest tests/test_server_offload_gate.py -q`.

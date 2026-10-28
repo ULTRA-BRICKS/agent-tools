@@ -5,7 +5,7 @@ Why this exists: on 2026-10-11 13:34 three concurrent `review diff` runs plus
 pytest/testcontainers/bun-test lost 26 GB in two minutes. Swap was already full, the kernel OOM
 killer never fired (file-cache thrash kept "making progress"), systemd-oomd only watches one
 cgroup that holds every omp session at once, and the box thrashed for 18 minutes. The agents that
-caused it had been told to offload heavy work to Runpod but nobody told them *while it happened*.
+caused it had been told to offload heavy work to the server but nobody told them *while it happened*.
 This daemon attributes memory to sessions (cgroup scope omp-<N>.scope, or process tree for legacy
 sessions), detects the spike while there is still headroom, and delivers a steer message into the
 session that owns it (`omp-steer`), escalating to a broadcast + desktop notification when the whole
@@ -507,7 +507,7 @@ class Sentinel:
                 f"reclaimable; heavy children: {top or 'none'}), {growth / GB:+.1f} GB in the last "
                 f"{CONFIG['GROWTH_WINDOW_S']:.0f} s; machine has {avail / GB:.1f} GB of {self.mem_total / GB:.0f} "
                 f"available, falling {max(fall, 0) / GB:.1f} GB/min. Why: {'; '.join(why)}. {action} and move it "
-                f"to Runpod (skill://runpod-offload, runpod-run -- ...); at 4 % free earlyoom kills the largest "
+                f"to the server (skill://server-offload, server-run -- ...); at 4 % free earlyoom kills the largest "
                 f"process without asking.")
 
     def steer(self, key, s, growth, avail, fall, docker, procs, why, now):

@@ -363,29 +363,28 @@ them to *every* project and user. If you want the catalog of always-apply behavi
 
 ---
 
-## Heavy work runs on Runpod
+## Heavy work runs on the server
 
 This workstation is shared by many agent sessions, the review queue and the owner's own
 desktop; a full suite here starves all of them (it froze the machine twice on 2026-10-10).
-**Rule: locally, a single test file at most; the full suite goes to a Runpod pod** via the
-`runpod-offload` universal skill this catalog ships (`skill://runpod-offload`, i.e.
-[`skills/universal/runpod-offload/SKILL.md`](skills/universal/runpod-offload/SKILL.md);
-script `~/.agents/skills/runpod-offload/runpod-run`, on PATH as `runpod-run`).
+**Rule: locally, a single test file at most; the full suite goes to the owner's server
+`ultra@65.21.40.51`** via the `server-offload` universal skill this catalog ships
+(`skill://server-offload`, i.e
+[`skills/universal/server-offload/SKILL.md`](skills/universal/server-offload/SKILL.md);
+script `~/.agents/skills/server-offload/server-run`, on PATH as `server-run`). Runpod is gone.
 
 Heavy here: `uv run --with pytest pytest tests/` (the whole suite — 6,000+ tests, the
 `ci/tests` gate), the `test_rig_detached_*` and bridge suites that spawn harness stubs.
 
 ```bash
-runpod-run --apt nodejs -- uv run --with 'pytest>=8,<9' --with pyyaml --with jsonschema pytest tests -q
-                                        # full suite on a 4-vCPU CPU pod ($0.16/h), pod deleted when done
-runpod-run --apt nodejs --ttl 10 -- uv run --with 'pytest>=8,<9' --with pyyaml --with jsonschema pytest tests -q
-                                        # same, keeping the pod 10 idle minutes between runs
+server-run -- uv run --with 'pytest>=8,<9' --with pyyaml --with jsonschema pytest tests -q
+                                        # full suite on the server, nice'd, exit code returned
 uv run --with pytest pytest tests/test_<one>.py -q    # local: one file, that's the limit
 ```
 
-`--apt nodejs` because the opencode-bridge tests shell out to `node`. `runpod-run --dry-run
--- …` prints the plan and price; `runpod-run --status` / `--stop` list and terminate the
-pods this machine created — leave none behind.
+The opencode-bridge tests shell out to `node` (present on the server). `server-run --dry-run
+-- …` prints the plan; `server-run --status` shows load, free slots and disk; `server-run
+--clean --this` removes this checkout's remote copy when you are done.
 
 ---
 
@@ -412,7 +411,7 @@ VS Code extension-host code, GNOME extensions, a macOS-native Swift helper.
 - **tg-cli is warn-only** until its port,
   [tg-cli#768](https://git.hyperide.ai/ultrabricks/tg-cli/issues/768), lands; then flip it to
   block. Every other ecosystem repo blocks.
-- **This repo is in scope.** Its remaining shell (`ci/ship/ship.sh`, `runpod-run`, the git-hook
+- **This repo is in scope.** Its remaining shell (`ci/ship/ship.sh`, the git-hook
   dispatcher, the `ci/*` gate scripts, `ops/*/install.sh`, the `rig-detached-*` launchers,
   `ghgql`) blocks on its next edit; port tickets:
   [#946](https://git.hyperide.ai/ultrabricks/agent-tools/issues/946),

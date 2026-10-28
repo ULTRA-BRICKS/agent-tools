@@ -12,30 +12,30 @@ Blocks STARTING a heavy operation while the machine is short of memory. Heavy op
   `mlx_lm`/`mlx_whisper` entry points (`mlx_lm.generate`, `python -m mlx_whisper`, …), or any
   command handed a `.bin`/`.gguf`/`.ggml`/`.safetensors` model file
 
-Not heavy: `runpod-run [options] -- <command>` (skill `runpod-offload`, the place this hook's own
-block message sends a suite). Everything after `--` runs on a Runpod pod over ssh; locally it is
+Not heavy: `server-run [options] -- <command>` (skill `server-offload`, the place this hook's own
+block message sends a suite). Everything after `--` runs on the server over ssh; locally it is
 an rsync + ssh. The program is found past env assignments, `nice`/`nohup`/`time`,
 `timeout [opts] DURATION` and their options (not behind `sudo`/`env`/`command -p`, which may
-resolve another `runpod-run`; see below). Only the installed script is exempt: a bare
-`runpod-run` must resolve via `PATH` (an absolute or `~/` path directly), after symlinks, to
-`~/.agents/skills/runpod-offload/runpod-run` (where rig installs the skill) or to
-`skills/universal/runpod-offload/runpod-run` in this hook's own agent-tools checkout (or one of its
+resolve another `server-run`; see below). Only the installed script is exempt: a bare
+`server-run` must resolve via `PATH` (an absolute or `~/` path directly), after symlinks, to
+`~/.agents/skills/server-offload/server-run` (where rig installs the skill) or to
+`skills/universal/server-offload/server-run` in this hook's own agent-tools checkout (or one of its
 registered git worktrees) — a name or a
 copied header proves nothing. A relative path gets no exemption, and neither does a command that
 could re-point a name in its local part: one that defines any function (the shell may expand the
-name — `function runpod${dash}run(){…}` is `runpod-run` in zsh; zsh's `functions[…]` table too) or
+name — `function server${dash}run(){…}` is `server-run` in zsh; zsh's `functions[…]` table too) or
 alias, assigns `PATH`, zsh's `path`, `fpath`/`FPATH`, `HOME` or `XDG_CONFIG_HOME` (also element-wise or
 `+=`) or names one of them as an argument of `set`/`typeset`/`declare`/`local`/`export`/`readonly`/`unset`/`integer`/`float`
 (`set -A path …`), uses `hash -p`, or runs shell code
 the hook cannot see (`source`, `.`, `eval`, `autoload`, `emulate`) —
-a spoofed `runpod-run() { shift; "$@"; }` would run the suite locally. What follows a
-`runpod-run`'s `--` runs on the pod and is not scanned (`runpod-run -- bash -c 'export PATH=…; make
+a spoofed `server-run() { shift; "$@"; }` would run the suite locally. What follows a
+`server-run`'s `--` runs on the server and is not scanned (`server-run -- bash -c 'export PATH=…; make
 test'` stays exempt). (A function or PATH
 change left behind by an earlier call of a persistent shell, or by a sourced file, is invisible
 to a pre-bash hook; this is a memory-safety gate, not a security boundary.)
-The exemption is per simple command: `runpod-run -- x && bun
-test`, `bun test; runpod-run …` and a command substitution the local shell expands inside its
-argv (`runpod-run -- echo "$(npm test)"`) are still classified and gated.
+The exemption is per simple command: `server-run -- x && bun
+test`, `bun test; server-run …` and a command substitution the local shell expands inside its
+argv (`server-run -- echo "$(npm test)"`) are still classified and gated.
 
 Handed to review-cli: a `review diff`/`quorum`/`brainstorm`/`just-ask` pass run by the installed
 review-cli with its admission controller (`reviewlib/admission.py`, review-cli#614). review-cli
@@ -43,7 +43,7 @@ queues every run until host CPU/RAM and each AI provider fit with 20% headroom, 
 same thing here twice only made agents retry. Such a review skips the memory budget, the swap
 check and the live-runner ceiling, and is blocked only on the emergency signals: `MemAvailable`
 below its floor, PSI above its limit, the wired share, the jetsam level. "Installed" is pinned like
-`runpod-run`: the `review` program must resolve (PATH lookup or absolute/`~/` path, symlinks
+`server-run`: the `review` program must resolve (PATH lookup or absolute/`~/` path, symlinks
 resolved) to `<root>/bin/review`, where `<root>` is the checkout `~/.local/bin/review` resolves to,
 its repository's main checkout, or one of its registered git worktrees (`<common .git>/worktrees/*/gitdir`;
 a directory merely put under `.worktrees/` is not one). Whether admission is on is asked from
@@ -53,7 +53,7 @@ anything it prints goes to stderr). A checkout without it, any failure there, or
 means no handoff. It is asked with the hook's own environment, so no handoff either for a command
 that may give the review another one: any mention of `REVIEW_ADMISSION` (`=0`, `=$OFF`, `unset`,
 `export` in any order), or a review prefixed with an assignment, an `env` option, or run behind
-`sudo`/`doas`/`env`/`su` (another user's PATH and config; `sudo runpod-run` gets no exemption either).
+`sudo`/`doas`/`env`/`su` (another user's PATH and config; `sudo server-run` gets no exemption either).
 Nor for a relative path, an interpreter in front (`python3 …/review`), or a command
 that defines any function or alias, assigns or declares (`set -A`/`typeset`/`export`/`unset`…)
 PATH/`path`/`fpath`/HOME/XDG_CONFIG_HOME, uses `hash -p` or
@@ -87,7 +87,7 @@ runner(s) already live" on a box with tens of GB free (agent-tools#911).
 | `bun test`, `vitest run` (or `--run`), `jest` | `bun test ./tests/x.test.ts -t foo` | `bun test`, `bun test ./tests`, `vitest x.test.ts` (may start watch mode) |
 | `go test` | `go test -run TestX ./pkg/foo_test.go` | `go test`, `go test ./pkg`, `go test ./...` |
 
-Operands follow runpod-offload-gate's rule: an existing path is judged by what it is; a path that
+Operands follow server-offload-gate's rule: an existing path is judged by what it is; a path that
 does not exist (`cd sub && bun test x.test.ts`) is a directory when its last component has no
 extension. Paths are looked up from the event's `cwd`, moved by a leading chain of literal
 `cd`/`pushd` joined by `&&`/`;`. After an unresolvable one (`cd "$X"`, `cd -`, `popd`), or into a
@@ -198,10 +198,10 @@ never spawns a subprocess — falling back to `/proc/<pid>/cwd`, then to the pid
 message shows the budget arithmetic (`Memory budget: A MB available − R MB reserved for N live
 runner(s) − C MB for this <op> = L MB left (headroom H MB)`) and lists the runners as `pid  PSS
 runner  (reserves R MB)  ← omp <pid> (<cwd>) "<title>"` — also when another signal blocked, so
-the agent knows who it is competing with. A real `runpod-run` process (its script argv word is
+the agent knows who it is competing with. A real `server-run` process (its script argv word is
 absolute and resolves to an installed copy; a bare or relative word is counted, since the scan
 cannot pin its cwd or PATH) and everything under it (its ssh child carries the remote
-suite's command line) is never counted: the suite runs on the pod. The scan itself takes ~20 ms on a 600-process box; an allow
+suite's command line) is never counted: the suite runs on the server. The scan itself takes ~20 ms on a 600-process box; an allow
 decision stays under 100 ms.
 
 Accepted residual: two agents that start a heavy op in the same instant both see the table

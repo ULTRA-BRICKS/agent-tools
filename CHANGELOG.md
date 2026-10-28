@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed
+
+- Runpod offloading is removed (owner tg#25309, agent-tools#1048). The `runpod-offload` skill
+  (`runpod-run`, its spend policy and tests) is replaced by the `server-offload` skill whose
+  `server-run -- <command>` rsyncs the checkout to the owner's server `ultra@65.21.40.51`, runs it under
+  `nice` in one of 3 shared slots and returns the exit code (`--fetch`, `--status`, `--clean`).
+  `agent-hooks/runpod-offload-gate` is now `agent-hooks/server-offload-gate` (opt-in marker
+  `server-run` / `Heavy work runs on the server`, hatch `RIG_HATCH_REQUEST_SERVER_OFFLOAD_GATE`) and no longer
+  mistakes a redirection (`2>&1`, `> out`) for a test directory operand. `heavy-op-memory-gate` exempts
+  `server-run` instead of `runpod-run`. Older entries below keep their historical Runpod wording.
+
 ### Added
 
 - `agenttools-chatgpt` 0.3.4: `chatgpt-guardian --workspace W coverage --cdp-port N [--apply]` reconciles every

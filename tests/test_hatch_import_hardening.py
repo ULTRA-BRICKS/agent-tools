@@ -35,7 +35,7 @@ HATCH_HOOKS = (
     "agent-hooks/pkill-guard/pkill_guard.py",
     "agent-hooks/require-review-before-commit/require_review.py",
     "agent-hooks/require-ticket-before-commit/require_ticket_before_commit.py",
-    "agent-hooks/runpod-offload-gate/runpod_offload_gate.py",
+    "agent-hooks/server-offload-gate/server_offload_gate.py",
     "agent-hooks/skills-read-gate/skills_read_gate.py",
     "agent-hooks/subagent-no-bg-longproc/subagent_no_bg_longproc.py",
     "agent-hooks/subagent-no-monitor/subagent_no_monitor.py",

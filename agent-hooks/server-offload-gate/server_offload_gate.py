@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""agents-hooks/v1 pre-bash hook — in a repo that says "heavy work runs on Runpod", a
+"""agents-hooks/v1 pre-bash hook — in a repo that says "heavy work runs on the server", a
 whole test suite, a type-check of the whole tree or a docker build does not run locally.
 
 WHY THIS EXISTS (2026-10-10 and 2026-10-11): the shared Linux workstation (48 GB RAM,
@@ -7,14 +7,14 @@ WHY THIS EXISTS (2026-10-10 and 2026-10-11): the shared Linux workstation (48 GB
 days. On 10-10 one session's subagent swarm ran dozens of concurrent `bun test ./tests`
 full suites plus `review diff`; on 10-11 three concurrent `review diff` runs, `uv run
 mypy` + `pytest` with testcontainers docker and several `bun test` runs lost 26 GB in two
-minutes on an already-full swap. The projects' AGENTS.md files ALREADY said "Heavy work
-runs on Runpod: locally a single test file at most; full suite / mypy / integration tests
-go to a Runpod pod via `runpod-run`" — and the agents ignored it, partly because a
-`runpod-run` had hung on ssh earlier that day. A rule in a doc is advice; this hook is
-the rule.
+minutes on an already-full swap. The projects' AGENTS.md files ALREADY said "locally a
+single test file at most; full suite / mypy / integration tests go off the workstation"
+— and the agents ignored it. A rule in a doc is advice; this hook is the rule. The
+owner's server `ultra@65.21.40.51` is the place heavy work goes (owner tg#25309; Runpod
+was removed), reached with `server-run -- <command>`.
 
 WHAT IT GATES. Only when the current repo opts in — an `AGENTS.md` or `CLAUDE.md` at the
-cwd or any parent mentions `runpod-run` or the phrase `Heavy work runs on Runpod` — it
+cwd or any parent mentions `server-run` or the phrase `Heavy work runs on the server` — it
 blocks the whole-suite shapes locally:
   * `pytest` (also `uv run pytest`, `python -m pytest`, `poetry run pytest`, …) with no
     path, with a directory path, or with more than two files;
@@ -26,7 +26,7 @@ blocks the whole-suite shapes locally:
   * `docker build`, `docker buildx build`, `docker compose up`, `docker-compose up`.
 A single test file stays allowed (`pytest tests/unit/test_x.py`, `bun test
 tests/x.test.ts`, `mypy src/mod.py`), as do `--help`/`--version`. The block message carries
-the exact `runpod-run -- bash -c '<original command>'` equivalent.
+the exact `server-run -- bash -c '<original command>'` equivalent.
 
 Detection is argv-aware, not a raw substring search: the command is shell-tokenized
 (quotes, comments and heredocs honored), split into segments, and each segment's REAL
@@ -36,7 +36,7 @@ inline `VAR=val`, no-op wrappers (`timeout N`, `env`, `nice`, …) and launchers
 carry (no-long-inline-process, block-no-verify, …): each hook is a standalone script.
 
 Escape hatch: the same deny-by-default Telegram hatch every hard-block hook here uses —
-`RIG_HATCH_REQUEST_RUNPOD_OFFLOAD_GATE="<written justification>"` asks the human live;
+`RIG_HATCH_REQUEST_SERVER_OFFLOAD_GATE="<written justification>"` asks the human live;
 a blank, a bare `1`, or a single token is rejected without a call.
 
 Contract (agents-hooks/v1):
@@ -126,14 +126,14 @@ hatch_escalation = _load_hatch_escalation()
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
-HOOK_ID = "runpod-offload-gate"
+HOOK_ID = "server-offload-gate"
 
 # ── the repo opt-in ───────────────────────────────────────────────────────────────────────────
 # A repo is gated when its agent instructions name the offload script or state the rule. Both
-# phrases come from the projects' own AGENTS.md "Heavy work runs on Runpod" section and the
-# runpod-offload skill; a repo without either keeps running its suites locally, unchanged.
+# phrases come from the projects' own AGENTS.md "Heavy work runs on the server" section and the
+# server-offload skill; a repo without either keeps running its suites locally, unchanged.
 _INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")
-_OPT_IN_MARKERS = ("runpod-run", "Heavy work runs on Runpod")
+_OPT_IN_MARKERS = ("server-run", "Heavy work runs on the server")
 _MAX_INSTRUCTION_BYTES = 512 * 1024
 
 # Unescaped shell metachars that, like whitespace, are a word boundary at which a `#` opens a comment
@@ -868,6 +868,25 @@ def _classify_argv(argv: list[str], cwd: str, depth: int = 0) -> str | None:
     return _classify_argv(_strip_wrappers(inner), cwd, depth + 1)
 
 
+_REDIRECT_OPS = frozenset({">", ">>", "<", "<<", "<<<", ">&", "<&", ">|", "&>", "&>>", "<>"})
+
+
+def _drop_redirections(segment: list[str]) -> list[str]:
+    """Remove `> file`, `2>&1`, `< in` and their fd digit: a redirection target is not an operand
+    of the runner (`pytest tests/x.py 2>&1` runs ONE file, not a directory named '2')."""
+    out: list[str] = []
+    i = 0
+    while i < len(segment):
+        if segment[i] in _REDIRECT_OPS:
+            if out and out[-1].isdigit():
+                out.pop()
+            i += 2
+            continue
+        out.append(segment[i])
+        i += 1
+    return out
+
+
 def classify_whole_suite(command: str, cwd: str, depth: int = 0) -> str | None:
     """A short label of the first whole-suite shape in `command`, or None. The command is
     shell-tokenized (quotes/heredocs honored) and split into segments; each segment is inspected
@@ -878,7 +897,7 @@ def classify_whole_suite(command: str, cwd: str, depth: int = 0) -> str | None:
     if tokens is None:
         return None
     for segment in _segments(tokens):
-        argv = _strip_wrappers(_split_inline_env(_strip_leading_shell_noise(segment)))
+        argv = _strip_wrappers(_split_inline_env(_strip_leading_shell_noise(_drop_redirections(segment))))
         label = _classify_argv(argv, cwd, depth)
         if label:
             return label
@@ -886,20 +905,21 @@ def classify_whole_suite(command: str, cwd: str, depth: int = 0) -> str | None:
 
 
 def block_message(command: str, label: str, opt_in: Path) -> str:
-    offload = f"runpod-run -- bash -c {shlex.quote(command)}"
+    offload = f"server-run -- bash -c {shlex.quote(command)}"
     return (
         f"Blocked ({HOOK_ID}): this runs {label} on the workstation, and this repo's "
-        f"{opt_in.name} says heavy work runs on Runpod ({opt_in}). A whole suite, a tree-wide "
+        f"{opt_in.name} says heavy work runs on the server ({opt_in}). A whole suite, a tree-wide "
         "mypy or a docker build next to the other agent sessions is exactly what thrashed this "
         "shared machine to a manual reset on 2026-10-10 and 2026-10-11. Run the same command on "
-        f"a pod instead — same checkout synced, output streamed back, pod deleted after:\n"
+        f"the server instead (owner's 65.21.40.51 — same checkout synced, output streamed back, "
+        f"exit code returned):\n"
         f"  {offload}\n"
-        "(`runpod-run --dry-run -- …` prints the plan and price; `runpod-run --ttl 10 -- …` keeps "
-        "the pod warm for the next run; skill runpod-offload.) Locally, ONE test file is fine "
+        "(`server-run --dry-run -- …` prints the plan; `server-run --status` shows load and free "
+        "slots; skill server-offload.) Locally, ONE test file is fine "
         "(`pytest tests/unit/test_x.py`, `bun test tests/x.test.ts`, `mypy src/mod.py`). There "
         "is NO self-service bypass. For a genuine exception, ASK the human, or request a one-time "
         "Telegram approval by setting "
-        "RIG_HATCH_REQUEST_RUNPOD_OFFLOAD_GATE=\"<written justification>\" "
+        "RIG_HATCH_REQUEST_SERVER_OFFLOAD_GATE=\"<written justification>\" "
         "(deny-by-default; a bare 1 or a single token like pytest is rejected)."
     )
 

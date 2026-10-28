@@ -1,13 +1,13 @@
-"""Tests for the runpod-offload-gate agent-hook (pre-bash, hard block with Telegram hatch).
+"""Tests for the server-offload-gate agent-hook (pre-bash, hard block with Telegram hatch).
 
-In a repo whose AGENTS.md/CLAUDE.md opts in (`runpod-run` / "Heavy work runs on Runpod"),
+In a repo whose AGENTS.md/CLAUDE.md opts in (`server-run` / "Heavy work runs on the server"),
 a whole-suite shape (pytest on a dir, bun test with no file, mypy on a tree, docker build, …)
-is blocked locally and the `runpod-run -- bash -c '<cmd>'` equivalent is named. Added after
+is blocked locally and the `server-run -- bash -c '<cmd>'` equivalent is named. Added after
 the 2026-10-10/11 thrash incidents. See the hook module's docstring.
 
 Run from the repo root::
 
-    uv run --with pytest python -m pytest tests/test_runpod_offload_gate.py -q
+    uv run --with pytest python -m pytest tests/test_server_offload_gate.py -q
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ from pathlib import Path
 
 import pytest
 
-_HOOK = Path(__file__).resolve().parents[1] / "agent-hooks" / "runpod-offload-gate" / "runpod_offload_gate.py"
-_spec = importlib.util.spec_from_file_location("runpod_offload_gate", _HOOK)
+_HOOK = Path(__file__).resolve().parents[1] / "agent-hooks" / "server-offload-gate" / "server_offload_gate.py"
+_spec = importlib.util.spec_from_file_location("server_offload_gate", _HOOK)
 assert _spec and _spec.loader
 hook = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hook)
@@ -30,7 +30,7 @@ _spec.loader.exec_module(hook)
 @pytest.fixture
 def repo(tmp_path):
     """An opted-in repo with a real `tests/` tree and one test file."""
-    (tmp_path / "AGENTS.md").write_text("## Heavy work runs on Runpod\nuse `runpod-run -- …`\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text("## Heavy work runs on the server\nuse `server-run -- …`\n", encoding="utf-8")
     (tmp_path / "tests" / "unit").mkdir(parents=True)
     (tmp_path / "tests" / "unit" / "test_x.py").write_text("def test_ok(): pass\n", encoding="utf-8")
     (tmp_path / "src").mkdir()
@@ -42,7 +42,7 @@ def repo(tmp_path):
 def _no_hatch(monkeypatch):
     """Never reach tg-ctl from a unit test; the hatch result is 'not requested'."""
     monkeypatch.setattr(hook.hatch_escalation, "request_hatch_approval", lambda *a, **k: hook._UnavailableHatchResult())
-    monkeypatch.delenv("RIG_HATCH_REQUEST_RUNPOD_OFFLOAD_GATE", raising=False)
+    monkeypatch.delenv("RIG_HATCH_REQUEST_SERVER_OFFLOAD_GATE", raising=False)
 
 
 # ── repo opt-in ───────────────────────────────────────────────────────────────────
@@ -52,7 +52,7 @@ def test_opt_in_found_in_parent_agents_md(repo):
 
 
 def test_opt_in_accepts_claude_md_and_either_marker(tmp_path):
-    (tmp_path / "CLAUDE.md").write_text("Heavy work runs on Runpod.\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").write_text("Heavy work runs on the server.\n", encoding="utf-8")
     assert hook.repo_opt_in_file(str(tmp_path)) == tmp_path / "CLAUDE.md"
 
 
@@ -165,12 +165,16 @@ def test_whole_suite_shapes_are_detected(command, repo):
     "docker ps",
     "docker compose down",
     "docker compose logs",
-    "git commit -m 'run pytest tests/ on the pod'",
+    "git commit -m 'run pytest tests/ on the server'",
     "echo 'bun test'",
     "tg 'bun test ./tests froze the box'",
     "grep -rn 'pytest tests/' docs/",
     "cat <<'EOF'\npytest tests/\nEOF",
-    "runpod-run -- bun test ./tests",  # the offload itself is not a local run
+    "server-run -- bun test ./tests",  # the offload itself is not a local run
+    "pytest tests/unit/test_x.py -q 2>&1 | tail -5",  # fd redirection is not an operand
+    "pytest tests/unit/test_x.py >out.txt 2>&1",
+    "bun test tests/x.test.ts 2>/dev/null",
+    "pytest tests/unit/test_x.py 2> err.txt",
     "command -v pytest",
     "command -V bun",
     "exec pytest tests/unit/test_x.py",
@@ -198,19 +202,19 @@ def test_directory_operand_heuristics(repo):
 
 # ── the block message ─────────────────────────────────────────────────────────────
 
-def test_block_message_quotes_the_original_command_for_runpod_run(repo):
+def test_block_message_quotes_the_original_command_for_server_run(repo):
     command = "cd sub && uv run --no-sync pytest -q tests/integration/ -x"
     message = hook.block_message(command, "pytest on a directory", repo / "AGENTS.md")
-    assert f"runpod-run -- bash -c '{command}'" in message
+    assert f"server-run -- bash -c '{command}'" in message
     assert "ONE test file is fine" in message
-    assert "RIG_HATCH_REQUEST_RUNPOD_OFFLOAD_GATE" in message
+    assert "RIG_HATCH_REQUEST_SERVER_OFFLOAD_GATE" in message
     assert str(repo / "AGENTS.md") in message
 
 
 def test_block_message_survives_single_quotes_in_the_command(repo):
     command = "pytest tests/ -k 'not slow'"
     message = hook.block_message(command, "pytest on a directory", repo / "AGENTS.md")
-    assert "runpod-run -- bash -c 'pytest tests/ -k '\"'\"'not slow'\"'\"''" in message
+    assert "server-run -- bash -c 'pytest tests/ -k '\"'\"'not slow'\"'\"''" in message
 
 
 # ── main() end-to-end wiring ──────────────────────────────────────────────────────
@@ -229,7 +233,7 @@ def test_main_blocks_a_directory_run_in_an_opted_in_repo(repo, monkeypatch):
     payload, code = _run("uv run pytest tests/", repo, monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert payload["decision"] == "block"
-    assert "runpod-run -- bash -c 'uv run pytest tests/'" in payload["message"]
+    assert "server-run -- bash -c 'uv run pytest tests/'" in payload["message"]
 
 
 def test_main_allows_one_file_in_an_opted_in_repo(repo, monkeypatch):

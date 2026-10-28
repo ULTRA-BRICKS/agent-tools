@@ -313,122 +313,122 @@ def test_one_unwrapped_load_next_to_a_wrapped_one_is_still_ungated():
     assert hook.classify_heavy_operation(command) == hook.GPU_MODEL_LABEL
 
 
-# ── runpod-run offload: the suite after `--` runs on a Runpod pod, not here ──────────
+# ── server-run offload: the suite after `--` runs on the server, not here ──────────
 
-_RUNPOD_RUN_HEADER = (
+_SERVER_RUN_HEADER = (
     "#!/usr/bin/env bash\n"
-    "# runpod-run — run one heavy command (test suite, build, benchmark) on a Runpod pod\n"
+    "# server-run — run one heavy command (test suite, build, benchmark) on the server\n"
 )
 
 
 @pytest.fixture
 def offload_script(tmp_path, monkeypatch):
-    """A real-looking runpod-run install: the skill script, a `~/.local/bin` symlink to it,
+    """A real-looking server-run install: the skill script, a `~/.local/bin` symlink to it,
     and that dir on PATH (as on a rig-managed machine). Returns the skill script's path."""
     home = tmp_path / "home"
-    skill = home / ".agents" / "skills" / "runpod-offload" / "runpod-run"
+    skill = home / ".agents" / "skills" / "server-offload" / "server-run"
     skill.parent.mkdir(parents=True)
-    skill.write_text(_RUNPOD_RUN_HEADER + "exec ssh pod \"$@\"\n")
+    skill.write_text(_SERVER_RUN_HEADER + "exec ssh server \"$@\"\n")
     skill.chmod(0o755)
     local_bin = home / ".local" / "bin"
     local_bin.mkdir(parents=True, exist_ok=True)  # the review_cli fixture may have made it
-    (local_bin / "runpod-run").symlink_to(skill)
+    (local_bin / "server-run").symlink_to(skill)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PATH", f"{local_bin}:{os.environ.get('PATH', '')}")
     return skill
 
 
 @pytest.mark.parametrize("command", [
-    "runpod-run -- bun test ./tests",
-    "runpod-run --ttl 30 -- bun test ./tests",
-    "~/.local/bin/runpod-run --cpu cpu3c-8 -- pytest -q",
+    "server-run -- bun test ./tests",
+    "server-run --ttl 30 -- bun test ./tests",
+    "~/.local/bin/server-run --cpu cpu3c-8 -- pytest -q",
     "{skill} --gpu 'NVIDIA GeForce RTX 4090' -- python bench.py",
-    "RUNPOD_RUN_STATE=/tmp/rr runpod-run --ttl 30 -- npm test",
-    "CI=1 timeout -k 30 3700 runpod-run -- cargo test --workspace",
-    "nice -n 5 runpod-run -- make all",
-    "cd /repo && runpod-run --ttl 30 -- bun test ./tests 2>&1 | tail -50",
-    "runpod-run -- bash -c 'bun test && pytest'",
-    "runpod-run -- stt a.wav",
-    # Re-pointing syntax in the REMOTE command runs on the pod, not here (review finding).
-    "runpod-run -- bash -c 'export PATH=/opt/bin:$PATH && make test'",
-    "runpod-run --ttl 30 -- bash -c 'f(){ make \"$@\"; }; f test'",
-    "runpod-run -- env PATH=/opt/bin bun test",
+    "SERVER_RUN_STATE=/tmp/rr server-run --ttl 30 -- npm test",
+    "CI=1 timeout -k 30 3700 server-run -- cargo test --workspace",
+    "nice -n 5 server-run -- make all",
+    "cd /repo && server-run --ttl 30 -- bun test ./tests 2>&1 | tail -50",
+    "server-run -- bash -c 'bun test && pytest'",
+    "server-run -- stt a.wav",
+    # Re-pointing syntax in the REMOTE command runs on the server, not here (review finding).
+    "server-run -- bash -c 'export PATH=/opt/bin:$PATH && make test'",
+    "server-run --ttl 30 -- bash -c 'f(){ make \"$@\"; }; f test'",
+    "server-run -- env PATH=/opt/bin bun test",
 ])
-def test_runpod_run_offloads_are_not_local_heavy_operations(command, offload_script):
+def test_server_run_offloads_are_not_local_heavy_operations(command, offload_script):
     command = command.replace("{skill}", str(offload_script))
     assert hook.classify_heavy_operation(command) is None, command
 
 
 @pytest.mark.parametrize("command", [
-    "runpod-run -- bun test ./tests && bun test",
-    "bun test; runpod-run --ttl 30 -- bun test",
-    "runpod-run -- true | pytest -q",
-    "runpod-run -- echo \"$(npm test)\"",
-    "runpod-run -- echo `pytest`",
-    "runpod-run -- x; review diff -C .",
-    "echo runpod-run && bun test",  # runpod-run as an operand is not the program
+    "server-run -- bun test ./tests && bun test",
+    "bun test; server-run --ttl 30 -- bun test",
+    "server-run -- true | pytest -q",
+    "server-run -- echo \"$(npm test)\"",
+    "server-run -- echo `pytest`",
+    "server-run -- x; review diff -C .",
+    "echo server-run && bun test",  # server-run as an operand is not the program
 ])
-def test_heavy_commands_chained_around_runpod_run_still_run_locally(command, offload_script):
+def test_heavy_commands_chained_around_server_run_still_run_locally(command, offload_script):
     assert hook.classify_heavy_operation(command) is not None, command
 
 
-def test_help_flag_of_runpod_run_does_not_exempt_a_chained_heavy_command(offload_script):
-    assert hook.classify_heavy_operation("runpod-run --help; review diff -C .") is not None
-    assert hook.classify_heavy_operation("runpod-run -- ls -h; review diff -C .") is not None
+def test_help_flag_of_server_run_does_not_exempt_a_chained_heavy_command(offload_script):
+    assert hook.classify_heavy_operation("server-run --help; review diff -C .") is not None
+    assert hook.classify_heavy_operation("server-run -- ls -h; review diff -C .") is not None
 
 
 @pytest.mark.parametrize("command", [
-    'function runpod-run { shift; "$@"; }; runpod-run -- bun test ./tests',
+    'function server-run { shift; "$@"; }; server-run -- bun test ./tests',
     # zsh expands the function NAME (review finding): any function definition disqualifies.
-    'dash=-; function runpod${dash}run(){ shift; "$@"; }; runpod-run -- bun test ./tests',
-    'dash=-; runpod${dash}run () { shift; "$@"; }; runpod-run -- bun test ./tests',
-    "eval 'f(){ :; }'; runpod-run -- bun test ./tests",
+    'dash=-; function server${dash}run(){ shift; "$@"; }; server-run -- bun test ./tests',
+    'dash=-; server${dash}run () { shift; "$@"; }; server-run -- bun test ./tests',
+    "eval 'f(){ :; }'; server-run -- bun test ./tests",
     # Sourced shell code is invisible to the hook and may define the function (review finding).
-    "source /tmp/evil; runpod-run -- bun test ./tests",
-    ". /tmp/evil && runpod-run -- bun test ./tests",
+    "source /tmp/evil; server-run -- bun test ./tests",
+    ". /tmp/evil && server-run -- bun test ./tests",
     # zsh: the `path` array and the `functions` table re-point a name too (review finding).
-    "path=(/tmp/evil $path); runpod-run -- bun test ./tests",
-    "functions[runpod-run]='shift; \"$@\"'; runpod-run -- bun test ./tests",
-    "export HOME=/tmp/evil; ~/.local/bin/runpod-run -- bun test ./tests",
-    "sudo runpod-run -- bun test ./tests",  # resolved through sudo's PATH, not ours (review finding)
-    "command -p runpod-run -- bun test ./tests",  # the shell's default PATH (review finding)
-    "builtin source /tmp/evil; runpod-run -- bun test ./tests",
-    "path[1]=/tmp/evil; runpod-run -- bun test ./tests",  # zsh, element-wise (review finding)
-    "PATH[0]=/tmp/evil; runpod-run -- bun test ./tests",
+    "path=(/tmp/evil $path); server-run -- bun test ./tests",
+    "functions[server-run]='shift; \"$@\"'; server-run -- bun test ./tests",
+    "export HOME=/tmp/evil; ~/.local/bin/server-run -- bun test ./tests",
+    "sudo server-run -- bun test ./tests",  # resolved through sudo's PATH, not ours (review finding)
+    "command -p server-run -- bun test ./tests",  # the shell's default PATH (review finding)
+    "builtin source /tmp/evil; server-run -- bun test ./tests",
+    "path[1]=/tmp/evil; server-run -- bun test ./tests",  # zsh, element-wise (review finding)
+    "PATH[0]=/tmp/evil; server-run -- bun test ./tests",
     # zsh re-points via declaration/array builtins and fpath too (review finding).
-    "set -A path /tmp/evil $path; runpod-run -- bun test ./tests",
-    "typeset path=(/tmp/evil); runpod-run -- bun test ./tests",
-    "typeset -U path; path+=/tmp/evil; runpod-run -- bun test ./tests",
-    "declare -x PATH; runpod-run -- bun test ./tests",
-    "local path; runpod-run -- bun test ./tests",
-    "readonly 'PATH'=/tmp/evil; runpod-run -- bun test ./tests",
-    "unset path; runpod-run -- bun test ./tests",
-    "path+=/tmp/evil; runpod-run -- bun test ./tests",
-    "fpath=(/tmp/evil $fpath); runpod-run -- bun test ./tests",
-    "FPATH=/tmp/evil runpod-run -- bun test ./tests",
-    'runpod-run() { shift; "$@"; }; runpod-run -- bun test ./tests',
-    "'runpod-run'() { shift; \"$@\"; }; runpod-run -- bun test ./tests",  # the shell removes the quotes
-    "alias runpod-run='env'; runpod-run -- bun test ./tests",
-    "alias 'runpod-run'=env; runpod-run -- bun test ./tests",
-    "PATH=/tmp/evil:$PATH runpod-run -- bun test ./tests",
-    "PATH=/tmp/evil:$PATH; runpod-run -- bun test ./tests",  # an earlier segment re-points it
-    "export PATH=/tmp/evil:$PATH && runpod-run -- bun test ./tests",
-    "hash -p /tmp/evil/runpod-run runpod-run; runpod-run -- bun test ./tests",
-    "./runpod-run -- bun test ./tests",  # relative: whatever sits in the cwd
-    "{fake} -- bun test ./tests",  # named runpod-run, but not the installed script
+    "set -A path /tmp/evil $path; server-run -- bun test ./tests",
+    "typeset path=(/tmp/evil); server-run -- bun test ./tests",
+    "typeset -U path; path+=/tmp/evil; server-run -- bun test ./tests",
+    "declare -x PATH; server-run -- bun test ./tests",
+    "local path; server-run -- bun test ./tests",
+    "readonly 'PATH'=/tmp/evil; server-run -- bun test ./tests",
+    "unset path; server-run -- bun test ./tests",
+    "path+=/tmp/evil; server-run -- bun test ./tests",
+    "fpath=(/tmp/evil $fpath); server-run -- bun test ./tests",
+    "FPATH=/tmp/evil server-run -- bun test ./tests",
+    'server-run() { shift; "$@"; }; server-run -- bun test ./tests',
+    "'server-run'() { shift; \"$@\"; }; server-run -- bun test ./tests",  # the shell removes the quotes
+    "alias server-run='env'; server-run -- bun test ./tests",
+    "alias 'server-run'=env; server-run -- bun test ./tests",
+    "PATH=/tmp/evil:$PATH server-run -- bun test ./tests",
+    "PATH=/tmp/evil:$PATH; server-run -- bun test ./tests",  # an earlier segment re-points it
+    "export PATH=/tmp/evil:$PATH && server-run -- bun test ./tests",
+    "hash -p /tmp/evil/server-run server-run; server-run -- bun test ./tests",
+    "./server-run -- bun test ./tests",  # relative: whatever sits in the cwd
+    "{fake} -- bun test ./tests",  # named server-run, but not the installed script
     "{forged} -- bun test ./tests",  # carries the real header, still not the installed script
-    "{symlink} -- bun test ./tests",  # a runpod-run symlink to python
+    "{symlink} -- bun test ./tests",  # a server-run symlink to python
 ])
-def test_spoofed_runpod_run_is_not_exempt(command, offload_script, tmp_path):
+def test_spoofed_server_run_is_not_exempt(command, offload_script, tmp_path):
     """Review findings: the name alone, or the script's header, is spoofable — each of these
     runs the suite locally."""
-    fake = tmp_path / "evil" / "runpod-run"
+    fake = tmp_path / "evil" / "server-run"
     fake.parent.mkdir()
     fake.write_text("#!/bin/sh\nshift; exec \"$@\"\n")
-    forged = tmp_path / "forged" / "runpod-run"
+    forged = tmp_path / "forged" / "server-run"
     forged.parent.mkdir()
-    forged.write_text(_RUNPOD_RUN_HEADER + "shift; exec \"$@\"\n")
-    symlink = tmp_path / "evil2" / "runpod-run"
+    forged.write_text(_SERVER_RUN_HEADER + "shift; exec \"$@\"\n")
+    symlink = tmp_path / "evil2" / "server-run"
     symlink.parent.mkdir()
     symlink.symlink_to(sys.executable)
     for name, path in (("{fake}", fake), ("{forged}", forged), ("{symlink}", symlink)):
@@ -436,17 +436,17 @@ def test_spoofed_runpod_run_is_not_exempt(command, offload_script, tmp_path):
     assert hook.classify_heavy_operation(command) is not None, command
 
 
-def test_the_runpod_run_on_path_must_be_the_installed_script(monkeypatch, tmp_path):
-    forged = tmp_path / "runpod-run"
-    forged.write_text(_RUNPOD_RUN_HEADER + "shift; exec \"$@\"\n")
+def test_the_server_run_on_path_must_be_the_installed_script(monkeypatch, tmp_path):
+    forged = tmp_path / "server-run"
+    forged.write_text(_SERVER_RUN_HEADER + "shift; exec \"$@\"\n")
     forged.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path))
-    assert hook.classify_heavy_operation("runpod-run -- bun test ./tests") is not None
+    assert hook.classify_heavy_operation("server-run -- bun test ./tests") is not None
 
 
-def test_the_checkout_copy_of_runpod_run_is_trusted():
+def test_the_checkout_copy_of_server_run_is_trusted():
     """The skill script in this hook's own agent-tools checkout is the other trusted install."""
-    script = _HOOK.parents[2] / "skills" / "universal" / "runpod-offload" / "runpod-run"
+    script = _HOOK.parents[2] / "skills" / "universal" / "server-offload" / "server-run"
     assert hook.classify_heavy_operation(f"{script} -- bun test ./tests") is None
 
 
@@ -471,10 +471,10 @@ def test_install_and_worktrees_from_a_linked_worktree(tmp_path):
     assert hook._install_and_worktrees(tmp_path / "plain") == {tmp_path / "plain"}
 
 
-def test_a_registered_worktree_copy_of_runpod_run_is_trusted(monkeypatch, tmp_path):
+def test_a_registered_worktree_copy_of_server_run_is_trusted(monkeypatch, tmp_path):
     checkout = tmp_path / "agent-tools"
     worktree = checkout / ".worktrees" / "feat"
-    worktree_script = worktree / "skills" / "universal" / "runpod-offload" / "runpod-run"
+    worktree_script = worktree / "skills" / "universal" / "server-offload" / "server-run"
     worktree_script.parent.mkdir(parents=True)
     worktree_script.write_text("#!/usr/bin/env bash\n")
     monkeypatch.setattr(hook, "__file__", str(checkout / "agent-hooks" / "heavy-op-memory-gate" / "heavy_op_memory_gate.py"))
@@ -482,15 +482,15 @@ def test_a_registered_worktree_copy_of_runpod_run_is_trusted(monkeypatch, tmp_pa
     assert hook.classify_heavy_operation(command) is not None, "a directory under .worktrees/ is not a worktree"
     _register_worktree(checkout, worktree)
     assert hook.classify_heavy_operation(command) is None
-    other = tmp_path / "elsewhere" / ".worktrees" / "feat" / "skills" / "universal" / "runpod-offload" / "runpod-run"
+    other = tmp_path / "elsewhere" / ".worktrees" / "feat" / "skills" / "universal" / "server-offload" / "server-run"
     other.parent.mkdir(parents=True)
     other.write_text("#!/bin/sh\n")
     assert hook.classify_heavy_operation(f"{other} -- bun test ./tests") is not None
 
 
-def test_runpod_run_not_on_path_is_not_exempt(monkeypatch, tmp_path):
+def test_server_run_not_on_path_is_not_exempt(monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", str(tmp_path))
-    assert hook.classify_heavy_operation("runpod-run -- bun test ./tests") is not None
+    assert hook.classify_heavy_operation("server-run -- bun test ./tests") is not None
 
 
 # ── review-cli handoff: review-cli admits its own runs (review-cli#614) ───────────────
@@ -630,8 +630,8 @@ def test_a_command_that_may_change_the_reviews_environment_is_not_handed_off(com
     assert hook.review_cli_handoff(command) is None, command
 
 
-def test_runpod_run_remote_tail_does_not_stop_a_review_handoff(review_cli, offload_script):
-    command = "runpod-run -- bash -c 'export PATH=/opt/bin:$PATH && make test' && review diff --staged"
+def test_server_run_remote_tail_does_not_stop_a_review_handoff(review_cli, offload_script):
+    command = "server-run -- bash -c 'export PATH=/opt/bin:$PATH && make test' && review diff --staged"
     rest = hook.review_cli_handoff(command)
     assert rest is not None and hook.classify_heavy_operation(rest) is None
 
@@ -1118,30 +1118,30 @@ def test_runner_label_ignores_runner_names_in_operand_positions(argv):
     assert hook._runner_label(argv) is None, argv
 
 
-def test_scan_does_not_count_runpod_run_trees(_fake_proc, offload_script):
-    """`runpod-run -- bun test` names a runner in its argv, but the suite runs on the pod;
+def test_scan_does_not_count_server_run_trees(_fake_proc, offload_script):
+    """`server-run -- bun test` names a runner in its argv, but the suite runs on the server;
     the local process and its ssh child are not heavy runners."""
     table = _table({
         1: (0, "systemd", ["/sbin/init"]),
         100: (1, "omp", ["omp"]),
-        400: (100, "runpod-run", ["bash", str(offload_script), "--ttl", "30", "--", "bun", "test", "./tests"]),
-        401: (400, "ssh", ["ssh", "-p", "22", "runner@1.2.3.4", "bash -c x runpod-run /workspace/r 3600s bun test ./tests"]),
+        400: (100, "server-run", ["bash", str(offload_script), "--ttl", "30", "--", "bun", "test", "./tests"]),
+        401: (400, "ssh", ["ssh", "-p", "22", "runner@1.2.3.4", "bash -c x server-run /workspace/r 3600s bun test ./tests"]),
         402: (400, "bun", ["bun", "test", "./tests"]),  # even a stray child is the offload's
-        410: (100, "bash", ["bash", "./runpod-run", "--", "pytest", "-q"]),  # relative: not pinnable, so counted
+        410: (100, "bash", ["bash", "./server-run", "--", "pytest", "-q"]),  # relative: not pinnable, so counted
         411: (410, "python", ["python", "-m", "pytest", "-q"]),
         500: (100, "bun", ["bun", "test", "./tests"]),  # a real local suite still counts
     })
     assert [r.pid for r in hook.scan_live_runners(table=table, pss=lambda pid: 0)] == [411, 500]
 
 
-def test_scan_counts_a_process_merely_named_runpod_run(_fake_proc, tmp_path):
-    """Review finding: a spoofed `runpod-run` (here a pass-through shim) runs the suite locally."""
-    fake = tmp_path / "evil" / "runpod-run"
+def test_scan_counts_a_process_merely_named_server_run(_fake_proc, tmp_path):
+    """Review finding: a spoofed `server-run` (here a pass-through shim) runs the suite locally."""
+    fake = tmp_path / "evil" / "server-run"
     fake.parent.mkdir()
     fake.write_text("#!/bin/sh\nexec \"$@\"\n")
     table = _table({
         1: (0, "systemd", ["/sbin/init"]),
-        600: (1, "runpod-run", ["sh", str(fake), "--", "bun", "test", "./tests"]),
+        600: (1, "server-run", ["sh", str(fake), "--", "bun", "test", "./tests"]),
         601: (600, "bun", ["bun", "test", "./tests"]),
     })
     assert [r.pid for r in hook.scan_live_runners(table=table, pss=lambda pid: 0)] == [601]
@@ -1152,15 +1152,15 @@ def test_scan_counts_a_process_merely_named_runpod_run(_fake_proc, tmp_path):
     ["/usr/bin/env", "bash", "{local_bin}", "--ttl", "30", "--", "pytest"],
     ["timeout", "3700", "{skill}", "--", "pytest"],
 ])
-def test_is_offload_process_matches_the_real_runpod_run_in_executable_position(argv, offload_script):
-    local_bin = Path(os.environ["HOME"]) / ".local" / "bin" / "runpod-run"
+def test_is_offload_process_matches_the_real_server_run_in_executable_position(argv, offload_script):
+    local_bin = Path(os.environ["HOME"]) / ".local" / "bin" / "server-run"
     argv = [word.format(skill=offload_script, local_bin=local_bin) for word in argv]
     assert hook._is_offload_process(hook._ProcInfo(1, "bash", argv))
 
 
-def test_is_offload_process_ignores_runpod_run_as_an_operand(offload_script):
+def test_is_offload_process_ignores_server_run_as_an_operand(offload_script):
     assert not hook._is_offload_process(hook._ProcInfo(1, "grep", ["grep", str(offload_script), "README.md"]))
-    assert not hook._is_offload_process(hook._ProcInfo(1, "pytest", ["pytest", "tests/test_runpod-run.py"]))
+    assert not hook._is_offload_process(hook._ProcInfo(1, "pytest", ["pytest", "tests/test_server-run.py"]))
 
 
 def _runners(n, label="pytest", pss_mb=None):
@@ -1240,7 +1240,7 @@ def test_live_runner_ceiling_blocks_even_with_plenty_of_ram():
         "  - pid 1003  503 MB  pytest  (reserves 2569 MB)  ← omp 13 (~/repo-3)\n"
         "  - pid 1004  504 MB  pytest  (reserves 2568 MB)  ← omp 14 (~/repo-4)"
     )
-    assert "runpod-run" in message
+    assert "server-run" in message
     assert hook.decide("test-suite runner", level=None, block_at=2, memory=_avail(200), live_runners=_runners(4)) == ("allow", None)
 
 
@@ -1657,14 +1657,14 @@ def test_main_does_not_apply_gpu_slots_to_non_gpu_heavy_ops(monkeypatch, gpu_slo
     assert code == 0
 
 
-def test_main_allows_runpod_run_under_critical_pressure(monkeypatch, offload_script):
-    out, _err, code = _run("runpod-run --ttl 30 -- bun test ./tests", monkeypatch, macos_level=4)
+def test_main_allows_server_run_under_critical_pressure(monkeypatch, offload_script):
+    out, _err, code = _run("server-run --ttl 30 -- bun test ./tests", monkeypatch, macos_level=4)
     assert code == 0
     assert json.loads(out)["decision"] == "allow"
 
 
-def test_main_still_blocks_a_local_suite_chained_after_runpod_run(monkeypatch, offload_script):
-    out, _err, code = _run("runpod-run -- bun test ./tests && bun test", monkeypatch, macos_level=4)
+def test_main_still_blocks_a_local_suite_chained_after_server_run(monkeypatch, offload_script):
+    out, _err, code = _run("server-run -- bun test ./tests && bun test", monkeypatch, macos_level=4)
     assert code == hook.BLOCK_EXIT_CODE
     assert json.loads(out)["decision"] == "block"
 
@@ -1901,6 +1901,6 @@ def test_small_test_run_still_blocked_on_emergency(signal, monkeypatch):
     assert "locally run one or two test files" not in result["message"], "would name the blocked command"
 
 
-def test_full_suite_block_still_points_at_runpod_and_small_runs():
+def test_full_suite_block_still_points_at_the_server_and_small_runs():
     _decision, message = hook.decide("build/test suite", level=4, block_at=2)
-    assert "runpod-run -- <command>" in message and "locally run one or two test files at most" in message
+    assert "server-run -- <command>" in message and "locally run one or two test files at most" in message
